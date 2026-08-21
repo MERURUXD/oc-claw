@@ -385,5 +385,26 @@
     "messagesLabel": "メッセージ",
     "messagesUnit": "件",
     "messageCountUnit": "メッセージ数"
+  },
+  "petGallery": {
+    "title": "",
+    "market": "",
+    "mySkins": "",
+    "searchPlaceholder": "",
+    "sortLatest": "",
+    "sortHot": "",
+    "sortDownloads": "",
+    "download": "",
+    "installed": "",
+    "favorite": "",
+    "equip": "",
+    "addToQueue": "",
+    "delete": "",
+    "details": "",
+    "loadMore": "",
+    "deleteConfirm": "",
+    "downloading": "",
+    "downloadFailed": "",
+    "author": ""
   }
 }
