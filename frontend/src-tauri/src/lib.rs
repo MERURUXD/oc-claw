@@ -9017,15 +9017,14 @@ fn codex_pets_dir() -> Option<PathBuf> {
 fn read_pet_meta(dir: &std::path::Path) -> Option<CodexPetMeta> {
     let raw = std::fs::read_to_string(dir.join("pet.json")).ok()?;
     let meta: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let id = meta
-        .get("id")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| {
-            dir.file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default()
-        });
+    // The folder name is the canonical id — delete/list/download key on it.
+    // Never trust a third-party pet.json `id` field, which may differ from the
+    // folder name (e.g. a market slug) and would break "installed" matching
+    // and delete-by-id.
+    let id = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
     let display_name = meta
         .get("displayName")
         .and_then(|v| v.as_str())
@@ -9041,7 +9040,13 @@ fn read_pet_meta(dir: &std::path::Path) -> Option<CodexPetMeta> {
         .and_then(|v| v.as_str())
         .map(String::from)
         .unwrap_or_else(|| "spritesheet.webp".into());
-    let abs = dir.join(&sheet_path);
+    // Collapse to the basename so a third-party pet.json can't point the
+    // spritesheet lookup outside the pet folder.
+    let sheet_name = std::path::Path::new(&sheet_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "spritesheet.webp".into());
+    let abs = dir.join(&sheet_name);
     if !abs.is_file() {
         return None;
     }
@@ -9189,7 +9194,10 @@ async fn fetch_market_pets(
 /// `dst/source.json` for the gallery details dialog. Any failure is silent —
 /// the file is optional and must never block a successful install.
 async fn write_source_json(client: &reqwest::Client, slug: &str, dst: &std::path::Path) {
-    let url = format!("{}/pets/{}", CODEXPET_API_BASE, slug);
+    let encoded_slug: String =
+        percent_encoding::utf8_percent_encode(slug, percent_encoding::NON_ALPHANUMERIC)
+            .to_string();
+    let url = format!("{}/pets/{}", CODEXPET_API_BASE, encoded_slug);
     let Ok(resp) = client.get(&url).send().await else {
         return;
     };
@@ -9245,7 +9253,10 @@ async fn download_codex_pet(slug: String) -> Result<CodexPetMeta, String> {
         .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| e.to_string())?;
-    let url = format!("{}/pets/{}/download", CODEXPET_API_BASE, slug);
+    let encoded_slug: String =
+        percent_encoding::utf8_percent_encode(&slug, percent_encoding::NON_ALPHANUMERIC)
+            .to_string();
+    let url = format!("{}/pets/{}/download", CODEXPET_API_BASE, encoded_slug);
     let bytes = client
         .get(&url)
         .send()
@@ -9295,7 +9306,14 @@ async fn download_codex_pet(slug: String) -> Result<CodexPetMeta, String> {
     // failure here is silent and never blocks a successful install.
     let _ = write_source_json(&client, &slug, &dst).await;
 
-    read_pet_meta(&dst).ok_or_else(|| "installed but pet.json missing".into())
+    match read_pet_meta(&dst) {
+        Some(meta) => Ok(meta),
+        None => {
+            // Missing pet.json → roll back so no orphan folder is left behind.
+            let _ = std::fs::remove_dir_all(&dst);
+            Err("installed but pet.json missing".into())
+        }
+    }
 }
 
 /// Delete a locally installed custom pet folder (`~/.codex/pets/<id>`). The
