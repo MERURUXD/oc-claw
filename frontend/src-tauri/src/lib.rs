@@ -9011,6 +9011,48 @@ fn codex_pets_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".codex").join("pets"))
 }
 
+/// Read `pet.json` inside a pet folder and build its `CodexPetMeta`. Returns
+/// `None` when the folder has no readable/valid `pet.json` or the spritesheet
+/// is missing. Shared by `list_custom_codex_pets` and `download_codex_pet`.
+fn read_pet_meta(dir: &std::path::Path) -> Option<CodexPetMeta> {
+    let raw = std::fs::read_to_string(dir.join("pet.json")).ok()?;
+    let meta: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let id = meta
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| {
+            dir.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+        });
+    let display_name = meta
+        .get("displayName")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| id.clone());
+    let description = meta
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_default();
+    let sheet_path = meta
+        .get("spritesheetPath")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| "spritesheet.webp".into());
+    let abs = dir.join(&sheet_path);
+    if !abs.is_file() {
+        return None;
+    }
+    Some(CodexPetMeta {
+        id,
+        display_name,
+        description,
+        spritesheet_url: codex_asset_url(&abs),
+    })
+}
+
 /// List custom codex pets the user has dropped into `~/.codex/pets`. Each
 /// pet folder must contain a `pet.json` metadata file plus a spritesheet
 /// (.webp/.png/.jpg). Missing pieces are skipped silently.
@@ -9032,53 +9074,9 @@ async fn list_custom_codex_pets() -> Result<Vec<CodexPetMeta>, String> {
         if !path.is_dir() {
             continue;
         }
-        let pet_json = path.join("pet.json");
-        if !pet_json.is_file() {
-            continue;
+        if let Some(meta) = read_pet_meta(&path) {
+            out.push(meta);
         }
-        let raw = match std::fs::read_to_string(&pet_json) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let meta: serde_json::Value = match serde_json::from_str(&raw) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let id = meta
-            .get("id")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .unwrap_or_else(|| {
-                path.file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default()
-            });
-        let display_name = meta
-            .get("displayName")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .unwrap_or_else(|| id.clone());
-        let description = meta
-            .get("description")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .unwrap_or_default();
-        let sheet_path = meta
-            .get("spritesheetPath")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .unwrap_or_else(|| "spritesheet.webp".into());
-        let abs = path.join(&sheet_path);
-        if !abs.is_file() {
-            continue;
-        }
-        let url = codex_asset_url(&abs);
-        out.push(CodexPetMeta {
-            id,
-            display_name,
-            description,
-            spritesheet_url: url,
-        });
     }
     out.sort_by(|a, b| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()));
     Ok(out)
@@ -9185,6 +9183,119 @@ async fn fetch_market_pets(
         total_pages: g("totalPages"),
         current_page: g("currentPage"),
     })
+}
+
+/// Fetch `GET /api/pets/{slug}` and write author/license/tags into
+/// `dst/source.json` for the gallery details dialog. Any failure is silent —
+/// the file is optional and must never block a successful install.
+async fn write_source_json(client: &reqwest::Client, slug: &str, dst: &std::path::Path) {
+    let url = format!("{}/pets/{}", CODEXPET_API_BASE, slug);
+    let Ok(resp) = client.get(&url).send().await else {
+        return;
+    };
+    if !resp.status().is_success() {
+        return;
+    }
+    let Ok(json) = resp.json::<serde_json::Value>().await else {
+        return;
+    };
+    let Some(pet) = json.get("pet") else {
+        return;
+    };
+    let author_name = pet
+        .get("author_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let license = pet
+        .get("license")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let tags: Vec<String> = pet
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let obj = serde_json::json!({
+        "author_name": author_name,
+        "license": license,
+        "tags": tags,
+    });
+    let _ = std::fs::write(
+        dst.join("source.json"),
+        serde_json::to_string_pretty(&obj).unwrap_or_default(),
+    );
+}
+
+/// Download a pet skin from codexpet.xyz and install it into
+/// `~/.codex/pets/<slug>`. The zip is fetched with a 60s timeout, extracted
+/// with zip-slip protection (only the basename of each entry is kept, so
+/// directory prefixes can never escape the destination), and the destination
+/// folder is rolled back on extraction failure so no half-installed pet is
+/// left behind.
+#[tauri::command]
+async fn download_codex_pet(slug: String) -> Result<CodexPetMeta, String> {
+    let slug = slug.trim().to_string();
+    if slug.is_empty() || slug.contains('/') || slug.contains('\\') || slug.contains("..") {
+        return Err("invalid slug".into());
+    }
+    let client = reqwest::Client::builder()
+        .user_agent("oc-claw")
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let url = format!("{}/pets/{}/download", CODEXPET_API_BASE, slug);
+    let bytes = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .bytes()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let Some(root) = codex_pets_dir() else {
+        return Err("home directory not found".into());
+    };
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let dst = root.join(&slug);
+    if dst.exists() {
+        let _ = std::fs::remove_dir_all(&dst);
+    }
+    std::fs::create_dir_all(&dst).map_err(|e| e.to_string())?;
+
+    // Extract; roll back by removing dst on failure to avoid leaving a
+    // half-installed folder behind.
+    let extract = || -> Result<(), String> {
+        let reader = std::io::Cursor::new(&bytes);
+        let mut archive = zip::ZipArchive::new(reader).map_err(|e| e.to_string())?;
+        for i in 0..archive.len() {
+            let mut f = archive.by_index(i).map_err(|e| e.to_string())?;
+            let base = std::path::Path::new(f.name())
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if base.is_empty() || f.is_dir() {
+                continue; // drop directory prefixes, prevents zip-slip
+            }
+            let mut out = std::fs::File::create(dst.join(&base)).map_err(|e| e.to_string())?;
+            std::io::copy(&mut f, &mut out).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    };
+    if let Err(e) = extract() {
+        let _ = std::fs::remove_dir_all(&dst);
+        return Err(format!("extract failed: {e}"));
+    }
+
+    // Persist source.json (author/license/tags) for the details dialog; a
+    // failure here is silent and never blocks a successful install.
+    let _ = write_source_json(&client, &slug, &dst).await;
+
+    read_pet_meta(&dst).ok_or_else(|| "installed but pet.json missing".into())
 }
 
 /// Forward a frontend diagnostic line to the dev terminal so debugging
