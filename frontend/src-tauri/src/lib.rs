@@ -9084,6 +9084,109 @@ async fn list_custom_codex_pets() -> Result<Vec<CodexPetMeta>, String> {
     Ok(out)
 }
 
+// ─── Pet gallery: codexpet.xyz market proxy ───
+//
+// codexpet.xyz is a public third-party pet skin marketplace (no auth, CORS
+// `*`). All requests go through the desktop shell so the webview never talks
+// to the site directly.
+
+/// Base URL of the public codexpet.xyz market API.
+const CODEXPET_API_BASE: &str = "https://codexpet.xyz/api";
+
+#[derive(serde::Serialize)]
+struct MarketPetMeta {
+    slug: String,
+    display_name: String,
+    description: String,
+    author_name: String,
+    license: String,
+    tags: Vec<String>,
+    download_count: u64,
+    like_count: u64,
+    hot_score: u64,
+    published_at: String,
+    spritesheet_url: String,
+    download_url: String,
+}
+
+#[derive(serde::Serialize)]
+struct MarketPetsPage {
+    pets: Vec<MarketPetMeta>,
+    total_items: u64,
+    total_pages: u64,
+    current_page: u64,
+}
+
+fn parse_tags(v: Option<&serde_json::Value>) -> Vec<String> {
+    match v {
+        Some(serde_json::Value::String(s)) => serde_json::from_str::<Vec<String>>(s).unwrap_or_default(),
+        Some(serde_json::Value::Array(a)) => a.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Proxy `GET /api/pets` from codexpet.xyz. Field access is fault-tolerant:
+/// missing/odd-typed entries fall back to defaults instead of failing the
+/// whole page.
+#[tauri::command]
+async fn fetch_market_pets(
+    q: Option<String>,
+    sort: Option<String>,
+    page: u32,
+    limit: u32,
+) -> Result<MarketPetsPage, String> {
+    let client = reqwest::Client::builder()
+        .user_agent("oc-claw")
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let url = format!("{}/pets", CODEXPET_API_BASE);
+    let mut query: Vec<(String, String)> = Vec::new();
+    if let Some(q) = q.as_ref().filter(|s| !s.trim().is_empty()) {
+        query.push(("q".into(), q.clone()));
+    }
+    if let Some(s) = sort.as_ref().filter(|s| !s.trim().is_empty()) {
+        query.push(("sort".into(), s.clone()));
+    }
+    query.push(("page".into(), page.to_string()));
+    query.push(("limit".into(), limit.to_string()));
+    let resp = client.get(&url).query(&query).send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+
+    let mut pets = Vec::new();
+    if let Some(arr) = json.get("pets").and_then(|v| v.as_array()) {
+        for item in arr {
+            let s = |k: &str| item.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let n = |k: &str| item.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+            pets.push(MarketPetMeta {
+                slug: s("slug"),
+                display_name: s("display_name"),
+                description: s("description"),
+                author_name: s("author_name"),
+                license: s("license"),
+                tags: parse_tags(item.get("tags_json")),
+                download_count: n("download_count"),
+                like_count: n("like_count"),
+                hot_score: n("hot_score"),
+                published_at: s("published_at"),
+                spritesheet_url: s("spritesheetUrl"),
+                download_url: s("downloadUrl"),
+            });
+        }
+    }
+    let pg = json.get("pagination").cloned().unwrap_or(serde_json::Value::Null);
+    let g = |k: &str| pg.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+    Ok(MarketPetsPage {
+        pets,
+        total_items: g("totalItems"),
+        total_pages: g("totalPages"),
+        current_page: g("currentPage"),
+    })
+}
+
 /// Forward a frontend diagnostic line to the dev terminal so debugging
 /// modal/blur/exit paths doesn't require opening webview DevTools.
 #[tauri::command]
