@@ -8639,16 +8639,18 @@ fn load_ooclaw_session_detail(hermes_dir: &std::path::Path, session_id: &str) ->
     None
 }
 
-/// Load recent Hermes sessions from ooclaw-status.json (plugin required).
-/// Only sessions present in ooclaw-status.json are shown. If the plugin
-/// is not installed (no JSON file), no Hermes sessions are displayed.
+/// Load recent Hermes sessions. The session LIST now comes from state.db
+/// (all desktop/platform sessions except cli/terminal), most recent first.
+/// The ooclaw-status.json plugin file is used only to enrich live status
+/// (blocked_on_user / processing) when the plugin is running — desktop
+/// (Hermes GUI) sessions are not tracked by that plugin, so we fall back to
+/// state.db's ended_at / last_activity_at for liveness.
 /// Session metadata (userPrompt, lastResponse) is enriched from state.db.
 fn load_recent_hermes_sessions_from_db() -> Result<Vec<ClaudeSession>, String> {
     let home = dirs::home_dir().ok_or("no home dir")?;
     let hermes_dir = home.join(".hermes");
 
-    // Load ooclaw plugin status — this is the single source of truth.
-    // No JSON → no sessions shown.
+    // Load ooclaw plugin status for live-state enrichment only.
     let mut plugin_status: HashMap<String, String> = HashMap::new();
     plugin_status.extend(load_ooclaw_status(&hermes_dir));
     let profiles_dir = hermes_dir.join("profiles");
@@ -8661,14 +8663,11 @@ fn load_recent_hermes_sessions_from_db() -> Result<Vec<ClaudeSession>, String> {
             }
         }
     }
-    if plugin_status.is_empty() {
-        return Ok(vec![]);
-    }
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
 
-    // Open state.db for enrichment (userPrompt, lastResponse, timestamps)
+    // Open state.db — now the primary source for the Hermes session list.
     let db_path = hermes_dir.join("state.db");
     let conn = if db_path.exists() {
         rusqlite::Connection::open_with_flags(
@@ -8681,22 +8680,53 @@ fn load_recent_hermes_sessions_from_db() -> Result<Vec<ClaudeSession>, String> {
 
     let mut sessions = Vec::new();
 
-    for (sid, claude_status) in &plugin_status {
-        // load_ooclaw_status uses "blocked_on_user" as a sentinel when the
-        // agent is paused waiting for user reply (PermissionRequest or an
-        // interactive tool like clarify). UI maps that to the waiting pet,
-        // while plain "waiting_for_input" means the turn cleanly ended.
-        let status = match claude_status.as_str() {
-            "processing" | "running_tool" | "waiting" => "processing".to_string(),
-            "blocked_on_user" => "waiting".to_string(),
-            _ => "stopped".to_string(),
+    // Read desktop sessions directly from state.db, most recent first.
+    // Keep active sessions (ended_at IS NULL) plus recently ended ones
+    // (last 7 days), capped at 20 to mirror the old plugin buffer.
+    let cutoff_sec = (now_ms as f64 / 1000.0) - 7.0 * 86400.0;
+    let db_rows: Vec<(String, String, Option<f64>, f64)> = if let Some(ref db) = conn {
+        let mut stmt = db.prepare(
+            "SELECT id, source, ended_at, last_activity_at FROM sessions \
+             WHERE source = 'desktop' \
+               AND (ended_at IS NULL OR last_activity_at > ?1) \
+             ORDER BY last_activity_at DESC LIMIT 20"
+        ).map_err(|e| format!("prepare: {}", e))?;
+        let rows = stmt.query_map(rusqlite::params![cutoff_sec], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<f64>>(2)?,
+                row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+            ))
+        }).map_err(|e| format!("query: {}", e))?;
+        rows.filter_map(|r| r.ok()).collect()
+    } else {
+        Vec::new()
+    };
+
+    for (sid, src, ended_at, last_activity_at) in &db_rows {
+        let platform = src.clone();
+
+        // Live status: prefer the ooclaw plugin's per-event status when it
+        // tracked this session (blocked_on_user sentinel etc.); otherwise fall
+        // back to state.db — ended_at IS NULL means the turn is still running.
+        let status = match plugin_status.get(sid.as_str()).map(|s| s.as_str()) {
+            Some("processing") | Some("running_tool") | Some("waiting") => "processing".to_string(),
+            Some("blocked_on_user") => "waiting".to_string(),
+            Some(_) => "stopped".to_string(),
+            None => {
+                if ended_at.is_none() {
+                    "processing".to_string()
+                } else {
+                    "stopped".to_string()
+                }
+            }
         };
         let is_active = status == "processing";
 
         let mut user_prompt: Option<String> = None;
         let mut asst_response: Option<String> = None;
-        let mut updated_at_ms = now_ms;
-        let mut platform = String::new();
+        let mut updated_at_ms = (*last_activity_at * 1000.0) as u64;
 
         // Read userPrompt/lastResponse from plugin status
         if let Some((up, lr)) = load_ooclaw_session_detail(&hermes_dir, sid) {
@@ -8706,11 +8736,6 @@ fn load_recent_hermes_sessions_from_db() -> Result<Vec<ClaudeSession>, String> {
 
         // Enrich from state.db
         if let Some(ref db) = conn {
-            if let Ok(src) = db.query_row(
-                "SELECT source FROM sessions WHERE id = ?1", rusqlite::params![sid], |r| r.get::<_, String>(0)
-            ) {
-                platform = src;
-            }
             if let Ok(Some(ts)) = db.query_row(
                 "SELECT MAX(timestamp) FROM messages WHERE session_id = ?1 AND role NOT IN ('session_meta','system','metadata')",
                 rusqlite::params![sid], |r| r.get::<_, Option<f64>>(0)
@@ -8743,11 +8768,6 @@ fn load_recent_hermes_sessions_from_db() -> Result<Vec<ClaudeSession>, String> {
                     asst_response = Some(r);
                 }
             }
-        }
-
-        // Skip CLI sessions
-        if platform == "cli" || platform == "terminal" {
-            continue;
         }
 
         sessions.push(ClaudeSession {
