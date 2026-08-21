@@ -15565,10 +15565,9 @@ _INTERACTIVE_TOOLS = ('clarify', 'ask_user', 'confirm')
 def _is_interactive_tool(t):
     """Tools that block the agent waiting for user reply (clarify, etc)."""
     return t in _INTERACTIVE_TOOLS
-# No plugin data at all → return empty
-if not _all_known_sids:
-    print(json.dumps([]))
-    import sys; sys.exit(0)
+# NOTE: do NOT return early when ooclaw-status.json has no sessions —
+# desktop sessions (hermes serve --isolated) never fire the ooclaw hook
+# plugin, so their source of truth is state.db (read in the desktop block).
 for _pdir in profile_dirs:
     sj = os.path.join(_pdir, 'sessions', 'sessions.json')
     db = os.path.join(_pdir, 'state.db')
@@ -15772,6 +15771,36 @@ for _pdir in profile_dirs:
                                 'inputTokens': r[6] or 0, 'outputTokens': r[7] or 0,
                                 'blockedType': _bk, 'blockedText': _bt,
                                 'active': active, 'status': sess_status, 'source': 'hermes'})
+        except: pass
+    # Desktop sessions: the ooclaw hook plugin never fires in isolated
+    # desktop sessions (hermes serve --isolated skips hook plugins), so they
+    # don't appear in ooclaw-status.json. Read them directly from state.db and
+    # infer active state from ended_at (NULL = still open).
+    if db_conn:
+        try:
+            _dcutoff = now - 7 * 86400
+            _dcur = db_conn.execute(
+                "SELECT id, source, model, started_at, ended_at, last_activity_at, message_count, input_tokens, output_tokens "
+                "FROM sessions WHERE source='desktop' AND parent_session_id IS NULL "
+                "AND (ended_at IS NULL OR ended_at > ?) "
+                "ORDER BY COALESCE(last_activity_at, started_at) DESC LIMIT 20", (_dcutoff,))
+            for _r in _dcur.fetchall():
+                _sid = _r[0]
+                if (_pfx + _sid) in seen: continue
+                seen.add(_pfx + _sid)
+                _latest = _find_latest_session(_sid)
+                _up, _lr = _fetch_prompt_response(_latest)
+                _db_last_ts = _r[5] or _r[3]
+                _active = (_r[4] is None)
+                _label = 'desktop'
+                if _profile_name != 'default': _label = _profile_name + '/desktop'
+                results.append({'sessionId': _pfx + _sid, 'platform': _label, 'model': _r[2] or '',
+                                'userPrompt': _up, 'lastResponse': _lr,
+                                'startedAt': _db_last_ts, 'messageCount': _r[6] or 0,
+                                'inputTokens': _r[7] or 0, 'outputTokens': _r[8] or 0,
+                                'blockedType': '', 'blockedText': '',
+                                'active': _active, 'status': ('running' if _active else 'stopped'),
+                                'source': 'hermes'})
         except: pass
     if db_conn:
         try: db_conn.close()
