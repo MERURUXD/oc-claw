@@ -9298,6 +9298,25 @@ async fn download_codex_pet(slug: String) -> Result<CodexPetMeta, String> {
     read_pet_meta(&dst).ok_or_else(|| "installed but pet.json missing".into())
 }
 
+/// Delete a locally installed custom pet folder (`~/.codex/pets/<id>`). The
+/// id is validated against path traversal before any filesystem access.
+#[tauri::command]
+async fn delete_custom_codex_pet(id: String) -> Result<(), String> {
+    let id = id.trim().to_string();
+    if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
+        return Err("invalid id".into()); // directory-traversal guard, hardcoded on purpose
+    }
+    let Some(root) = codex_pets_dir() else {
+        return Err("home directory not found".into());
+    };
+    let target = root.join(&id);
+    if !target.exists() {
+        return Err(format!("pet not found: {id}"));
+    }
+    std::fs::remove_dir_all(&target).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Forward a frontend diagnostic line to the dev terminal so debugging
 /// modal/blur/exit paths doesn't require opening webview DevTools.
 #[tauri::command]
