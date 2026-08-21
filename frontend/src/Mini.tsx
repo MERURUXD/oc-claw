@@ -38,6 +38,7 @@ import {
 import { MiniPetMascot } from './components/MiniPetMascot'
 import { SpritePet } from './components/SpritePet'
 import { PetPicker } from './components/PetPicker'
+import { PetGallery } from './components/PetGallery'
 
 interface CharacterMeta {
   name: string
@@ -637,7 +638,7 @@ export default function Mini() {
       setHiding(false)
     }
   }, [hiding, settingsMode, showSettingsOverlay, settingsTransitioning, debugToTerminal])
-  const [settingsNav, setSettingsNav] = useState<'pairing' | 'settings'>('pairing')
+  const [settingsNav, setSettingsNav] = useState<'pairing' | 'settings' | 'gallery'>('pairing')
   const [isCreateModalOpen, _setIsCreateModalOpen] = useState(false)
   const isCreateModalOpenRef = useRef(false)
   const setIsCreateModalOpen = (v: boolean) => {
@@ -6230,7 +6231,7 @@ export default function Mini() {
                     >
                       <span style={{ fontSize: 13 }}>&lsaquo;</span> {t('common.back')}
                     </button>
-                    {(appMode === 'pet' ? ['settings'] as const : ['pairing', 'settings'] as const).map((nav) => (
+                    {(appMode === 'pet' ? ['gallery', 'settings'] as const : ['pairing', 'gallery', 'settings'] as const).map((nav) => (
                       <button
                         key={nav}
                         data-no-drag
@@ -6249,7 +6250,7 @@ export default function Mini() {
                           fontWeight: settingsNav === nav ? 600 : 400,
                         }}
                       >
-                        {nav === 'pairing' ? t('mini.pairing') : t('mini.settings')}
+                        {nav === 'pairing' ? t('mini.pairing') : nav === 'gallery' ? t('petGallery.title') : t('mini.settings')}
                       </button>
                     ))}
                   </div>
@@ -6470,6 +6471,18 @@ export default function Mini() {
                           await store.set('pet_idle_interval_min', clamped)
                           await store.save()
                         }}
+                      />
+                    </div>
+                  )}
+                  {settingsNav === 'gallery' && (
+                    <div className="h-full overflow-y-auto bg-[#151515] scrollbar-hidden">
+                      <PetGallery
+                        miniPetId={miniPet?.id ?? null}
+                        onEquip={async (pet) => {
+                          setMiniPet(pet)
+                          await saveMiniPetId(pet.id)
+                        }}
+                        onAddToQueue={(id) => savePetQueue([...petQueue, id])}
                       />
                     </div>
                   )}
