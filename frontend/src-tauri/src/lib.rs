@@ -3249,7 +3249,8 @@ fn win_ui_scale(monitor: &tauri::Monitor) -> f64 {
 #[cfg(target_os = "windows")]
 fn fullscreen_foreground_monitor() -> Option<windows::Win32::Graphics::Gdi::HMONITOR> {
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowRect, GetClassNameW,
+        GetForegroundWindow, GetWindowRect, GetClassNameW, IsZoomed, GetWindowLongPtrW,
+        GetWindowThreadProcessId, GWL_STYLE, WS_CAPTION, WS_THICKFRAME,
     };
     use windows::Win32::Graphics::Gdi::{
         MonitorFromWindow, GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTONEAREST,
@@ -3258,6 +3259,14 @@ fn fullscreen_foreground_monitor() -> Option<windows::Win32::Graphics::Gdi::HMON
     unsafe {
         let fg = GetForegroundWindow();
         if fg.0 == std::ptr::null_mut() {
+            return None;
+        }
+
+        // Exclude our own process: oc-claw's own windows must never be
+        // treated as a fullscreen foreground window.
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(fg, Some(&mut pid));
+        if pid == std::process::id() {
             return None;
         }
 
@@ -3291,6 +3300,21 @@ fn fullscreen_foreground_monitor() -> Option<windows::Win32::Graphics::Gdi::HMON
             && fg_rect.right >= mr.right
             && fg_rect.bottom >= mr.bottom
         {
+            // The window covers the whole monitor, but a normal maximized
+            // window (taskbar auto-hidden or not) covers it too.  Only hide
+            // for true fullscreen:
+            // - IsZoomed == false -> classic fullscreen (F11, PowerPoint,
+            //   exclusive fullscreen games) -> hide
+            // - IsZoomed == true with WS_CAPTION/WS_THICKFRAME -> normal
+            //   maximized window -> do NOT hide
+            // - IsZoomed == true without those decorations -> borderless
+            //   fullscreen -> hide
+            if IsZoomed(fg).as_bool() {
+                let style = GetWindowLongPtrW(fg, GWL_STYLE) as u32;
+                if (style & (WS_CAPTION.0 | WS_THICKFRAME.0)) != 0 {
+                    return None;
+                }
+            }
             Some(monitor)
         } else {
             None
