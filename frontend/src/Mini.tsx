@@ -2582,6 +2582,9 @@ export default function Mini() {
   // plain collapsed mascot. Only applies to coding mode (pet mode stays as-is).
   const bubbleCount = hermesBubbles.length
   const bubbleModeActiveRef = useRef(false)
+  // 追踪最新 bubbleCount 供 collapse 闭包读取（collapse 的 useCallback 依赖不含 hermesBubbles）
+  const bubbleCountRef = useRef(0)
+  bubbleCountRef.current = bubbleCount
   useEffect(() => {
     if (appMode === 'pet' || expanded) return
     const wantActive = bubbleCount > 0
@@ -3642,10 +3645,23 @@ export default function Mini() {
             position: mascotPositionRef.current,
             efficiency: viewModeRef.current === 'efficiency',
             mascotScale: mascotScaleRef.current,
-            largeMascot: true,
+            // coding 模式收起应为 miniPet（false），此前硬编码 true 会把窗口
+            // resize 成 large collapsed mascot 尺寸，导致回桌面后气泡宽度异常。
+            largeMascot: largeMascotRef.current,
             largeMascotScale: largeMascotScaleRef.current,
           })
           await restoreCollapsedMascotPosition()
+          // 收起后主动恢复气泡模式，确保窗口尺寸最终由 set_hermes_bubble_mode
+          // 决定。依赖 useEffect 的时序会在 set_mini_expanded 之前触发 active=true
+          // 而被后者覆盖，使气泡窗口停留在错误的宽度（3~4 倍 bug 根因）。
+          if (appModeRef.current !== 'pet' && bubbleCountRef.current > 0) {
+            bubbleModeActiveRef.current = true
+            await invoke('set_hermes_bubble_mode', {
+              active: true,
+              mascotScale: mascotScaleRef.current,
+              bubbleCount: bubbleCountRef.current,
+            }).catch(() => {})
+          }
         }
       } catch {
         /* ensure hiding is always cleared */
@@ -4507,7 +4523,12 @@ export default function Mini() {
             // above it. `alignItems` (cross axis) is what pins it to the
             // bottom in a row flex container — `justifyContent` only affects
             // the horizontal axis, so it stays centered.
-            justifyContent: (appMode === 'pet' && largeMascot) ? undefined : 'center',
+            justifyContent: (appMode === 'pet' && largeMascot)
+              ? undefined
+              : (appMode !== 'pet' && hermesBubbles.length > 0 ? 'flex-end' : 'center'),
+            // 宠物相对气泡向右偏移（参照 hwdc：气泡右边缘对齐宠物右边缘）。
+            // 有气泡时 mascot 靠右对齐，留 8px 边距避免贴边。
+            paddingRight: (appMode !== 'pet' && hermesBubbles.length > 0) ? 8 : undefined,
             // No background. Used to be `rgba(0,0,0,0.01)` to coax macOS
             // WKWebView into delivering hover events on transparent area,
             // but mini-panel no longer uses panel-level hover/click
@@ -4533,7 +4554,7 @@ export default function Mini() {
                 alignItems: 'stretch',
                 gap: 8,
                 maxHeight: `calc(100% - ${collapsedMascotSize + 28}px)`,
-                overflowY: 'auto',
+                overflowY: 'hidden',
                 overflowX: 'hidden',
                 pointerEvents: 'auto',
                 zIndex: 50,
