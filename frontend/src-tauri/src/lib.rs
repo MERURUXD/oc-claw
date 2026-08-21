@@ -60,6 +60,15 @@ static PET_POMODORO_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// so it reads this on each pass instead of capturing the size it started with.
 static PET_MASCOT_SCALES: Mutex<(f64, f64)> = Mutex::new((1.0, LARGE_MASCOT_SIZE_MULTIPLIER));
 
+/// Whether the coding-mode Hermes speech-bubble window (expanded collapsed
+/// window: 260×180 with the mascot bottom-anchored and the bubble stack above)
+/// is currently active. When active, a dedicated pass-through poll keeps only
+/// the mascot area clickable while the bubble area clicks through to the
+/// desktop (bubbles are read-only this phase).
+static HERMES_BUBBLE_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Whether the coding-mode bubble pass-through poll thread is alive.
+static HERMES_BUBBLE_THREAD_ALIVE: AtomicBool = AtomicBool::new(false);
+
 /// Coalesces drag-apply tasks so we never queue more than one
 /// setFrameOrigin: call on the main thread at a time. The poll thread
 /// records the anchor (cursor-to-origin offset at drag start) once; each
@@ -5338,6 +5347,259 @@ async fn set_pet_mode_window(
         }
     }
     Ok(())
+}
+
+/// Coding-mode Hermes speech-bubble window. Expands the collapsed mascot
+/// window to a fixed 260×180 box (mascot bottom-anchored, bubble stack above)
+/// and runs a dedicated pass-through poll so only the mascot area is clickable
+/// while the bubble area lets clicks through (bubbles are read-only).
+///
+/// NOTE: native window geometry is NOT verifiable on the Linux dev box — this
+/// compiles only on the macOS/Windows build machines (winpc), where it is
+/// exercised against the real window server.
+#[tauri::command]
+async fn set_hermes_bubble_mode(
+    app: tauri::AppHandle,
+    active: bool,
+    mascot_scale: Option<f64>,
+) -> Result<(), String> {
+    let win = app.get_webview_window("mini").ok_or("mini window not found")?;
+    let mascot_scale = sanitized_mascot_scale(mascot_scale);
+
+    if active {
+        let was_active = HERMES_BUBBLE_ACTIVE.load(Ordering::SeqCst);
+        #[cfg(target_os = "macos")]
+        {
+            let win_clone = win.clone();
+            app.run_on_main_thread(move || {
+                use objc2::runtime::AnyObject;
+                use objc2::msg_send;
+                use objc2_foundation::{NSRect, NSPoint, NSSize};
+                if let Ok(ns_win) = win_clone.ns_window() {
+                    let obj = unsafe { &*(ns_win as *mut AnyObject) };
+                    let cur: NSRect = unsafe { msg_send![obj, frame] };
+                    // Keep the top edge fixed, grow downward; widen symmetrically.
+                    // The mascot then sits bottom-anchored with the bubbles above.
+                    let w = 260.0_f64;
+                    let h = 180.0_f64;
+                    let x = cur.origin.x - (w - cur.size.width) / 2.0;
+                    let y = cur.origin.y + cur.size.height - h;
+                    let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
+                    unsafe {
+                        if !was_active {
+                            let _: () = msg_send![obj, setIgnoresMouseEvents: true];
+                        }
+                        let _: () = msg_send![obj, setFrame: frame, display: true, animate: false];
+                    }
+                    if let Ok(mut f) = MINI_WINDOW_FRAME.lock() {
+                        *f = Some((x, y, w, h));
+                    }
+                }
+            }).map_err(|e| e.to_string())?;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(Some(monitor)) = win.current_monitor() {
+                let scale = monitor.scale_factor();
+                let ui = win_ui_scale(&monitor);
+                if let (Ok(pos), Ok(size)) = (win.outer_position(), win.outer_size()) {
+                    let cur_x = pos.x as f64 / scale;
+                    let cur_y = pos.y as f64 / scale;
+                    let cur_w = size.width as f64 / scale;
+                    let w = (260.0 * ui).round();
+                    let h = (180.0 * ui).round();
+                    let x = cur_x - (w - cur_w) / 2.0;
+                    let y = cur_y; // keep top edge fixed
+                    let _ = win.set_size(tauri::LogicalSize::new(w, h));
+                    let _ = win.set_position(tauri::LogicalPosition::new(x, y));
+                    if let Ok(mut f) = MINI_WINDOW_FRAME.lock() {
+                        *f = Some((x, y, w, h));
+                    }
+                }
+            }
+        }
+        HERMES_BUBBLE_ACTIVE.store(true, Ordering::SeqCst);
+        #[cfg(target_os = "macos")]
+        if !HERMES_BUBBLE_THREAD_ALIVE.load(Ordering::SeqCst) {
+            let app2 = app.clone();
+            std::thread::spawn(move || hermes_bubble_passthrough_poll(app2, mascot_scale));
+        }
+        #[cfg(target_os = "windows")]
+        if !HERMES_BUBBLE_THREAD_ALIVE.load(Ordering::SeqCst) {
+            let app2 = app.clone();
+            std::thread::spawn(move || hermes_bubble_passthrough_poll_windows(app2, mascot_scale));
+        }
+    } else {
+        HERMES_BUBBLE_ACTIVE.store(false, Ordering::SeqCst);
+        #[cfg(target_os = "macos")]
+        {
+            let win_clone = win.clone();
+            app.run_on_main_thread(move || {
+                use objc2::runtime::AnyObject;
+                use objc2::msg_send;
+                use objc2_foundation::{NSRect, NSPoint, NSSize};
+                if let Ok(ns_win) = win_clone.ns_window() {
+                    let obj = unsafe { &*(ns_win as *mut AnyObject) };
+                    let cur: NSRect = unsafe { msg_send![obj, frame] };
+                    let w = COLLAPSED_MASCOT_BASE_W * mascot_scale;
+                    let h = COLLAPSED_MASCOT_BASE_H * mascot_scale;
+                    let x = cur.origin.x + (cur.size.width - w) / 2.0;
+                    let y = cur.origin.y + cur.size.height - h;
+                    let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
+                    unsafe {
+                        let _: () = msg_send![obj, setIgnoresMouseEvents: false];
+                        let _: () = msg_send![obj, setFrame: frame, display: true, animate: false];
+                    }
+                    if let Ok(mut f) = MINI_WINDOW_FRAME.lock() {
+                        *f = Some((x, y, w, h));
+                    }
+                }
+            }).map_err(|e| e.to_string())?;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(Some(monitor)) = win.current_monitor() {
+                let scale = monitor.scale_factor();
+                let ui = win_ui_scale(&monitor);
+                if let (Ok(pos), Ok(size)) = (win.outer_position(), win.outer_size()) {
+                    let cur_x = pos.x as f64 / scale;
+                    let cur_y = pos.y as f64 / scale;
+                    let cur_w = size.width as f64 / scale;
+                    let w = (COLLAPSED_MASCOT_BASE_W * mascot_scale * ui).round();
+                    let h = (COLLAPSED_MASCOT_BASE_H * mascot_scale * ui).round();
+                    let x = cur_x + (cur_w - w) / 2.0;
+                    let y = cur_y;
+                    let _ = win.set_size(tauri::LogicalSize::new(w, h));
+                    let _ = win.set_position(tauri::LogicalPosition::new(x, y));
+                    if let Ok(mut f) = MINI_WINDOW_FRAME.lock() {
+                        *f = Some((x, y, w, h));
+                    }
+                }
+            }
+            if let Some(win) = app.get_webview_window("mini") {
+                let _ = win.set_ignore_cursor_events(false);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Coding-mode bubble pass-through poll (macOS). Keeps only the bottom-anchored
+/// mascot area clickable; the bubble area above it passes clicks through.
+#[cfg(target_os = "macos")]
+fn hermes_bubble_passthrough_poll(app: tauri::AppHandle, mascot_scale: f64) {
+    use std::time::Duration;
+    HERMES_BUBBLE_THREAD_ALIVE.store(true, Ordering::SeqCst);
+    let mut was_interactive = false;
+    while HERMES_BUBBLE_ACTIVE.load(Ordering::SeqCst) {
+        let frame = MINI_WINDOW_FRAME.lock().ok().and_then(|g| *g);
+        let should_be_interactive = if let Some((fx, fy, fw, _fh)) = frame {
+            let cursor = macos_cursor_position();
+            // mascot: bottom-anchored, horizontally centered, ~43×~47 CSS px.
+            let mw = 43.0 * mascot_scale;
+            let mh = 43.0 * mascot_scale * 208.0 / 192.0;
+            let mascot_left = fx + (fw - mw) / 2.0;
+            let mascot_right = mascot_left + mw;
+            let mascot_bottom = fy; // macOS y = window bottom edge
+            let mascot_top = mascot_bottom + mh;
+            cursor.0 >= mascot_left && cursor.0 <= mascot_right
+                && cursor.1 >= mascot_bottom && cursor.1 <= mascot_top
+        } else {
+            false
+        };
+        if should_be_interactive != was_interactive {
+            let app1 = app.clone();
+            let app2 = app.clone();
+            let val = should_be_interactive;
+            let _ = app1.run_on_main_thread(move || {
+                if let Some(win) = app2.get_webview_window("mini") {
+                    if let Ok(ns_win) = win.ns_window() {
+                        use objc2::msg_send;
+                        let obj = unsafe { &*(ns_win as *mut objc2::runtime::AnyObject) };
+                        unsafe {
+                            let _: () = msg_send![obj, setIgnoresMouseEvents: !val];
+                        }
+                    }
+                }
+            });
+            was_interactive = should_be_interactive;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let app_exit = app.clone();
+    let _ = app_exit.run_on_main_thread(move || {
+        if let Some(win) = app_exit.get_webview_window("mini") {
+            if let Ok(ns_win) = win.ns_window() {
+                use objc2::msg_send;
+                let obj = unsafe { &*(ns_win as *mut objc2::runtime::AnyObject) };
+                unsafe {
+                    let _: () = msg_send![obj, setIgnoresMouseEvents: false];
+                }
+            }
+        }
+    });
+    HERMES_BUBBLE_THREAD_ALIVE.store(false, Ordering::SeqCst);
+}
+
+/// Coding-mode bubble pass-through poll (Windows). Keeps only the bottom-anchored
+/// mascot area clickable; the bubble area above it passes clicks through.
+#[cfg(target_os = "windows")]
+fn hermes_bubble_passthrough_poll_windows(app: tauri::AppHandle, mascot_scale: f64) {
+    use std::time::Duration;
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    HERMES_BUBBLE_THREAD_ALIVE.store(true, Ordering::SeqCst);
+    let mut last_state: Option<bool> = None;
+    while HERMES_BUBBLE_ACTIVE.load(Ordering::SeqCst) {
+        // Read the live window frame in physical pixels (matches GetCursorPos),
+        // same as pet_passthrough_poll_windows — the MINI_WINDOW_FRAME cache
+        // holds logical px on Windows and would misalign the DPI-scaled hitbox.
+        let cursor = unsafe {
+            let mut pt = POINT::default();
+            if GetCursorPos(&mut pt).is_ok() {
+                Some((pt.x as f64, pt.y as f64))
+            } else {
+                None
+            }
+        };
+        let win = app.get_webview_window("mini");
+        let should_be_interactive = match (win, cursor) {
+            (Some(win), Some((cx, cy))) => {
+                let pos = win.outer_position().ok();
+                let size = win.outer_size().ok();
+                let scale = win.scale_factor().unwrap_or(1.0);
+                if let (Some(pos), Some(size)) = (pos, size) {
+                    let fx = pos.x as f64;
+                    let fy = pos.y as f64;
+                    let fw = size.width as f64;
+                    let fh = size.height as f64;
+                    // mascot: bottom-anchored, horizontally centered.
+                    let mw = 43.0 * mascot_scale * scale;
+                    let mh = 43.0 * mascot_scale * 208.0 / 192.0 * scale;
+                    let mascot_left = fx + (fw - mw) / 2.0;
+                    let mascot_right = mascot_left + mw;
+                    let mascot_bottom = fy + fh;
+                    let mascot_top = mascot_bottom - mh;
+                    cx >= mascot_left && cx <= mascot_right
+                        && cy >= mascot_top && cy <= mascot_bottom
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if last_state != Some(should_be_interactive) {
+            if let Some(win) = app.get_webview_window("mini") {
+                let _ = win.set_ignore_cursor_events(!should_be_interactive);
+            }
+            last_state = Some(should_be_interactive);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if let Some(win) = app.get_webview_window("mini") {
+        let _ = win.set_ignore_cursor_events(false);
+    }
+    HERMES_BUBBLE_THREAD_ALIVE.store(false, Ordering::SeqCst);
 }
 
 /// Tell the pet-mode pass-through poll whether a pomodoro timer is active.
@@ -14644,8 +14906,8 @@ def _handle(event_name, **kwargs):
     # of just the status sentinel.
     #   - pre_approval_request kwargs: command, description (see
     #     hermes_cli/plugins.py hook contract)
-    #   - pre_tool_call(clarify/ask_user/confirm) kwargs: args.{question,
-    #     choices} or args.questions[{question, choices}] (batch clarify)
+    #   - pre_tool_call(clarify/ask_user/confirm) kwargs: args.{{question,
+    #     choices}} or args.questions[{{question, choices}}] (batch clarify)
     if event_name == "pre_approval_request":
         cmd = kwargs.get("command", "") or ""
         desc = kwargs.get("description", "") or ""
@@ -15756,8 +16018,8 @@ def _handle(event_name, **kwargs):
     # of just the status sentinel.
     #   - pre_approval_request kwargs: command, description (see
     #     hermes_cli/plugins.py hook contract)
-    #   - pre_tool_call(clarify/ask_user/confirm) kwargs: args.{question,
-    #     choices} or args.questions[{question, choices}] (batch clarify)
+    #   - pre_tool_call(clarify/ask_user/confirm) kwargs: args.{{question,
+    #     choices}} or args.questions[{{question, choices}}] (batch clarify)
     if event_name == "pre_approval_request":
         cmd = kwargs.get("command", "") or ""
         desc = kwargs.get("description", "") or ""
@@ -17500,7 +17762,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs])
+        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, set_hermes_bubble_mode, get_now_playing, get_system_idle_time, get_keyboard_idle_secs])
         .manage(ActiveAgentPid { pid: Mutex::new(None) })
         .manage(ClaudeState { sessions: Arc::new(Mutex::new(HashMap::new())), pending_permissions: Arc::new(Mutex::new(HashMap::new())), dismissed: Arc::new(Mutex::new(std::collections::HashSet::new())) })
         .run(tauri::generate_context!())

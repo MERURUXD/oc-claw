@@ -2570,6 +2570,21 @@ export default function Mini() {
       return (b.updatedAt || '').localeCompare(a.updatedAt || '')
     })
 
+  // ─── Window expansion for the Hermes bubble stack ───
+  // When the coding-mode collapsed mascot has ≥1 Hermes bubble, expand the
+  // window to the 260×180 bubble box (mascot bottom-anchored, bubbles above)
+  // and run the native pass-through poll. When empty, shrink back to the
+  // plain collapsed mascot. Only applies to coding mode (pet mode stays as-is).
+  const bubbleCount = hermesBubbles.length
+  const bubbleModeActiveRef = useRef(false)
+  useEffect(() => {
+    if (appMode === 'pet' || expanded) return
+    const wantActive = bubbleCount > 0
+    if (wantActive === bubbleModeActiveRef.current) return
+    bubbleModeActiveRef.current = wantActive
+    invoke('set_hermes_bubble_mode', { active: wantActive, mascotScale: mascotScaleRef.current }).catch(() => {})
+  }, [appMode, expanded, bubbleCount])
+
   const claudeSlots: SessionSlot[] = visibleClaudeSessions.map((cs, i) => {
     const isWaiting = cs.status === 'waiting'
     const isCompacting = cs.status === 'compacting'
@@ -4433,7 +4448,12 @@ export default function Mini() {
             position: 'relative',
             display: (appMode === 'pet' && largeMascot) ? 'block' : 'flex',
             alignItems: (appMode === 'pet' && largeMascot) ? undefined : 'center',
-            justifyContent: (appMode === 'pet' && largeMascot) ? undefined : 'center',
+            // With a Hermes bubble stack present (coding mode), anchor the
+            // mascot to the bottom of the expanded window so the bubbles sit
+            // above it. Otherwise keep it vertically centered.
+            justifyContent: (appMode === 'pet' && largeMascot)
+              ? undefined
+              : (appMode !== 'pet' && hermesBubbles.length > 0 ? 'flex-end' : 'center'),
             // No background. Used to be `rgba(0,0,0,0.01)` to coax macOS
             // WKWebView into delivering hover events on transparent area,
             // but mini-panel no longer uses panel-level hover/click
