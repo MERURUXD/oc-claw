@@ -2690,6 +2690,13 @@ export default function Mini() {
     document.documentElement.style.opacity = '0'
     try {
       await new Promise<void>((r) => setTimeout(r, 50))
+      // 展开 panel 前停掉 Hermes 气泡模式。否则 Rust 端的
+      // hermes_bubble_passthrough_poll 会在鼠标离开 mascot hitbox 时对整个
+      // 窗口 set_ignore_cursor_events(true)，导致展开面板里的内容全都点不了。
+      if (bubbleModeActiveRef.current) {
+        bubbleModeActiveRef.current = false
+        await invoke('set_hermes_bubble_mode', { active: false, mascotScale: mascotScaleRef.current, bubbleCount: 0 }).catch(() => {})
+      }
       await syncExpandedWindowLayout(viewModeRef.current)
       setExpanded(true)
       expandedRef.current = true
@@ -3022,6 +3029,33 @@ export default function Mini() {
     }
   }, [])
 
+  // Collapsed coding-mode mascot (miniPet) size. The pet's compact size is
+  // 43px × `mascotScale` (1–3); the "Mascot Size" resize handle used to only
+  // drive `largeMascotScale` (the big pet), leaving the miniPet stuck at its
+  // 43px default with no way to resize it. This mirrors applyLargeMascotScale
+  // but drives `mascotScale` so the miniPet can be resized in coding mode.
+  const applyMascotScale = useCallback(async (value: number, persist = true) => {
+    const clamped = clampMascotScale(value)
+    setMascotScale(clamped)
+    mascotScaleRef.current = clamped
+    if (appModeRef.current !== 'pet' && !expandedRef.current) {
+      await invoke('set_mini_expanded', {
+        expanded: false,
+        position: mascotPositionRef.current,
+        efficiency: true,
+        keepPosition: true,
+        mascotScale: clamped,
+        largeMascot: false,
+        largeMascotScale: largeMascotScaleRef.current,
+      }).catch(() => {})
+    }
+    if (persist) {
+      const store = await load('settings.json', { defaults: {}, autoSave: true })
+      await store.set('mascot_scale', clamped)
+      await store.save()
+    }
+  }, [])
+
   useEffect(() => {
     const unlisten = listen<{ scale?: number }>('mascot-scale-change', (ev) => {
       const scale = ev.payload?.scale
@@ -3041,11 +3075,18 @@ export default function Mini() {
     e.stopPropagation()
     setMascotDragActive(true)
 
+    const isLarge = largeMascotRef.current
+    const apply = isLarge ? applyLargeMascotScale : applyMascotScale
     const startX = e.screenX
     const startY = e.screenY
-    const startScale = largeMascotScaleRef.current
-    const startSize = Math.round(MASCOT_BASE_SIZE * mascotScaleRef.current) * startScale
-    const baseSize = Math.max(1, Math.round(MASCOT_BASE_SIZE * mascotScaleRef.current))
+    const startScale = isLarge ? largeMascotScaleRef.current : mascotScaleRef.current
+    // Large mascot: 43 × mascotScale × largeMascotScale; miniPet: 43 × mascotScale.
+    const startSize = isLarge
+      ? Math.round(MASCOT_BASE_SIZE * mascotScaleRef.current) * startScale
+      : Math.round(MASCOT_BASE_SIZE * startScale)
+    const baseSize = isLarge
+      ? Math.max(1, Math.round(MASCOT_BASE_SIZE * mascotScaleRef.current))
+      : MASCOT_BASE_SIZE
     const aspect = 208 / 192
     const pid = e.pointerId
     let rafId: number | null = null
@@ -3060,7 +3101,7 @@ export default function Mini() {
         return
       }
       applying = true
-      applyLargeMascotScale(latestScale, false)
+      apply(latestScale, false)
         .finally(() => {
           applying = false
           if (dirty) {
@@ -3080,7 +3121,9 @@ export default function Mini() {
       const dx = ev.screenX - startX
       const dy = ev.screenY - startY
       const targetSize = startSize + Math.max(dx, dy / aspect)
-      latestScale = clampLargeMascotScale(targetSize / baseSize)
+      latestScale = isLarge
+        ? clampLargeMascotScale(targetSize / baseSize)
+        : clampMascotScale(targetSize / baseSize)
       schedule()
     }
 
@@ -3094,7 +3137,7 @@ export default function Mini() {
       window.removeEventListener('pointermove', onMove)
       window.removeEventListener('pointerup', onUp)
       window.removeEventListener('pointercancel', onCancel)
-      await applyLargeMascotScale(latestScale, true)
+      await apply(latestScale, true)
     }
 
     const onUp = (ev: PointerEvent) => {
@@ -3110,7 +3153,7 @@ export default function Mini() {
     window.addEventListener('pointermove', onMove)
     window.addEventListener('pointerup', onUp, { once: true })
     window.addEventListener('pointercancel', onCancel, { once: true })
-  }, [applyLargeMascotScale])
+  }, [applyLargeMascotScale, applyMascotScale])
 
 
   const handleMascotPointerDown = useCallback(
@@ -4489,9 +4532,13 @@ export default function Mini() {
                 flexDirection: 'column-reverse',
                 alignItems: 'stretch',
                 gap: 8,
-                pointerEvents: 'none',
+                maxHeight: `calc(100% - ${collapsedMascotSize + 28}px)`,
+                overflowY: 'auto',
+                overflowX: 'hidden',
+                pointerEvents: 'auto',
                 zIndex: 50,
                 padding: '0 8px',
+                boxSizing: 'border-box',
               }}
             >
               {hermesBubbles.map((b) => (
@@ -4541,7 +4588,7 @@ export default function Mini() {
                       lineHeight: 1.45,
                       color: '#d6d6dc',
                       display: '-webkit-box',
-                      WebkitLineClamp: 3,
+                      WebkitLineClamp: 1,
                       WebkitBoxOrient: 'vertical',
                       overflow: 'hidden',
                       wordBreak: 'break-word',
