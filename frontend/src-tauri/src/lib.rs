@@ -5385,7 +5385,7 @@ async fn set_hermes_bubble_mode(
                     let cur: NSRect = unsafe { msg_send![obj, frame] };
                     // Keep the top edge fixed, grow downward; widen symmetrically.
                     // The mascot then sits bottom-anchored with the bubbles above.
-                    let w = 260.0_f64;
+                    let w = 312.0_f64;
                     let h = bubble_h;
                     let x = cur.origin.x - (w - cur.size.width) / 2.0;
                     let y = cur.origin.y + cur.size.height - h;
@@ -5411,7 +5411,7 @@ async fn set_hermes_bubble_mode(
                     let cur_x = pos.x as f64 / scale;
                     let cur_y = pos.y as f64 / scale;
                     let cur_w = size.width as f64 / scale;
-                    let w = (260.0 * ui).round();
+                    let w = (312.0 * ui).round();
                     let h = (bubble_h * ui).round();
                     let x = cur_x - (w - cur_w) / 2.0;
                     let y = cur_y; // keep top edge fixed
@@ -5492,26 +5492,14 @@ async fn set_hermes_bubble_mode(
 /// Coding-mode bubble pass-through poll (macOS). Keeps only the bottom-anchored
 /// mascot area clickable; the bubble area above it passes clicks through.
 #[cfg(target_os = "macos")]
-fn hermes_bubble_passthrough_poll(app: tauri::AppHandle, mascot_scale: f64) {
+fn hermes_bubble_passthrough_poll(app: tauri::AppHandle, _mascot_scale: f64) {
     use std::time::Duration;
     HERMES_BUBBLE_THREAD_ALIVE.store(true, Ordering::SeqCst);
     let mut was_interactive = false;
     while HERMES_BUBBLE_ACTIVE.load(Ordering::SeqCst) {
-        let frame = MINI_WINDOW_FRAME.lock().ok().and_then(|g| *g);
-        let should_be_interactive = if let Some((fx, fy, fw, _fh)) = frame {
-            let cursor = macos_cursor_position();
-            // mascot: bottom-anchored, horizontally centered, ~43×~47 CSS px.
-            let mw = 43.0 * mascot_scale;
-            let mh = 43.0 * mascot_scale * 208.0 / 192.0;
-            let mascot_left = fx + (fw - mw) / 2.0;
-            let mascot_right = mascot_left + mw;
-            let mascot_bottom = fy; // macOS y = window bottom edge
-            let mascot_top = mascot_bottom + mh;
-            cursor.0 >= mascot_left && cursor.0 <= mascot_right
-                && cursor.1 >= mascot_bottom && cursor.1 <= mascot_top
-        } else {
-            false
-        };
+        // 气泡模式下整个窗口保持可交互：气泡区需接收滚轮滚动，mascot 需接收拖拽/右键。
+        // 不再按 mascot hitbox 切换穿透，否则鼠标悬在气泡上时窗口会穿透、滚轮失效。
+        let should_be_interactive = true;
         if should_be_interactive != was_interactive {
             let app1 = app.clone();
             let app2 = app.clone();
@@ -5549,50 +5537,14 @@ fn hermes_bubble_passthrough_poll(app: tauri::AppHandle, mascot_scale: f64) {
 /// Coding-mode bubble pass-through poll (Windows). Keeps only the bottom-anchored
 /// mascot area clickable; the bubble area above it passes clicks through.
 #[cfg(target_os = "windows")]
-fn hermes_bubble_passthrough_poll_windows(app: tauri::AppHandle, mascot_scale: f64) {
+fn hermes_bubble_passthrough_poll_windows(app: tauri::AppHandle, _mascot_scale: f64) {
     use std::time::Duration;
-    use windows::Win32::Foundation::POINT;
-    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
     HERMES_BUBBLE_THREAD_ALIVE.store(true, Ordering::SeqCst);
     let mut last_state: Option<bool> = None;
     while HERMES_BUBBLE_ACTIVE.load(Ordering::SeqCst) {
-        // Read the live window frame in physical pixels (matches GetCursorPos),
-        // same as pet_passthrough_poll_windows — the MINI_WINDOW_FRAME cache
-        // holds logical px on Windows and would misalign the DPI-scaled hitbox.
-        let cursor = unsafe {
-            let mut pt = POINT::default();
-            if GetCursorPos(&mut pt).is_ok() {
-                Some((pt.x as f64, pt.y as f64))
-            } else {
-                None
-            }
-        };
-        let win = app.get_webview_window("mini");
-        let should_be_interactive = match (win, cursor) {
-            (Some(win), Some((cx, cy))) => {
-                let pos = win.outer_position().ok();
-                let size = win.outer_size().ok();
-                let scale = win.scale_factor().unwrap_or(1.0);
-                if let (Some(pos), Some(size)) = (pos, size) {
-                    let fx = pos.x as f64;
-                    let fy = pos.y as f64;
-                    let fw = size.width as f64;
-                    let fh = size.height as f64;
-                    // mascot: bottom-anchored, horizontally centered.
-                    let mw = 43.0 * mascot_scale * scale;
-                    let mh = 43.0 * mascot_scale * 208.0 / 192.0 * scale;
-                    let mascot_left = fx + (fw - mw) / 2.0;
-                    let mascot_right = mascot_left + mw;
-                    let mascot_bottom = fy + fh;
-                    let mascot_top = mascot_bottom - mh;
-                    cx >= mascot_left && cx <= mascot_right
-                        && cy >= mascot_top && cy <= mascot_bottom
-                } else {
-                    false
-                }
-            }
-            _ => false,
-        };
+        // 气泡模式下整个窗口保持可交互：气泡区需接收滚轮滚动，mascot 需接收拖拽/右键。
+        // 不再按 mascot hitbox 切换穿透，否则鼠标悬在气泡上时窗口会穿透、滚轮失效。
+        let should_be_interactive = true;
         if last_state != Some(should_be_interactive) {
             if let Some(win) = app.get_webview_window("mini") {
                 let _ = win.set_ignore_cursor_events(!should_be_interactive);
