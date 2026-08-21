@@ -5362,9 +5362,14 @@ async fn set_hermes_bubble_mode(
     app: tauri::AppHandle,
     active: bool,
     mascot_scale: Option<f64>,
+    bubble_count: Option<u32>,
 ) -> Result<(), String> {
     let win = app.get_webview_window("mini").ok_or("mini window not found")?;
     let mascot_scale = sanitized_mascot_scale(mascot_scale);
+    // Bubble box height grows with the (capped) stack: 57px reserves the
+    // bottom-anchored mascot (43px) + 14px gap, ~90px per bubble.
+    let bubble_count = bubble_count.unwrap_or(1).clamp(1, 3) as f64;
+    let bubble_h = (57.0 + bubble_count * 90.0).max(180.0).min(420.0);
 
     if active {
         let was_active = HERMES_BUBBLE_ACTIVE.load(Ordering::SeqCst);
@@ -5381,7 +5386,7 @@ async fn set_hermes_bubble_mode(
                     // Keep the top edge fixed, grow downward; widen symmetrically.
                     // The mascot then sits bottom-anchored with the bubbles above.
                     let w = 260.0_f64;
-                    let h = 180.0_f64;
+                    let h = bubble_h;
                     let x = cur.origin.x - (w - cur.size.width) / 2.0;
                     let y = cur.origin.y + cur.size.height - h;
                     let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
@@ -5407,7 +5412,7 @@ async fn set_hermes_bubble_mode(
                     let cur_y = pos.y as f64 / scale;
                     let cur_w = size.width as f64 / scale;
                     let w = (260.0 * ui).round();
-                    let h = (180.0 * ui).round();
+                    let h = (bubble_h * ui).round();
                     let x = cur_x - (w - cur_w) / 2.0;
                     let y = cur_y; // keep top edge fixed
                     let _ = win.set_size(tauri::LogicalSize::new(w, h));

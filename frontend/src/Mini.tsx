@@ -107,6 +107,10 @@ const MAX_SLOTS = 10
 const MASCOT_SCALE_MIN = 1
 const MASCOT_SCALE_MAX = 3
 const MASCOT_BASE_SIZE = 43
+// Cap the Hermes speech-bubble stack so the expanded window never grows
+// unboundedly (each bubble ≈90px tall). The oldest/stopped sessions fall
+// off the top; the highest-priority (waiting) stays bottom-most.
+const MAX_HERMES_BUBBLES = 3
 // Codex sprite-pets render very small at the legacy mascot size (192x208
 // cells scaled down to ~43px). These multipliers blow them up only at the
 // rendering layer, leaving the underlying window/hitbox math untouched so
@@ -2569,6 +2573,7 @@ export default function Mini() {
       if (d !== 0) return d
       return (b.updatedAt || '').localeCompare(a.updatedAt || '')
     })
+    .slice(0, MAX_HERMES_BUBBLES)
 
   // ─── Window expansion for the Hermes bubble stack ───
   // When the coding-mode collapsed mascot has ≥1 Hermes bubble, expand the
@@ -2582,7 +2587,7 @@ export default function Mini() {
     const wantActive = bubbleCount > 0
     if (wantActive === bubbleModeActiveRef.current) return
     bubbleModeActiveRef.current = wantActive
-    invoke('set_hermes_bubble_mode', { active: wantActive, mascotScale: mascotScaleRef.current }).catch(() => {})
+    invoke('set_hermes_bubble_mode', { active: wantActive, mascotScale: mascotScaleRef.current, bubbleCount }).catch(() => {})
   }, [appMode, expanded, bubbleCount])
 
   const claudeSlots: SessionSlot[] = visibleClaudeSessions.map((cs, i) => {
@@ -4363,6 +4368,10 @@ export default function Mini() {
   const collapsedStatusSize = 5
   const collapsedStatusBorder = 1.1
   const largeMascotVisualSize = collapsedMascotSize * largeMascotScale
+  // Collapsed-mode mascot display size: pet mode keeps the large visual size;
+  // coding mode drops to the compact `collapsedMascotSize` so the 260×180
+  // bubble box leaves room for the speech-bubble stack above the pet.
+  const collapsedMascotDisplaySize = largeMascot ? largeMascotVisualSize : collapsedMascotSize
 
   // Keep the coding-mode extra mascots scaled together with the primary one:
   // broadcast the current visual size whenever the "Mascot Size" slider moves.
@@ -4447,13 +4456,15 @@ export default function Mini() {
             height: '100%',
             position: 'relative',
             display: (appMode === 'pet' && largeMascot) ? 'block' : 'flex',
-            alignItems: (appMode === 'pet' && largeMascot) ? undefined : 'center',
-            // With a Hermes bubble stack present (coding mode), anchor the
-            // mascot to the bottom of the expanded window so the bubbles sit
-            // above it. Otherwise keep it vertically centered.
-            justifyContent: (appMode === 'pet' && largeMascot)
+            alignItems: (appMode === 'pet' && largeMascot)
               ? undefined
               : (appMode !== 'pet' && hermesBubbles.length > 0 ? 'flex-end' : 'center'),
+            // With a Hermes bubble stack present (coding mode), anchor the
+            // mascot to the bottom of the expanded window so the bubbles sit
+            // above it. `alignItems` (cross axis) is what pins it to the
+            // bottom in a row flex container — `justifyContent` only affects
+            // the horizontal axis, so it stays centered.
+            justifyContent: (appMode === 'pet' && largeMascot) ? undefined : 'center',
             // No background. Used to be `rgba(0,0,0,0.01)` to coax macOS
             // WKWebView into delivering hover events on transparent area,
             // but mini-panel no longer uses panel-level hover/click
@@ -4471,24 +4482,23 @@ export default function Mini() {
               data-no-drag
               style={{
                 position: 'absolute',
-                left: '50%',
-                transform: 'translateX(-50%)',
+                left: 0,
+                right: 0,
                 bottom: collapsedMascotSize + 14,
                 display: 'flex',
-                flexDirection: 'column',
-                alignItems: 'center',
+                flexDirection: 'column-reverse',
+                alignItems: 'stretch',
                 gap: 8,
                 pointerEvents: 'none',
                 zIndex: 50,
-                maxWidth: '90%',
+                padding: '0 8px',
               }}
             >
               {hermesBubbles.map((b) => (
                 <div
                   key={b.sessionId}
                   style={{
-                    minWidth: 120,
-                    maxWidth: 240,
+                    width: '100%',
                     padding: '8px 12px',
                     borderRadius: 12,
                     background: 'rgba(20, 20, 24, 0.92)',
@@ -4514,6 +4524,8 @@ export default function Mini() {
                         fontWeight: 700,
                         letterSpacing: 0.3,
                         color: '#fff',
+                        flex: 1,
+                        minWidth: 0,
                         whiteSpace: 'nowrap',
                         overflow: 'hidden',
                         textOverflow: 'ellipsis',
@@ -4689,14 +4701,14 @@ export default function Mini() {
               <div
                 style={{
                   position: 'relative',
-                  width: largeMascotVisualSize,
-                  height: Math.round(largeMascotVisualSize * (208 / 192)),
+                  width: collapsedMascotDisplaySize,
+                  height: Math.round(collapsedMascotDisplaySize * (208 / 192)),
                 }}
               >
                 <MiniPetMascot
                   pet={miniPet}
                   baseState={mainSpriteState}
-                  size={largeMascotVisualSize}
+                  size={collapsedMascotDisplaySize}
                   enableHoverJump
                   externalHover={mascotHover}
                   useExternalHover={!isWindowsPlatform}
@@ -4706,8 +4718,8 @@ export default function Mini() {
             ) : (
               <div
                 style={{
-                  width: largeMascotVisualSize,
-                  height: largeMascotVisualSize,
+                  width: collapsedMascotDisplaySize,
+                  height: collapsedMascotDisplaySize,
                   borderRadius: collapsedPlaceholderRadius,
                   background: 'rgba(0,0,0,0.3)',
                   display: 'flex',
