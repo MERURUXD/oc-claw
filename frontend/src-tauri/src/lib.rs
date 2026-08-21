@@ -14639,6 +14639,34 @@ def _handle(event_name, **kwargs):
     }}
     if tool_name:
         payload["tool"] = tool_name
+    # Extract approval / clarify content so oc-claw can render the
+    # "blocked_on_user" bubble with the real question/command text instead
+    # of just the status sentinel.
+    #   - pre_approval_request kwargs: command, description (see
+    #     hermes_cli/plugins.py hook contract)
+    #   - pre_tool_call(clarify/ask_user/confirm) kwargs: args.{question,
+    #     choices} or args.questions[{question, choices}] (batch clarify)
+    if event_name == "pre_approval_request":
+        cmd = kwargs.get("command", "") or ""
+        desc = kwargs.get("description", "") or ""
+        if cmd and isinstance(cmd, str):
+            payload["command"] = cmd[:500]
+        if desc and isinstance(desc, str):
+            payload["description"] = desc[:500]
+    elif event_name == "pre_tool_call" and tool_name in ("clarify", "ask_user", "confirm"):
+        args = kwargs.get("args")
+        if isinstance(args, dict):
+            question = args.get("question", "") or ""
+            choices = args.get("choices")
+            if not question:
+                qs = args.get("questions")
+                if isinstance(qs, list) and qs and isinstance(qs[0], dict):
+                    question = qs[0].get("question", "") or ""
+                    choices = qs[0].get("choices")
+            if question and isinstance(question, str):
+                payload["question"] = question[:500]
+            if isinstance(choices, list) and choices:
+                payload["choices"] = [str(c) for c in choices[:10]]
     if event_name == "pre_llm_call":
         prompt = kwargs.get("user_message", "") or kwargs.get("prompt", "") or kwargs.get("message", "")
         if prompt and isinstance(prompt, str):
@@ -15353,6 +15381,29 @@ for _pdir in profile_dirs:
                 if _v: _lr = _v
             if _up and _lr: break
         return (_up, _lr)
+    def _scan_ooclaw_blocked(sid):
+        """Scan backward for the text of the current blocked_on_user event.
+
+        Returns (kind, text):
+          - kind='approval': latest PermissionRequest carrying command/description
+          - kind='clarify':  latest PreToolUse(clarify/ask_user/confirm) carrying question
+          - kind='', text='' when not blocked
+        """
+        for _e in reversed(_ooclaw_status.get(_profile_name, {}).get(sid, [])):
+            _ev = _e.get('event', '')
+            if _ev == 'PermissionRequest':
+                _cmd = _e.get('command') or ''
+                _desc = _e.get('description') or ''
+                _txt = _cmd + ((': ' + _desc) if (_cmd and _desc) else (_desc if _desc else ''))
+                if _txt:
+                    return ('approval', _txt)
+                return ('approval', '')
+            if _ev == 'PreToolUse' and _is_interactive_tool(_e.get('tool', '')):
+                _q = _e.get('question') or ''
+                if _q:
+                    return ('clarify', _q)
+                return ('clarify', '')
+        return ('', '')
     if os.path.exists(sj):
         try:
             data = json.load(open(sj))
@@ -15385,6 +15436,7 @@ for _pdir in profile_dirs:
                         last_ts = _evt_max
                 # Prefer ooclaw plugin's recorded prompt/response, fall back to state.db
                 _up, _lr = _scan_ooclaw_text(sid)
+                _bk, _bt = _scan_ooclaw_blocked(sid)
                 if not _up or not _lr:
                     _db_up, _db_lr = _fetch_prompt_response(_real_sid)
                     if not _up: _up = _db_up
@@ -15394,6 +15446,7 @@ for _pdir in profile_dirs:
                                 'status': sess_status, 'source': 'hermes',
                                 'startedAt': last_ts,
                                 'userPrompt': _up, 'lastResponse': _lr,
+                                'blockedType': _bk, 'blockedText': _bt,
                                 'ooclaw': _ooclaw_status.get(_profile_name, {}).get(sid)})
         except: pass
     if db_conn:
@@ -15426,6 +15479,7 @@ for _pdir in profile_dirs:
                     if _evt_max2 and (not db_last_ts or _evt_max2 > db_last_ts):
                         db_last_ts = _evt_max2
                 _up, _lr = _scan_ooclaw_text(sid)
+                _bk, _bt = _scan_ooclaw_blocked(sid)
                 if not _up or not _lr:
                     _db_up, _db_lr = _fetch_prompt_response(latest_sid)
                     if not _up: _up = _db_up
@@ -15434,6 +15488,7 @@ for _pdir in profile_dirs:
                                 'userPrompt': _up, 'lastResponse': _lr,
                                 'startedAt': db_last_ts, 'messageCount': r[5] or 0,
                                 'inputTokens': r[6] or 0, 'outputTokens': r[7] or 0,
+                                'blockedType': _bk, 'blockedText': _bt,
                                 'active': active, 'status': sess_status, 'source': 'hermes'})
         except: pass
     if db_conn:
@@ -15696,6 +15751,34 @@ def _handle(event_name, **kwargs):
     }}
     if tool_name:
         payload["tool"] = tool_name
+    # Extract approval / clarify content so oc-claw can render the
+    # "blocked_on_user" bubble with the real question/command text instead
+    # of just the status sentinel.
+    #   - pre_approval_request kwargs: command, description (see
+    #     hermes_cli/plugins.py hook contract)
+    #   - pre_tool_call(clarify/ask_user/confirm) kwargs: args.{question,
+    #     choices} or args.questions[{question, choices}] (batch clarify)
+    if event_name == "pre_approval_request":
+        cmd = kwargs.get("command", "") or ""
+        desc = kwargs.get("description", "") or ""
+        if cmd and isinstance(cmd, str):
+            payload["command"] = cmd[:500]
+        if desc and isinstance(desc, str):
+            payload["description"] = desc[:500]
+    elif event_name == "pre_tool_call" and tool_name in ("clarify", "ask_user", "confirm"):
+        args = kwargs.get("args")
+        if isinstance(args, dict):
+            question = args.get("question", "") or ""
+            choices = args.get("choices")
+            if not question:
+                qs = args.get("questions")
+                if isinstance(qs, list) and qs and isinstance(qs[0], dict):
+                    question = qs[0].get("question", "") or ""
+                    choices = qs[0].get("choices")
+            if question and isinstance(question, str):
+                payload["question"] = question[:500]
+            if isinstance(choices, list) and choices:
+                payload["choices"] = [str(c) for c in choices[:10]]
     if event_name == "pre_llm_call":
         prompt = kwargs.get("user_message", "") or kwargs.get("prompt", "") or kwargs.get("message", "")
         if prompt and isinstance(prompt, str):

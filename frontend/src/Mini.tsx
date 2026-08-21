@@ -2300,6 +2300,10 @@ export default function Mini() {
                   userPrompt,
                   user_prompt: userPrompt,
                   lastResponse: rs.lastResponse || '',
+                  // blocked_on_user bubble text: approval command/description or
+                  // clarify question, extracted by the remote script.
+                  blockedType: rs.blockedType || '',
+                  blockedText: rs.blockedText || '',
                   isActiveTab: false,
                 })
               }
@@ -2518,6 +2522,54 @@ export default function Mini() {
     const isDesktop = cs.hostTerminal === 'Claude Desktop'
     return isDesktop ? enableClaudeDesktop : enableClaudeCode
   })
+
+  // ─── Hermes bubble feed ───
+  // Coding-mode collapsed mascot shows a persistent speech-bubble stack above
+  // the pet, one bubble per Hermes session. Priority: blocked_on_user
+  // (waiting) > processing > stopped, then by updatedAt. Each bubble renders
+  // session title + status-dependent body text (user prompt / AI response /
+  // approval+clarify request). Read-only this phase — no interactive reply.
+  const hermesBubbles = visibleClaudeSessions
+    .filter((cs) => cs.source === 'hermes')
+    .map((cs) => {
+      const status: 'waiting' | 'processing' | 'stopped' =
+        cs.status === 'waiting' ? 'waiting' : cs.status === 'processing' ? 'processing' : 'stopped'
+      // Body text by state:
+      //   waiting    → blocked text (approval command / clarify question)
+      //   processing → user prompt (what the agent is working on)
+      //   stopped    → AI's last response
+      let body = ''
+      let label = '✓'
+      if (status === 'waiting') {
+        // blocked_on_user: show the real approval command / clarify question;
+        // fall back to the user prompt, then a fixed "waiting" placeholder if
+        // neither is present.
+        body = cs.blockedText || cs.userPrompt || '等你回复'
+        label = '⏳'
+      } else if (status === 'processing') {
+        body = cs.userPrompt || ''
+        label = '✦'
+      } else {
+        body = cs.lastResponse || ''
+        label = '✓'
+      }
+      return {
+        sessionId: cs.sessionId as string,
+        title: `Hermes #${getHermesSeq(cs.sessionId)}`,
+        body: (body || '').trim(),
+        label,
+        status,
+        updatedAt: cs.updatedAt || '',
+      }
+    })
+    .filter((b) => b.body || b.status === 'waiting')
+    .sort((a, b) => {
+      const prio = { waiting: 3, processing: 2, stopped: 1 } as const
+      const d = (prio[b.status] || 0) - (prio[a.status] || 0)
+      if (d !== 0) return d
+      return (b.updatedAt || '').localeCompare(a.updatedAt || '')
+    })
+
   const claudeSlots: SessionSlot[] = visibleClaudeSessions.map((cs, i) => {
     const isWaiting = cs.status === 'waiting'
     const isCompacting = cs.status === 'compacting'
@@ -4393,6 +4445,82 @@ export default function Mini() {
             cursor: 'default',
           }}
         >
+          {/* Hermes speech-bubble stack (coding mode, collapsed only) */}
+          {appMode !== 'pet' && hermesBubbles.length > 0 && (
+            <div
+              data-no-drag
+              style={{
+                position: 'absolute',
+                left: '50%',
+                transform: 'translateX(-50%)',
+                bottom: collapsedMascotSize + 14,
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                gap: 8,
+                pointerEvents: 'none',
+                zIndex: 50,
+                maxWidth: '90%',
+              }}
+            >
+              {hermesBubbles.map((b) => (
+                <div
+                  key={b.sessionId}
+                  style={{
+                    minWidth: 120,
+                    maxWidth: 240,
+                    padding: '8px 12px',
+                    borderRadius: 12,
+                    background: 'rgba(20, 20, 24, 0.92)',
+                    color: '#eee',
+                    boxShadow: '0 4px 16px rgba(0,0,0,0.35)',
+                    border: '1px solid rgba(255,255,255,0.12)',
+                    backdropFilter: 'blur(6px)',
+                    fontFamily: 'inherit',
+                    textAlign: 'left',
+                  }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 6,
+                      marginBottom: 4,
+                    }}
+                  >
+                    <span
+                      style={{
+                        fontSize: 11,
+                        fontWeight: 700,
+                        letterSpacing: 0.3,
+                        color: '#fff',
+                        whiteSpace: 'nowrap',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                      }}
+                    >
+                      {b.title}
+                    </span>
+                    <span style={{ fontSize: 11, opacity: 0.9 }}>{b.label}</span>
+                  </div>
+                  <div
+                    style={{
+                      fontSize: 12,
+                      lineHeight: 1.45,
+                      color: '#d6d6dc',
+                      display: '-webkit-box',
+                      WebkitLineClamp: 3,
+                      WebkitBoxOrient: 'vertical',
+                      overflow: 'hidden',
+                      wordBreak: 'break-word',
+                    }}
+                  >
+                    {b.body}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
           <div
             onPointerDown={handleMascotPointerDown}
             onContextMenu={handleMascotContextMenu}
