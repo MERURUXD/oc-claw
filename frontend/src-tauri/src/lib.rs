@@ -5369,7 +5369,11 @@ async fn set_hermes_bubble_mode(
     // Bubble box height grows with the (capped) stack: 57px reserves the
     // bottom-anchored mascot (43px) + 14px gap, ~90px per bubble.
     let bubble_count = bubble_count.unwrap_or(1).clamp(1, 3) as f64;
-    let bubble_h = (57.0 + bubble_count * 90.0).max(180.0).min(420.0);
+    // 窗口高度随内容增长：miniPet 显示高度(43*scale) + 14px 间距 + 气泡栈 + 12px
+    // 顶部留白。参照 hwdc 动态窗口高度 —— 去掉滚动条后窗口必须完整容纳气泡，
+    // 否则内容被截断。随 mascot_scale 增长，避免宠物调大时气泡区被压缩。
+    let mascot_display_h = 43.0 * mascot_scale;
+    let bubble_h = (mascot_display_h + 14.0 + bubble_count * 90.0 + 12.0).max(180.0).min(600.0);
 
     if active {
         let was_active = HERMES_BUBBLE_ACTIVE.load(Ordering::SeqCst);
@@ -5413,8 +5417,17 @@ async fn set_hermes_bubble_mode(
                     let cur_w = size.width as f64 / scale;
                     let w = (312.0 * ui).round();
                     let h = (bubble_h * ui).round();
-                    let x = cur_x - (w - cur_w) / 2.0;
-                    let y = cur_y; // keep top edge fixed
+                    let mut x = cur_x - (w - cur_w) / 2.0;
+                    let mut y = cur_y; // keep top edge fixed
+                    // 边沿自动回正：clamp 到当前 monitor 边界，气泡窗口触碰屏幕边缘时
+                    // 不溢出（参照 hwdc _horizontalPosition/_clamp）。
+                    let mp = monitor.position();
+                    let mx = mp.x as f64 / scale;
+                    let my = mp.y as f64 / scale;
+                    let mw = monitor.size().width as f64 / scale;
+                    let mh = monitor.size().height as f64 / scale;
+                    x = x.max(mx).min(mx + mw - w);
+                    y = y.max(my).min(my + mh - h);
                     let _ = win.set_size(tauri::LogicalSize::new(w, h));
                     let _ = win.set_position(tauri::LogicalPosition::new(x, y));
                     if let Ok(mut f) = MINI_WINDOW_FRAME.lock() {
