@@ -142,30 +142,31 @@ fn spawn_hermes_bubble_follow_thread(app: tauri::AppHandle) {
     }
     // Event-driven re-anchor while dragging: every mini-window move wakes a
     // dedicated applier immediately (poll tick only acts as a fallback).
-    let app_move = app.clone();
-    app.on_window_event(move |window, event| {
-        if window.label() != "mini" {
-            return; // Ignore the bubble window's own moves — no feedback loop.
-        }
-        if !matches!(event, tauri::WindowEvent::Moved(_)) {
-            return;
-        }
-        if !HERMES_BUBBLE_ACTIVE.load(Ordering::SeqCst) {
-            return;
-        }
-        // Coalesce: if an applier is already queued, it reads the latest
-        // mini position when it runs, so skip duplicate events in a burst.
-        if HERMES_BUBBLE_MOVE_QUEUED.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let app2 = app_move.clone();
-        let _ = std::thread::Builder::new()
-            .name("hermes-bubble-move".into())
-            .spawn(move || {
-                apply_hermes_bubble_follow(&app2);
-                HERMES_BUBBLE_MOVE_QUEUED.store(false, Ordering::SeqCst);
-            });
-    });
+    // Attached to the mini window itself (AppHandle has no on_window_event
+    // in Tauri 2), which also scopes events to mini — no feedback loop.
+    if let Some(mwin) = app.get_webview_window("mini") {
+        let app_move = app.clone();
+        mwin.on_window_event(move |event| {
+            if !matches!(event, tauri::WindowEvent::Moved(_)) {
+                return;
+            }
+            if !HERMES_BUBBLE_ACTIVE.load(Ordering::SeqCst) {
+                return;
+            }
+            // Coalesce: if an applier is already queued, it reads the latest
+            // mini position when it runs, so skip duplicate events in a burst.
+            if HERMES_BUBBLE_MOVE_QUEUED.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let app2 = app_move.clone();
+            let _ = std::thread::Builder::new()
+                .name("hermes-bubble-move".into())
+                .spawn(move || {
+                    apply_hermes_bubble_follow(&app2);
+                    HERMES_BUBBLE_MOVE_QUEUED.store(false, Ordering::SeqCst);
+                });
+        });
+    }
     let handle = std::thread::spawn(move || {
         loop {
             if HERMES_BUBBLE_FOLLOW_EPOCH.load(Ordering::SeqCst) != my_epoch
@@ -201,7 +202,7 @@ fn apply_hermes_bubble_follow(app: &tauri::AppHandle) {
         let want_h_phys = if content_logical > 0.0 {
             (content_logical * scale).round() as i32
         } else {
-            bs.height
+            bs.height as i32
         };
         let gap_px = (HERMES_BUBBLE_GAP_LOGICAL * scale).round() as i32;
         // Physical px target: right edges aligned with mini, bottom sits
