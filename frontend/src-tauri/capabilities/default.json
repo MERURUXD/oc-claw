@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "enables the default permissions",
-  "windows": ["pet", "detail", "mini", "room", "demo-mascot-*", "extra-mascot-*"],
+  "windows": ["pet", "detail", "mini", "room", "hermes_bubbles", "demo-mascot-*", "extra-mascot-*"],
   "permissions": [
     "core:default",
     "core:window:allow-create",

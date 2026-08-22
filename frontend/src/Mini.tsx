@@ -2588,60 +2588,45 @@ export default function Mini() {
   // 追踪最新 bubbleCount 供 collapse 闭包读取（collapse 的 useCallback 依赖不含 hermesBubbles）
   const bubbleCountRef = useRef(0)
   bubbleCountRef.current = bubbleCount
+  // 独立气泡窗口架构：Mini 是数据大脑（2s 轮询算好排序/上限），通过
+  // `hermes-bubble-data` 事件推给哑渲染窗口；窗口几何由 Rust 的
+  // set_hermes_bubble_mode 管理，与宠物窗口完全解耦。
+  useEffect(() => {
+    if (appMode === 'pet' || expanded) {
+      emit('hermes-bubble-data', []).catch(() => {})
+      return
+    }
+    emit('hermes-bubble-data', hermesBubbles).catch(() => {})
+  }, [appMode, expanded, hermesBubbles])
+
   useEffect(() => {
     if (appMode === 'pet' || expanded) return
-    const wantActive = bubbleCount > 0
     // 注意：不能在 wantActive 与 ref 相同时提前 return —— bubbleCount 变化时
     // （如第 3 条气泡出现）窗口高度必须跟着重设，否则顶部气泡被截断，
     // 直到用户开合一次 box 才恢复（旧 bug 根因）。
+    const wantActive = bubbleCount > 0
     bubbleModeActiveRef.current = wantActive
     invoke('set_hermes_bubble_mode', { active: wantActive, mascotScale: mascotScaleRef.current, bubbleCount }).catch(() => {})
   }, [appMode, expanded, bubbleCount])
 
-  // ─── 可交互区（hitbox）动态上报 ───
-  // Rust 端轮询按这些矩形决定整窗是否穿透：只有「宠物本体 ∪ 各气泡关闭按钮」
-  // 命中时可点击，其余区域全部点穿到桌面（与视觉一致）。
-  // 坐标为相对窗口左上角的 CSS px，Rust 端乘 scale 换算物理像素。
+  // 气泡窗口 ✕ 关闭回传：Mini 维护 dismissed 集合并过滤数据源。
   useEffect(() => {
-    if (appMode === 'pet' || expanded || bubbleModeActiveRef.current !== true) return
-    let raf = 0
-    const collect = () => {
-      raf = 0
-      try {
-        const mascotEl = document.getElementById('hermes-bubble-mascot')
-        const closeEls = document.querySelectorAll<HTMLElement>('[data-hermes-bubble-close]')
-        if (!mascotEl) return
-        type Rect = { x: number; y: number; w: number; h: number }
-        const rects: Rect[] = []
-        const pushRect = (el: Element, pad: number) => {
-          const r = el.getBoundingClientRect()
-          rects.push({
-            x: Math.max(0, Math.round(r.left - pad)),
-            y: Math.max(0, Math.round(r.top - pad)),
-            w: Math.min(window.innerWidth, Math.round(r.width + pad * 2)),
-            h: Math.min(window.innerHeight, Math.round(r.height + pad * 2)),
-          })
-        }
-        pushRect(mascotEl, 2)
-        closeEls.forEach((el) => pushRect(el, 6))
-        invoke('set_hermes_bubble_hitboxes', { rectsJson: JSON.stringify(rects) }).catch(() => {})
-      } catch {
-        /* DOM not ready — skip this tick */
-      }
-    }
-    collect()
-    // 布局/滚动/动画期间低成本跟踪：rAF 节流 + 500ms 心跳兜底。
-    const onScroll = () => { if (!raf) raf = requestAnimationFrame(collect) }
-    window.addEventListener('scroll', onScroll, true)
-    window.addEventListener('resize', onScroll)
-    const tid = window.setInterval(collect, 500)
+    const unlisten = listen<string>('hermes-bubble-dismiss', (ev) => {
+      const sid = ev.payload
+      if (!sid) return
+      setDismissedHermesBubbles((prev) => {
+        if (prev.has(sid)) return prev
+        const next = new Set(prev)
+        next.add(sid)
+        return next
+      })
+    })
     return () => {
-      if (raf) cancelAnimationFrame(raf)
-      window.removeEventListener('scroll', onScroll, true)
-      window.removeEventListener('resize', onScroll)
-      window.clearInterval(tid)
+      unlisten.then((fn) => fn())
     }
-  }, [appMode, expanded, bubbleCount])
+  }, [])
+
+  // ─── 可交互区上报已移交独立气泡窗口（HermesBubbles.tsx）───
 
   const claudeSlots: SessionSlot[] = visibleClaudeSessions.map((cs, i) => {
     const isWaiting = cs.status === 'waiting'
@@ -4565,20 +4550,14 @@ export default function Mini() {
             height: '100%',
             position: 'relative',
             display: (appMode === 'pet' && largeMascot) ? 'block' : 'flex',
+            // 独立气泡窗口架构：气泡不再渲染在 mini 窗口内，宠物恢复默认居中，
+            // 不再随气泡数量沉底/右偏（旧内嵌布局遗留）。
             alignItems: (appMode === 'pet' && largeMascot)
               ? undefined
-              : (appMode !== 'pet' && hermesBubbles.length > 0 ? 'flex-end' : 'center'),
-            // With a Hermes bubble stack present (coding mode), anchor the
-            // mascot to the bottom of the expanded window so the bubbles sit
-            // above it. `alignItems` (cross axis) is what pins it to the
-            // bottom in a row flex container — `justifyContent` only affects
-            // the horizontal axis, so it stays centered.
+              : 'center',
             justifyContent: (appMode === 'pet' && largeMascot)
               ? undefined
-              : (appMode !== 'pet' && hermesBubbles.length > 0 ? 'flex-end' : 'center'),
-            // 宠物相对气泡向右偏移（参照 hwdc：气泡右边缘对齐宠物右边缘）。
-            // 有气泡时 mascot 靠右对齐，留 8px 边距避免贴边。
-            paddingRight: (appMode !== 'pet' && hermesBubbles.length > 0) ? 8 : undefined,
+              : 'center',
             // No background. Used to be `rgba(0,0,0,0.01)` to coax macOS
             // WKWebView into delivering hover events on transparent area,
             // but mini-panel no longer uses panel-level hover/click
@@ -4590,118 +4569,6 @@ export default function Mini() {
             cursor: 'default',
           }}
         >
-          {/* Hermes speech-bubble stack (coding mode, collapsed only) */}
-          {appMode !== 'pet' && hermesBubbles.length > 0 && (
-            <div
-              data-no-drag
-              style={{
-                position: 'absolute',
-                left: 0,
-                right: 0,
-                bottom: collapsedMascotSize + 14,
-                display: 'flex',
-                flexDirection: 'column-reverse',
-                alignItems: 'stretch',
-                gap: 8,
-                maxHeight: `calc(100% - ${collapsedMascotSize + 28}px)`,
-                overflowY: 'hidden',
-                overflowX: 'hidden',
-                pointerEvents: 'auto',
-                zIndex: 50,
-                padding: '0 8px',
-                boxSizing: 'border-box',
-              }}
-            >
-              {hermesBubbles.map((b) => (
-                <div
-                  key={b.sessionId}
-                  style={{
-                    width: '100%',
-                    padding: '8px 12px',
-                    borderRadius: 12,
-                    background: 'rgba(20, 20, 24, 0.92)',
-                    color: '#eee',
-                    boxShadow: '0 4px 16px rgba(0,0,0,0.35)',
-                    border: '1px solid rgba(255,255,255,0.12)',
-                    backdropFilter: 'blur(6px)',
-                    fontFamily: 'inherit',
-                    textAlign: 'left',
-                  }}
-                >
-                  <div
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: 6,
-                      marginBottom: 4,
-                    }}
-                  >
-                    <span
-                      style={{
-                        fontSize: 11,
-                        fontWeight: 700,
-                        letterSpacing: 0.3,
-                        color: '#fff',
-                        flex: 1,
-                        minWidth: 0,
-                        whiteSpace: 'nowrap',
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                      }}
-                    >
-                      {b.title}
-                    </span>
-                    <span style={{ fontSize: 11, opacity: 0.9 }}>{b.label}</span>
-                    <button
-                      type="button"
-                      data-hermes-bubble-close
-                      data-no-drag
-                      aria-label="close"
-                      onPointerDown={(e) => e.stopPropagation()}
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        setDismissedHermesBubbles((prev) => {
-                          const next = new Set(prev)
-                          next.add(b.sessionId)
-                          return next
-                        })
-                      }}
-                      style={{
-                        width: 16,
-                        height: 16,
-                        lineHeight: '14px',
-                        padding: 0,
-                        flex: 'none',
-                        borderRadius: 8,
-                        border: '1px solid rgba(255,255,255,0.25)',
-                        background: 'transparent',
-                        color: 'rgba(255,255,255,0.75)',
-                        fontSize: 11,
-                        cursor: 'pointer',
-                        textAlign: 'center',
-                      }}
-                    >
-                      ✕
-                    </button>
-                  </div>
-                  <div
-                    style={{
-                      fontSize: 12,
-                      lineHeight: 1.45,
-                      color: '#d6d6dc',
-                      display: '-webkit-box',
-                      WebkitLineClamp: 1,
-                      WebkitBoxOrient: 'vertical',
-                      overflow: 'hidden',
-                      wordBreak: 'break-word',
-                    }}
-                  >
-                    {b.body}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
           <div
             onPointerDown={handleMascotPointerDown}
             onContextMenu={handleMascotContextMenu}

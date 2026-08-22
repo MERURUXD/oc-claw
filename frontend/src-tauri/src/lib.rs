@@ -77,6 +77,37 @@ static HERMES_BUBBLE_THREAD_ALIVE: AtomicBool = AtomicBool::new(false);
 /// the Windows poll scales them by the window's scale_factor to compare
 /// against GetCursorPos physical px.
 static HERMES_BUBBLE_HITBOXES: Mutex<Vec<(f64, f64, f64, f64)>> = Mutex::new(Vec::new());
+/// Last applied geometry of the standalone Hermes bubble window (logical px,
+/// top-left origin): (x, y, w, h). Written by the geometry applier, read by
+/// the passthrough polls (hitbox math) and as a position fallback.
+static HERMES_BUBBLE_FRAME: Mutex<Option<(f64, f64, f64, f64)>> = Mutex::new(None);
+
+/// Create the standalone coding-mode Hermes bubble window (`hermes_bubbles`)
+/// if it doesn't exist yet. It renders `index.html#/mini?bubbles=1` — the same
+/// bundle as the mini window but a dumb bubble-only tree (see App.tsx).
+fn ensure_hermes_bubble_window(app: &tauri::AppHandle, w: f64, h: f64) -> Result<(), String> {
+    if app.get_webview_window("hermes_bubbles").is_some() {
+        return Ok(());
+    }
+    WebviewWindowBuilder::new(
+        app,
+        "hermes_bubbles",
+        WebviewUrl::App("index.html#/mini?bubbles=1".into()),
+    )
+    .title("oc-claw Hermes Bubbles")
+    .inner_size(w, h)
+    .decorations(false)
+    .transparent(true)
+    .shadow(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .resizable(false)
+    .visible(false)
+    .accept_first_mouse(true)
+    .build()
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
 
 /// Coalesces drag-apply tasks so we never queue more than one
 /// setFrameOrigin: call on the main thread at a time. The poll thread
@@ -5373,73 +5404,76 @@ async fn set_hermes_bubble_mode(
     mascot_scale: Option<f64>,
     bubble_count: Option<u32>,
 ) -> Result<(), String> {
-    let win = app.get_webview_window("mini").ok_or("mini window not found")?;
+    // 独立气泡窗口（hermes_bubbles）：宽度固定 312 逻辑 px，高度只随气泡条数
+    // 增长 —— 与 mini 窗口（宠物）的几何彻底解耦，宠物缩放/面板乘数不再影响
+    // 气泡尺寸。mini 窗口只作为锚点参考（右缘对齐、底边留 gap），永不被改写。
     let mascot_scale = sanitized_mascot_scale(mascot_scale);
-    // Bubble box height grows with the (capped) stack: 57px reserves the
-    // bottom-anchored mascot (43px) + 14px gap, ~90px per bubble.
     let bubble_count = bubble_count.unwrap_or(1).clamp(1, 3) as f64;
-    // 窗口高度随内容增长：miniPet 显示高度(43*scale) + 14px 间距 + 气泡栈 + 12px
-    // 顶部留白。参照 hwdc 动态窗口高度 —— 去掉滚动条后窗口必须完整容纳气泡，
-    // 否则内容被截断。随 mascot_scale 增长，避免宠物调大时气泡区被压缩。
-    let mascot_display_h = 43.0 * mascot_scale;
-    let bubble_h = (mascot_display_h + 14.0 + bubble_count * 90.0 + 12.0).max(180.0).min(600.0);
+    let bubble_w = 312.0_f64;
+    let gap = 14.0_f64;
+    let bubble_h = (12.0 + bubble_count * 90.0 + (gap - 8.0)).max(120.0).min(600.0);
 
     if active {
-        let was_active = HERMES_BUBBLE_ACTIVE.load(Ordering::SeqCst);
+        ensure_hermes_bubble_window(&app, bubble_w, bubble_h)?;
+        let bwin = app.get_webview_window("hermes_bubbles").ok_or("hermes_bubbles window not found")?;
         #[cfg(target_os = "macos")]
         {
-            let win_clone = win.clone();
+            let bwin_clone = bwin.clone();
             app.run_on_main_thread(move || {
                 use objc2::runtime::AnyObject;
                 use objc2::msg_send;
                 use objc2_foundation::{NSRect, NSPoint, NSSize};
-                if let Ok(ns_win) = win_clone.ns_window() {
+                if let Ok(ns_win) = bwin_clone.ns_window() {
                     let obj = unsafe { &*(ns_win as *mut AnyObject) };
                     let cur: NSRect = unsafe { msg_send![obj, frame] };
-                    // Keep the top edge fixed, grow downward; widen symmetrically.
-                    // The mascot then sits bottom-anchored with the bubbles above.
-                    let w = 312.0_f64;
-                    let h = bubble_h;
-                    let x = cur.origin.x - (w - cur.size.width) / 2.0;
-                    let y = cur.origin.y + cur.size.height - h;
-                    let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
-                    unsafe {
-                        if !was_active {
+                    // Anchor: right edge of the bubble window aligns to the
+                    // mini window's right edge; bottom sits gap px above the
+                    // mini window's top edge.
+                    if let Some((fx, fy, fw, fh)) = MINI_WINDOW_FRAME.lock().ok().and_then(|g| *g) {
+                        let x = fx + fw - cur.size.width;
+                        let y = fy + fh + gap;
+                        let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(cur.size.width, cur.size.height));
+                        unsafe {
+                            let _: () = msg_send![obj, setFrame: frame, display: true, animate: false];
                             let _: () = msg_send![obj, setIgnoresMouseEvents: true];
+                            let _: () = msg_send![obj, makeKeyAndOrderFront: obj];
                         }
-                        let _: () = msg_send![obj, setFrame: frame, display: true, animate: false];
-                    }
-                    if let Ok(mut f) = MINI_WINDOW_FRAME.lock() {
-                        *f = Some((x, y, w, h));
+                        if let Ok(mut f) = HERMES_BUBBLE_FRAME.lock() {
+                            *f = Some((x, y, cur.size.width, cur.size.height));
+                        }
                     }
                 }
             }).map_err(|e| e.to_string())?;
         }
         #[cfg(target_os = "windows")]
-        {
-            if let Ok(Some(monitor)) = win.current_monitor() {
+        if let Some(mwin) = app.get_webview_window("mini") {
+            // 锚点取 mini 窗口的实时几何；显示器取气泡窗口当前所在屏（通常与
+            // mini 同屏），clamp 保证不溢出屏幕。
+            if let Ok(Some(monitor)) = bwin.current_monitor().or_else(|_| mwin.current_monitor()) {
                 let scale = monitor.scale_factor();
                 let ui = win_ui_scale(&monitor);
-                if let (Ok(pos), Ok(size)) = (win.outer_position(), win.outer_size()) {
-                    let cur_x = pos.x as f64 / scale;
-                    let cur_y = pos.y as f64 / scale;
-                    let cur_w = size.width as f64 / scale;
-                    let w = (312.0 * ui).round();
+                if let (Ok(mpos), Ok(msize)) = (mwin.outer_position(), mwin.outer_size()) {
+                    let mx = mpos.x as f64 / scale;
+                    let my = mpos.y as f64 / scale;
+                    let mw = msize.width as f64 / scale;
+                    let w = (bubble_w * ui).round();
                     let h = (bubble_h * ui).round();
-                    let mut x = cur_x - (w - cur_w) / 2.0;
-                    let mut y = cur_y; // keep top edge fixed
+                    // 右边缘对齐 mini 窗口右缘，底边贴 mini 窗口顶边上方留 gap。
+                    let mut x = mx + mw - w;
+                    let mut y = my - h - gap;
                     // 边沿自动回正：clamp 到当前 monitor 边界，气泡窗口触碰屏幕边缘时
                     // 不溢出（参照 hwdc _horizontalPosition/_clamp）。
                     let mp = monitor.position();
-                    let mx = mp.x as f64 / scale;
-                    let my = mp.y as f64 / scale;
-                    let mw = monitor.size().width as f64 / scale;
-                    let mh = monitor.size().height as f64 / scale;
-                    x = x.max(mx).min(mx + mw - w);
-                    y = y.max(my).min(my + mh - h);
-                    let _ = win.set_size(tauri::LogicalSize::new(w, h));
-                    let _ = win.set_position(tauri::LogicalPosition::new(x, y));
-                    if let Ok(mut f) = MINI_WINDOW_FRAME.lock() {
+                    let bx = mp.x as f64 / scale;
+                    let by = mp.y as f64 / scale;
+                    let bw_total = monitor.size().width as f64 / scale;
+                    let bh_total = monitor.size().height as f64 / scale;
+                    x = x.max(bx).min(bx + bw_total - w);
+                    y = y.max(by).min(by + bh_total - h);
+                    let _ = bwin.set_size(tauri::LogicalSize::new(w, h));
+                    let _ = bwin.set_position(tauri::LogicalPosition::new(x, y));
+                    let _ = bwin.show();
+                    if let Ok(mut f) = HERMES_BUBBLE_FRAME.lock() {
                         *f = Some((x, y, w, h));
                     }
                 }
@@ -5463,54 +5497,37 @@ async fn set_hermes_bubble_mode(
         }
     } else {
         HERMES_BUBBLE_ACTIVE.store(false, Ordering::SeqCst);
+        // 独立气泡窗口：只隐藏它并复位穿透标志。mini（宠物）窗口的几何永远
+        // 不在这里被动 —— 宠物缩放由 applyMascotScale/applyLargeMascotScale
+        // 自己管理，气泡模式退出不得反向改宠物尺寸（旧 bug：收起面板后宠物
+        // 尺寸被气泡逻辑重置）。
         #[cfg(target_os = "macos")]
         {
-            let win_clone = win.clone();
-            app.run_on_main_thread(move || {
+            let bwin_clone = app.get_webview_window("hermes_bubbles");
+            let _ = app.run_on_main_thread(move || {
                 use objc2::runtime::AnyObject;
                 use objc2::msg_send;
-                use objc2_foundation::{NSRect, NSPoint, NSSize};
-                if let Ok(ns_win) = win_clone.ns_window() {
-                    let obj = unsafe { &*(ns_win as *mut AnyObject) };
-                    let cur: NSRect = unsafe { msg_send![obj, frame] };
-                    let w = COLLAPSED_MASCOT_BASE_W * mascot_scale;
-                    let h = COLLAPSED_MASCOT_BASE_H * mascot_scale;
-                    let x = cur.origin.x + (cur.size.width - w) / 2.0;
-                    let y = cur.origin.y + cur.size.height - h;
-                    let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
-                    unsafe {
-                        let _: () = msg_send![obj, setIgnoresMouseEvents: false];
-                        let _: () = msg_send![obj, setFrame: frame, display: true, animate: false];
-                    }
-                    if let Ok(mut f) = MINI_WINDOW_FRAME.lock() {
-                        *f = Some((x, y, w, h));
+                if let Some(bwin) = bwin_clone {
+                    if let Ok(ns_win) = bwin.ns_window() {
+                        let obj = unsafe { &*(ns_win as *mut AnyObject) };
+                        unsafe {
+                            let _: () = msg_send![obj, orderOut: obj];
+                        }
                     }
                 }
-            }).map_err(|e| e.to_string())?;
+            });
         }
         #[cfg(target_os = "windows")]
         {
-            if let Ok(Some(monitor)) = win.current_monitor() {
-                let scale = monitor.scale_factor();
-                let ui = win_ui_scale(&monitor);
-                if let (Ok(pos), Ok(size)) = (win.outer_position(), win.outer_size()) {
-                    let cur_x = pos.x as f64 / scale;
-                    let cur_y = pos.y as f64 / scale;
-                    let cur_w = size.width as f64 / scale;
-                    let w = (COLLAPSED_MASCOT_BASE_W * mascot_scale * ui).round();
-                    let h = (COLLAPSED_MASCOT_BASE_H * mascot_scale * ui).round();
-                    let x = cur_x + (cur_w - w) / 2.0;
-                    let y = cur_y;
-                    let _ = win.set_size(tauri::LogicalSize::new(w, h));
-                    let _ = win.set_position(tauri::LogicalPosition::new(x, y));
-                    if let Ok(mut f) = MINI_WINDOW_FRAME.lock() {
-                        *f = Some((x, y, w, h));
-                    }
-                }
+            if let Some(bwin) = app.get_webview_window("hermes_bubbles") {
+                let _ = bwin.hide();
             }
-            if let Some(win) = app.get_webview_window("mini") {
-                let _ = win.set_ignore_cursor_events(false);
-            }
+        }
+        if let Some(win) = app.get_webview_window("mini") {
+            let _ = win.set_ignore_cursor_events(false);
+        }
+        if let Some(bwin) = app.get_webview_window("hermes_bubbles") {
+            let _ = bwin.set_ignore_cursor_events(false);
         }
     }
     Ok(())
@@ -5551,9 +5568,10 @@ fn hermes_bubble_passthrough_poll(app: tauri::AppHandle, _mascot_scale: f64) {
     HERMES_BUBBLE_THREAD_ALIVE.store(true, Ordering::SeqCst);
     let mut was_interactive = false;
     while HERMES_BUBBLE_ACTIVE.load(Ordering::SeqCst) {
-        // 可交互判定：光标是否落在前端上报的 hitbox 并集内（宠物本体 ∪ 各气泡 ✕）。
+        // 可交互判定：光标是否落在前端上报的 hitbox 并集内（各气泡 ✕ 按钮）。
+        // 基准 = 气泡窗口自身的 frame（HERMES_BUBBLE_FRAME，逻辑 px）；
         // 其余区域一律穿透到桌面；上报缺失/过期时整窗穿透（宁漏一拍不挡桌面）。
-        let frame = MINI_WINDOW_FRAME.lock().ok().and_then(|g| *g);
+        let frame = HERMES_BUBBLE_FRAME.lock().ok().and_then(|g| *g);
         let should_be_interactive = match (frame, macos_cursor_position()) {
             (Some((fx, fy, _fw, _fh)), (cx, cy)) => {
                 let boxes = HERMES_BUBBLE_HITBOXES.lock().ok();
@@ -5588,7 +5606,7 @@ fn hermes_bubble_passthrough_poll(app: tauri::AppHandle, _mascot_scale: f64) {
     }
     let app_exit = app.clone();
     let _ = app_exit.run_on_main_thread(move || {
-        if let Some(win) = app_exit.get_webview_window("mini") {
+        if let Some(win) = app_exit.get_webview_window("hermes_bubbles") {
             if let Ok(ns_win) = win.ns_window() {
                 use objc2::msg_send;
                 let obj = unsafe { &*(ns_win as *mut objc2::runtime::AnyObject) };
@@ -5621,13 +5639,13 @@ fn hermes_bubble_passthrough_poll_windows(app: tauri::AppHandle, _mascot_scale: 
                 None
             }
         };
-        // 可交互判定：光标是否落在前端上报的 hitbox 并集内（宠物本体 ∪ 各气泡 ✕）。
-        // 矩形是相对窗口左上角的 CSS px，乘 scale 换算物理像素后再比较。其余区域
-        // 一律穿透到桌面（与视觉一致）；上报缺失/过期时整窗穿透——宁漏一拍不挡桌面。
-        let should_be_interactive = match (app.get_webview_window("mini"), cursor) {
-            (Some(win), Some((cx, cy))) => {
-                let pos = win.outer_position().ok();
-                let scale = win.scale_factor().unwrap_or(1.0);
+        // 可交互判定：光标是否落在前端上报的 hitbox 并集内（各气泡 ✕ 按钮）。
+        // 矩形是相对气泡窗口左上角的 CSS px，乘 scale 换算物理像素后再比较。
+        // 其余区域一律穿透到桌面（与视觉一致）；上报缺失/过期时整窗穿透——宁漏一拍不挡桌面。
+        let should_be_interactive = match (app.get_webview_window("hermes_bubbles"), cursor) {
+            (Some(bwin), Some((cx, cy))) => {
+                let pos = bwin.outer_position().ok();
+                let scale = bwin.scale_factor().unwrap_or(1.0);
                 if let Some(pos) = pos {
                     let fx = pos.x as f64;
                     let fy = pos.y as f64;
@@ -5655,7 +5673,7 @@ fn hermes_bubble_passthrough_poll_windows(app: tauri::AppHandle, _mascot_scale: 
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    if let Some(win) = app.get_webview_window("mini") {
+    if let Some(win) = app.get_webview_window("hermes_bubbles") {
         let _ = win.set_ignore_cursor_events(false);
     }
     HERMES_BUBBLE_THREAD_ALIVE.store(false, Ordering::SeqCst);
