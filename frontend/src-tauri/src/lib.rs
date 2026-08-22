@@ -144,15 +144,15 @@ fn spawn_hermes_bubble_follow_thread(app: tauri::AppHandle) {
                 let gap_px = (HERMES_BUBBLE_GAP_LOGICAL * scale).round() as i32;
                 // Physical px target: right edges aligned with mini, bottom sits
                 // GAP_PX above mini's top edge.
-                let tx = mp.x + ms.x as i32 - bs.x as i32;
-                let ty = mp.y - bs.y as i32 - gap_px;
+                let tx = mp.x + ms.width as i32 - bs.width as i32;
+                let ty = mp.y - bs.height as i32 - gap_px;
                 let moved = last_applied.map_or(true, |(lx, ly)| lx != tx as f64 || ly != ty as f64);
                 if moved {
                     let _ = bwin.set_position(tauri::PhysicalPosition::new(tx, ty));
                     last_applied = Some((tx as f64, ty as f64));
                 }
             }
-            std::thread::sleep(Duration::from_millis(60));
+            std::thread::sleep(std::time::Duration::from_millis(60));
         }
     });
     if let Ok(mut slot) = HERMES_BUBBLE_FOLLOW_THREAD.lock() {
