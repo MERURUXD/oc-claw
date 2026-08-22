@@ -4224,6 +4224,45 @@ export default function Mini() {
     }, 2000)
     return () => clearInterval(t)
   }, [appMode])
+  // Report the pet sprites' real layout box (union, transform-excluded via
+  // the offsetParent chain so the bob animation can't jitter the anchor) to
+  // Rust, so the bubble follower docks to the actual pet pixels instead of
+  // the mini window frame (which has big transparent margins).
+  useEffect(() => {
+    const collect = () => {
+      try {
+        // Freeze the bob animation for one measurement so getBoundingClientRect
+        // is stable (it INCLUDES transforms), then unfreeze. The rects come
+        // back in real CSS px of the window viewport, already accounting for
+        // any `zoom` on ancestors — no manual scale math needed.
+        const els = Array.from(document.querySelectorAll<HTMLElement>('[data-mini-pet-anchor]'))
+        if (els.length === 0) {
+          invoke('set_mini_pet_anchor_rect', { x: 0, y: 0, w: 0, h: 0 }).catch(() => {})
+          return
+        }
+        const prev: Array<string | undefined> = els.map((el) => el.style.animation)
+        els.forEach((el) => { el.style.animation = 'none' })
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+        try {
+          els.forEach((el) => {
+            const r = el.getBoundingClientRect()
+            minX = Math.min(minX, r.left)
+            minY = Math.min(minY, r.top)
+            maxX = Math.max(maxX, r.right)
+            maxY = Math.max(maxY, r.bottom)
+          })
+        } finally {
+          els.forEach((el, i) => { el.style.animation = prev[i] ?? '' })
+        }
+        invoke('set_mini_pet_anchor_rect', { x: minX, y: minY, w: maxX - minX, h: maxY - minY }).catch(() => {})
+      } catch {
+        /* DOM not ready */
+      }
+    }
+    collect()
+    const tid = window.setInterval(collect, 500)
+    return () => window.clearInterval(tid)
+  }, [])
 
   const fallbackLargeActions = useMemo(() => {
     const c = characters.find((ch) => ch.largeActions && Object.keys(ch.largeActions).length > 0)
@@ -5950,12 +5989,14 @@ export default function Mini() {
                           }}
                         >
                           {miniPet ? (
-                            <SpritePet
-                              pet={miniPet}
-                              state="idle"
-                              size={Math.round(68 * SESSION_SPRITE_DISPLAY_MULTIPLIER)}
-                              style={{ animation: 'bob 2s ease-in-out infinite', opacity: 0.8 }}
-                            />
+                            <span data-mini-pet-anchor="1" style={{ display: 'inline-block', lineHeight: 0 }}>
+                              <SpritePet
+                                pet={miniPet}
+                                state="idle"
+                                size={Math.round(68 * SESSION_SPRITE_DISPLAY_MULTIPLIER)}
+                                style={{ animation: 'bob 2s ease-in-out infinite', opacity: 0.8 }}
+                              />
+                            </span>
                           ) : (
                             <span style={{ color: 'rgba(255,255,255,0.3)', fontSize: 11 }}>{t('mini.waitingForAgents')}</span>
                           )}
@@ -6019,7 +6060,9 @@ export default function Mini() {
                                 {(() => {
                                   const rowPet = getQueuePet(sortedIdx)
                                   return rowPet ? (
-                                    <SpritePet pet={rowPet} state={slotSpriteState} size={Math.round(56 * SESSION_SPRITE_DISPLAY_MULTIPLIER)} />
+                                    <span data-mini-pet-anchor="1" style={{ display: 'inline-block', lineHeight: 0 }}>
+                                      <SpritePet pet={rowPet} state={slotSpriteState} size={Math.round(56 * SESSION_SPRITE_DISPLAY_MULTIPLIER)} />
+                                    </span>
                                   ) : null
                                 })()}
                                 {!miniPet && petQueueResolved.length === 0 && (
