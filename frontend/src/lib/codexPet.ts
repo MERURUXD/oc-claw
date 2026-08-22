@@ -211,102 +211,40 @@ export async function loadCustomCodexPets(): Promise<CodexPet[]> {
   }
 }
 
-// ─── Pet gallery: codexpet.xyz market ───
+// ─── Pet gallery: petdex.dev manifest ───
 //
-// Market data is fetched through the Rust `fetch_market_pets` proxy command,
-// which serializes the snake_case API fields as-is; we map them to camelCase
-// here for the UI layer.
-export interface MarketPet {
+// The full pet registry is fetched once per process lifetime from the Rust
+// `fetch_petdex_manifest` command (GET https://petdex.dev/api/manifest).
+// Search/filter/pagination all happen client-side over the cached array.
+export interface PetdexPet {
   slug: string
   displayName: string
-  description: string
-  authorName: string
-  license: string
-  tags: string[]
-  downloadCount: number
-  likeCount: number
-  hotScore: number
-  publishedAt: string
+  kind: 'creature' | 'character' | 'object'
+  submittedBy: string
   spritesheetUrl: string
-  downloadUrl: string
+  zipUrl: string
+  spriteVersionNumber: number
 }
 
-export interface MarketPetsPage {
-  pets: MarketPet[]
-  totalItems: number
-  totalPages: number
-  currentPage: number
-}
+let cachedManifest: Promise<PetdexPet[]> | null = null
 
-export interface MarketFetchOptions {
-  q?: string
-  sort?: 'latest' | 'hot' | 'downloads'
-  page?: number
-  limit?: number
-}
-
-interface RawMarketPetMeta {
-  slug: string
-  display_name: string
-  description: string
-  author_name: string
-  license: string
-  tags: string[]
-  download_count: number
-  like_count: number
-  hot_score: number
-  published_at: string
-  spritesheet_url: string
-  download_url: string
-}
-
-interface RawMarketPetsPage {
-  pets: RawMarketPetMeta[]
-  total_items: number
-  total_pages: number
-  current_page: number
-}
-
-function mapMarketPet(p: RawMarketPetMeta): MarketPet {
-  return {
-    slug: p.slug,
-    displayName: p.display_name,
-    description: p.description,
-    authorName: p.author_name,
-    license: p.license,
-    tags: Array.isArray(p.tags) ? p.tags : [],
-    downloadCount: p.download_count,
-    likeCount: p.like_count,
-    hotScore: p.hot_score,
-    publishedAt: p.published_at,
-    spritesheetUrl: p.spritesheet_url,
-    downloadUrl: p.download_url,
+export function loadPetdexManifest(): Promise<PetdexPet[]> {
+  if (!cachedManifest) {
+    cachedManifest = (async () => {
+      const { invoke } = await import('@tauri-apps/api/core')
+      return (await invoke('fetch_petdex_manifest')) as PetdexPet[]
+    })()
   }
+  return cachedManifest
 }
 
-// Fetch one page of market pets through the Rust proxy. `q` and `sort` are
-// optional; page/limit default to 1/60.
-export async function fetchMarketPets(opts: MarketFetchOptions = {}): Promise<MarketPetsPage> {
+// One-click install of a market pet into `~/.codex/pets/<slug>`. The zip URL
+// comes from the cached manifest entry; Rust validates the assets.petdex.dev
+// prefix before downloading. Returns the installed pet (camelCase from the
+// Rust command).
+export async function downloadMarketPet(slug: string, zipUrl: string): Promise<CodexPet> {
   const { invoke } = await import('@tauri-apps/api/core')
-  const raw = (await invoke('fetch_market_pets', {
-    q: opts.q || null,
-    sort: opts.sort || null,
-    page: opts.page ?? 1,
-    limit: opts.limit ?? 60,
-  })) as RawMarketPetsPage
-  return {
-    pets: Array.isArray(raw.pets) ? raw.pets.map(mapMarketPet) : [],
-    totalItems: raw.total_items ?? 0,
-    totalPages: raw.total_pages ?? 0,
-    currentPage: raw.current_page ?? 0,
-  }
-}
-
-// One-click install of a market pet into `~/.codex/pets/<slug>`. Returns the
-// installed pet (already camelCase from the Rust command).
-export async function downloadMarketPet(slug: string): Promise<CodexPet> {
-  const { invoke } = await import('@tauri-apps/api/core')
-  return (await invoke('download_codex_pet', { slug })) as CodexPet
+  return (await invoke('download_codex_pet', { slug, zipUrl })) as CodexPet
 }
 
 // Delete a locally installed custom pet folder (`~/.codex/pets/<id>`).
