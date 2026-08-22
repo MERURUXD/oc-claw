@@ -200,15 +200,15 @@ fn apply_hermes_bubble_follow(app: &tauri::AppHandle) {
         // fall back to the current window size before the first report.
         let content_logical = hermes_bubble_content_height();
         let want_h_phys = if content_logical > 0.0 {
-            (content_logical * scale).round() as i32
+            (content_logical * scale).round() as u32
         } else {
-            bs.height as i32
+            bs.height
         };
         let gap_px = (HERMES_BUBBLE_GAP_LOGICAL * scale).round() as i32;
         // Physical px target: right edges aligned with mini, bottom sits
         // GAP_PX above mini's top edge.
         let tx = mp.x + ms.width as i32 - bs.width as i32;
-        let ty = mp.y - want_h_phys - gap_px;
+        let ty = mp.y - want_h_phys as i32 - gap_px;
         let moved = bs.height != want_h_phys
             || bwin.outer_position().map(|bp| bp.x != tx || bp.y != ty).unwrap_or(true);
         if moved {
