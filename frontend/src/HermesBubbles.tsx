@@ -63,8 +63,39 @@ export default function HermesBubbles() {
     }
   }, [bubbles])
 
+  // Report the live content height so Rust shrinks the window to hug the
+  // stack (bottom edge anchored above the pet — kills the transparent dead
+  // zone that made the bubble look far away). scrollHeight works even when
+  // content overflows the current clip.
+  useEffect(() => {
+    let last = -1
+    const report = () => {
+      try {
+        const root = document.querySelector<HTMLElement>('[data-hermes-bubble-stack]')
+        if (!root || !root.lastElementChild) return
+        // Measure the real visual extent (last bubble's bottom edge + the
+        // root's top padding), NOT scrollHeight — the root is height:100%,
+        // so scrollHeight would just echo the window height.
+        const rootTop = root.getBoundingClientRect().top
+        const lastBottom = root.lastElementChild.getBoundingClientRect().bottom
+        const h = Math.ceil(lastBottom - rootTop)
+        if (h > 0 && h !== last) {
+          last = h
+          invoke('set_hermes_bubble_content_height', { h }).catch(() => {})
+        }
+      } catch {
+        /* DOM not ready */
+      }
+    }
+    report()
+    requestAnimationFrame(report)
+    const tid = window.setTimeout(report, 250) // after webfonts/layout settle
+    return () => window.clearTimeout(tid)
+  }, [bubbles])
+
   return (
     <div
+      data-hermes-bubble-stack
       style={{
         width: '100%',
         height: '100%',

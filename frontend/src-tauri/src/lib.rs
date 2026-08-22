@@ -87,6 +87,20 @@ static HERMES_BUBBLE_FOLLOW_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> =
 static HERMES_BUBBLE_FOLLOW_EPOCH: AtomicU64 = AtomicU64::new(0);
 /// Gap between bubble window bottom and pet top, logical px.
 const HERMES_BUBBLE_GAP_LOGICAL: f64 = 14.0;
+/// Live bubble-stack height (logical px) reported by the bubble renderer, so
+/// the window hugs its content instead of a per-count estimate (stored as f64
+/// bits; 0 = no report yet). Kills the transparent dead zone between the
+/// bubble stack and the pet.
+static HERMES_BUBBLE_CONTENT_H_BITS: AtomicU64 = AtomicU64::new(0);
+
+fn hermes_bubble_content_height() -> f64 {
+    let bits = HERMES_BUBBLE_CONTENT_H_BITS.load(Ordering::SeqCst);
+    if bits == 0 { 0.0 } else { f64::from_bits(bits) }
+}
+
+/// Coalesces mini-window Moved events so a burst of drag updates queues at
+/// most one applier thread at a time (no thread storm).
+static HERMES_BUBBLE_MOVE_QUEUED: AtomicBool = AtomicBool::new(false);
 
 /// Create the standalone coding-mode Hermes bubble window (`hermes_bubbles`)
 /// if it doesn't exist yet. It renders `index.html#/mini?bubbles=1` — the same
@@ -126,37 +140,84 @@ fn spawn_hermes_bubble_follow_thread(app: tauri::AppHandle) {
     if let Some(handle) = HERMES_BUBBLE_FOLLOW_THREAD.lock().ok().and_then(|mut h| h.take()) {
         let _ = handle.join();
     }
+    // Event-driven re-anchor while dragging: every mini-window move wakes a
+    // dedicated applier immediately (poll tick only acts as a fallback).
+    let app_move = app.clone();
+    app.on_window_event(move |window, event| {
+        if window.label() != "mini" {
+            return; // Ignore the bubble window's own moves — no feedback loop.
+        }
+        if !matches!(event, tauri::WindowEvent::Moved(_)) {
+            return;
+        }
+        if !HERMES_BUBBLE_ACTIVE.load(Ordering::SeqCst) {
+            return;
+        }
+        // Coalesce: if an applier is already queued, it reads the latest
+        // mini position when it runs, so skip duplicate events in a burst.
+        if HERMES_BUBBLE_MOVE_QUEUED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let app2 = app_move.clone();
+        let _ = std::thread::Builder::new()
+            .name("hermes-bubble-move".into())
+            .spawn(move || {
+                apply_hermes_bubble_follow(&app2);
+                HERMES_BUBBLE_MOVE_QUEUED.store(false, Ordering::SeqCst);
+            });
+    });
     let handle = std::thread::spawn(move || {
-        let mut last_applied: Option<(f64, f64)> = None;
         loop {
             if HERMES_BUBBLE_FOLLOW_EPOCH.load(Ordering::SeqCst) != my_epoch
                 || !HERMES_BUBBLE_ACTIVE.load(Ordering::SeqCst)
             {
                 break;
             }
-            let (Some(mwin), Some(bwin)) =
-                (app.get_webview_window("mini"), app.get_webview_window("hermes_bubbles"))
-            else {
-                break;
-            };
-            let scale = mwin.scale_factor().unwrap_or(1.0);
-            if let (Ok(mp), Ok(ms), Ok(bs)) = (mwin.outer_position(), mwin.outer_size(), bwin.outer_size()) {
-                let gap_px = (HERMES_BUBBLE_GAP_LOGICAL * scale).round() as i32;
-                // Physical px target: right edges aligned with mini, bottom sits
-                // GAP_PX above mini's top edge.
-                let tx = mp.x + ms.width as i32 - bs.width as i32;
-                let ty = mp.y - bs.height as i32 - gap_px;
-                let moved = last_applied.map_or(true, |(lx, ly)| lx != tx as f64 || ly != ty as f64);
-                if moved {
-                    let _ = bwin.set_position(tauri::PhysicalPosition::new(tx, ty));
-                    last_applied = Some((tx as f64, ty as f64));
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(60));
+            apply_hermes_bubble_follow(&app);
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
     });
     if let Ok(mut slot) = HERMES_BUBBLE_FOLLOW_THREAD.lock() {
         *slot = Some(handle);
+    }
+}
+
+/// Compute and apply the bubble window's follow position in one shot: right
+/// edge aligned with mini, bottom edge GAP_PX above mini's top. The window
+/// height hugs its live reported content, and when it shrinks/grows the
+/// bottom stays anchored (stack grows upward), so the visual gap to the pet
+/// never changes.
+fn apply_hermes_bubble_follow(app: &tauri::AppHandle) {
+    let (Some(mwin), Some(bwin)) =
+        (app.get_webview_window("mini"), app.get_webview_window("hermes_bubbles"))
+    else {
+        return;
+    };
+    let scale = mwin.scale_factor().unwrap_or(1.0);
+    if let (Ok(mp), Ok(ms), Ok(bs)) = (mwin.outer_position(), mwin.outer_size(), bwin.outer_size()) {
+        // Content-hugging height: prefer the renderer-reported stack height,
+        // fall back to the current window size before the first report.
+        let content_logical = hermes_bubble_content_height();
+        let want_h_phys = if content_logical > 0.0 {
+            (content_logical * scale).round() as i32
+        } else {
+            bs.height
+        };
+        let gap_px = (HERMES_BUBBLE_GAP_LOGICAL * scale).round() as i32;
+        // Physical px target: right edges aligned with mini, bottom sits
+        // GAP_PX above mini's top edge.
+        let tx = mp.x + ms.width as i32 - bs.width as i32;
+        let ty = mp.y - want_h_phys - gap_px;
+        let moved = bs.height != want_h_phys
+            || bwin.outer_position().map(|bp| bp.x != tx || bp.y != ty).unwrap_or(true);
+        if moved {
+            if bs.height != want_h_phys {
+                let _ = bwin.set_size(tauri::PhysicalSize::new(bs.width, want_h_phys));
+                let _ = bwin.set_position(tauri::PhysicalPosition::new(tx, ty));
+            } else {
+                let _ = bwin.set_position(tauri::PhysicalPosition::new(tx, ty));
+            }
+        }
     }
 }
 
@@ -5585,6 +5646,17 @@ async fn set_hermes_bubble_mode(
             let _ = bwin.set_ignore_cursor_events(false);
         }
     }
+    Ok(())
+}
+
+/// Renderer-reported live content height of the bubble stack (logical px).
+/// Stores it globally and re-applies the follow geometry immediately so the
+/// window hugs its content (bottom edge anchored above the pet).
+#[tauri::command]
+async fn set_hermes_bubble_content_height(app: tauri::AppHandle, h: f64) -> Result<(), String> {
+    let h = h.clamp(24.0, 600.0);
+    HERMES_BUBBLE_CONTENT_H_BITS.store(h.to_bits(), Ordering::SeqCst);
+    apply_hermes_bubble_follow(&app);
     Ok(())
 }
 
@@ -17947,7 +18019,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, set_hermes_bubble_mode, set_hermes_bubble_hitboxes, get_now_playing, get_system_idle_time, get_keyboard_idle_secs])
+        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, set_hermes_bubble_mode, set_hermes_bubble_hitboxes, set_hermes_bubble_content_height, get_now_playing, get_system_idle_time, get_keyboard_idle_secs])
         .manage(ActiveAgentPid { pid: Mutex::new(None) })
         .manage(ClaudeState { sessions: Arc::new(Mutex::new(HashMap::new())), pending_permissions: Arc::new(Mutex::new(HashMap::new())), dismissed: Arc::new(Mutex::new(std::collections::HashSet::new())) })
         .run(tauri::generate_context!())
