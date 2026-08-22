@@ -9108,7 +9108,7 @@ where
     Ok(v.unwrap_or_default())
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct PetdexPetMeta {
     slug: String,
     #[serde(rename = "displayName")]
