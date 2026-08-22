@@ -68,6 +68,15 @@ static PET_MASCOT_SCALES: Mutex<(f64, f64)> = Mutex::new((1.0, LARGE_MASCOT_SIZE
 static HERMES_BUBBLE_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Whether the coding-mode bubble pass-through poll thread is alive.
 static HERMES_BUBBLE_THREAD_ALIVE: AtomicBool = AtomicBool::new(false);
+/// Interactive hitboxes for the coding-mode Hermes bubble window, reported by
+/// the frontend in CSS px relative to the window's top-left corner (logical).
+/// Union of: mascot body + each bubble's ✕ close button. The passthrough poll
+/// keeps the window clickable only while the cursor is inside one of these
+/// rects; everywhere else clicks fall through to the desktop. Empty list =
+/// nothing interactive (whole window passes through). Stored as logical px;
+/// the Windows poll scales them by the window's scale_factor to compare
+/// against GetCursorPos physical px.
+static HERMES_BUBBLE_HITBOXES: Mutex<Vec<(f64, f64, f64, f64)>> = Mutex::new(Vec::new());
 
 /// Coalesces drag-apply tasks so we never queue more than one
 /// setFrameOrigin: call on the main thread at a time. The poll thread
@@ -5437,6 +5446,11 @@ async fn set_hermes_bubble_mode(
             }
         }
         HERMES_BUBBLE_ACTIVE.store(true, Ordering::SeqCst);
+        // 进入/更新气泡模式时清掉上一次的 hitbox 缓存，等前端重新上报，
+        // 避免布局变化后轮询仍按旧矩形判定可交互区。
+        if let Ok(mut g) = HERMES_BUBBLE_HITBOXES.lock() {
+            g.clear();
+        }
         #[cfg(target_os = "macos")]
         if !HERMES_BUBBLE_THREAD_ALIVE.load(Ordering::SeqCst) {
             let app2 = app.clone();
@@ -5502,17 +5516,57 @@ async fn set_hermes_bubble_mode(
     Ok(())
 }
 
-/// Coding-mode bubble pass-through poll (macOS). Keeps only the bottom-anchored
-/// mascot area clickable; the bubble area above it passes clicks through.
+/// Frontend-reported interactive hitboxes for the coding-mode Hermes bubble
+/// window. `rects_json` is a JSON array of `{x,y,w,h}` in CSS px relative to
+/// the window's top-left corner: mascot body + each bubble's ✕ close button.
+/// The passthrough polls treat only these rects as clickable; everything else
+/// passes through to the desktop. Empty array = whole window passes through.
+#[tauri::command]
+async fn set_hermes_bubble_hitboxes(rects_json: String) -> Result<(), String> {
+    #[derive(serde::Deserialize)]
+    struct Rect {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+    }
+    let rects: Vec<Rect> = serde_json::from_str(&rects_json).unwrap_or_default();
+    if let Ok(mut g) = HERMES_BUBBLE_HITBOXES.lock() {
+        g.clear();
+        for r in rects {
+            if r.w > 0.0 && r.h > 0.0 {
+                g.push((r.x, r.y, r.w, r.h));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Coding-mode bubble pass-through poll (macOS). Keeps only the frontend-
+/// reported hitbox union (mascot body + each bubble's ✕ close button)
+/// clickable; everything else passes through to the desktop.
 #[cfg(target_os = "macos")]
 fn hermes_bubble_passthrough_poll(app: tauri::AppHandle, _mascot_scale: f64) {
     use std::time::Duration;
     HERMES_BUBBLE_THREAD_ALIVE.store(true, Ordering::SeqCst);
     let mut was_interactive = false;
     while HERMES_BUBBLE_ACTIVE.load(Ordering::SeqCst) {
-        // 气泡模式下整个窗口保持可交互：气泡区需接收滚轮滚动，mascot 需接收拖拽/右键。
-        // 不再按 mascot hitbox 切换穿透，否则鼠标悬在气泡上时窗口会穿透、滚轮失效。
-        let should_be_interactive = true;
+        // 可交互判定：光标是否落在前端上报的 hitbox 并集内（宠物本体 ∪ 各气泡 ✕）。
+        // 其余区域一律穿透到桌面；上报缺失/过期时整窗穿透（宁漏一拍不挡桌面）。
+        let frame = MINI_WINDOW_FRAME.lock().ok().and_then(|g| *g);
+        let should_be_interactive = match (frame, macos_cursor_position()) {
+            (Some((fx, fy, _fw, _fh)), (cx, cy)) => {
+                let boxes = HERMES_BUBBLE_HITBOXES.lock().ok();
+                boxes
+                    .map(|g| {
+                        g.iter().any(|&(x, y, w, h)| {
+                            cx >= fx + x && cx <= fx + x + w && cy >= fy + y && cy <= fy + y + h
+                        })
+                    })
+                    .unwrap_or(false)
+            }
+            _ => false,
+        };
         if should_be_interactive != was_interactive {
             let app1 = app.clone();
             let app2 = app.clone();
@@ -5547,17 +5601,52 @@ fn hermes_bubble_passthrough_poll(app: tauri::AppHandle, _mascot_scale: f64) {
     HERMES_BUBBLE_THREAD_ALIVE.store(false, Ordering::SeqCst);
 }
 
-/// Coding-mode bubble pass-through poll (Windows). Keeps only the bottom-anchored
-/// mascot area clickable; the bubble area above it passes clicks through.
+/// Coding-mode bubble pass-through poll (Windows). Keeps only the frontend-
+/// reported hitbox union (mascot body + each bubble's ✕ close button)
+/// clickable; everything else passes through to the desktop.
 #[cfg(target_os = "windows")]
 fn hermes_bubble_passthrough_poll_windows(app: tauri::AppHandle, _mascot_scale: f64) {
     use std::time::Duration;
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
     HERMES_BUBBLE_THREAD_ALIVE.store(true, Ordering::SeqCst);
     let mut last_state: Option<bool> = None;
     while HERMES_BUBBLE_ACTIVE.load(Ordering::SeqCst) {
-        // 气泡模式下整个窗口保持可交互：气泡区需接收滚轮滚动，mascot 需接收拖拽/右键。
-        // 不再按 mascot hitbox 切换穿透，否则鼠标悬在气泡上时窗口会穿透、滚轮失效。
-        let should_be_interactive = true;
+        // Read the live window position in physical pixels (matches GetCursorPos).
+        let cursor = unsafe {
+            let mut pt = POINT::default();
+            if GetCursorPos(&mut pt).is_ok() {
+                Some((pt.x as f64, pt.y as f64))
+            } else {
+                None
+            }
+        };
+        // 可交互判定：光标是否落在前端上报的 hitbox 并集内（宠物本体 ∪ 各气泡 ✕）。
+        // 矩形是相对窗口左上角的 CSS px，乘 scale 换算物理像素后再比较。其余区域
+        // 一律穿透到桌面（与视觉一致）；上报缺失/过期时整窗穿透——宁漏一拍不挡桌面。
+        let should_be_interactive = match (app.get_webview_window("mini"), cursor) {
+            (Some(win), Some((cx, cy))) => {
+                let pos = win.outer_position().ok();
+                let scale = win.scale_factor().unwrap_or(1.0);
+                if let Some(pos) = pos {
+                    let fx = pos.x as f64;
+                    let fy = pos.y as f64;
+                    let boxes = HERMES_BUBBLE_HITBOXES.lock().ok();
+                    boxes
+                        .map(|g| {
+                            g.iter().any(|&(x, y, w, h)| {
+                                let left = fx + x * scale;
+                                let top = fy + y * scale;
+                                cx >= left && cx <= left + w * scale && cy >= top && cy <= top + h * scale
+                            })
+                        })
+                        .unwrap_or(false)
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
         if last_state != Some(should_be_interactive) {
             if let Some(win) = app.get_webview_window("mini") {
                 let _ = win.set_ignore_cursor_events(!should_be_interactive);
@@ -17781,7 +17870,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, set_hermes_bubble_mode, get_now_playing, get_system_idle_time, get_keyboard_idle_secs])
+        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, set_hermes_bubble_mode, set_hermes_bubble_hitboxes, get_now_playing, get_system_idle_time, get_keyboard_idle_secs])
         .manage(ActiveAgentPid { pid: Mutex::new(None) })
         .manage(ClaudeState { sessions: Arc::new(Mutex::new(HashMap::new())), pending_permissions: Arc::new(Mutex::new(HashMap::new())), dismissed: Arc::new(Mutex::new(std::collections::HashSet::new())) })
         .run(tauri::generate_context!())

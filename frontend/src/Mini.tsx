@@ -2533,6 +2533,8 @@ export default function Mini() {
   // (waiting) > processing > stopped, then by updatedAt. Each bubble renders
   // session title + status-dependent body text (user prompt / AI response /
   // approval+clarify request). Read-only this phase — no interactive reply.
+  // 用户点 ✕ 关闭的会话气泡（内存态即可；同会话后续消息不复活该气泡）
+  const [dismissedHermesBubbles, setDismissedHermesBubbles] = useState<Set<string>>(new Set())
   const hermesBubbles = visibleClaudeSessions
     .filter((cs) => cs.source === 'hermes')
     .map((cs) => {
@@ -2573,6 +2575,7 @@ export default function Mini() {
       if (d !== 0) return d
       return (b.updatedAt || '').localeCompare(a.updatedAt || '')
     })
+    .filter((b) => !dismissedHermesBubbles.has(b.sessionId))
     .slice(0, MAX_HERMES_BUBBLES)
 
   // ─── Window expansion for the Hermes bubble stack ───
@@ -2588,9 +2591,56 @@ export default function Mini() {
   useEffect(() => {
     if (appMode === 'pet' || expanded) return
     const wantActive = bubbleCount > 0
-    if (wantActive === bubbleModeActiveRef.current) return
+    // 注意：不能在 wantActive 与 ref 相同时提前 return —— bubbleCount 变化时
+    // （如第 3 条气泡出现）窗口高度必须跟着重设，否则顶部气泡被截断，
+    // 直到用户开合一次 box 才恢复（旧 bug 根因）。
     bubbleModeActiveRef.current = wantActive
     invoke('set_hermes_bubble_mode', { active: wantActive, mascotScale: mascotScaleRef.current, bubbleCount }).catch(() => {})
+  }, [appMode, expanded, bubbleCount])
+
+  // ─── 可交互区（hitbox）动态上报 ───
+  // Rust 端轮询按这些矩形决定整窗是否穿透：只有「宠物本体 ∪ 各气泡关闭按钮」
+  // 命中时可点击，其余区域全部点穿到桌面（与视觉一致）。
+  // 坐标为相对窗口左上角的 CSS px，Rust 端乘 scale 换算物理像素。
+  useEffect(() => {
+    if (appMode === 'pet' || expanded || bubbleModeActiveRef.current !== true) return
+    let raf = 0
+    const collect = () => {
+      raf = 0
+      try {
+        const mascotEl = document.getElementById('hermes-bubble-mascot')
+        const closeEls = document.querySelectorAll<HTMLElement>('[data-hermes-bubble-close]')
+        if (!mascotEl) return
+        type Rect = { x: number; y: number; w: number; h: number }
+        const rects: Rect[] = []
+        const pushRect = (el: Element, pad: number) => {
+          const r = el.getBoundingClientRect()
+          rects.push({
+            x: Math.max(0, Math.round(r.left - pad)),
+            y: Math.max(0, Math.round(r.top - pad)),
+            w: Math.min(window.innerWidth, Math.round(r.width + pad * 2)),
+            h: Math.min(window.innerHeight, Math.round(r.height + pad * 2)),
+          })
+        }
+        pushRect(mascotEl, 2)
+        closeEls.forEach((el) => pushRect(el, 6))
+        invoke('set_hermes_bubble_hitboxes', { rectsJson: JSON.stringify(rects) }).catch(() => {})
+      } catch {
+        /* DOM not ready — skip this tick */
+      }
+    }
+    collect()
+    // 布局/滚动/动画期间低成本跟踪：rAF 节流 + 500ms 心跳兜底。
+    const onScroll = () => { if (!raf) raf = requestAnimationFrame(collect) }
+    window.addEventListener('scroll', onScroll, true)
+    window.addEventListener('resize', onScroll)
+    const tid = window.setInterval(collect, 500)
+    return () => {
+      if (raf) cancelAnimationFrame(raf)
+      window.removeEventListener('scroll', onScroll, true)
+      window.removeEventListener('resize', onScroll)
+      window.clearInterval(tid)
+    }
   }, [appMode, expanded, bubbleCount])
 
   const claudeSlots: SessionSlot[] = visibleClaudeSessions.map((cs, i) => {
@@ -4602,6 +4652,37 @@ export default function Mini() {
                       {b.title}
                     </span>
                     <span style={{ fontSize: 11, opacity: 0.9 }}>{b.label}</span>
+                    <button
+                      type="button"
+                      data-hermes-bubble-close
+                      data-no-drag
+                      aria-label="close"
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        setDismissedHermesBubbles((prev) => {
+                          const next = new Set(prev)
+                          next.add(b.sessionId)
+                          return next
+                        })
+                      }}
+                      style={{
+                        width: 16,
+                        height: 16,
+                        lineHeight: '14px',
+                        padding: 0,
+                        flex: 'none',
+                        borderRadius: 8,
+                        border: '1px solid rgba(255,255,255,0.25)',
+                        background: 'transparent',
+                        color: 'rgba(255,255,255,0.75)',
+                        fontSize: 11,
+                        cursor: 'pointer',
+                        textAlign: 'center',
+                      }}
+                    >
+                      ✕
+                    </button>
                   </div>
                   <div
                     style={{
@@ -4765,8 +4846,10 @@ export default function Mini() {
                   />
                 )
               })}
-            </div>) : miniPet ? (
+            </div>
+          ) : miniPet ? (
               <div
+                id="hermes-bubble-mascot"
                 style={{
                   position: 'relative',
                   width: collapsedMascotDisplaySize,
