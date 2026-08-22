@@ -234,6 +234,11 @@ export function loadPetdexManifest(): Promise<PetdexPet[]> {
       const { invoke } = await import('@tauri-apps/api/core')
       return (await invoke('fetch_petdex_manifest')) as PetdexPet[]
     })()
+    // A rejected promise would otherwise stay cached forever, leaving the
+    // market tab dead until app restart; drop it so the next call retries.
+    cachedManifest.catch(() => {
+      cachedManifest = null
+    })
   }
   return cachedManifest
 }
