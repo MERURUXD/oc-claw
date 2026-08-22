@@ -1,23 +1,25 @@
-// Pet Gallery: browse and one-click install pet skins from the codexpet.xyz
-// market, and manage locally installed skins (equip, queue, favorite, delete,
+// Pet Gallery: browse and one-click install pet skins from the petdex.dev
+// registry, and manage locally installed skins (equip, queue, favorite, delete,
 // details).
 //
-// Market data goes through the Rust proxy commands (fetch_market_pets /
-// download_codex_pet / delete_custom_codex_pet) so the webview never talks to
-// the site directly; local skins are served by the codexpet:// protocol. A
-// per-card error boundary keeps one broken/odd-atlas skin from taking down
-// the whole grid section.
-import { Component, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+// Market data: the full petdex manifest (GET https://petdex.dev/api/manifest)
+// is fetched once through the Rust `fetch_petdex_manifest` command; search,
+// kind filter and pagination all run client-side. Downloads go through
+// `download_codex_pet` with the manifest's zipUrl (Rust validates the
+// assets.petdex.dev prefix); local skins are served by the codexpet://
+// protocol. A per-card error boundary keeps one broken/odd-atlas skin from
+// taking down the whole grid section.
+import { Component, useCallback, useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Download, Info, Loader2, Search, Star, Trash2, X } from 'lucide-react'
 import { SpritePet } from './SpritePet'
 import {
   type CodexPet,
-  type MarketPet,
+  type PetdexPet,
   downloadMarketPet,
   deleteLocalPet,
-  fetchMarketPets,
   loadCustomCodexPets,
+  loadPetdexManifest,
 } from '../lib/codexPet'
 import { loadPetFavorites, savePetFavorites } from '../lib/petStore'
 
@@ -29,13 +31,20 @@ interface PetGalleryProps {
 
 const MARKET_PAGE_SIZE = 60
 
-type SortKey = 'latest' | 'hot' | 'downloads'
+type KindFilter = 'all' | 'creature' | 'character' | 'object'
 
-function marketPetToCodexPet(p: MarketPet): CodexPet {
+const KIND_LABEL_KEYS: Record<'creature' | 'character' | 'object', string> = {
+  creature: 'petGallery.kindCreature',
+  character: 'petGallery.kindCharacter',
+  object: 'petGallery.kindObject',
+}
+
+function petdexPetToCodexPet(p: PetdexPet): CodexPet {
   return {
     id: p.slug,
     displayName: p.displayName,
-    description: p.description,
+    // The petdex manifest has no description field.
+    description: '',
     spritesheetUrl: p.spritesheetUrl,
   }
 }
@@ -90,7 +99,7 @@ interface LocalSource {
 }
 
 type DetailItem =
-  | { kind: 'market'; pet: MarketPet }
+  | { kind: 'market'; pet: PetdexPet }
   | { kind: 'local'; pet: CodexPet; source: LocalSource | null }
 
 export function PetGallery({ miniPetId, onEquip, onAddToQueue }: PetGalleryProps) {
@@ -99,10 +108,10 @@ export function PetGallery({ miniPetId, onEquip, onAddToQueue }: PetGalleryProps
 
   // Market state
   const [q, setQ] = useState('')
-  const [sort, setSort] = useState<SortKey>('hot')
-  const [marketPets, setMarketPets] = useState<MarketPet[]>([])
-  const [marketTotalPages, setMarketTotalPages] = useState(0)
-  const [marketPage, setMarketPage] = useState(1)
+  const [debouncedQ, setDebouncedQ] = useState('')
+  const [kind, setKind] = useState<KindFilter>('all')
+  const [marketPets, setMarketPets] = useState<PetdexPet[]>([])
+  const [visibleCount, setVisibleCount] = useState(MARKET_PAGE_SIZE)
   const [marketLoading, setMarketLoading] = useState(false)
   const [marketError, setMarketError] = useState<string | null>(null)
   const [downloading, setDownloading] = useState<Set<string>>(new Set())
@@ -112,9 +121,6 @@ export function PetGallery({ miniPetId, onEquip, onAddToQueue }: PetGalleryProps
   const [favorites, setFavorites] = useState<string[]>([])
   const [detail, setDetail] = useState<DetailItem | null>(null)
   const [localSources, setLocalSources] = useState<Record<string, LocalSource | null>>({})
-
-  // Guards against stale responses when q/sort change mid-flight.
-  const reqIdRef = useRef(0)
 
   const refreshCustoms = useCallback(async () => {
     setCustoms(await loadCustomCodexPets())
@@ -129,43 +135,41 @@ export function PetGallery({ miniPetId, onEquip, onAddToQueue }: PetGalleryProps
     void refreshFavorites()
   }, [refreshCustoms, refreshFavorites])
 
-  // Load one page (reset=true starts over, false appends for "load more").
-  const loadPage = useCallback(
-    async (page: number, reset: boolean) => {
-      const reqId = ++reqIdRef.current
-      setMarketLoading(true)
-      setMarketError(null)
-      try {
-        const pageData = await fetchMarketPets({
-          q: q.trim() || undefined,
-          sort,
-          page,
-          limit: MARKET_PAGE_SIZE,
-        })
-        if (reqId !== reqIdRef.current) return // stale response, drop it
-        setMarketPage(pageData.currentPage || page)
-        setMarketTotalPages(pageData.totalPages)
-        setMarketPets((prev) => (reset ? pageData.pets : [...prev, ...pageData.pets]))
-      } catch (e) {
-        if (reqId !== reqIdRef.current) return
-        setMarketError(e instanceof Error ? e.message : String(e))
-      } finally {
-        if (reqId === reqIdRef.current) setMarketLoading(false)
-      }
-    },
-    [q, sort],
-  )
-
-  // Debounced (400ms) server-side search; restart at page 1 on q/sort change.
+  // Fetch the petdex manifest once on mount; search/filter/pagination all
+  // happen client-side over the cached array afterwards.
   useEffect(() => {
-    const timer = setTimeout(() => void loadPage(1, true), 400)
+    let cancelled = false
+    setMarketLoading(true)
+    setMarketError(null)
+    loadPetdexManifest()
+      .then((pets) => {
+        if (!cancelled) setMarketPets(pets)
+      })
+      .catch((e) => {
+        if (!cancelled) setMarketError(e instanceof Error ? e.message : String(e))
+      })
+      .finally(() => {
+        if (!cancelled) setMarketLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  // Debounced (400ms) client-side search query.
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedQ(q), 400)
     return () => clearTimeout(timer)
-  }, [q, sort, loadPage])
+  }, [q])
+
+  // Restart at the top of the list whenever the query or kind filter changes.
+  useEffect(() => {
+    setVisibleCount(MARKET_PAGE_SIZE)
+  }, [debouncedQ, kind])
 
   const loadMore = useCallback(() => {
-    if (marketLoading || marketPage >= marketTotalPages) return
-    void loadPage(marketPage + 1, false)
-  }, [marketLoading, marketPage, marketTotalPages, loadPage])
+    setVisibleCount((c) => c + MARKET_PAGE_SIZE)
+  }, [])
 
   const toggleFavorite = useCallback(async (id: string) => {
     setFavorites((prev) => {
@@ -176,10 +180,10 @@ export function PetGallery({ miniPetId, onEquip, onAddToQueue }: PetGalleryProps
   }, [])
 
   const handleDownload = useCallback(
-    async (slug: string) => {
+    async (slug: string, zipUrl: string) => {
       setDownloading((prev) => new Set(prev).add(slug))
       try {
-        await downloadMarketPet(slug)
+        await downloadMarketPet(slug, zipUrl)
         await refreshCustoms()
       } catch (e) {
         console.warn('[PetGallery] download failed:', e)
@@ -232,7 +236,25 @@ export function PetGallery({ miniPetId, onEquip, onAddToQueue }: PetGalleryProps
 
   const installedIds = useMemo(() => new Set(customs.map((c) => c.id)), [customs])
   const favSet = useMemo(() => new Set(favorites), [favorites])
-  const hasMore = marketPage < marketTotalPages
+
+  // Client-side search (substring, case-insensitive, over displayName/slug/
+  // submittedBy) + kind filter, ordered by displayName (locale-aware).
+  const filteredPets = useMemo(() => {
+    const needle = debouncedQ.trim().toLowerCase()
+    const byKind = kind === 'all' ? marketPets : marketPets.filter((p) => p.kind === kind)
+    const matched = needle
+      ? byKind.filter(
+          (p) =>
+            p.displayName.toLowerCase().includes(needle) ||
+            p.slug.toLowerCase().includes(needle) ||
+            p.submittedBy.toLowerCase().includes(needle),
+        )
+      : byKind
+    return [...matched].sort((a, b) => a.displayName.localeCompare(b.displayName))
+  }, [marketPets, debouncedQ, kind])
+
+  const visiblePets = useMemo(() => filteredPets.slice(0, visibleCount), [filteredPets, visibleCount])
+  const hasMore = visiblePets.length < filteredPets.length
 
   const tabBtnStyle = (active: boolean): React.CSSProperties => ({
     background: active ? 'rgba(255,255,255,0.12)' : 'none',
@@ -288,13 +310,14 @@ export function PetGallery({ miniPetId, onEquip, onAddToQueue }: PetGalleryProps
                 />
               </div>
               <select
-                value={sort}
-                onChange={(e) => setSort(e.target.value as SortKey)}
+                value={kind}
+                onChange={(e) => setKind(e.target.value as KindFilter)}
                 className="bg-white/5 border border-white/10 rounded-lg px-2 py-1.5 text-xs outline-none text-white/85 cursor-pointer"
               >
-                <option value="latest">{t('petGallery.sortLatest')}</option>
-                <option value="hot">{t('petGallery.sortHot')}</option>
-                <option value="downloads">{t('petGallery.sortDownloads')}</option>
+                <option value="all">{t('petGallery.kindAll')}</option>
+                <option value="creature">{t('petGallery.kindCreature')}</option>
+                <option value="character">{t('petGallery.kindCharacter')}</option>
+                <option value="object">{t('petGallery.kindObject')}</option>
               </select>
             </div>
 
@@ -304,13 +327,20 @@ export function PetGallery({ miniPetId, onEquip, onAddToQueue }: PetGalleryProps
               </div>
             )}
 
+            {marketLoading && marketPets.length === 0 && (
+              <div className="flex flex-col items-center gap-2 py-10 text-white/40">
+                <Loader2 className="w-5 h-5 animate-spin" />
+                <p className="text-[11px]">{t('common.loading')}</p>
+              </div>
+            )}
+
             {/* Market grid */}
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-              {marketPets.map((p) => {
+              {visiblePets.map((p) => {
                 const installed = installedIds.has(p.slug)
                 const isDownloading = downloading.has(p.slug)
                 const fav = favSet.has(p.slug)
-                const codexPet = marketPetToCodexPet(p)
+                const codexPet = petdexPetToCodexPet(p)
                 return (
                   <div
                     key={p.slug}
@@ -327,10 +357,9 @@ export function PetGallery({ miniPetId, onEquip, onAddToQueue }: PetGalleryProps
                       <p className="text-xs font-medium truncate" title={p.displayName}>
                         {p.displayName || p.slug}
                       </p>
-                      <p className="text-[10px] text-white/40 truncate">{p.description || '—'}</p>
+                      <p className="text-[10px] text-white/40 truncate">{t(KIND_LABEL_KEYS[p.kind])}</p>
                       <p className="text-[10px] text-white/35 mt-0.5">
-                        {p.authorName ? `${t('petGallery.author')}: ${p.authorName}` : ''}
-                        {p.downloadCount > 0 ? ` · ${p.downloadCount.toLocaleString()} ⬇` : ''}
+                        {p.submittedBy ? `${t('petGallery.author')}: ${p.submittedBy}` : ''}
                       </p>
                     </div>
                     <div className="flex items-center gap-1.5 mt-auto">
@@ -345,7 +374,7 @@ export function PetGallery({ miniPetId, onEquip, onAddToQueue }: PetGalleryProps
                       ) : (
                         <button
                           style={actionBtnStyle}
-                          onClick={() => void handleDownload(p.slug)}
+                          onClick={() => void handleDownload(p.slug, p.zipUrl)}
                           className="hover:bg-white/10"
                         >
                           <Download className="w-3 h-3" /> {t('petGallery.download')}
@@ -377,15 +406,13 @@ export function PetGallery({ miniPetId, onEquip, onAddToQueue }: PetGalleryProps
               })}
             </div>
 
-            {marketPets.length === 0 && !marketLoading && !marketError && (
+            {filteredPets.length === 0 && !marketLoading && !marketError && (
               <p className="text-center text-xs text-white/35 py-10">—</p>
             )}
 
             {/* Load more */}
             <div className="flex justify-center mt-4">
-              {marketLoading && marketPets.length > 0 ? (
-                <Loader2 className="w-4 h-4 animate-spin text-white/40" />
-              ) : hasMore ? (
+              {hasMore ? (
                 <button
                   onClick={() => void loadMore()}
                   className="text-xs text-white/70 border border-white/15 rounded-lg px-4 py-1.5 hover:bg-white/10"
@@ -491,7 +518,7 @@ export function PetGallery({ miniPetId, onEquip, onAddToQueue }: PetGalleryProps
             <div className="flex items-start gap-3">
               <div className="flex justify-center bg-black/20 rounded-lg p-2 shrink-0">
                 {detail.kind === 'market' ? (
-                  <SpritePreview pet={marketPetToCodexPet(detail.pet)} size={72} />
+                  <SpritePreview pet={petdexPetToCodexPet(detail.pet)} size={72} />
                 ) : (
                   <SpritePreview pet={detail.pet} size={72} />
                 )}
@@ -501,7 +528,9 @@ export function PetGallery({ miniPetId, onEquip, onAddToQueue }: PetGalleryProps
                   {detail.kind === 'market' ? detail.pet.displayName || detail.pet.slug : detail.pet.displayName || detail.pet.id}
                 </p>
                 <p className="text-[11px] text-white/45 break-words mt-0.5">
-                  {detail.kind === 'market' ? detail.pet.description || '—' : detail.pet.description || '—'}
+                  {detail.kind === 'market'
+                    ? t(KIND_LABEL_KEYS[detail.pet.kind])
+                    : detail.pet.description || '—'}
                 </p>
               </div>
               <button onClick={() => setDetail(null)} className="text-white/50 hover:text-white shrink-0">
@@ -512,42 +541,22 @@ export function PetGallery({ miniPetId, onEquip, onAddToQueue }: PetGalleryProps
             <dl className="mt-4 space-y-2 text-[11px]">
               {detail.kind === 'market' ? (
                 <>
-                  {detail.pet.authorName && (
-                    <div className="flex gap-2">
-                      <dt className="text-white/40 w-20 shrink-0">{t('petGallery.author')}</dt>
-                      <dd className="text-white/85 break-words">{detail.pet.authorName}</dd>
-                    </div>
-                  )}
-                  {detail.pet.license && (
-                    <div className="flex gap-2">
-                      <dt className="text-white/40 w-20 shrink-0">License</dt>
-                      <dd className="text-white/85 break-words">{detail.pet.license}</dd>
-                    </div>
-                  )}
-                  {detail.pet.tags.length > 0 && (
-                    <div className="flex gap-2">
-                      <dt className="text-white/40 w-20 shrink-0">Tags</dt>
-                      <dd className="text-white/85 break-words">{detail.pet.tags.join(', ')}</dd>
-                    </div>
-                  )}
-                  {detail.pet.downloadCount > 0 && (
-                    <div className="flex gap-2">
-                      <dt className="text-white/40 w-20 shrink-0">⬇</dt>
-                      <dd className="text-white/85">{detail.pet.downloadCount.toLocaleString()}</dd>
-                    </div>
-                  )}
-                  {detail.pet.likeCount > 0 && (
-                    <div className="flex gap-2">
-                      <dt className="text-white/40 w-20 shrink-0">♥</dt>
-                      <dd className="text-white/85">{detail.pet.likeCount.toLocaleString()}</dd>
-                    </div>
-                  )}
-                  {detail.pet.publishedAt && (
-                    <div className="flex gap-2">
-                      <dt className="text-white/40 w-20 shrink-0">🕒</dt>
-                      <dd className="text-white/85">{new Date(detail.pet.publishedAt).toLocaleDateString()}</dd>
-                    </div>
-                  )}
+                  <div className="flex gap-2">
+                    <dt className="text-white/40 w-20 shrink-0">Kind</dt>
+                    <dd className="text-white/85 break-words">{t(KIND_LABEL_KEYS[detail.pet.kind])}</dd>
+                  </div>
+                  <div className="flex gap-2">
+                    <dt className="text-white/40 w-20 shrink-0">{t('petGallery.author')}</dt>
+                    <dd className="text-white/85 break-words">{detail.pet.submittedBy}</dd>
+                  </div>
+                  <div className="flex gap-2">
+                    <dt className="text-white/40 w-20 shrink-0">Slug</dt>
+                    <dd className="text-white/85 break-words">{detail.pet.slug}</dd>
+                  </div>
+                  <div className="flex gap-2">
+                    <dt className="text-white/40 w-20 shrink-0">Version</dt>
+                    <dd className="text-white/85 break-words">{detail.pet.spriteVersionNumber}</dd>
+                  </div>
                 </>
               ) : (
                 <>
