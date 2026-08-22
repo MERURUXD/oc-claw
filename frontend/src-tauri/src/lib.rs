@@ -228,8 +228,8 @@ fn apply_hermes_bubble_follow(app: &tauri::AppHandle) {
             let pet_right_phys = mp.x + ((anchor.0 + anchor.2) * scale).round() as i32;
             let pet_top_phys = mp.y + (anchor.1 * scale).round() as i32;
             (
-                pet_right_phys.round() as i32 - bs.width as i32,
-                pet_top_phys.round() as i32 - want_h_phys as i32 - gap_px,
+                pet_right_phys - bs.width as i32,
+                pet_top_phys - want_h_phys as i32 - gap_px,
             )
         } else {
             // Window-frame fallback: right edges aligned, bottom above top edge.
