@@ -5590,8 +5590,9 @@ fn hermes_bubble_passthrough_poll(app: tauri::AppHandle, _mascot_scale: f64) {
             let app2 = app.clone();
             let val = should_be_interactive;
             let _ = app1.run_on_main_thread(move || {
-                if let Some(win) = app2.get_webview_window("mini") {
-                    if let Ok(ns_win) = win.ns_window() {
+                // 只切换气泡窗口自身；mini（宠物）窗口永远不归本线程管，
+                // 否则宠物会被设成忽略鼠标，拖不动也点不开面板。
+                if let Some(win) = app2.get_webview_window("hermes_bubbles") {
                         use objc2::msg_send;
                         let obj = unsafe { &*(ns_win as *mut objc2::runtime::AnyObject) };
                         unsafe {
@@ -5666,8 +5667,10 @@ fn hermes_bubble_passthrough_poll_windows(app: tauri::AppHandle, _mascot_scale: 
             _ => false,
         };
         if last_state != Some(should_be_interactive) {
-            if let Some(win) = app.get_webview_window("mini") {
-                let _ = win.set_ignore_cursor_events(!should_be_interactive);
+            // 只切换气泡窗口自身的穿透标志；mini（宠物）窗口永远不归本线程管，
+            // 否则光标不在 ✕ 上时宠物会被设成忽略鼠标，拖不动也点不开面板。
+            if let Some(bwin) = app.get_webview_window("hermes_bubbles") {
+                let _ = bwin.set_ignore_cursor_events(!should_be_interactive);
             }
             last_state = Some(should_be_interactive);
         }
