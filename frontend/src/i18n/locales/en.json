@@ -425,5 +425,26 @@
     "messagesLabel": "Messages",
     "messagesUnit": "",
     "messageCountUnit": "Messages"
+  },
+  "petGallery": {
+    "title": "Gallery",
+    "market": "Market",
+    "mySkins": "My Skins",
+    "searchPlaceholder": "Search skins...",
+    "sortLatest": "Latest",
+    "sortHot": "Hot",
+    "sortDownloads": "Most downloaded",
+    "download": "Download",
+    "installed": "Installed",
+    "favorite": "Favorite",
+    "equip": "Equip",
+    "addToQueue": "Add to queue",
+    "delete": "Delete",
+    "details": "Details",
+    "loadMore": "Load more",
+    "deleteConfirm": "Delete \"{{name}}\"?",
+    "downloading": "Downloading",
+    "downloadFailed": "Download failed",
+    "author": "Author"
   }
 }

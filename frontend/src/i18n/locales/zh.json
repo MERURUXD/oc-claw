@@ -425,5 +425,26 @@
     "messagesLabel": "消息",
     "messagesUnit": "条",
     "messageCountUnit": "消息数"
+  },
+  "petGallery": {
+    "title": "画廊",
+    "market": "市场",
+    "mySkins": "我的皮肤",
+    "searchPlaceholder": "搜索皮肤...",
+    "sortLatest": "最新",
+    "sortHot": "最热",
+    "sortDownloads": "下载最多",
+    "download": "下载",
+    "installed": "已装",
+    "favorite": "收藏",
+    "equip": "装备",
+    "addToQueue": "加入队列",
+    "delete": "删除",
+    "details": "详情",
+    "loadMore": "加载更多",
+    "deleteConfirm": "确定要删除「{{name}}」吗？",
+    "downloading": "下载中",
+    "downloadFailed": "下载失败",
+    "author": "作者"
   }
 }

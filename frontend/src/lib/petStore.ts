@@ -347,3 +347,20 @@ export function applyFeed(data: PetData, food: FoodItem): PetData {
   }
   return d
 }
+
+// ─── Pet gallery favorites ───
+//
+// Favorited pet ids from the gallery. Market slugs and local pet ids share
+// one namespace (pet.json.id === slug on codexpet.xyz), so a single string
+// list covers both. Persisted in pet-data.json under `pet_favorites`.
+export async function loadPetFavorites(): Promise<string[]> {
+  const store = await getPetStore()
+  const v = await store.get('pet_favorites')
+  return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []
+}
+
+export async function savePetFavorites(ids: string[]): Promise<void> {
+  const store = await getPetStore()
+  await store.set('pet_favorites', ids)
+  await store.save()
+}

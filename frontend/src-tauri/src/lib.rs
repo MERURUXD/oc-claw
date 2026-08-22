@@ -9011,6 +9011,53 @@ fn codex_pets_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".codex").join("pets"))
 }
 
+/// Read `pet.json` inside a pet folder and build its `CodexPetMeta`. Returns
+/// `None` when the folder has no readable/valid `pet.json` or the spritesheet
+/// is missing. Shared by `list_custom_codex_pets` and `download_codex_pet`.
+fn read_pet_meta(dir: &std::path::Path) -> Option<CodexPetMeta> {
+    let raw = std::fs::read_to_string(dir.join("pet.json")).ok()?;
+    let meta: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    // The folder name is the canonical id — delete/list/download key on it.
+    // Never trust a third-party pet.json `id` field, which may differ from the
+    // folder name (e.g. a market slug) and would break "installed" matching
+    // and delete-by-id.
+    let id = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let display_name = meta
+        .get("displayName")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| id.clone());
+    let description = meta
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_default();
+    let sheet_path = meta
+        .get("spritesheetPath")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| "spritesheet.webp".into());
+    // Collapse to the basename so a third-party pet.json can't point the
+    // spritesheet lookup outside the pet folder.
+    let sheet_name = std::path::Path::new(&sheet_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "spritesheet.webp".into());
+    let abs = dir.join(&sheet_name);
+    if !abs.is_file() {
+        return None;
+    }
+    Some(CodexPetMeta {
+        id,
+        display_name,
+        description,
+        spritesheet_url: codex_asset_url(&abs),
+    })
+}
+
 /// List custom codex pets the user has dropped into `~/.codex/pets`. Each
 /// pet folder must contain a `pet.json` metadata file plus a spritesheet
 /// (.webp/.png/.jpg). Missing pieces are skipped silently.
@@ -9032,56 +9079,278 @@ async fn list_custom_codex_pets() -> Result<Vec<CodexPetMeta>, String> {
         if !path.is_dir() {
             continue;
         }
-        let pet_json = path.join("pet.json");
-        if !pet_json.is_file() {
-            continue;
+        if let Some(meta) = read_pet_meta(&path) {
+            out.push(meta);
         }
-        let raw = match std::fs::read_to_string(&pet_json) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let meta: serde_json::Value = match serde_json::from_str(&raw) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let id = meta
-            .get("id")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .unwrap_or_else(|| {
-                path.file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default()
-            });
-        let display_name = meta
-            .get("displayName")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .unwrap_or_else(|| id.clone());
-        let description = meta
-            .get("description")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .unwrap_or_default();
-        let sheet_path = meta
-            .get("spritesheetPath")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .unwrap_or_else(|| "spritesheet.webp".into());
-        let abs = path.join(&sheet_path);
-        if !abs.is_file() {
-            continue;
-        }
-        let url = codex_asset_url(&abs);
-        out.push(CodexPetMeta {
-            id,
-            display_name,
-            description,
-            spritesheet_url: url,
-        });
     }
     out.sort_by(|a, b| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()));
     Ok(out)
+}
+
+// ─── Pet gallery: codexpet.xyz market proxy ───
+//
+// codexpet.xyz is a public third-party pet skin marketplace (no auth, CORS
+// `*`). All requests go through the desktop shell so the webview never talks
+// to the site directly.
+
+/// Base URL of the public codexpet.xyz market API.
+const CODEXPET_API_BASE: &str = "https://codexpet.xyz/api";
+
+/// Percent-encode a market slug for use as a URL path segment. Slugs are
+/// validated to `[a-z0-9-]` before reaching this; we still encode defensively,
+/// but must NOT touch unreserved characters: `NON_ALPHANUMERIC` turns '-' into
+/// %2D, which codexpet.xyz does not normalize back → every hyphenated slug
+/// 404s on download/detail endpoints. Keep '-' literal here.
+fn encode_market_slug(slug: &str) -> String {
+    const SLUG_SET: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+        .add(b' ')
+        .add(b'"')
+        .add(b'#')
+        .add(b'%')
+        .add(b'/')
+        .add(b'<')
+        .add(b'>')
+        .add(b'?')
+        .add(b'`')
+        .add(b'{')
+        .add(b'}')
+        .add(b'\\');
+    percent_encoding::utf8_percent_encode(slug, SLUG_SET).to_string()
+}
+
+#[derive(serde::Serialize)]
+struct MarketPetMeta {
+    slug: String,
+    display_name: String,
+    description: String,
+    author_name: String,
+    license: String,
+    tags: Vec<String>,
+    download_count: u64,
+    like_count: u64,
+    hot_score: u64,
+    published_at: String,
+    spritesheet_url: String,
+    download_url: String,
+}
+
+#[derive(serde::Serialize)]
+struct MarketPetsPage {
+    pets: Vec<MarketPetMeta>,
+    total_items: u64,
+    total_pages: u64,
+    current_page: u64,
+}
+
+fn parse_tags(v: Option<&serde_json::Value>) -> Vec<String> {
+    match v {
+        Some(serde_json::Value::String(s)) => serde_json::from_str::<Vec<String>>(s).unwrap_or_default(),
+        Some(serde_json::Value::Array(a)) => a.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Proxy `GET /api/pets` from codexpet.xyz. Field access is fault-tolerant:
+/// missing/odd-typed entries fall back to defaults instead of failing the
+/// whole page.
+#[tauri::command]
+async fn fetch_market_pets(
+    q: Option<String>,
+    sort: Option<String>,
+    page: u32,
+    limit: u32,
+) -> Result<MarketPetsPage, String> {
+    let client = reqwest::Client::builder()
+        .user_agent("oc-claw")
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let url = format!("{}/pets", CODEXPET_API_BASE);
+    let mut query: Vec<(String, String)> = Vec::new();
+    if let Some(q) = q.as_ref().filter(|s| !s.trim().is_empty()) {
+        query.push(("q".into(), q.clone()));
+    }
+    if let Some(s) = sort.as_ref().filter(|s| !s.trim().is_empty()) {
+        query.push(("sort".into(), s.clone()));
+    }
+    query.push(("page".into(), page.to_string()));
+    query.push(("limit".into(), limit.to_string()));
+    let resp = client.get(&url).query(&query).send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+
+    let mut pets = Vec::new();
+    if let Some(arr) = json.get("pets").and_then(|v| v.as_array()) {
+        for item in arr {
+            let s = |k: &str| item.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let n = |k: &str| item.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+            pets.push(MarketPetMeta {
+                slug: s("slug"),
+                display_name: s("display_name"),
+                description: s("description"),
+                author_name: s("author_name"),
+                license: s("license"),
+                tags: parse_tags(item.get("tags_json")),
+                download_count: n("download_count"),
+                like_count: n("like_count"),
+                hot_score: n("hot_score"),
+                published_at: s("published_at"),
+                spritesheet_url: s("spritesheetUrl"),
+                download_url: s("downloadUrl"),
+            });
+        }
+    }
+    let pg = json.get("pagination").cloned().unwrap_or(serde_json::Value::Null);
+    let g = |k: &str| pg.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+    Ok(MarketPetsPage {
+        pets,
+        total_items: g("totalItems"),
+        total_pages: g("totalPages"),
+        current_page: g("currentPage"),
+    })
+}
+
+/// Fetch `GET /api/pets/{slug}` and write author/license/tags into
+/// `dst/source.json` for the gallery details dialog. Any failure is silent —
+/// the file is optional and must never block a successful install.
+async fn write_source_json(client: &reqwest::Client, slug: &str, dst: &std::path::Path) {
+    let encoded_slug = encode_market_slug(slug);
+    let url = format!("{}/pets/{}", CODEXPET_API_BASE, encoded_slug);
+    let Ok(resp) = client.get(&url).send().await else {
+        return;
+    };
+    if !resp.status().is_success() {
+        return;
+    }
+    let Ok(json) = resp.json::<serde_json::Value>().await else {
+        return;
+    };
+    let Some(pet) = json.get("pet") else {
+        return;
+    };
+    let author_name = pet
+        .get("author_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let license = pet
+        .get("license")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let tags: Vec<String> = pet
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let obj = serde_json::json!({
+        "author_name": author_name,
+        "license": license,
+        "tags": tags,
+    });
+    let _ = std::fs::write(
+        dst.join("source.json"),
+        serde_json::to_string_pretty(&obj).unwrap_or_default(),
+    );
+}
+
+/// Download a pet skin from codexpet.xyz and install it into
+/// `~/.codex/pets/<slug>`. The zip is fetched with a 60s timeout, extracted
+/// with zip-slip protection (only the basename of each entry is kept, so
+/// directory prefixes can never escape the destination), and the destination
+/// folder is rolled back on extraction failure so no half-installed pet is
+/// left behind.
+#[tauri::command]
+async fn download_codex_pet(slug: String) -> Result<CodexPetMeta, String> {
+    let slug = slug.trim().to_string();
+    if slug.is_empty() || slug.contains('/') || slug.contains('\\') || slug.contains("..") {
+        return Err("invalid slug".into());
+    }
+    let client = reqwest::Client::builder()
+        .user_agent("oc-claw")
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let encoded_slug = encode_market_slug(&slug);
+    let url = format!("{}/pets/{}/download", CODEXPET_API_BASE, encoded_slug);
+    let bytes = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .bytes()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let Some(root) = codex_pets_dir() else {
+        return Err("home directory not found".into());
+    };
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let dst = root.join(&slug);
+    if dst.exists() {
+        let _ = std::fs::remove_dir_all(&dst);
+    }
+    std::fs::create_dir_all(&dst).map_err(|e| e.to_string())?;
+
+    // Extract; roll back by removing dst on failure to avoid leaving a
+    // half-installed folder behind.
+    let extract = || -> Result<(), String> {
+        let reader = std::io::Cursor::new(&bytes);
+        let mut archive = zip::ZipArchive::new(reader).map_err(|e| e.to_string())?;
+        for i in 0..archive.len() {
+            let mut f = archive.by_index(i).map_err(|e| e.to_string())?;
+            let base = std::path::Path::new(f.name())
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if base.is_empty() || f.is_dir() {
+                continue; // drop directory prefixes, prevents zip-slip
+            }
+            let mut out = std::fs::File::create(dst.join(&base)).map_err(|e| e.to_string())?;
+            std::io::copy(&mut f, &mut out).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    };
+    if let Err(e) = extract() {
+        let _ = std::fs::remove_dir_all(&dst);
+        return Err(format!("extract failed: {e}"));
+    }
+
+    // Persist source.json (author/license/tags) for the details dialog; a
+    // failure here is silent and never blocks a successful install.
+    let _ = write_source_json(&client, &slug, &dst).await;
+
+    match read_pet_meta(&dst) {
+        Some(meta) => Ok(meta),
+        None => {
+            // Missing pet.json → roll back so no orphan folder is left behind.
+            let _ = std::fs::remove_dir_all(&dst);
+            Err("installed but pet.json missing".into())
+        }
+    }
+}
+
+/// Delete a locally installed custom pet folder (`~/.codex/pets/<id>`). The
+/// id is validated against path traversal before any filesystem access.
+#[tauri::command]
+async fn delete_custom_codex_pet(id: String) -> Result<(), String> {
+    let id = id.trim().to_string();
+    if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
+        return Err("invalid id".into()); // directory-traversal guard, hardcoded on purpose
+    }
+    let Some(root) = codex_pets_dir() else {
+        return Err("home directory not found".into());
+    };
+    let target = root.join(&id);
+    if !target.exists() {
+        return Err(format!("pet not found: {id}"));
+    }
+    std::fs::remove_dir_all(&target).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Forward a frontend diagnostic line to the dev terminal so debugging
@@ -17417,7 +17686,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs])
+        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs, fetch_market_pets, download_codex_pet, delete_custom_codex_pet])
         .manage(ActiveAgentPid { pid: Mutex::new(None) })
         .manage(ClaudeState { sessions: Arc::new(Mutex::new(HashMap::new())), pending_permissions: Arc::new(Mutex::new(HashMap::new())), dismissed: Arc::new(Mutex::new(std::collections::HashSet::new())) })
         .run(tauri::generate_context!())
