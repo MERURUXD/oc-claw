@@ -5593,6 +5593,7 @@ fn hermes_bubble_passthrough_poll(app: tauri::AppHandle, _mascot_scale: f64) {
                 // 只切换气泡窗口自身；mini（宠物）窗口永远不归本线程管，
                 // 否则宠物会被设成忽略鼠标，拖不动也点不开面板。
                 if let Some(win) = app2.get_webview_window("hermes_bubbles") {
+                    if let Ok(ns_win) = win.ns_window() {
                         use objc2::msg_send;
                         let obj = unsafe { &*(ns_win as *mut objc2::runtime::AnyObject) };
                         unsafe {
