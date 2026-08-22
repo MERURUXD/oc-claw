@@ -7,7 +7,7 @@ use std::time::SystemTime;
 #[cfg(target_os = "windows")]
 static FULLSCREEN_HIDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 use percent_encoding::percent_decode_str;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Whether the efficiency-mode notch hover tracking thread should be running.
 static EFFICIENCY_HOVER_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -81,6 +81,12 @@ static HERMES_BUBBLE_HITBOXES: Mutex<Vec<(f64, f64, f64, f64)>> = Mutex::new(Vec
 /// top-left origin): (x, y, w, h). Written by the geometry applier, read by
 /// the passthrough polls (hitbox math) and as a position fallback.
 static HERMES_BUBBLE_FRAME: Mutex<Option<(f64, f64, f64, f64)>> = Mutex::new(None);
+/// Standalone bubble window follow-thread handle (bubble-follows-pet).
+static HERMES_BUBBLE_FOLLOW_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+/// Bumped when the follow thread should exit (mode off / thread replaced).
+static HERMES_BUBBLE_FOLLOW_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// Gap between bubble window bottom and pet top, logical px.
+const HERMES_BUBBLE_GAP_LOGICAL: f64 = 14.0;
 
 /// Create the standalone coding-mode Hermes bubble window (`hermes_bubbles`)
 /// if it doesn't exist yet. It renders `index.html#/mini?bubbles=1` — the same
@@ -107,6 +113,51 @@ fn ensure_hermes_bubble_window(app: &tauri::AppHandle, w: f64, h: f64) -> Result
     .build()
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Spawn the "bubble follows pet" thread: while bubble mode is active it reads
+/// the mini (pet) window's live physical position every tick and keeps the
+/// standalone bubble window docked above-right of it (right edges aligned,
+/// hovering GAP_PX above the pet's top edge). Reading mini.outer_position()
+/// directly (not the cached frame) means zero drift even mid-drag.
+fn spawn_hermes_bubble_follow_thread(app: tauri::AppHandle) {
+    // Stop any previous follower: bump the epoch so its loop sees a mismatch.
+    let my_epoch = HERMES_BUBBLE_FOLLOW_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+    if let Some(handle) = HERMES_BUBBLE_FOLLOW_THREAD.lock().ok().and_then(|mut h| h.take()) {
+        let _ = handle.join();
+    }
+    let handle = std::thread::spawn(move || {
+        let mut last_applied: Option<(f64, f64)> = None;
+        loop {
+            if HERMES_BUBBLE_FOLLOW_EPOCH.load(Ordering::SeqCst) != my_epoch
+                || !HERMES_BUBBLE_ACTIVE.load(Ordering::SeqCst)
+            {
+                break;
+            }
+            let (Some(mwin), Some(bwin)) =
+                (app.get_webview_window("mini"), app.get_webview_window("hermes_bubbles"))
+            else {
+                break;
+            };
+            let scale = mwin.scale_factor().unwrap_or(1.0);
+            if let (Ok(mp), Ok(ms), Ok(bs)) = (mwin.outer_position(), mwin.outer_size(), bwin.outer_size()) {
+                let gap_px = (HERMES_BUBBLE_GAP_LOGICAL * scale).round() as i32;
+                // Physical px target: right edges aligned with mini, bottom sits
+                // GAP_PX above mini's top edge.
+                let tx = mp.x + ms.x as i32 - bs.x as i32;
+                let ty = mp.y - bs.y as i32 - gap_px;
+                let moved = last_applied.map_or(true, |(lx, ly)| lx != tx as f64 || ly != ty as f64);
+                if moved {
+                    let _ = bwin.set_position(tauri::PhysicalPosition::new(tx, ty));
+                    last_applied = Some((tx as f64, ty as f64));
+                }
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+    });
+    if let Ok(mut slot) = HERMES_BUBBLE_FOLLOW_THREAD.lock() {
+        *slot = Some(handle);
+    }
 }
 
 /// Coalesces drag-apply tasks so we never queue more than one
@@ -5495,8 +5546,12 @@ async fn set_hermes_bubble_mode(
             let app2 = app.clone();
             std::thread::spawn(move || hermes_bubble_passthrough_poll_windows(app2, mascot_scale));
         }
+        // 气泡跟随宠物：独立线程持续把气泡窗锚在 mini 窗口右上方（拖动零漂移）。
+        spawn_hermes_bubble_follow_thread(app.clone());
     } else {
         HERMES_BUBBLE_ACTIVE.store(false, Ordering::SeqCst);
+        // 停掉跟随线程（epoch 失配使其退出）。
+        HERMES_BUBBLE_FOLLOW_EPOCH.fetch_add(1, Ordering::SeqCst);
         // 独立气泡窗口：只隐藏它并复位穿透标志。mini（宠物）窗口的几何永远
         // 不在这里被动 —— 宠物缩放由 applyMascotScale/applyLargeMascotScale
         // 自己管理，气泡模式退出不得反向改宠物尺寸（旧 bug：收起面板后宠物
