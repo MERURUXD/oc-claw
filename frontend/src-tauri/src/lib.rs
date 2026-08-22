@@ -9096,13 +9096,29 @@ async fn list_custom_codex_pets() -> Result<Vec<CodexPetMeta>, String> {
 
 /// A single pet entry from the petdex.dev manifest. Manifest field names are
 /// camelCase, so each one is mapped with an explicit `#[serde(rename)]`.
+///
+/// `submittedBy` is explicitly null on a handful of upstream entries (~14 of
+/// ~4600), so it falls back to an empty string instead of failing the whole
+/// manifest parse.
+fn deserialize_null_default<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v: Option<String> = serde::Deserialize::deserialize(d)?;
+    Ok(v.unwrap_or_default())
+}
+
 #[derive(serde::Deserialize)]
 struct PetdexPetMeta {
     slug: String,
     #[serde(rename = "displayName")]
     display_name: String,
     kind: String,
-    #[serde(rename = "submittedBy")]
+    #[serde(
+        rename = "submittedBy",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
     submitted_by: String,
     #[serde(rename = "spritesheetUrl")]
     spritesheet_url: String,
