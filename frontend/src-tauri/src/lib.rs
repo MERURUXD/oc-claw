@@ -225,8 +225,8 @@ fn apply_hermes_bubble_follow(app: &tauri::AppHandle) {
         let (tx, ty) = if anchor.2 > 0.0 && anchor.3 > 0.0 {
             // Anchor rect is in CSS px relative to the mini window's
             // viewport top-left; convert to physical px.
-            let pet_right_phys = mp.x + (anchor.0 + anchor.2) * scale;
-            let pet_top_phys = mp.y + anchor.1 * scale;
+            let pet_right_phys = mp.x + ((anchor.0 + anchor.2) * scale).round() as i32;
+            let pet_top_phys = mp.y + (anchor.1 * scale).round() as i32;
             (
                 pet_right_phys.round() as i32 - bs.width as i32,
                 pet_top_phys.round() as i32 - want_h_phys as i32 - gap_px,
