@@ -316,8 +316,12 @@ export function PetGallery({ miniPetId, onEquip, onAddToQueue }: PetGalleryProps
                     key={p.slug}
                     className="bg-white/[0.03] border border-white/10 rounded-xl p-3 flex flex-col gap-2"
                   >
-                    <div className="flex justify-center bg-black/20 rounded-lg py-2">
-                      <SpritePreview pet={codexPet} size={64} />
+                    <div className="flex justify-center">
+                      {/* Dark plate hugs the 64px sprite instead of stretching
+                          full card width — full-width plates looked disjointed. */}
+                      <div className="bg-black/20 rounded-lg py-2 px-3">
+                        <SpritePreview pet={codexPet} size={64} />
+                      </div>
                     </div>
                     <div className="min-h-0">
                       <p className="text-xs font-medium truncate" title={p.displayName}>
@@ -407,8 +411,11 @@ export function PetGallery({ miniPetId, onEquip, onAddToQueue }: PetGalleryProps
                       key={pet.id}
                       className="bg-white/[0.03] border border-white/10 rounded-xl p-3 flex flex-col gap-2"
                     >
-                      <div className="flex justify-center bg-black/20 rounded-lg py-2">
-                        <SpritePreview pet={pet} size={64} />
+                      <div className="flex justify-center">
+                        {/* Same hugging plate as the market cards. */}
+                        <div className="bg-black/20 rounded-lg py-2 px-3">
+                          <SpritePreview pet={pet} size={64} />
+                        </div>
                       </div>
                       <div className="min-h-0">
                         <p className="text-xs font-medium truncate" title={pet.displayName}>
