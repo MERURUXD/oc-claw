@@ -9096,6 +9096,28 @@ async fn list_custom_codex_pets() -> Result<Vec<CodexPetMeta>, String> {
 /// Base URL of the public codexpet.xyz market API.
 const CODEXPET_API_BASE: &str = "https://codexpet.xyz/api";
 
+/// Percent-encode a market slug for use as a URL path segment. Slugs are
+/// validated to `[a-z0-9-]` before reaching this; we still encode defensively,
+/// but must NOT touch unreserved characters: `NON_ALPHANUMERIC` turns '-' into
+/// %2D, which codexpet.xyz does not normalize back → every hyphenated slug
+/// 404s on download/detail endpoints. Keep '-' literal here.
+fn encode_market_slug(slug: &str) -> String {
+    const SLUG_SET: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+        .add(b' ')
+        .add(b'"')
+        .add(b'#')
+        .add(b'%')
+        .add(b'/')
+        .add(b'<')
+        .add(b'>')
+        .add(b'?')
+        .add(b'`')
+        .add(b'{')
+        .add(b'}')
+        .add(b'\\');
+    percent_encoding::utf8_percent_encode(slug, SLUG_SET).to_string()
+}
+
 #[derive(serde::Serialize)]
 struct MarketPetMeta {
     slug: String,
@@ -9194,9 +9216,7 @@ async fn fetch_market_pets(
 /// `dst/source.json` for the gallery details dialog. Any failure is silent —
 /// the file is optional and must never block a successful install.
 async fn write_source_json(client: &reqwest::Client, slug: &str, dst: &std::path::Path) {
-    let encoded_slug: String =
-        percent_encoding::utf8_percent_encode(slug, percent_encoding::NON_ALPHANUMERIC)
-            .to_string();
+    let encoded_slug = encode_market_slug(slug);
     let url = format!("{}/pets/{}", CODEXPET_API_BASE, encoded_slug);
     let Ok(resp) = client.get(&url).send().await else {
         return;
@@ -9253,9 +9273,7 @@ async fn download_codex_pet(slug: String) -> Result<CodexPetMeta, String> {
         .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| e.to_string())?;
-    let encoded_slug: String =
-        percent_encoding::utf8_percent_encode(&slug, percent_encoding::NON_ALPHANUMERIC)
-            .to_string();
+    let encoded_slug = encode_market_slug(&slug);
     let url = format!("{}/pets/{}/download", CODEXPET_API_BASE, encoded_slug);
     let bytes = client
         .get(&url)
