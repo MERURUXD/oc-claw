@@ -9682,8 +9682,10 @@ async fn sync_mascot_bubble(app: tauri::AppHandle, width: f64, height: f64) -> R
         () => return Ok(()),
     };
 
-    let scale = mini.scale_factor().unwrap_or(1.0);
-    let margin = 8.0 * scale;
+    // Coordinates above are already logical (macOS NSWindow frame points;
+    // Windows divided by scale in the closure), so the margin must also be
+    // logical — scaling it again would double the inset on HiDPI displays.
+    let margin = 8.0;
     let bubble_w = width.max(8.0);
     let bubble_h = height.max(8.0);
 
