@@ -15706,9 +15706,10 @@ for _pdir in profile_dirs:
                 for _sid, _evts in _st.items():
                     if isinstance(_evts, list) and _evts:
                         # Skip sub-agents (only emit PostToolUse + SubagentStop).
-                        # The 30-event buffer is large enough that real user turns
-                        # will always retain at least one of these markers.
-                        _has_user = any(_e.get('event') in ('UserPromptSubmit', 'SessionStart', 'Stop') for _e in _evts)
+                        # PreToolUse is also a user-session marker: a long-running
+                        # real turn can rotate UserPromptSubmit/Stop out of the
+                        # 30-event buffer and look like a subagent, so accept it.
+                        _has_user = any(_e.get('event') in ('UserPromptSubmit', 'SessionStart', 'Stop', 'PreToolUse') for _e in _evts)
                         if not _has_user: continue
                         _filtered[_sid] = _evts
                         _all_known_sids.add(_sid)
