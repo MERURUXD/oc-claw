@@ -15878,11 +15878,19 @@ for _pdir in profile_dirs:
         except: pass
     if db_conn:
         try:
-            cutoff = now - 7200
-            cur = db_conn.execute(
-                'SELECT id, source, model, started_at, ended_at, message_count, input_tokens, output_tokens '
-                'FROM sessions WHERE started_at > ? AND parent_session_id IS NULL ORDER BY started_at DESC LIMIT 20', (cutoff,))
-            for r in cur.fetchall():
+            # Fetch sessions the ooclaw plugin knows about (recent activity) by
+            # id — NOT by started_at. The old `started_at > now-7200` cutoff
+            # dropped long-running sessions that are still active.
+            if _all_known_sids:
+                _ph = ','.join('?' * len(_all_known_sids))
+                cur = db_conn.execute(
+                    'SELECT id, source, model, started_at, ended_at, message_count, input_tokens, output_tokens '
+                    f'FROM sessions WHERE id IN ({_ph}) AND parent_session_id IS NULL ORDER BY started_at DESC',
+                    list(_all_known_sids))
+                _rows = cur.fetchall()
+            else:
+                _rows = []
+            for r in _rows:
                 sid = r[0]
                 if (_pfx + sid) in seen: continue
                 # Only show sessions known to ooclaw plugin
