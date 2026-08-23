@@ -2029,9 +2029,16 @@ export default function Mini() {
 
   // Poll Claude/Codex/Cursor sessions
   useEffect(() => {
-    if (appMode !== 'coding') { setClaudeSessions([]); return }
+    if (appMode !== 'coding') {
+      setClaudeSessions([])
+      // The status bubble only exists in coding mode — make sure it is
+      // hidden when leaving it (pet mode etc.).
+      invoke('set_mascot_bubble_visible', { visible: false }).catch(() => {})
+      return
+    }
     if (!(enableClaudeCode || enableClaudeDesktop || enableCodex || enableCursor || enableGemini || enableOpencode || enableHermes)) {
       setClaudeSessions([])
+      invoke('set_mascot_bubble_visible', { visible: false }).catch(() => {})
       return
     }
     const seenCompletions = new Set<string>(shownCompletionsRef.current)
@@ -2207,6 +2214,23 @@ export default function Mini() {
         // React batches them: the panel's first render after expand already
         // has the filtered single-session view, no full-list flash.
         setClaudeSessions(sessions)
+        // Mascot status bubble: derive a one-line summary from the merged
+        // session list (single source of truth — same list the panel shows,
+        // including merged remote Hermes sessions). Show it only while the
+        // panel is collapsed and at least one session is active.
+        let bubbleRunning = 0
+        let bubbleWaiting = 0
+        for (const s of sessions) {
+          const st = s.status
+          if (st === 'processing' || st === 'tool_running' || st === 'compacting') bubbleRunning++
+          else if (st === 'waiting') bubbleWaiting++
+        }
+        const bubbleActive = bubbleRunning + bubbleWaiting > 0
+        const bubbleShouldShow = !expandedRef.current && bubbleActive
+        invoke('set_mascot_bubble_visible', { visible: bubbleShouldShow }).catch(() => {})
+        if (bubbleShouldShow) {
+          emit('mascot-bubble-summary', { running: bubbleRunning, waiting: bubbleWaiting }).catch(() => {})
+        }
         if (completionCandidate) {
           shownCompletionsRef.current.add(completionCandidate.sessionId)
           hoverExpandedRef.current = true
@@ -2568,6 +2592,10 @@ export default function Mini() {
   useEffect(() => {
     if (appMode !== 'coding') return
     invoke('set_extra_mascots_hidden', { hidden: expanded }).catch(() => {})
+    // The status bubble hides immediately when the panel expands (the panel
+    // already shows the full status); the session poll re-shows it on the
+    // next tick once collapsed.
+    if (expanded) invoke('set_mascot_bubble_visible', { visible: false }).catch(() => {})
   }, [expanded, appMode])
 
   const updateModalWindowAdjustedRef = useRef(false)
