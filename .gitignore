@@ -4,3 +4,4 @@
 .claude/settings.local.json
 build-signed.sh
 .hermes.md
+.hermes/
