@@ -3210,6 +3210,12 @@ const MASCOT_TOP_INSET: f64 = 120.0;
 const MASCOT_SCALE_MIN: f64 = 1.0;
 const MASCOT_SCALE_MAX: f64 = 3.0;
 const LARGE_MASCOT_SIZE_MULTIPLIER: f64 = 3.0;
+/// Horizontal inset (logical px) between the primary mascot and its status
+/// bubble when the bubble is anchored to the mascot's right side.
+const MASCOT_BUBBLE_INSET: f64 = 8.0;
+/// Vertical gap (logical px) between the primary mascot and its status bubble
+/// when the bubble is stacked above/below the mascot.
+const MASCOT_BUBBLE_GAP: f64 = 6.0;
 
 fn sanitized_mascot_scale(scale: Option<f64>) -> f64 {
     let scale = scale.unwrap_or(1.0);
@@ -9535,6 +9541,255 @@ async fn set_extra_mascots_hidden(app: tauri::AppHandle, hidden: bool) -> Result
     Ok(())
 }
 
+/// Spawn the mascot status bubble window — a small transparent always-on-top
+/// window anchored to the primary mascot that renders a one-line agent status
+/// summary ("● N running · M waiting"). Mirrors `spawn_mascot_window`'s
+/// frameless/transparent template but starts hidden (`.visible(false)`) so the
+/// webview can't flash on screen before the first summary arrives;
+/// `sync_mascot_bubble` positions it and `set_mascot_bubble_visible` drives
+/// visibility.
+fn spawn_mascot_bubble(app: tauri::AppHandle) -> Result<(), String> {
+    let win = tauri::WebviewWindowBuilder::new(
+        &app,
+        "mascot-bubble",
+        tauri::WebviewUrl::App("index.html#/mascot-bubble".into()),
+    )
+    .title("oc-claw mascot status bubble")
+    .inner_size(200.0, 40.0)
+    .min_inner_size(8.0, 8.0)
+    .decorations(false)
+    .transparent(true)
+    .shadow(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .resizable(false)
+    .visible(false)
+    .accept_first_mouse(true)
+    .build()
+    .map_err(|e| e.to_string())?;
+
+    // macOS: float at level 27 like the mini, but with only the
+    // CanJoinAllSpaces | Stationary | FullScreenAuxiliary collection
+    // behavior bits (no over-fullscreen bits) so the bubble hides together
+    // with the mini when another app goes fullscreen.
+    #[cfg(target_os = "macos")]
+    {
+        let win_clone = win.clone();
+        let _ = app.run_on_main_thread(move || {
+            use objc2::msg_send;
+            use objc2::runtime::AnyObject;
+            if let Ok(ns_win) = win_clone.ns_window() {
+                let obj = unsafe { &*(ns_win as *mut AnyObject) };
+                unsafe {
+                    let _: () = msg_send![obj, setLevel: 27isize];
+                    let behavior: usize = (1 << 4) | (1 << 6);
+                    let _: () = msg_send![obj, setCollectionBehavior: behavior];
+                }
+            }
+        });
+    }
+    Ok(())
+}
+
+/// Position the mascot status bubble next to the primary mascot window.
+/// `width`/`height` are the bubble's content size in logical pixels, measured
+/// by the frontend via ResizeObserver.
+///
+/// Anchor: horizontally right-aligned to the mini with a small inset (flipping
+/// to the mini's left side when the right side would overflow the monitor),
+/// vertically stacked above the mascot by default and flipped below when there
+/// is no room. Coordinate axes differ per platform — macOS uses the NSWindow
+/// frame (bottom-left origin) while Windows uses screen coordinates
+/// (top-left origin), so both the fit test and the actual positioning call
+/// are platform-specific.
+#[tauri::command]
+async fn sync_mascot_bubble(app: tauri::AppHandle, width: f64, height: f64) -> Result<(), String> {
+    let Some(win) = app.get_webview_window("mascot-bubble") else {
+        return Ok(());
+    };
+    let Some(mini) = app.get_webview_window("mini") else {
+        return Ok(());
+    };
+
+    // Mini window frame + its monitor rect, both in logical pixels.
+    let (mini_x, mini_y, mini_w, mini_h, mon_x, mon_y, mon_w, mon_h): (f64, f64, f64, f64, f64, f64, f64, f64) = match () {
+        #[cfg(target_os = "macos")]
+        () => {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mini_clone = mini.clone();
+            let app_clone = app.clone();
+            app_clone
+                .run_on_main_thread(move || {
+                    use objc2::msg_send;
+                    use objc2::runtime::{AnyClass, AnyObject};
+                    use objc2_foundation::NSRect;
+                    if let Ok(ns_win) = mini_clone.ns_window() {
+                        let obj = unsafe { &*(ns_win as *mut AnyObject) };
+                        let frame: NSRect = unsafe { msg_send![obj, frame] };
+                        let screen: *mut AnyObject = unsafe { msg_send![obj, screen] };
+                        let screen_frame: NSRect = if screen.is_null() {
+                            let cls = match AnyClass::get(c"NSScreen") {
+                                Some(c) => c,
+                                None => return,
+                            };
+                            let main_screen: *mut AnyObject = unsafe { msg_send![cls, mainScreen] };
+                            if main_screen.is_null() {
+                                return;
+                            }
+                            unsafe { msg_send![&*main_screen, frame] }
+                        } else {
+                            unsafe { msg_send![&*screen, frame] }
+                        };
+                        let _ = tx.send((
+                            frame.origin.x,
+                            frame.origin.y,
+                            frame.size.width,
+                            frame.size.height,
+                            screen_frame.origin.x,
+                            screen_frame.origin.y,
+                            screen_frame.size.width,
+                            screen_frame.size.height,
+                        ));
+                    }
+                })
+                .map_err(|e| e.to_string())?;
+            rx.recv_timeout(std::time::Duration::from_secs(1))
+                .map_err(|e| e.to_string())?
+        }
+        #[cfg(target_os = "windows")]
+        () => {
+            let scale = mini.scale_factor().unwrap_or(1.0);
+            let pos = mini.outer_position().map_err(|e| e.to_string())?;
+            let size = mini.outer_size().map_err(|e| e.to_string())?;
+            let monitor = mini
+                .current_monitor()
+                .map_err(|e| e.to_string())?
+                .ok_or("mini has no monitor")?;
+            let mpos = monitor.position();
+            let msize = monitor.size();
+            (
+                pos.x as f64 / scale,
+                pos.y as f64 / scale,
+                size.width as f64 / scale,
+                size.height as f64 / scale,
+                mpos.x as f64 / scale,
+                mpos.y as f64 / scale,
+                msize.width as f64 / scale,
+                msize.height as f64 / scale,
+            )
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        () => return Ok(()),
+    };
+
+    let scale = mini.scale_factor().unwrap_or(1.0);
+    let margin = 8.0 * scale;
+    let bubble_w = width.max(8.0);
+    let bubble_h = height.max(8.0);
+
+    // Horizontal: right-align the bubble to the mascot with a small inset,
+    // flipping to the mascot's left side when it would overflow the monitor,
+    // then clamp into the monitor with a margin.
+    let mut x = mini_x + mini_w - bubble_w + MASCOT_BUBBLE_INSET;
+    if x + bubble_w > mon_x + mon_w - margin {
+        x = mini_x - MASCOT_BUBBLE_INSET - bubble_w;
+    }
+    let x_min = mon_x + margin;
+    let x_max = (mon_x + mon_w - bubble_w - margin).max(x_min);
+    let x = x.clamp(x_min, x_max);
+
+    // Vertical: prefer stacking above the mascot, flip below when there is
+    // not enough room on that side. Axis-aware (see fn docs).
+    #[cfg(target_os = "macos")]
+    let y = {
+        let above_y = mini_y + mini_h + MASCOT_BUBBLE_GAP;
+        let fits_above = above_y + bubble_h <= mon_y + mon_h - margin;
+        if fits_above {
+            above_y
+        } else {
+            mini_y - bubble_h - MASCOT_BUBBLE_GAP
+        }
+    };
+    #[cfg(target_os = "windows")]
+    let y = {
+        let above_y = mini_y - bubble_h - MASCOT_BUBBLE_GAP;
+        let fits_above = above_y >= mon_y + margin;
+        if fits_above {
+            above_y
+        } else {
+            mini_y + mini_h + MASCOT_BUBBLE_GAP
+        }
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let y = mini_y;
+
+    let y_min = mon_y + margin;
+    let y_max = (mon_y + mon_h - bubble_h - margin).max(y_min);
+    let y = y.clamp(y_min, y_max);
+
+    let _ = win.set_size(tauri::LogicalSize::new(bubble_w, bubble_h));
+
+    // macOS positions via setFrame: (bottom-left origin frame coords, matches
+    // the math above); Windows uses Tauri's set_position (top-left origin).
+    #[cfg(target_os = "macos")]
+    {
+        let win_clone = win.clone();
+        let app_clone = app.clone();
+        app_clone
+            .run_on_main_thread(move || {
+                use objc2::msg_send;
+                use objc2::runtime::AnyObject;
+                use objc2_foundation::{NSPoint, NSRect, NSSize};
+                if let Ok(ns_win) = win_clone.ns_window() {
+                    let obj = unsafe { &*(ns_win as *mut AnyObject) };
+                    let new_frame = NSRect::new(NSPoint::new(x, y), NSSize::new(bubble_w, bubble_h));
+                    unsafe {
+                        let _: () = msg_send![obj, setFrame: new_frame, display: true, animate: false];
+                    }
+                }
+            })
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = win.set_position(tauri::LogicalPosition::new(x, y));
+    }
+
+    // Don't re-assert always-on-top while the Windows fullscreen watcher has
+    // the mini hidden — the bubble must stay off the fullscreen app too.
+    #[cfg(target_os = "windows")]
+    let want_top = !FULLSCREEN_HIDING.load(Ordering::SeqCst);
+    #[cfg(not(target_os = "windows"))]
+    let want_top = true;
+    let _ = win.set_always_on_top(want_top);
+    Ok(())
+}
+
+/// Show or hide the mascot status bubble. `visible=true` spawns the window on
+/// first use, refuses to show while the Windows fullscreen watcher has the
+/// mini hidden (the frontend's next poll re-shows it once fullscreen exits),
+/// and re-asserts floating levels afterwards — showing the bubble can demote
+/// the mini's always-on-top status (see `reassert_mini_floating`).
+#[tauri::command]
+async fn set_mascot_bubble_visible(app: tauri::AppHandle, visible: bool) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    if visible && FULLSCREEN_HIDING.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    if visible {
+        if app.get_webview_window("mascot-bubble").is_none() {
+            spawn_mascot_bubble(app.clone())?;
+        }
+        if let Some(win) = app.get_webview_window("mascot-bubble") {
+            let _ = win.show();
+        }
+        reassert_mini_floating(&app);
+    } else if let Some(win) = app.get_webview_window("mascot-bubble") {
+        let _ = win.hide();
+    }
+    Ok(())
+}
+
 /// Open the platform's native folder picker so the user can choose a
 /// codex pet directory to import. Returns the absolute path or `null` if
 /// the user cancelled. Implemented with `osascript` on macOS and
@@ -9564,6 +9819,11 @@ fn reassert_mini_floating(app: &tauri::AppHandle) {
             // Extra mascots omit the fullscreen bits so they hide on fullscreen.
             wins.push((win, false));
         }
+    }
+    // The mascot status bubble floats at the same level as the mini but hides
+    // on fullscreen like the extra mascots.
+    if let Some(win) = app.get_webview_window("mascot-bubble") {
+        wins.push((win, false));
     }
     for (win, over_fullscreen) in wins {
         let win_clone = win.clone();
@@ -17506,6 +17766,13 @@ pub fn run() {
                                     let _ = win.set_always_on_top(false);
                                     let _ = win.set_position(tauri::LogicalPosition::new(-9999.0_f64, -9999.0_f64));
                                     was_hidden = true;
+                                    // Keep the status bubble hidden with the mini
+                                    // while a fullscreen app covers this monitor.
+                                    // Restore happens via the frontend's next
+                                    // session poll calling set_mascot_bubble_visible.
+                                    if let Some(bubble) = app_handle.get_webview_window("mascot-bubble") {
+                                        let _ = bubble.hide();
+                                    }
                                 }
                             } else if was_hidden {
                                 non_fs_streak += 1;
@@ -17635,7 +17902,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs, fetch_petdex_manifest, download_codex_pet, delete_custom_codex_pet, get_hermes_remote_conversation])
+        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, sync_mascot_bubble, set_mascot_bubble_visible, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs, fetch_petdex_manifest, download_codex_pet, delete_custom_codex_pet, get_hermes_remote_conversation])
         .manage(ActiveAgentPid { pid: Mutex::new(None) })
         .manage(ClaudeState { sessions: Arc::new(Mutex::new(HashMap::new())), pending_permissions: Arc::new(Mutex::new(HashMap::new())), dismissed: Arc::new(Mutex::new(std::collections::HashSet::new())) })
         .run(tauri::generate_context!())
