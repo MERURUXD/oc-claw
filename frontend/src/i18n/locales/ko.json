@@ -340,6 +340,8 @@
     "idleStatus": "대기",
     "currentTask": "현재 작업",
     "recentActivity": "최근 활동",
+    "noConversation": "대화 없음",
+    "conversation": "대화",
     "tokensUsed": "토큰 사용량",
     "sessionStatus": "세션 상태",
     "messages": "메시지",

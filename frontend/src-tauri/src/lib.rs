@@ -12503,9 +12503,6 @@ if sid:
                 new_frontier.append(cid)
         frontier = new_frontier
 
-def trunc(s, n):
-    return s[:n] + '…' if len(s) > n else s
-
 _q = ('SELECT role, content, tool_name, tool_calls, timestamp '
       'FROM messages WHERE role IN ("user","human","assistant","tool")')
 if all_sids:
@@ -12517,19 +12514,8 @@ else:
 for role, content, tool_name, tool_calls, ts in cur.fetchall():
     content = content or ''
     if role == 'tool':
-        name = tool_name or ''
-        body = trunc(content, 300)
-        text = ('[Tool: %s]\n%s' % (name, body)) if name else ('[Tool result]\n%s' % body)
-        results.append({{'role': 'assistant', 'text': text, 'timestamp': ts}})
+        continue
     elif role == 'assistant':
-        if tool_calls:
-            try:
-                for tc in json.loads(tool_calls):
-                    fn = tc.get('function') or {{}}
-                    fname = fn.get('name', 'unknown')
-                    fargs = trunc(fn.get('arguments', '') or '', 200)
-                    results.append({{'role': 'assistant', 'text': '🔧 %s\n```\n%s\n```' % (fname, fargs), 'timestamp': ts}})
-            except: pass
         if content.strip():
             results.append({{'role': 'assistant', 'text': content.strip(), 'timestamp': ts}})
     elif role in ('user', 'human'):
@@ -12577,7 +12563,7 @@ fn load_hermes_conversation(session_id: &str) -> Result<Vec<ChatMessage>, String
 
     let mut messages = Vec::new();
     for row in rows {
-        let (role, content, tool_name, tool_calls, ts) = row.map_err(|e| format!("row: {}", e))?;
+        let (role, content, _tool_name, _tool_calls, ts) = row.map_err(|e| format!("row: {}", e))?;
 
         // Format timestamp as ISO string
         let ts_secs = ts as i64;
@@ -12586,47 +12572,11 @@ fn load_hermes_conversation(session_id: &str) -> Result<Vec<ChatMessage>, String
             .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string());
 
         if role == "tool" {
-            // Tool result: show tool_name and truncated content
-            let name = tool_name.unwrap_or_default();
-            let body = content.unwrap_or_default();
-            let truncated = if body.chars().count() > 300 {
-                format!("{}…", truncate_chars(&body, 300))
-            } else {
-                body
-            };
-            let text = if name.is_empty() {
-                format!("[Tool result]\n{}", truncated)
-            } else {
-                format!("[Tool: {}]\n{}", name, truncated)
-            };
-            messages.push(ChatMessage { role: "assistant".to_string(), text, timestamp });
             continue;
         }
 
         if role == "assistant" {
-            // Check for tool_calls (function calls the model wants to make)
-            if let Some(ref tc_str) = tool_calls {
-                if let Ok(tc_arr) = serde_json::from_str::<Vec<serde_json::Value>>(tc_str) {
-                    for tc in &tc_arr {
-                        let fn_name = tc.get("function")
-                            .and_then(|f| f.get("name"))
-                            .and_then(|n| n.as_str())
-                            .unwrap_or("unknown");
-                        let fn_args = tc.get("function")
-                            .and_then(|f| f.get("arguments"))
-                            .and_then(|a| a.as_str())
-                            .unwrap_or("");
-                        let args_truncated = if fn_args.chars().count() > 200 {
-                            format!("{}…", truncate_chars(fn_args, 200))
-                        } else {
-                            fn_args.to_string()
-                        };
-                        let text = format!("🔧 {}\n```\n{}\n```", fn_name, args_truncated);
-                        messages.push(ChatMessage { role: "assistant".to_string(), text, timestamp: timestamp.clone() });
-                    }
-                }
-            }
-            // Also include text content if present
+            // Only dialogue text; tool calls are intentionally dropped.
             if let Some(ref text) = content {
                 let trimmed = text.trim();
                 if !trimmed.is_empty() {

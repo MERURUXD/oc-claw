@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { Loader2 } from 'lucide-react'
 import { motion } from 'motion/react'
 import { formatTokens } from '../lib/agents'
+import { ChatList } from './ChatList'
 
 interface DailyStats {
   date: string
@@ -132,6 +133,19 @@ function HermesDetailView({ stats, isActive, channel, sshConn, sessionId }: { st
     return () => clearInterval(t)
   }, [sshConn?.host, sshConn?.user, sessionId])
 
+  const [messages, setMessages] = useState<any[]>([])
+  useEffect(() => {
+    const fetchMessages = () => {
+      const cmd = sshConn
+        ? invoke('get_hermes_remote_conversation', { sshHost: sshConn.host, sshUser: sshConn.user, sessionId: sessionId || '' })
+        : invoke('get_claude_conversation', { sessionId: sessionId || '' })
+      cmd.then((msgs: any) => setMessages(msgs || [])).catch(() => {})
+    }
+    fetchMessages()
+    const t = setInterval(fetchMessages, 5000)
+    return () => clearInterval(t)
+  }, [sshConn?.host, sshConn?.user, sessionId])
+
   const fmtTime = (ts: number) => {
     const d = new Date(ts * 1000)
     return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
@@ -158,6 +172,18 @@ function HermesDetailView({ stats, isActive, channel, sshConn, sessionId }: { st
             <span className={`w-1.5 h-1.5 rounded-full ${active ? 'bg-emerald-400 animate-pulse' : 'bg-white/30'}`} />
             {active ? t('agentDetail.working') : t('agentDetail.idleStatus')}
           </span>
+        </div>
+      </div>
+
+      {/* Conversation */}
+      <div className="flex flex-col gap-3">
+        <span className="text-[10px] font-medium text-white/40 uppercase tracking-wider px-1">{t('agentDetail.conversation')}</span>
+        <div className="bg-[#0a0a0a] border border-white/5 rounded-2xl p-3 flex flex-col max-h-[320px]">
+          {messages.length === 0 ? (
+            <span className="text-white/30 text-xs py-2 px-1">{t('agentDetail.noConversation')}</span>
+          ) : (
+            <ChatList messages={messages} accentColor="#8A2BE2" />
+          )}
         </div>
       </div>
 

@@ -340,6 +340,8 @@
     "idleStatus": "アイドル",
     "currentTask": "現在のタスク",
     "recentActivity": "最近のアクティビティ",
+    "noConversation": "会話はまだありません",
+    "conversation": "会話",
     "tokensUsed": "トークン使用量",
     "sessionStatus": "セッション状態",
     "messages": "メッセージ",

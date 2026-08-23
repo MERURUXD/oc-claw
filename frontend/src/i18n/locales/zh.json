@@ -380,6 +380,8 @@
     "idleStatus": "空闲",
     "currentTask": "当前任务",
     "recentActivity": "最近动态",
+    "noConversation": "暂无对话",
+    "conversation": "对话",
     "tokensUsed": "消耗 (Tokens)",
     "sessionStatus": "会话状态",
     "messages": "消息",
