@@ -12447,6 +12447,92 @@ print(json.dumps(deduped[:15]))
     Ok(items)
 }
 
+#[tauri::command]
+async fn get_hermes_remote_conversation(ssh_host: String, ssh_user: String, session_id: String) -> Result<Vec<serde_json::Value>, String> {
+    let sid_escaped = session_id.replace('\'', "");
+    let py_script = format!(r#"
+import json, os, sqlite3, sys
+raw_sid = '{sid}'
+profile = 'default'
+if ':' in raw_sid:
+    profile, raw_sid = raw_sid.split(':', 1)
+if profile == 'default':
+    db = os.path.expanduser('~/.hermes/state.db')
+else:
+    db = os.path.expanduser('~/.hermes/profiles/' + profile + '/state.db')
+
+results = []
+if not os.path.exists(db):
+    print(json.dumps([]))
+    sys.exit(0)
+
+conn = sqlite3.connect(db)
+
+def _resolve_latest_session(s):
+    cur = s
+    for _ in range(20):
+        child = conn.execute(
+            'SELECT id FROM sessions WHERE parent_session_id=? ORDER BY started_at DESC LIMIT 1',
+            (cur,)).fetchone()
+        if not child:
+            break
+        cur = child[0]
+    row = conn.execute(
+        'SELECT id FROM sessions WHERE (id = ? OR id LIKE ? OR id = ? OR id LIKE ?) '
+        'ORDER BY started_at DESC LIMIT 1',
+        (s, s + ':%', cur, cur + ':%')).fetchone()
+    if row:
+        cur = row[0]
+    return cur
+
+sid = _resolve_latest_session(raw_sid) if raw_sid else ''
+all_sids = []
+if sid:
+    all_sids = [sid]
+    frontier = [sid]
+    for _ in range(5):
+        if not frontier: break
+        placeholders = ','.join('?' * len(frontier))
+        rows = conn.execute(
+            'SELECT id FROM sessions WHERE parent_session_id IN (' + placeholders + ')',
+            frontier).fetchall()
+        new_frontier = []
+        for (cid,) in rows:
+            if cid not in all_sids:
+                all_sids.append(cid)
+                new_frontier.append(cid)
+        frontier = new_frontier
+
+_q = ('SELECT role, content, tool_name, tool_calls, timestamp '
+      'FROM messages WHERE role IN ("user","human","assistant","tool")')
+if all_sids:
+    placeholders = ','.join('?' * len(all_sids))
+    cur = conn.execute(_q + ' AND session_id IN (' + placeholders + ') ORDER BY timestamp ASC LIMIT 500', all_sids)
+else:
+    cur = conn.execute(_q + ' ORDER BY timestamp ASC LIMIT 500')
+
+for role, content, tool_name, tool_calls, ts in cur.fetchall():
+    content = content or ''
+    if role == 'tool':
+        continue
+    elif role == 'assistant':
+        if content.strip():
+            results.append({{'role': 'assistant', 'text': content.strip(), 'timestamp': ts}})
+    elif role in ('user', 'human'):
+        if content.strip():
+            results.append({{'role': 'user', 'text': content.strip(), 'timestamp': ts}})
+
+conn.close()
+print(json.dumps(results))
+"#, sid = sid_escaped);
+    let cmd = format!("python3 -c {}", shell_escape_single(&py_script));
+    let output = ssh_exec(&ssh_host, &ssh_user, &cmd).await?;
+    let trimmed = output.trim();
+    let items: Vec<serde_json::Value> = serde_json::from_str(trimmed)
+        .map_err(|e| format!("parse hermes remote conversation: {}", e))?;
+    Ok(items)
+}
+
 /// Load conversation messages for a Hermes session from ~/.hermes/state.db.
 fn load_hermes_conversation(session_id: &str) -> Result<Vec<ChatMessage>, String> {
     let home = dirs::home_dir().ok_or("no home dir")?;
@@ -12477,7 +12563,7 @@ fn load_hermes_conversation(session_id: &str) -> Result<Vec<ChatMessage>, String
 
     let mut messages = Vec::new();
     for row in rows {
-        let (role, content, tool_name, tool_calls, ts) = row.map_err(|e| format!("row: {}", e))?;
+        let (role, content, _tool_name, _tool_calls, ts) = row.map_err(|e| format!("row: {}", e))?;
 
         // Format timestamp as ISO string
         let ts_secs = ts as i64;
@@ -12486,47 +12572,11 @@ fn load_hermes_conversation(session_id: &str) -> Result<Vec<ChatMessage>, String
             .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string());
 
         if role == "tool" {
-            // Tool result: show tool_name and truncated content
-            let name = tool_name.unwrap_or_default();
-            let body = content.unwrap_or_default();
-            let truncated = if body.chars().count() > 300 {
-                format!("{}…", truncate_chars(&body, 300))
-            } else {
-                body
-            };
-            let text = if name.is_empty() {
-                format!("[Tool result]\n{}", truncated)
-            } else {
-                format!("[Tool: {}]\n{}", name, truncated)
-            };
-            messages.push(ChatMessage { role: "assistant".to_string(), text, timestamp });
             continue;
         }
 
         if role == "assistant" {
-            // Check for tool_calls (function calls the model wants to make)
-            if let Some(ref tc_str) = tool_calls {
-                if let Ok(tc_arr) = serde_json::from_str::<Vec<serde_json::Value>>(tc_str) {
-                    for tc in &tc_arr {
-                        let fn_name = tc.get("function")
-                            .and_then(|f| f.get("name"))
-                            .and_then(|n| n.as_str())
-                            .unwrap_or("unknown");
-                        let fn_args = tc.get("function")
-                            .and_then(|f| f.get("arguments"))
-                            .and_then(|a| a.as_str())
-                            .unwrap_or("");
-                        let args_truncated = if fn_args.chars().count() > 200 {
-                            format!("{}…", truncate_chars(fn_args, 200))
-                        } else {
-                            fn_args.to_string()
-                        };
-                        let text = format!("🔧 {}\n```\n{}\n```", fn_name, args_truncated);
-                        messages.push(ChatMessage { role: "assistant".to_string(), text, timestamp: timestamp.clone() });
-                    }
-                }
-            }
-            // Also include text content if present
+            // Only dialogue text; tool calls are intentionally dropped.
             if let Some(ref text) = content {
                 let trimmed = text.trim();
                 if !trimmed.is_empty() {
@@ -17585,7 +17635,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs, fetch_petdex_manifest, download_codex_pet, delete_custom_codex_pet])
+        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs, fetch_petdex_manifest, download_codex_pet, delete_custom_codex_pet, get_hermes_remote_conversation])
         .manage(ActiveAgentPid { pid: Mutex::new(None) })
         .manage(ClaudeState { sessions: Arc::new(Mutex::new(HashMap::new())), pending_permissions: Arc::new(Mutex::new(HashMap::new())), dismissed: Arc::new(Mutex::new(std::collections::HashSet::new())) })
         .run(tauri::generate_context!())

@@ -380,6 +380,8 @@
     "idleStatus": "Idle",
     "currentTask": "Current Task",
     "recentActivity": "Recent Activity",
+    "noConversation": "No conversation yet",
+    "conversation": "Conversation",
     "tokensUsed": "Tokens Used",
     "sessionStatus": "Session Status",
     "messages": "Messages",

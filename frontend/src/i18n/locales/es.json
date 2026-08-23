@@ -340,6 +340,8 @@
     "idleStatus": "Inactivo",
     "currentTask": "Tarea actual",
     "recentActivity": "Actividad reciente",
+    "noConversation": "Sin conversación aún",
+    "conversation": "Conversación",
     "tokensUsed": "Tokens utilizados",
     "sessionStatus": "Estado de sesión",
     "messages": "Mensajes",
