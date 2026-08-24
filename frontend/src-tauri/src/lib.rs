@@ -59,6 +59,9 @@ static PET_POMODORO_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Latest pet-mode mascot scales. The click-through poll thread is long-lived,
 /// so it reads this on each pass instead of capturing the size it started with.
 static PET_MASCOT_SCALES: Mutex<(f64, f64)> = Mutex::new((1.0, LARGE_MASCOT_SIZE_MULTIPLIER));
+/// Last-reported size (logical px) of the mascot status bubble window, so the
+/// bubble can be re-anchored to the mini window whenever the mini moves/resizes.
+static BUBBLE_SIZE: Mutex<(f64, f64)> = Mutex::new((200.0, 40.0));
 
 /// Coalesces drag-apply tasks so we never queue more than one
 /// setFrameOrigin: call on the main thread at a time. The poll thread
@@ -3087,7 +3090,19 @@ async fn open_mini(app: tauri::AppHandle) -> Result<(), String> {
         .skip_taskbar(true)
         .resizable(false)
         .visible(false)
-        .accept_first_mouse(true); // single click from any app
+        .accept_first_mouse(true) // single click from any app
+        .on_window_event({
+            let app_for_events = app.clone();
+            move |event| {
+                if matches!(event, tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)) {
+                    let (w, h) = *BUBBLE_SIZE.lock().unwrap();
+                    let app = app_for_events.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let _ = sync_mascot_bubble(app, w, h).await;
+                    });
+                }
+            }
+        });
 
     let win = builder.build().map_err(|e| e.to_string())?;
 
@@ -9604,6 +9619,7 @@ fn spawn_mascot_bubble(app: tauri::AppHandle) -> Result<(), String> {
 /// are platform-specific.
 #[tauri::command]
 async fn sync_mascot_bubble(app: tauri::AppHandle, width: f64, height: f64) -> Result<(), String> {
+    *BUBBLE_SIZE.lock().unwrap() = (width, height);
     let Some(win) = app.get_webview_window("mascot-bubble") else {
         return Ok(());
     };

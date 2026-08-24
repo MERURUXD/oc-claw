@@ -4513,7 +4513,7 @@ export default function Mini() {
                   pointerEvents: 'auto',
                   zIndex: 12,
                   touchAction: 'none',
-                  background: 'rgba(255,255,255,0.01)',
+                  background: 'rgba(255,255,255,0)',
                   display: 'flex',
                   alignItems: 'flex-end',
                   justifyContent: 'flex-end',
