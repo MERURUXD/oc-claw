@@ -105,3 +105,75 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
 }
 .markdown-inline > p { display: inline; }
 .markdown-inline > * { display: inline; }
+
+/* ---------------------------------------------------------------------------
+ * Mascot status bubble window (index.html#/mascot-bubble)
+ * A small transparent always-on-top window anchored next to the primary
+ * mascot. The window rect is transparent, so ANY outer box-shadow on the card
+ * gets clipped by the window bounds and leaves artifacts on the desktop —
+ * the card must never use an outer shadow, only inset highlights.
+ * ------------------------------------------------------------------------- */
+.mascot-bubble-root {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+.mascot-bubble-card {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px 5px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: linear-gradient(180deg, rgba(32, 36, 52, 0.92), rgba(16, 19, 30, 0.94));
+  box-shadow: none; /* transparent window: outer shadows get clipped — forbidden */
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+  letter-spacing: 0.01em;
+}
+
+/* Inset top highlight — drawn inside the card, safe on a transparent window. */
+.mascot-bubble-card::before {
+  content: '';
+  position: absolute;
+  top: 1px;
+  left: 1px;
+  right: 1px;
+  height: 40%;
+  border-radius: 999px 999px 40% 40%;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.10), rgba(255, 255, 255, 0));
+  pointer-events: none;
+}
+
+.mascot-bubble-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: none;
+}
+.mascot-bubble-dot.is-running {
+  background: #60a5fa; /* accent (blue) */
+  box-shadow: 0 0 6px rgba(96, 165, 250, 0.7);
+}
+.mascot-bubble-dot.is-waiting {
+  background: #fbbf24; /* amber */
+  box-shadow: 0 0 6px rgba(251, 191, 36, 0.7);
+}
+
+.mascot-bubble-running {
+  color: #60a5fa; /* accent */
+}
+.mascot-bubble-waiting {
+  color: #fbbf24; /* amber */
+}
+.mascot-bubble-sep {
+  color: rgba(255, 255, 255, 0.35);
+  margin: 0 1px;
+}
