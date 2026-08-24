@@ -9711,12 +9711,12 @@ async fn sync_mascot_bubble(app: tauri::AppHandle, width: f64, height: f64) -> R
     let bubble_w = width.max(8.0);
     let bubble_h = height.max(8.0);
 
-    // Horizontal: right-align the bubble to the mascot with a small inset,
-    // flipping to the mascot's left side when it would overflow the monitor,
+    // Horizontal: left-align the bubble to the mascot with a small inset,
+    // flipping to the mascot's right side when it would overflow the monitor,
     // then clamp into the monitor with a margin.
-    let mut x = mini_x + mini_w - bubble_w + MASCOT_BUBBLE_INSET;
-    if x + bubble_w > mon_x + mon_w - margin {
-        x = mini_x - MASCOT_BUBBLE_INSET - bubble_w;
+    let mut x = mini_x - MASCOT_BUBBLE_INSET;
+    if x < mon_x + margin {
+        x = mini_x + mini_w + MASCOT_BUBBLE_INSET;
     }
     let x_min = mon_x + margin;
     let x_max = (mon_x + mon_w - bubble_w - margin).max(x_min);
