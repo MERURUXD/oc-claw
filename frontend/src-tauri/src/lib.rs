@@ -3090,21 +3090,21 @@ async fn open_mini(app: tauri::AppHandle) -> Result<(), String> {
         .skip_taskbar(true)
         .resizable(false)
         .visible(false)
-        .accept_first_mouse(true) // single click from any app
-        .on_window_event({
-            let app_for_events = app.clone();
-            move |event| {
-                if matches!(event, tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)) {
-                    let (w, h) = *BUBBLE_SIZE.lock().unwrap();
-                    let app = app_for_events.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let _ = sync_mascot_bubble(app, w, h).await;
-                    });
-                }
-            }
-        });
+        .accept_first_mouse(true); // single click from any app
 
     let win = builder.build().map_err(|e| e.to_string())?;
+    {
+        let app_for_events = app.clone();
+        win.on_window_event(move |event| {
+            if matches!(event, tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)) {
+                let (w, h) = *BUBBLE_SIZE.lock().unwrap();
+                let app = app_for_events.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = sync_mascot_bubble(app, w, h).await;
+                });
+            }
+        });
+    }
 
     // Use macOS native API to position at menu bar level (like notchi)
     // Must run on main thread for AppKit calls
