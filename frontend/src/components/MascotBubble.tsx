@@ -49,8 +49,9 @@ export default function MascotBubble() {
     const el = contentRef.current
     if (!el || !summary) return
     const ro = new ResizeObserver((entries) => {
-      const rect = entries[0]?.contentRect
-      if (!rect) return
+      const el = entries[0]?.target as HTMLElement | undefined
+      if (!el) return
+      const rect = el.getBoundingClientRect()
       const width = Math.min(Math.ceil(rect.width), 200)
       const height = Math.ceil(rect.height)
       const last = lastSizeRef.current
