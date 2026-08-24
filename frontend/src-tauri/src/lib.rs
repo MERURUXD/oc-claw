@@ -3616,6 +3616,8 @@ async fn set_mini_origin(
                 x, y
             );
             let _ = win.set_position(tauri::LogicalPosition::new(x, y));
+            let (bw, bh) = *BUBBLE_SIZE.lock().unwrap();
+            let _ = sync_mascot_bubble(app.clone(), bw, bh).await;
             return Ok(());
         }
         if let Ok(Some(monitor)) = win.current_monitor() {
