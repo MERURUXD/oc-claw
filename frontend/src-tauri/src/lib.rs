@@ -3426,6 +3426,8 @@ async fn move_mini_by(app: tauri::AppHandle, dx: f64, dy: f64) -> Result<(), Str
             let _ = win.set_position(tauri::LogicalPosition::new(logical_x + dx, logical_y + dy));
         }
     }
+    let (bw, bh) = *BUBBLE_SIZE.lock().unwrap();
+    let _ = sync_mascot_bubble(app.clone(), bw, bh).await;
     Ok(())
 }
 
@@ -3647,6 +3649,8 @@ async fn set_mini_origin(
             let _ = win.set_position(tauri::LogicalPosition::new(x, y + MASCOT_TOP_INSET));
         }
     }
+    let (bw, bh) = *BUBBLE_SIZE.lock().unwrap();
+    let _ = sync_mascot_bubble(app.clone(), bw, bh).await;
     Ok(())
 }
 
