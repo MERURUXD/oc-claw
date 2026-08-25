@@ -5289,11 +5289,11 @@ export default function Mini() {
                                               setEditingSessionTitle(cs.sessionId)
                                             }}
                                           >
-                                            {projectName}
+                                            {cs.source === 'antigravity' && cs.cursorWorkspaceName ? `[${cs.cursorWorkspaceName}] ${projectName}` : projectName}
                                           </span>
                                         )}
-                                        {subtitle && <span className="min-w-0 max-w-[25%] truncate text-[13px] font-normal text-slate-500">· {subtitle}</span>}
-                                        {cs.lastResponse && <span className="min-w-0 max-w-[30%] truncate text-[11px] text-white/40">· {cs.lastResponse}</span>}
+                                        {subtitle && <span className="min-w-0 max-w-[28%] truncate text-[13px] font-normal text-slate-500">· {subtitle}</span>}
+                                        {cs.lastResponse && cs.lastResponse !== '✓' && <span className="min-w-0 max-w-[32%] truncate text-[11px] text-white/40">· {cs.lastResponse}</span>}
                                       </div>
                                       <div className="flex items-center gap-2 shrink-0 ml-auto">
                                         <span className={`text-[11px] px-2 py-0.5 rounded-md font-normal whitespace-nowrap ${sourceBadgeClass}`}>{sourceLabel}</span>
@@ -5579,7 +5579,7 @@ export default function Mini() {
                                           <span className="text-[11px] px-1.5 py-0.5 rounded bg-emerald-900/50 text-emerald-400 shrink-0 ml-2">{t('mini.done', '完成')}</span>
                                         </div>
                                         <div className="px-3 py-2 max-h-[160px] overflow-y-auto scrollbar-thin text-[12px] text-slate-400 leading-[1.6] markdown-content">
-                                          {(cs.source === 'cursor' || cs.source === 'codex' || cs.source === 'gemini' || cs.source === 'opencode' || cs.source === 'antigravity') && cs.lastResponse === '✓' ? (
+                                          {(cs.source === 'cursor' || cs.source === 'codex' || cs.source === 'gemini' || cs.source === 'opencode') && (cs.lastResponse === '✓' || !cs.lastResponse) ? (
                                             <p>
                                               {cs.source === 'codex'
                                                 ? t('mini.codeDone', 'Code has finished working. Click to view.')
@@ -5589,12 +5589,10 @@ export default function Mini() {
                                                       : t('mini.geminiDone', 'Gemini has finished working. Click to view.'))
                                                   : cs.source === 'opencode'
                                                     ? t('mini.opencodeDone', 'opencode has finished working. Click to view.')
-                                                    : cs.source === 'antigravity'
-                                                      ? t('mini.antigravityDone', 'Antigravity has finished working. Click to view.')
-                                                      : t('mini.cursorDone', 'Cursor has finished working. Click to view.')}
+                                                    : t('mini.cursorDone', 'Cursor has finished working. Click to view.')}
                                             </p>
                                           ) : (
-                                            <ReactMarkdown>{cs.lastResponse}</ReactMarkdown>
+                                            <ReactMarkdown>{cs.lastResponse || (cs.source === 'antigravity' ? t('mini.antigravityDone', 'Antigravity has finished working. Click to view.') : '')}</ReactMarkdown>
                                           )}
                                         </div>
                                       </div>
