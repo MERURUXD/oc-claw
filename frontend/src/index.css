@@ -108,127 +108,168 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
 
 /* ---------------------------------------------------------------------------
  * Mascot status bubble window (index.html#/mascot-bubble)
- * A small transparent always-on-top window anchored next to the primary
- * mascot. The window rect is transparent, so ANY outer box-shadow on the card
- * gets clipped by the window bounds and leaves artifacts on the desktop —
- * the card must never use an outer shadow, only inset highlights.
+ * A sleek transparent always-on-top capsule anchored next to the primary mascot.
  * ------------------------------------------------------------------------- */
 .mascot-bubble-root {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 100%;
-  height: 100%;
-  overflow: hidden;
+  width: fit-content;
+  height: fit-content;
+  padding: 4px 6px;
+  box-sizing: border-box;
 }
 
 .mascot-bubble-card {
   position: relative;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 5px 12px 5px 10px;
-  border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  background: linear-gradient(180deg, rgba(32, 36, 52, 0.92), rgba(16, 19, 30, 0.94));
-  box-shadow: none; /* transparent window: outer shadows get clipped — forbidden */
-  font-size: 12px;
-  font-weight: 500;
-  line-height: 1.3;
+  gap: 7px;
+  padding: 4px 10px 4px 9px;
+  border-radius: 9999px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: linear-gradient(135deg, rgba(23, 27, 39, 0.92) 0%, rgba(13, 16, 25, 0.96) 100%);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.22),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.4),
+    0 4px 14px -2px rgba(0, 0, 0, 0.5),
+    0 2px 6px rgba(0, 0, 0, 0.3);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: 11.5px;
+  line-height: 1.2;
   white-space: nowrap;
-  letter-spacing: 0.01em;
+  letter-spacing: 0.015em;
+  user-select: none;
+  cursor: pointer;
+  transition: transform 0.15s ease, border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
 }
 
-/* Inset top highlight — drawn inside the card, safe on a transparent window. */
+.mascot-bubble-card:hover {
+  border-color: rgba(255, 255, 255, 0.28);
+  background: linear-gradient(135deg, rgba(28, 33, 48, 0.95) 0%, rgba(16, 20, 32, 0.98) 100%);
+  transform: translateY(-0.5px);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.28),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.4),
+    0 6px 18px -2px rgba(0, 0, 0, 0.6),
+    0 2px 8px rgba(0, 0, 0, 0.35);
+}
+
+.mascot-bubble-card:active {
+  transform: translateY(0) scale(0.97);
+}
+
+/* Inset top highlight sheen */
 .mascot-bubble-card::before {
   content: '';
   position: absolute;
-  top: 1px;
-  left: 1px;
-  right: 1px;
-  height: 40%;
-  border-radius: 999px 999px 40% 40%;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.10), rgba(255, 255, 255, 0));
+  top: 0;
+  left: 10px;
+  right: 10px;
+  height: 1px;
+  background: linear-gradient(90deg, rgba(255, 255, 255, 0) 0%, rgba(255, 255, 255, 0.4) 50%, rgba(255, 255, 255, 0) 100%);
   pointer-events: none;
 }
 
-.mascot-bubble-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
+.mascot-bubble-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.mascot-bubble-beacon {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 10px;
+  height: 10px;
   flex: none;
 }
-.mascot-bubble-dot.is-running {
-  background: #60a5fa; /* accent (blue) */
-  box-shadow: 0 0 6px rgba(96, 165, 250, 0.7);
-}
-.mascot-bubble-dot.is-waiting {
-  background: #fbbf24; /* amber */
-  box-shadow: 0 0 6px rgba(251, 191, 36, 0.7);
+
+.mascot-bubble-beacon-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  z-index: 1;
+  flex: none;
 }
 
-.mascot-bubble-running {
-  color: #60a5fa; /* accent */
-}
-.mascot-bubble-waiting {
-  color: #fbbf24; /* amber */
-}
-.mascot-bubble-sep {
-  color: rgba(255, 255, 255, 0.35);
-  margin: 0 1px;
+.mascot-bubble-beacon-dot.is-running {
+  background: #38bdf8;
+  box-shadow: 0 0 6px rgba(56, 189, 248, 0.9), 0 0 12px rgba(56, 189, 248, 0.4);
 }
 
-/* ---------------------------------------------------------------------------
- * Mascot status bubble text — 辉光 + 辉光扫描线（暗色反色）
- * 参照 Hermes Studio「正在思考」shimmer（tw-shimmer 手法）：
- *   background-clip: text + 倾斜线性渐变 + 平移 background-position 的亮带。
- * ⚠️ mascot-bubble 是透明窗口：text-shadow / filter: drop-shadow 的外发光
- *   会被窗口边界裁剪出脏边 —— 必须用字形内渐变，禁止外发光。
- * 「反色」：气泡背景恒暗，扫描亮带用偏白色，在暗底上反色成辉光。
- * 兜底：保留各 class 的 `color` 原值（#60a5fa / #fbbf24），只加
- *   `-webkit-text-fill-color: transparent`；不支持 background-clip:text 的
- *   旧引擎回退显示原色，不会隐形。
- * ------------------------------------------------------------------------- */
-.mascot-bubble-running,
-.mascot-bubble-waiting {
-  background-clip: text;
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-size: 200% 100%;
-  animation: mascot-bubble-glow-sweep 3.2s linear infinite;
+.mascot-bubble-beacon-dot.is-waiting {
+  background: #fbbf24;
+  box-shadow: 0 0 6px rgba(251, 191, 36, 0.9), 0 0 12px rgba(251, 191, 36, 0.4);
 }
 
-/* running = 蓝，亮带偏亮蓝白；waiting = 琥珀，亮带偏亮琥珀白 */
-.mascot-bubble-running {
-  --bubble-text: #60a5fa;
-  --bubble-glow: #c9e4ff;
-  background-image: linear-gradient(
-    100deg,
-    var(--bubble-text) 0%,
-    var(--bubble-text) 38%,
-    var(--bubble-glow) 50%,
-    var(--bubble-text) 62%,
-    var(--bubble-text) 100%
-  );
-}
-.mascot-bubble-waiting {
-  --bubble-text: #fbbf24;
-  --bubble-glow: #ffe9b8;
-  background-image: linear-gradient(
-    100deg,
-    var(--bubble-text) 0%,
-    var(--bubble-text) 38%,
-    var(--bubble-glow) 50%,
-    var(--bubble-text) 62%,
-    var(--bubble-text) 100%
-  );
+.mascot-bubble-beacon-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  pointer-events: none;
 }
 
-@keyframes mascot-bubble-glow-sweep {
+.mascot-bubble-beacon-ring.is-running {
+  background: rgba(56, 189, 248, 0.6);
+  animation: mascot-beacon-pulse 2s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+
+.mascot-bubble-beacon-ring.is-waiting {
+  background: rgba(251, 191, 36, 0.6);
+  animation: mascot-beacon-pulse 2.2s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+
+@keyframes mascot-beacon-pulse {
   0% {
-    background-position: 200% 0;
+    transform: scale(0.8);
+    opacity: 0.85;
+  }
+  70% {
+    transform: scale(2.2);
+    opacity: 0;
   }
   100% {
-    background-position: -200% 0;
+    transform: scale(2.2);
+    opacity: 0;
   }
 }
+
+.mascot-bubble-count {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-weight: 700;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.mascot-bubble-count.is-running {
+  color: #38bdf8;
+  text-shadow: 0 0 8px rgba(56, 189, 248, 0.4);
+}
+
+.mascot-bubble-count.is-waiting {
+  color: #fbbf24;
+  text-shadow: 0 0 8px rgba(251, 191, 36, 0.4);
+}
+
+.mascot-bubble-label {
+  color: rgba(241, 245, 249, 0.85);
+  font-weight: 500;
+  font-size: 11px;
+  line-height: 1;
+  letter-spacing: 0.01em;
+}
+
+.mascot-bubble-divider {
+  width: 1px;
+  height: 10px;
+  background: rgba(255, 255, 255, 0.16);
+  margin: 0 2px;
+  flex: none;
+}
+

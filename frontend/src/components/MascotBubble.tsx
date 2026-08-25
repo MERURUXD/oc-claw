@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
+import { emit, listen } from '@tauri-apps/api/event'
 
 interface BubbleSummary {
   running: number
@@ -8,19 +8,16 @@ interface BubbleSummary {
 }
 
 /**
- * Mascot status bubble — a *passive* renderer for the `mascot-bubble` window
+ * Mascot status bubble — an interactive status capsule for the `mascot-bubble` window
  * (`index.html#/mascot-bubble`).
  *
- * It only does three things:
  *   1. Listens for `mascot-bubble-summary` events emitted by Mini.tsx and
- *      renders a one-line "● N running · M waiting" summary.
+ *      renders a refined glassmorphism status capsule.
  *   2. Measures its own content size with a ResizeObserver and reports it to
  *      Rust via `sync_mascot_bubble` so the window can be positioned next to
  *      the primary mascot.
- *   3. Renders nothing when no summary has arrived yet.
- *
- * It never polls sessions and never decides its own visibility — show/hide is
- * driven exclusively by Mini.tsx via `set_mascot_bubble_visible`.
+ *   3. Allows clicking on the bubble to expand the main session panel.
+ *   4. Renders nothing when no summary has arrived yet.
  */
 export default function MascotBubble() {
   const [summary, setSummary] = useState<BubbleSummary | null>(null)
@@ -44,7 +41,7 @@ export default function MascotBubble() {
   }, [])
 
   // Report content size changes to Rust so it can reposition the bubble next
-  // to the mascot (right-aligned, above/below with platform-aware axes).
+  // to the mascot.
   useEffect(() => {
     const el = contentRef.current
     if (!el || !summary) return
@@ -52,7 +49,7 @@ export default function MascotBubble() {
       const el = entries[0]?.target as HTMLElement | undefined
       if (!el) return
       const rect = el.getBoundingClientRect()
-      const width = Math.min(Math.ceil(rect.width), 200)
+      const width = Math.min(Math.ceil(rect.width), 260)
       const height = Math.ceil(rect.height)
       const last = lastSizeRef.current
       if (last && last.width === width && last.height === height) return
@@ -67,16 +64,42 @@ export default function MascotBubble() {
 
   const hasRunning = summary.running > 0
   const hasWaiting = summary.waiting > 0
+  if (!hasRunning && !hasWaiting) return <div className="mascot-bubble-root" />
+
+  const handleClick = () => {
+    emit('mascot-bubble-click').catch(() => {})
+  }
+
   return (
-    <div className="mascot-bubble-root">
-      <div className="mascot-bubble-card" ref={contentRef}>
-        <span className={`mascot-bubble-dot ${hasRunning ? 'is-running' : 'is-waiting'}`} />
-        {hasRunning && <span className="mascot-bubble-running">{summary.running} running</span>}
+    <div className="mascot-bubble-root" ref={contentRef}>
+      <div
+        className="mascot-bubble-card"
+        onClick={handleClick}
+        role="button"
+        tabIndex={0}
+      >
+        {hasRunning && (
+          <div className="mascot-bubble-item">
+            <span className="mascot-bubble-beacon">
+              <span className="mascot-bubble-beacon-ring is-running" />
+              <span className="mascot-bubble-beacon-dot is-running" />
+            </span>
+            <span className="mascot-bubble-count is-running">{summary.running}</span>
+            <span className="mascot-bubble-label">running</span>
+          </div>
+        )}
+
+        {hasRunning && hasWaiting && <span className="mascot-bubble-divider" />}
+
         {hasWaiting && (
-          <>
-            {hasRunning && <span className="mascot-bubble-sep">·</span>}
-            <span className="mascot-bubble-waiting">{summary.waiting} waiting</span>
-          </>
+          <div className="mascot-bubble-item">
+            <span className="mascot-bubble-beacon">
+              <span className="mascot-bubble-beacon-ring is-waiting" />
+              <span className="mascot-bubble-beacon-dot is-waiting" />
+            </span>
+            <span className="mascot-bubble-count is-waiting">{summary.waiting}</span>
+            <span className="mascot-bubble-label">waiting</span>
+          </div>
         )}
       </div>
     </div>
