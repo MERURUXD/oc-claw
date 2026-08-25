@@ -2,6 +2,8 @@ import type { ChromaKeyOptions, Offset } from '../utils/spriteUtils'
 
 export type { ChromaKeyOptions, Offset }
 
+export type ClaudeStatsSource = 'cc' | 'codex' | 'cursor' | 'gemini' | 'hermes' | 'opencode' | 'antigravity'
+
 export interface SessionInfo {
   id: string
   label?: string

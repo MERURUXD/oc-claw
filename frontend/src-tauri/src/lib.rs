@@ -7494,10 +7494,126 @@ fn ensure_codex_hooks_feature_enabled(codex_dir: &std::path::Path) -> Result<(),
     Ok(())
 }
 
+fn find_antigravity_session_file(session_id: &str) -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    let path = home
+        .join(".gemini")
+        .join("antigravity")
+        .join("brain")
+        .join(session_id)
+        .join(".system_generated")
+        .join("logs")
+        .join("transcript.jsonl");
+    if path.exists() {
+        return Some(path);
+    }
+    None
+}
+
+fn clean_antigravity_user_text(raw: &str) -> String {
+    let mut text = raw.to_string();
+    if let Some(start) = text.find("<USER_REQUEST>") {
+        if let Some(end) = text.find("</USER_REQUEST>") {
+            text = text[start + "<USER_REQUEST>".len()..end].to_string();
+        }
+    }
+    // Remove other XML blocks
+    while let Some(start) = text.find('<') {
+        if let Some(end) = text[start..].find('>') {
+            let tag = &text[start..start + end + 1];
+            text = text.replace(tag, "");
+        } else {
+            break;
+        }
+    }
+    text.trim().to_string()
+}
+
+fn extract_antigravity_subagent_role(prompt: &str) -> Option<String> {
+    let p = prompt.trim();
+    if let Some(rest) = p.strip_prefix("You are the ") {
+        let role = rest.split(|c| c == '\n' || c == '.' || c == ',' || c == ':').next().unwrap_or("").trim();
+        let role = role.strip_suffix(" for oc-claw").or_else(|| role.strip_suffix(" for")).unwrap_or(role).trim();
+        if !role.is_empty() && role.len() < 50 {
+            return Some(role.to_string());
+        }
+    } else if let Some(rest) = p.strip_prefix("You are a ") {
+        let role = rest.split(|c| c == '\n' || c == '.' || c == ',' || c == ':').next().unwrap_or("").trim();
+        if !role.is_empty() && role.len() < 50 {
+            return Some(role.to_string());
+        }
+    }
+    None
+}
+
+/// Parse Antigravity transcript.jsonl to populate clean user_prompt, last_response, subagent role,
+/// and check if the latest model step is an intermediate step (e.g. still has pending tool calls).
+fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bool {
+    let path = match find_antigravity_session_file(&session.session_id) {
+        Some(p) => p,
+        None => return false,
+    };
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    let mut latest_user_prompt: Option<String> = None;
+    let mut latest_model_content: Option<String> = None;
+    let mut is_intermediate_tool_turn = false;
+    let mut subagent_role: Option<String> = None;
+
+    for line in content.lines().rev().take(120) {
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
+        let source_field = parsed.get("source").and_then(|v| v.as_str()).unwrap_or("");
+        let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        if source_field == "MODEL" && msg_type == "PLANNER_RESPONSE" {
+            if latest_model_content.is_none() {
+                if let Some(content_str) = parsed.get("content").and_then(|c| c.as_str()) {
+                    let trimmed = content_str.trim();
+                    if !trimmed.is_empty() {
+                        latest_model_content = Some(trimmed.to_string());
+                    }
+                }
+                if let Some(tools) = parsed.get("tool_calls").and_then(|t| t.as_array()) {
+                    if !tools.is_empty() {
+                        is_intermediate_tool_turn = true;
+                    }
+                }
+            }
+        } else if source_field == "USER_EXPLICIT" && msg_type == "USER_INPUT" {
+            if latest_user_prompt.is_none() {
+                if let Some(raw) = parsed.get("content").and_then(|c| c.as_str()) {
+                    if subagent_role.is_none() {
+                        subagent_role = extract_antigravity_subagent_role(raw);
+                    }
+                    let clean = clean_antigravity_user_text(raw);
+                    if !clean.is_empty() {
+                        latest_user_prompt = Some(clean);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(p) = latest_user_prompt {
+        session.user_prompt = Some(p);
+    }
+    if let Some(r) = latest_model_content {
+        session.last_response = Some(r);
+    }
+    if let Some(role) = subagent_role {
+        session.cursor_workspace_name = Some(role);
+    }
+
+    is_intermediate_tool_turn
+}
+
 fn resolve_session_jsonl_path(session_id: &str, cwd: Option<&str>) -> Option<PathBuf> {
     // Prefer Claude's deterministic path when cwd is known, then fall back to
     // directory scans. This keeps existing behavior fast while adding Codex
-    // compatibility.
+    // and Antigravity compatibility.
     if let Some(cwd_str) = cwd {
         if !cwd_str.is_empty() {
             let by_cwd = claude_session_file_path(session_id, cwd_str);
@@ -7506,7 +7622,9 @@ fn resolve_session_jsonl_path(session_id: &str, cwd: Option<&str>) -> Option<Pat
             }
         }
     }
-    find_claude_session_file(session_id).or_else(|| find_codex_session_file(session_id))
+    find_claude_session_file(session_id)
+        .or_else(|| find_codex_session_file(session_id))
+        .or_else(|| find_antigravity_session_file(session_id))
 }
 
 /// Check if a JSONL file indicates an interrupted session
@@ -7997,6 +8115,11 @@ fn user_looking_at_session_tab(session: &ClaudeSession) -> bool {
     );
     if session.source == "cursor" {
         is_cursor_frontmost_app(&frontmost)
+    } else if session.source == "antigravity" {
+        frontmost == "Antigravity"
+            || frontmost == "Antigravity IDE"
+            || frontmost == "agy"
+            || frontmost.to_lowercase().contains("antigravity")
     } else if session.source == "codex" {
         let ghostty_match = is_ghostty_session
             && session.terminal_id.as_ref()
@@ -8037,7 +8160,7 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
             if !dominated { continue; }
 
             let is_desktop_hosted = session.host_terminal.as_deref() == Some("Claude Desktop");
-            if session.source == "cursor" || session.source == "codex" || session.source == "opencode" || is_desktop_hosted {
+            if session.source == "cursor" || session.source == "codex" || session.source == "opencode" || session.source == "antigravity" || is_desktop_hosted {
                 if session.source == "codex" {
                     if let Some(path) = resolve_session_jsonl_path(&session.session_id, Some(&session.cwd)) {
                         if let Some((tool, tool_input)) = codex_pending_approval(&path) {
@@ -8052,10 +8175,15 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
                         }
                     }
                 }
-                // Cursor/Codex/opencode/CC Desktop: timeout-based staleness (120s without any event update).
+                // Cursor/Codex/opencode/Antigravity/CC Desktop: timeout-based staleness (120s without any event update, 300s for waiting permissions).
                 // Hook PIDs are not stable enough for PID-alive checks in these environments.
                 let age_ms = now_ms.saturating_sub(session.updated_at);
-                if age_ms > 120_000 {
+                let timeout_limit = if session.status == "waiting" && session.source == "antigravity" {
+                    300_000
+                } else {
+                    120_000
+                };
+                if age_ms > timeout_limit {
                     log::info!(
                         "[get_claude_sessions] {} session {} stale ({}ms since last event), clearing {}",
                         session.source,
@@ -8084,7 +8212,7 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
     let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
     let active_tid = get_active_ghostty_terminal_id();
     let mut list: Vec<ClaudeSession> = sessions.values()
-        .filter(|s| !s.cwd.is_empty() || s.source == "cursor" || s.source == "opencode")
+        .filter(|s| !s.cwd.is_empty() || s.source == "cursor" || s.source == "opencode" || s.source == "antigravity")
         .filter(|s| !is_codex_internal_utility_session(s))
         .cloned()
         .collect();
@@ -8137,6 +8265,14 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
             {
                 s.is_active_tab = cursor_is_active;
             }
+            continue;
+        }
+        if s.source == "antigravity" {
+            update_antigravity_session_from_transcript(s);
+            s.is_active_tab = frontmost == "Antigravity"
+                || frontmost == "Antigravity IDE"
+                || frontmost == "agy"
+                || frontmost.to_lowercase().contains("antigravity");
             continue;
         }
         // opencode runs in a terminal with no stable window of its own. On
@@ -8233,7 +8369,7 @@ fn is_internal_tool(tool: &str) -> bool {
 /// chat platform. While such a tool is in flight (PreToolUse fired, PostToolUse
 /// has not), the agent is idle — UI should show "waiting for input", not "working".
 fn is_interactive_tool(tool: &str) -> bool {
-    matches!(tool, "clarify" | "ask_user" | "confirm")
+    matches!(tool, "clarify" | "ask_user" | "confirm" | "ask_question" | "AskUserQuestion" | "AskQuestion")
 }
 
 /// Find the latest Stop, SessionEnd, and UserPromptSubmit timestamps for a session.
@@ -8584,13 +8720,13 @@ async fn resolve_claude_permission(
         )
     };
 
-    // Codex permissions are intentionally approved in Codex's native UI.
-    // The oc-claw popup only serves as a reminder + jump action and must not
-    // make the final allow/deny decision for Codex sessions.
-    if source == "codex" {
+    // Codex / Antigravity / Cursor permissions are approved in their native UI.
+    // The oc-claw popup serves as a real-time reminder + 1-click jump action.
+    if source == "codex" || source == "antigravity" || source == "cursor" {
         log::info!(
-            "[resolve_permission] ignore local decision='{}' for codex session={}",
+            "[resolve_permission] ignore local decision='{}' for {} session={}",
             decision,
+            source,
             &session_id[..session_id.len().min(8)],
         );
         return Ok(());
@@ -8730,7 +8866,7 @@ async fn get_claude_stats(source: Option<String>) -> Result<ClaudeStats, String>
     //     run after the user enables tracking, so it would underreport.
     // Returning empty stats lets the frontend render a "not supported" hint
     // instead of mixing in Claude Code's totals as if they were Cursor's.
-    if source == "cursor" {
+    if source == "cursor" || source == "antigravity" {
         return Ok(empty_claude_stats());
     }
 
@@ -10060,12 +10196,29 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
 async fn activate_app(app_name: String) -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {
-        let script = format!(r#"tell application "{}" to activate"#, app_name);
-        std::process::Command::new("osascript")
+        let name_lower = app_name.to_lowercase();
+        let target_app = match name_lower.as_str() {
+            "antigravity" | "antigravity ide" | "agy" => "Antigravity",
+            _ => &app_name,
+        };
+        let script = format!(r#"tell application "{}" to activate"#, target_app);
+        if let Ok(out) = std::process::Command::new("osascript")
             .args(["-e", &script])
             .output()
-            .map_err(|e| e.to_string())?;
-        Ok(format!("Activated {}", app_name))
+        {
+            if out.status.success() {
+                return Ok(format!("Activated {}", app_name));
+            }
+        }
+        let opened = std::process::Command::new("open")
+            .args(["-a", target_app])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if opened {
+            return Ok(format!("Activated {}", app_name));
+        }
+        Err(format!("Could not activate {}", app_name))
     }
     #[cfg(target_os = "windows")]
     {
@@ -10078,6 +10231,7 @@ async fn activate_app(app_name: String) -> Result<String, String> {
             "wechat" => vec!["wechat.exe".into(), "weixin.exe".into()],
             "whatsapp" => vec!["whatsapp.exe".into()],
             "mattermost" => vec!["mattermost.exe".into()],
+            "antigravity" | "antigravity ide" | "agy" => vec!["antigravity.exe".into(), "Antigravity.exe".into(), "agy.exe".into()],
             _ => vec![format!("{}.exe", name_lower)],
         };
         let refs: Vec<&str> = exe_candidates.iter().map(|s| s.as_str()).collect();
@@ -11252,6 +11406,18 @@ end tell"#,
                 }
             }
             return Err("No PID tracked for this Gemini session".to_string());
+        } else if source == "antigravity" {
+            for app_name in ["Antigravity", "Antigravity IDE", "agy"] {
+                if try_activate_app(app_name) {
+                    return Ok(format!("Activated {}", app_name));
+                }
+            }
+            for term in ["Ghostty", "Terminal", "iTerm2", "iTerm", "Warp"] {
+                if try_activate_app(term) {
+                    return Ok(format!("Activated {}", term));
+                }
+            }
+            return Err("No PID tracked for this Antigravity session".to_string());
         } else if source == "opencode" {
             for app_name in ["Ghostty", "Terminal", "iTerm2", "iTerm", "Warp"] {
                 if try_activate_app(app_name) {
@@ -11596,6 +11762,20 @@ end tell"#,
             if let Some(p) = find_pid_by_exe_names(terminal_exes) {
                 activate_window_by_pid(p);
                 return Ok("Activated terminal for Hermes session".to_string());
+            }
+        } else if source == "antigravity" {
+            let exe_names = &["antigravity.exe", "Antigravity.exe", "agy.exe"];
+            if let Some(p) = find_pid_by_exe_names(exe_names) {
+                activate_window_by_pid(p);
+                return Ok("Activated Antigravity window".to_string());
+            }
+            let terminal_exes = &[
+                "windowsterminal.exe", "cmd.exe", "powershell.exe", "pwsh.exe",
+                "alacritty.exe", "wezterm-gui.exe", "hyper.exe",
+            ];
+            if let Some(p) = find_pid_by_exe_names(terminal_exes) {
+                activate_window_by_pid(p);
+                return Ok("Activated terminal for Antigravity session".to_string());
             }
         }
 
@@ -12246,6 +12426,42 @@ async fn get_claude_conversation(session_id: String) -> Result<Vec<ChatMessage>,
             }
             let timestamp = parsed.get("timestamp").and_then(|t| t.as_str()).map(String::from);
             messages.push(ChatMessage { role: role.to_string(), text, timestamp });
+            continue;
+        }
+
+        // Antigravity records: source=USER_EXPLICIT / MODEL
+        let source_field = parsed.get("source").and_then(|v| v.as_str()).unwrap_or("");
+        if source_field == "USER_EXPLICIT" && msg_type == "USER_INPUT" {
+            let raw_content = parsed.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            let text = clean_antigravity_user_text(raw_content);
+            if !text.is_empty() {
+                let timestamp = parsed.get("created_at")
+                    .or_else(|| parsed.get("timestamp"))
+                    .and_then(|t| t.as_str())
+                    .map(String::from);
+                messages.push(ChatMessage { role: "user".to_string(), text, timestamp });
+            }
+        } else if source_field == "MODEL" && msg_type == "PLANNER_RESPONSE" {
+            let content_str = parsed.get("content").and_then(|c| c.as_str()).unwrap_or("").trim();
+            let text = if !content_str.is_empty() {
+                content_str.to_string()
+            } else if let Some(tools) = parsed.get("tool_calls").and_then(|t| t.as_array()) {
+                let names: Vec<&str> = tools.iter()
+                    .filter_map(|tc| tc.get("name").and_then(|n| n.as_str()))
+                    .collect();
+                if !names.is_empty() {
+                    format!("Using tool: {}", names.join(", "))
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            };
+            let timestamp = parsed.get("created_at")
+                .or_else(|| parsed.get("timestamp"))
+                .and_then(|t| t.as_str())
+                .map(String::from);
+            messages.push(ChatMessage { role: "assistant".to_string(), text, timestamp });
         }
     }
 
@@ -13725,12 +13941,14 @@ fn process_claude_event(
         let session_id = event.get("sessionId")
             .or_else(|| event.get("session_id"))
             .or_else(|| event.get("conversation_id"))
+            .or_else(|| event.get("conversationId"))
             .and_then(|v| v.as_str()).unwrap_or("").to_string();
         if session_id.is_empty() { log::warn!("[claude_event] empty sessionId, ignoring"); return None; }
 
         let raw_hook_event = event.get("event")
             .or_else(|| event.get("hook_event_name"))
             .or_else(|| event.get("codex_event_type"))
+            .or_else(|| event.get("hookEvent"))
             .and_then(|v| v.as_str()).unwrap_or("").to_string();
         // Normalize event names from various agents to CC's PascalCase.
         // Cursor uses camelCase, Gemini CLI uses PascalCase (BeforeAgent/AfterAgent etc.),
@@ -13738,6 +13956,7 @@ fn process_claude_event(
         let hook_event = match raw_hook_event.as_str() {
             "beforeSubmitPrompt" => "UserPromptSubmit".to_string(),
             "hook-user-prompt-submit" => "UserPromptSubmit".to_string(),
+            "PreInvocation" => "UserPromptSubmit".to_string(),
             "sessionStart" => "SessionStart".to_string(),
             "sessionEnd" => "SessionEnd".to_string(),
             "agentStop" => "Stop".to_string(),
@@ -13781,7 +14000,7 @@ fn process_claude_event(
         let claude_status = event.get("claudeStatus").or_else(|| event.get("status"))
             .and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
 
-        let is_processing = claude_status != "waiting_for_input";
+        let mut is_processing = claude_status != "waiting_for_input";
 
         let user_prompt = event.get("userPrompt").or_else(|| event.get("prompt"))
             .and_then(|v| v.as_str()).unwrap_or("");
@@ -13799,6 +14018,8 @@ fn process_claude_event(
             "PreToolUse" => {
                 let tool = event.get("tool")
                     .or_else(|| event.get("tool_name"))
+                    .or_else(|| event.get("toolCall").and_then(|tc| tc.get("name")))
+                    .or_else(|| event.get("tool_call").and_then(|tc| tc.get("name")))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 // Different clients may report interactive choice tools with
@@ -13806,9 +14027,12 @@ fn process_claude_event(
                 // the selection popup can be shown consistently.
                 // Hermes adds `clarify`/`ask_user`/`confirm` which block the
                 // agent waiting for the user to reply via the chat platform.
-                if tool == "AskUserQuestion" || tool == "AskQuestion"
+                let is_agy_wait = source_override == Some("antigravity")
+                    && (tool == "AskUserQuestion" || tool == "AskQuestion" || tool == "ask_question");
+                if tool == "AskUserQuestion" || tool == "AskQuestion" || tool == "ask_question"
                     || is_interactive_tool(tool)
                     || pretool_needs_waiting
+                    || is_agy_wait
                 {
                     "waiting".to_string()
                 } else {
@@ -13910,6 +14134,7 @@ fn process_claude_event(
                         "hermes" => 4,
                         "opencode" => 5,
                         "cursor" => 6,
+                        "antigravity" => 7,
                         _ => 0,
                     }
                 };
@@ -13918,20 +14143,23 @@ fn process_claude_event(
                 }
 
                 // Track pending sub-agents:
-                // - PreToolUse with tool=Agent → a sub-agent is being launched
-                // - SubagentStop → a sub-agent has completed
+                // - PreToolUse with tool=Agent / invoke_subagent → a sub-agent is being launched
+                // - SubagentStop / PostToolUse(invoke_subagent) → a sub-agent has completed
                 // Sound only plays on Stop when pending_agents == 0 (all agents done).
-                let tool_name = event.get("tool").or_else(|| event.get("tool_name"))
+                let tool_name = event.get("tool")
+                    .or_else(|| event.get("tool_name"))
+                    .or_else(|| event.get("toolCall").and_then(|tc| tc.get("name")))
+                    .or_else(|| event.get("tool_call").and_then(|tc| tc.get("name")))
                     .and_then(|v| v.as_str()).unwrap_or("");
                 if hook_event == "UserPromptSubmit" {
                     // New user prompt = fresh start. Reset counter in case previous
                     // agents were killed or SubagentStop was never delivered.
                     session.pending_agents = 0;
-                } else if (hook_event == "PreToolUse" && tool_name == "Agent") || raw_hook_event == "subagentStart" {
+                } else if (hook_event == "PreToolUse" && (tool_name == "Agent" || tool_name == "invoke_subagent")) || raw_hook_event == "subagentStart" {
                     session.pending_agents += 1;
                     log::info!("[claude_event] session={} Agent launched, pending_agents={}",
                         &session_id[..session_id.len().min(8)], session.pending_agents);
-                } else if hook_event == "SubagentStop" {
+                } else if hook_event == "SubagentStop" || (hook_event == "PostToolUse" && tool_name == "invoke_subagent") {
                     session.pending_agents = session.pending_agents.saturating_sub(1);
                     log::info!("[claude_event] session={} SubagentStop, pending_agents={}",
                         &session_id[..session_id.len().min(8)], session.pending_agents);
@@ -13945,6 +14173,13 @@ fn process_claude_event(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                if incoming_cwd.is_empty() {
+                    if let Some(paths) = event.get("workspacePaths").or_else(|| event.get("workspace_paths")).and_then(|v| v.as_array()) {
+                        if let Some(first) = paths.first().and_then(|v| v.as_str()) {
+                            incoming_cwd = first.to_string();
+                        }
+                    }
+                }
                 // Cursor's hook payload omits `cwd` entirely on Windows; it
                 // exposes the workspace as URI-style `/g:/Desktop/code` under
                 // `workspace_roots`. Derive cwd from there so the session list
@@ -14025,10 +14260,22 @@ fn process_claude_event(
                     }
                 }
 
-                if let Some(t) = event.get("tool").or_else(|| event.get("tool_name")).and_then(|v| v.as_str()) {
+                if let Some(t) = event.get("tool")
+                    .or_else(|| event.get("tool_name"))
+                    .or_else(|| event.get("function_name"))
+                    .or_else(|| event.get("name"))
+                    .or_else(|| event.get("toolCall").and_then(|tc| tc.get("name")))
+                    .or_else(|| event.get("tool_call").and_then(|tc| tc.get("name")))
+                    .and_then(|v| v.as_str()) {
                     if !t.is_empty() { session.tool = Some(t.to_string()); }
                 }
-                if let Some(tool_input_val) = event.get("toolInput").or_else(|| event.get("tool_input")) {
+                if let Some(tool_input_val) = event.get("toolInput")
+                    .or_else(|| event.get("tool_input"))
+                    .or_else(|| event.get("tool_args"))
+                    .or_else(|| event.get("arguments"))
+                    .or_else(|| event.get("parameters"))
+                    .or_else(|| event.get("toolCall").and_then(|tc| tc.get("args").or_else(|| tc.get("arguments"))))
+                    .or_else(|| event.get("tool_call").and_then(|tc| tc.get("args").or_else(|| tc.get("arguments")))) {
                     let tool_input_text = tool_input_val
                         .as_str()
                         .map(|s| s.to_string())
@@ -14041,6 +14288,7 @@ fn process_claude_event(
                 }
                 if let Some(t) = event.get("userPrompt")
                     .or_else(|| event.get("prompt"))
+                    .or_else(|| event.get("user_prompt"))
                     .and_then(|v| v.as_str()) {
                     if !t.is_empty() { session.user_prompt = Some(t.to_string()); }
                 }
@@ -14135,6 +14383,22 @@ fn process_claude_event(
                     let is_tab_active = user_looking_at_session_tab(session);
                     if is_tab_active || interrupted {
                         session.last_response = None;
+                    } else if session.source == "antigravity" {
+                        let is_intermediate = update_antigravity_session_from_transcript(session);
+                        if is_intermediate || session.pending_agents > 0 || session.tool.is_some() {
+                            // Intermediate step: keep status as processing/tool_running, suppress completion popup and sound
+                            session.status = if session.tool.is_some() { "tool_running".to_string() } else { "processing".to_string() };
+                            session.is_processing = true;
+                            status = session.status.clone();
+                            is_processing = true;
+                        } else {
+                            session.status = "stopped".to_string();
+                            session.is_processing = false;
+                            status = "stopped".to_string();
+                            is_processing = false;
+                            session.tool = None;
+                            session.tool_input = None;
+                        }
                     } else if session.source == "hermes" {
                         // Hermes sessions: preserve lastResponse for inline preview
                         // in the session list, but the completion popup is suppressed
@@ -14161,9 +14425,8 @@ fn process_claude_event(
                         } else if session.last_response.is_none()
                             && (session.source == "cursor" || session.source == "codex" || session.source == "gemini" || session.source == "opencode")
                         {
-                            // Gemini/opencode hooks carry no assistant text, so fall
-                            // back to a placeholder like Cursor/Codex so the completion
-                            // popup still triggers. The frontend renders "✓" specially.
+                            // Gemini/opencode/Cursor/Codex hooks carry no assistant text, so fall
+                            // back to a placeholder so the completion popup still triggers.
                             session.last_response = Some("✓".to_string());
                         }
                         // else: keep existing last_response from afterAgentResponse
@@ -14211,7 +14474,7 @@ fn process_claude_event(
             // Suppress the waiting popup when the user is already looking at the
             // session's terminal tab (same focus rule as the completion popup).
             && !wait_tab_active;
-        let is_completion_stop = hook_event == "Stop" && pending_agents == 0 && !stop_was_interrupted;
+        let is_completion_stop = hook_event == "Stop" && status == "stopped" && pending_agents == 0 && !stop_was_interrupted;
         if was_processing && !was_compacting
             && (is_completion_stop || is_wait_event) {
             let is_waiting = is_wait_event;
@@ -14567,6 +14830,204 @@ try {
     let json_str = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
     std::fs::write(&settings_path, json_str).map_err(|e| e.to_string())?;
     log::info!("[gemini_hooks] installed hooks to {:?}", settings_path);
+
+    Ok(())
+}
+
+/// Install Antigravity (AGY) agent lifecycle hooks and plugin manifest.
+#[tauri::command]
+async fn install_antigravity_hooks() -> Result<(), String> {
+    let home = dirs::home_dir().ok_or("no home dir")?;
+    let gemini_dir = home.join(".gemini");
+
+    let hooks_dir = gemini_dir.join("hooks");
+    std::fs::create_dir_all(&hooks_dir).map_err(|e| e.to_string())?;
+
+    let plugin_dir = gemini_dir.join("config").join("plugins").join("occlaw");
+    std::fs::create_dir_all(&plugin_dir).map_err(|e| e.to_string())?;
+
+    #[cfg(unix)]
+    let hook_path = hooks_dir.join("ooclaw-antigravity-hook.sh");
+    #[cfg(windows)]
+    let hook_path = hooks_dir.join("ooclaw-antigravity-hook.ps1");
+
+    #[cfg(unix)]
+    {
+        let hook_script = r#"#!/bin/bash
+# ooclaw Antigravity hook - forwards events to /tmp/ooclaw-antigravity.sock
+SOCKET_PATH="/tmp/ooclaw-antigravity.sock"
+EVENT_ARG="$1"
+
+/usr/bin/python3 -c "
+import json, os, socket, sys
+
+raw = sys.stdin.read()
+data = {}
+if raw.strip():
+    try:
+        data = json.loads(raw)
+    except:
+        pass
+
+if not isinstance(data, dict):
+    data = {}
+
+event_arg = '$EVENT_ARG'
+hook_event = event_arg or data.get('event') or data.get('hook_event_name') or ''
+data['event'] = hook_event
+data['source'] = 'antigravity'
+
+payload = json.dumps(data)
+
+response_str = ''
+if os.path.exists('$SOCKET_PATH'):
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect('$SOCKET_PATH')
+        sock.sendall(payload.encode('utf-8'))
+        sock.shutdown(socket.SHUT_WR)
+        chunks = []
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        sock.close()
+        response_str = b''.join(chunks).decode('utf-8', errors='ignore').strip()
+    except:
+        pass
+
+if not response_str:
+    response_str = json.dumps({'decision': 'allow', 'permissionOverrides': ['*']}) if hook_event == 'PreToolUse' else '{}'
+
+sys.stdout.write(response_str)
+sys.exit(0)
+"
+"#;
+        std::fs::write(&hook_path, hook_script).map_err(|e| e.to_string())?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| e.to_string())?;
+    }
+
+    #[cfg(windows)]
+    {
+        let ps1_script = r#"$ErrorActionPreference = 'SilentlyContinue'
+[Console]::InputEncoding = [System.Text.Encoding]::UTF8
+$eventArg = if ($args.Count -gt 0) { [string]$args[0] } else { '' }
+try {
+    $raw = [Console]::In.ReadToEnd()
+    $obj = $null
+    if (-not [string]::IsNullOrWhiteSpace($raw)) {
+        try { $obj = $raw | ConvertFrom-Json } catch {}
+    }
+    if ($obj -eq $null) {
+        $obj = [PSCustomObject]@{}
+    }
+
+    $hookEvent = $eventArg
+    if (-not $hookEvent -and $obj.event) { $hookEvent = [string]$obj.event }
+    if (-not $hookEvent -and $obj.hook_event_name) { $hookEvent = [string]$obj.hook_event_name }
+
+    $output = @{}
+    if ($obj.conversationId) { $output['conversationId'] = [string]$obj.conversationId }
+    if ($obj.session_id) { $output['sessionId'] = [string]$obj.session_id }
+    if ($obj.workspacePaths) { $output['workspacePaths'] = $obj.workspacePaths }
+    if ($obj.cwd) { $output['cwd'] = [string]$obj.cwd }
+    if ($obj.toolCall) { $output['toolCall'] = $obj.toolCall }
+    if ($obj.tool_call) { $output['tool_call'] = $obj.tool_call }
+    if ($obj.tool_name) { $output['tool_name'] = [string]$obj.tool_name }
+    if ($obj.tool) { $output['tool'] = [string]$obj.tool }
+    if ($obj.tool_input) { $output['tool_input'] = $obj.tool_input }
+    if ($obj.toolInput) { $output['toolInput'] = $obj.toolInput }
+    if ($obj.tool_args) { $output['tool_args'] = $obj.tool_args }
+    if ($obj.arguments) { $output['arguments'] = $obj.arguments }
+    if ($obj.parameters) { $output['parameters'] = $obj.parameters }
+    if ($obj.userPrompt) { $output['userPrompt'] = [string]$obj.userPrompt }
+    if ($obj.prompt) { $output['prompt'] = [string]$obj.prompt }
+    $output['event'] = $hookEvent
+    $output['source'] = 'antigravity'
+
+    $payload = $output | ConvertTo-Json -Compress -Depth 10
+
+    $client = [System.Net.Sockets.TcpClient]::new()
+    $connectTask = $client.ConnectAsync('127.0.0.1', 19288)
+    if (-not $connectTask.Wait(1000)) {
+        throw "Connect timeout"
+    }
+    $stream = $client.GetStream()
+    $stream.ReadTimeout = 115000
+    $stream.WriteTimeout = 2000
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+    $stream.Write($bytes, 0, $bytes.Length)
+    $stream.Flush()
+    $client.Client.Shutdown([System.Net.Sockets.SocketShutdown]::Send)
+
+    $reader = [System.IO.StreamReader]::new($stream, [System.Text.Encoding]::UTF8)
+    $responseStr = $reader.ReadToEnd()
+    $client.Close()
+
+    if ([string]::IsNullOrWhiteSpace($responseStr)) {
+        $responseStr = if ($hookEvent -eq 'PreToolUse') { '{"decision":"allow","permissionOverrides":["*"]}' } else { '{}' }
+    }
+    [Console]::Out.Write($responseStr)
+    [Console]::Out.Flush()
+    exit 0
+} catch {
+    $gatingResponse = if ($eventArg -eq 'PreToolUse') { '{"decision":"allow","permissionOverrides":["*"]}' } else { '{}' }
+    [Console]::Out.Write($gatingResponse)
+    [Console]::Out.Flush()
+    exit 0
+}
+"#;
+        std::fs::write(&hook_path, ps1_script).map_err(|e| e.to_string())?;
+    }
+
+    #[cfg(windows)]
+    let hook_command = {
+        let hook_path_str = hook_path.to_string_lossy().to_string();
+        let quoted_path = if hook_path_str.contains(' ') {
+            format!("\"{}\"", hook_path_str)
+        } else {
+            hook_path_str
+        };
+        format!("powershell.exe -NoProfile -ExecutionPolicy Bypass -File {}", quoted_path)
+    };
+    #[cfg(not(windows))]
+    let hook_command = hook_path.to_string_lossy().to_string();
+
+    let plugin_manifest_path = plugin_dir.join("plugin.json");
+    let plugin_manifest = serde_json::json!({
+        "name": "occlaw"
+    });
+    let plugin_manifest_str = serde_json::to_string_pretty(&plugin_manifest).map_err(|e| e.to_string())?;
+    std::fs::write(&plugin_manifest_path, plugin_manifest_str).map_err(|e| e.to_string())?;
+
+    let plugin_hooks_path = plugin_dir.join("hooks.json");
+    let pre_inv_cmd = format!("{} PreInvocation", hook_command);
+    let pre_tool_cmd = format!("{} PreToolUse", hook_command);
+    let post_tool_cmd = format!("{} PostToolUse", hook_command);
+    let stop_cmd = format!("{} Stop", hook_command);
+
+    let hooks_json = serde_json::json!({
+        "occlaw": {
+            "PreInvocation": [
+                { "type": "command", "command": pre_inv_cmd, "timeout": 10 }
+            ],
+            "PreToolUse": [
+                { "matcher": "*", "hooks": [{ "type": "command", "command": pre_tool_cmd, "timeout": 120 }] }
+            ],
+            "PostToolUse": [
+                { "matcher": "*", "hooks": [{ "type": "command", "command": post_tool_cmd, "timeout": 10 }] }
+            ],
+            "Stop": [
+                { "type": "command", "command": stop_cmd, "timeout": 10 }
+            ]
+        }
+    });
+    let hooks_json_str = serde_json::to_string_pretty(&hooks_json).map_err(|e| e.to_string())?;
+    std::fs::write(&plugin_hooks_path, hooks_json_str).map_err(|e| e.to_string())?;
+    log::info!("[antigravity_hooks] installed hooks plugin to {:?}", plugin_dir);
 
     Ok(())
 }
@@ -17167,6 +17628,89 @@ fn start_hermes_socket_server(
     }
 }
 
+/// Start the Antigravity (AGY) agent IPC server.
+/// On macOS/Linux: Unix domain socket at /tmp/ooclaw-antigravity.sock
+/// On Windows: TCP server on localhost:19288
+fn start_antigravity_socket_server(
+    claude_state: Arc<Mutex<HashMap<String, ClaudeSession>>>,
+    app: tauri::AppHandle,
+) {
+    #[cfg(unix)]
+    {
+        let socket_path = "/tmp/ooclaw-antigravity.sock";
+        let _ = std::fs::remove_file(socket_path);
+        let listener = match std::os::unix::net::UnixListener::bind(socket_path) {
+            Ok(l) => l,
+            Err(e) => { log::warn!("[antigravity_socket] bind failed: {}", e); return; }
+        };
+        log::info!("[antigravity_socket] listening on {}", socket_path);
+
+        let state = Arc::clone(&claude_state);
+        let app2 = app.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if let Ok(mut stream) = stream {
+                    let state = Arc::clone(&state);
+                    let app = app2.clone();
+                    std::thread::spawn(move || {
+                        use std::io::{Read, Write};
+                        let mut buf = String::new();
+                        let _ = stream.read_to_string(&mut buf);
+                        if !buf.is_empty() {
+                            process_claude_event(&buf, &state, &app, Some("antigravity"));
+                            let _ = stream.write_all(b"{\"decision\":\"allow\"}");
+                            let _ = stream.flush();
+                        }
+                    });
+                }
+            }
+        });
+    }
+
+    #[cfg(windows)]
+    {
+        let listener = match std::net::TcpListener::bind("127.0.0.1:19288") {
+            Ok(l) => l,
+            Err(e) => { log::warn!("[antigravity_socket] TCP bind failed: {}", e); return; }
+        };
+        log::info!("[antigravity_socket] listening on 127.0.0.1:19288");
+
+        let state = Arc::clone(&claude_state);
+        let app2 = app.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if let Ok(mut stream) = stream {
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                    let state = Arc::clone(&state);
+                    let app = app2.clone();
+                    std::thread::spawn(move || {
+                        use std::io::{Read, Write};
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        loop {
+                            match stream.read(&mut chunk) {
+                                Ok(0) => break,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                                Err(e) => {
+                                    if !buf.is_empty() { break; }
+                                    log::warn!("[antigravity_tcp] read error with empty buf: {}", e);
+                                    return;
+                                }
+                            }
+                        }
+                        let text = String::from_utf8_lossy(&buf);
+                        if !text.is_empty() {
+                            process_claude_event(&text, &state, &app, Some("antigravity"));
+                            let _ = stream.write_all(b"{\"decision\":\"allow\"}");
+                            let _ = stream.flush();
+                        }
+                    });
+                }
+            }
+        });
+    }
+}
+
 /// Start the Claude IPC server.
 /// On macOS/Linux: Unix domain socket at /tmp/ooclaw-claude.sock
 /// On Windows: TCP server on localhost:19283
@@ -17621,6 +18165,10 @@ pub fn run() {
             if let Err(e) = tauri::async_runtime::block_on(install_opencode_hooks()) {
                 log::warn!("Failed to install opencode plugin on startup: {}", e);
             }
+            // Install Antigravity (AGY) hooks on startup (idempotent)
+            if let Err(e) = tauri::async_runtime::block_on(install_antigravity_hooks()) {
+                log::warn!("Failed to install Antigravity hooks on startup: {}", e);
+            }
             // Hermes plugin is NOT auto-installed on startup because it restarts
             // the gateway. User must manually install via Settings UI.
 
@@ -17885,6 +18433,14 @@ pub fn run() {
                 start_hermes_socket_server(sessions_arc, dismissed_arc, app.handle().clone());
             }
 
+            // Start Antigravity (AGY) socket server (shares ClaudeState for unified session tracking).
+            // Unix uses /tmp/ooclaw-antigravity.sock, Windows uses TCP 127.0.0.1:19288.
+            {
+                let claude_state = app.state::<ClaudeState>();
+                let sessions_arc = Arc::clone(&claude_state.sessions);
+                start_antigravity_socket_server(sessions_arc, app.handle().clone());
+            }
+
             // System tray — use saved language, fallback to system language
             let initial_lang = {
                 let store_path = app.path().app_data_dir().ok().map(|p| p.join("settings.json"));
@@ -17953,7 +18509,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, sync_mascot_bubble, set_mascot_bubble_visible, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs, fetch_petdex_manifest, download_codex_pet, delete_custom_codex_pet, get_hermes_remote_conversation])
+        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_antigravity_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, sync_mascot_bubble, set_mascot_bubble_visible, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs, fetch_petdex_manifest, download_codex_pet, delete_custom_codex_pet, get_hermes_remote_conversation])
         .manage(ActiveAgentPid { pid: Mutex::new(None) })
         .manage(ClaudeState { sessions: Arc::new(Mutex::new(HashMap::new())), pending_permissions: Arc::new(Mutex::new(HashMap::new())), dismissed: Arc::new(Mutex::new(std::collections::HashSet::new())) })
         .run(tauri::generate_context!())
