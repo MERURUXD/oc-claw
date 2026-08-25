@@ -6,7 +6,7 @@ import {
   disable as disableAutostartCmd,
   isEnabled as isAutostartEnabled,
 } from '@tauri-apps/plugin-autostart'
-import { Loader2, Check, ChevronDown, Copy, Plus, Trash2 } from 'lucide-react'
+import { Loader2, Check, ChevronDown, Copy, Plus, Trash2, Sparkles, RefreshCw } from 'lucide-react'
 import { AnimatePresence, motion } from 'motion/react'
 import { useTranslation } from 'react-i18next'
 import { getStore, loadOcConnections, saveOcConnections } from '../lib/store'
@@ -680,7 +680,7 @@ function HermesSection({ hermesHookStatus, t }: {
   )
 }
 
-export function SettingsTab({ notifySound, onChangeNotifySound, waitingSound, onToggleWaitingSound, soundEnabled, onToggleSoundEnabled, codexSoundEnabled, onToggleCodexSoundEnabled, cursorSoundEnabled, onToggleCursorSoundEnabled, geminiSoundEnabled, onToggleGeminiSoundEnabled, opencodeSoundEnabled, onToggleOpencodeSoundEnabled, hermesSoundEnabled, onToggleHermesSoundEnabled, autoCloseCompletion, onToggleAutoCloseCompletion, autoExpandOnTask, onToggleAutoExpandOnTask, islandBg, onChangeIslandBg, bgPos, onChangeBgPos, panelMaxHeight, onChangePanelMaxHeight, hoverDelay, onChangeHoverDelay, largeMascotScale, onChangeLargeMascotScale, appMode, onChangeAppMode, petSfxEnabled, onTogglePetSfxEnabled, petIdleIntervalMin, onChangePetIdleIntervalMin }: { notifySound: 'default' | 'manbo'; onChangeNotifySound: (v: 'default' | 'manbo') => void; waitingSound: boolean; onToggleWaitingSound: (v: boolean) => void; soundEnabled: boolean; onToggleSoundEnabled: (v: boolean) => void; codexSoundEnabled: boolean; onToggleCodexSoundEnabled: (v: boolean) => void; cursorSoundEnabled: boolean; onToggleCursorSoundEnabled: (v: boolean) => void; geminiSoundEnabled: boolean; onToggleGeminiSoundEnabled: (v: boolean) => void; opencodeSoundEnabled: boolean; onToggleOpencodeSoundEnabled: (v: boolean) => void; hermesSoundEnabled: boolean; onToggleHermesSoundEnabled: (v: boolean) => void; autoCloseCompletion: boolean; onToggleAutoCloseCompletion: (v: boolean) => void; autoExpandOnTask: boolean; onToggleAutoExpandOnTask: (v: boolean) => void; islandBg: string; onChangeIslandBg: (v: string) => void; bgPos: { x: number; y: number }; onChangeBgPos: (v: { x: number; y: number }) => void; panelMaxHeight: number; onChangePanelMaxHeight: (v: number) => void; hoverDelay: number; onChangeHoverDelay: (v: number) => void; largeMascotScale: number; onChangeLargeMascotScale: (v: number) => void; appMode?: 'coding' | 'pet' | null; onChangeAppMode?: (v: 'coding' | 'pet') => void; petSfxEnabled?: boolean; onTogglePetSfxEnabled?: (v: boolean) => void; petIdleIntervalMin?: number; onChangePetIdleIntervalMin?: (v: number) => void }) {
+export function SettingsTab({ notifySound, onChangeNotifySound, waitingSound, onToggleWaitingSound, soundEnabled, onToggleSoundEnabled, codexSoundEnabled, onToggleCodexSoundEnabled, cursorSoundEnabled, onToggleCursorSoundEnabled, geminiSoundEnabled, onToggleGeminiSoundEnabled, opencodeSoundEnabled, onToggleOpencodeSoundEnabled, hermesSoundEnabled, onToggleHermesSoundEnabled, antigravitySoundEnabled, onToggleAntigravitySoundEnabled, autoCloseCompletion, onToggleAutoCloseCompletion, autoExpandOnTask, onToggleAutoExpandOnTask, islandBg, onChangeIslandBg, bgPos, onChangeBgPos, panelMaxHeight, onChangePanelMaxHeight, hoverDelay, onChangeHoverDelay, largeMascotScale, onChangeLargeMascotScale, appMode, onChangeAppMode, petSfxEnabled, onTogglePetSfxEnabled, petIdleIntervalMin, onChangePetIdleIntervalMin }: { notifySound: 'default' | 'manbo'; onChangeNotifySound: (v: 'default' | 'manbo') => void; waitingSound: boolean; onToggleWaitingSound: (v: boolean) => void; soundEnabled: boolean; onToggleSoundEnabled: (v: boolean) => void; codexSoundEnabled: boolean; onToggleCodexSoundEnabled: (v: boolean) => void; cursorSoundEnabled: boolean; onToggleCursorSoundEnabled: (v: boolean) => void; geminiSoundEnabled: boolean; onToggleGeminiSoundEnabled: (v: boolean) => void; opencodeSoundEnabled: boolean; onToggleOpencodeSoundEnabled: (v: boolean) => void; hermesSoundEnabled: boolean; onToggleHermesSoundEnabled: (v: boolean) => void; antigravitySoundEnabled?: boolean; onToggleAntigravitySoundEnabled?: (v: boolean) => void; autoCloseCompletion: boolean; onToggleAutoCloseCompletion: (v: boolean) => void; autoExpandOnTask: boolean; onToggleAutoExpandOnTask: (v: boolean) => void; islandBg: string; onChangeIslandBg: (v: string) => void; bgPos: { x: number; y: number }; onChangeBgPos: (v: { x: number; y: number }) => void; panelMaxHeight: number; onChangePanelMaxHeight: (v: number) => void; hoverDelay: number; onChangeHoverDelay: (v: number) => void; largeMascotScale: number; onChangeLargeMascotScale: (v: number) => void; appMode?: 'coding' | 'pet' | null; onChangeAppMode?: (v: 'coding' | 'pet') => void; petSfxEnabled?: boolean; onTogglePetSfxEnabled?: (v: boolean) => void; petIdleIntervalMin?: number; onChangePetIdleIntervalMin?: (v: number) => void }) {
   const { t, i18n } = useTranslation()
   const [connections, setConnections] = useState<OcConnection[]>([])
   const [enableClaudeCode, setEnableClaudeCode] = useState(true)
@@ -695,6 +695,9 @@ export function SettingsTab({ notifySound, onChangeNotifySound, waitingSound, on
   const [geminiHookStatus, setGeminiHookStatus] = useState('')
   const [enableOpencode, setEnableOpencode] = useState(true)
   const [opencodeHookStatus, setOpencodeHookStatus] = useState('')
+  const [enableAntigravity, setEnableAntigravity] = useState(true)
+  const [antigravityHookStatus, setAntigravityHookStatus] = useState('')
+  const [reinstallingAntigravity, setReinstallingAntigravity] = useState(false)
   const [hermesHookStatus] = useState('')
   const [enableAutostart, setEnableAutostart] = useState(false)
   const [autostartStatus, setAutostartStatus] = useState('')
@@ -762,6 +765,8 @@ export function SettingsTab({ notifySound, onChangeNotifySound, waitingSound, on
       if (typeof gem === 'boolean') setEnableGemini(gem)
       const oc = await store.get('enable_opencode')
       if (typeof oc === 'boolean') setEnableOpencode(oc)
+      const agy = await store.get('enable_antigravity')
+      if (typeof agy === 'boolean') setEnableAntigravity(agy)
       // Reconcile autostart toggle with the system: the OS-level registration
       // (registry on Windows, LaunchAgent on macOS) is the source of truth in
       // case the user disabled it externally; mirror that into our store so
@@ -974,6 +979,33 @@ export function SettingsTab({ notifySound, onChangeNotifySound, waitingSound, on
       } catch (e: any) {
         setOpencodeHookStatus(`${t('settings.hookFailed')} ${String(e)}`)
       }
+    }
+  }
+
+  const toggleAntigravity = async (val: boolean) => {
+    setEnableAntigravity(val)
+    const store = await getStore()
+    await store.set('enable_antigravity', val)
+    await store.save()
+    if (val) {
+      try {
+        await invoke('install_antigravity_hooks')
+        setAntigravityHookStatus(t('settings.antigravityHooksInstalled', t('settings.hookInstalled', 'Hook 已安装')))
+      } catch (e: any) {
+        setAntigravityHookStatus(`${t('settings.antigravityHooksFailed', t('settings.hookFailed', '安装失败:'))} ${String(e)}`)
+      }
+    }
+  }
+
+  const reinstallAntigravityHook = async () => {
+    setReinstallingAntigravity(true)
+    try {
+      await invoke('install_antigravity_hooks')
+      setAntigravityHookStatus(t('settings.antigravityHooksInstalled', t('settings.hookInstalled', 'Hook 已安装')))
+    } catch (e: any) {
+      setAntigravityHookStatus(`${t('settings.antigravityHooksFailed', t('settings.hookFailed', '安装失败:'))} ${String(e)}`)
+    } finally {
+      setReinstallingAntigravity(false)
     }
   }
 
@@ -1219,6 +1251,37 @@ export function SettingsTab({ notifySound, onChangeNotifySound, waitingSound, on
         </div>
       </section>
 
+      {/* Antigravity */}
+      <section className="flex flex-col gap-4">
+        <h2 className="text-lg font-medium text-white">Antigravity</h2>
+        <div className="bg-[#0f0f0f] border border-white/5 rounded-2xl overflow-hidden">
+          <div className="flex items-center justify-between p-4">
+            <div className="flex flex-col gap-1">
+              <div className="flex items-center gap-2">
+                <div className="w-5 h-5 rounded-md bg-purple-500/20 border border-purple-500/30 flex items-center justify-center text-purple-400">
+                  <Sparkles className="w-3 h-3" />
+                </div>
+                <span className="text-sm font-medium text-white/90">{t('settings.enableAntigravity', 'Enable Antigravity')}</span>
+                <span className="px-1.5 py-0.5 text-[10px] font-medium bg-purple-500/20 text-purple-300 border border-purple-500/30 rounded">AGY</span>
+              </div>
+              <span className="text-xs text-white/40">{t('settings.enableAntigravityDesc', 'Monitor local Antigravity sessions via Hooks')}</span>
+              {antigravityHookStatus && <span className="text-xs text-white/30 mt-1">{antigravityHookStatus}</span>}
+            </div>
+            <div className="flex items-center gap-3">
+              <button
+                onClick={reinstallAntigravityHook}
+                disabled={reinstallingAntigravity}
+                className="px-2.5 py-1 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-xs font-medium text-white/70 hover:text-white transition-colors flex items-center gap-1.5 disabled:opacity-50"
+              >
+                {reinstallingAntigravity ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
+                {t('settings.reinstallAntigravityHooks', '重新安装 Hook')}
+              </button>
+              <Toggle checked={enableAntigravity} onChange={toggleAntigravity} />
+            </div>
+          </div>
+        </div>
+      </section>
+
       {/* 显示设置 */}
       <section className="flex flex-col gap-4">
         <h2 className="text-lg font-medium text-white">{t('settings.display')}</h2>
@@ -1414,6 +1477,13 @@ export function SettingsTab({ notifySound, onChangeNotifySound, waitingSound, on
               <span className="text-xs text-white/40">{t('settings.hermesSoundDesc', 'Play sound when Hermes finishes a task')}</span>
             </div>
             <Toggle checked={hermesSoundEnabled} onChange={onToggleHermesSoundEnabled} />
+          </div>
+          <div className="flex items-center justify-between p-4 border-b border-white/5">
+            <div className="flex flex-col gap-1">
+              <span className="text-sm font-medium text-white/90">{t('settings.antigravitySound', 'Antigravity Completion Sound')}</span>
+              <span className="text-xs text-white/40">{t('settings.antigravitySoundDesc', 'Play sound when Antigravity finishes a task')}</span>
+            </div>
+            <Toggle checked={antigravitySoundEnabled ?? true} onChange={(v) => onToggleAntigravitySoundEnabled?.(v)} />
           </div>
           <div className="flex items-center justify-between p-4 border-b border-white/5">
             <div className="flex flex-col gap-1">

@@ -17,8 +17,8 @@
 
 <p align="center">
   <b>コーディングモード</b><br/>
-  <sub>macOS: OpenClaw, Claude Code, Cursor, Codex, OpenCode, Gemini CLI, Hermes Agent</sub><br/>
-  <sub>Windows: OpenClaw, Claude Code, Cursor, Codex, OpenCode, Gemini CLI, Hermes Agent (リモート SSH)</sub>
+  <sub>macOS: OpenClaw, Claude Code, Cursor, Codex, OpenCode, Gemini CLI, Google Antigravity, Hermes Agent</sub><br/>
+  <sub>Windows: OpenClaw, Claude Code, Cursor, Codex, OpenCode, Gemini CLI, Google Antigravity, Hermes Agent (リモート SSH)</sub>
 </p>
 <p align="center">
   <img src="https://github.com/user-attachments/assets/74b8bbf8-ddcf-4149-a91e-d18d5c24fec6" width="600" />
@@ -32,11 +32,11 @@
 
 ## 機能
 
-- OpenClaw / Claude Code / Codex / Cursor / Gemini CLI / Hermes Agent エージェントの活動にリアルタイムで反応（稼働中・アイドル・待機中）
+- OpenClaw / Claude Code / Codex / Cursor / Gemini CLI / Google Antigravity / Hermes Agent エージェントの活動にリアルタイムで反応（稼働中・アイドル・待機中）
 - デスクトップにキャラクターが住み着き（macOS / Windows）、エージェント稼働中はアニメーション、アイドル時は居眠り
 - **macOS**：ノッチエリアにホバーするとセッション詳細パネルが表示
 - ローカルの OpenClaw エージェントを自動検出し、セッション一覧・チャット履歴・呼び出し数/トークン統計を表示
-- Hook 経由でローカル Claude Code、Codex、Cursor、Gemini CLI セッションをリッスンし、リアルタイム会話を表示
+- Hook 経由でローカル Claude Code、Codex、Cursor、Gemini CLI、Google Antigravity セッションをリッスンし、リアルタイム会話を表示
 - Gemini CLI のトークン使用統計（ローカルテレメトリ経由）
 - SSH 経由でリモートサーバー上の OpenClaw / Hermes Agent インスタンスに接続
 - カスタムアニメーション、エージェントごとに異なるキャラクターを割り当て
@@ -46,22 +46,23 @@
 ## 必要条件
 
 - macOS または Windows
-- [OpenClaw](https://github.com/nicepkg/openclaw)、[Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、[Cursor](https://www.cursor.com)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)、[Hermes Agent](https://github.com/NousResearch/hermes-agent) のいずれかがインストール済み
+- [OpenClaw](https://github.com/nicepkg/openclaw)、[Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、[Cursor](https://www.cursor.com)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)、[Google Antigravity](https://antigravity.google)、[Hermes Agent](https://github.com/NousResearch/hermes-agent) のいずれかがインストール済み
 
 ## 仕組み
 
 ```
-OpenClaw Agents ──→ JSONL セッションファイル ──→ ヘルスポーリング ──→ 活動状態
-Claude Code     ──→ Hooks ──→ イベントパーサー ──→ 活動状態
-Codex           ──→ Hooks ──→ イベントパーサー ──→ 活動状態
-Cursor          ──→ Hooks ──→ イベントパーサー ──→ 活動状態
-Gemini CLI      ──→ Hooks ──→ イベントパーサー ──→ 活動状態
-Hermes Agent    ──→ Plugin ──→ イベントパーサー ──→ 活動状態
+OpenClaw Agents    ──→ JSONL セッションファイル ──→ ヘルスポーリング ──→ 活動状態
+Claude Code        ──→ Hooks ──→ イベントパーサー ──→ 活動状態
+Codex              ──→ Hooks ──→ イベントパーサー ──→ 活動状態
+Cursor             ──→ Hooks ──→ イベントパーサー ──→ 活動状態
+Gemini CLI         ──→ Hooks ──→ イベントパーサー ──→ 活動状態
+Google Antigravity ──→ Hooks ──→ イベントパーサー ──→ 活動状態
+Hermes Agent       ──→ Plugin ──→ イベントパーサー ──→ 活動状態
                                                       ↓
                   アニメスプライト ← ステートマシン ← サウンドエフェクト
 ```
 
-OC-Claw は OpenClaw のセッションファイルをポーリングしてエージェントの活動を検出し、インストールされた Hook/プラグインを通じて Claude Code、Codex、Cursor、Gemini CLI、Hermes Agent をリッスンします。活動状態がノッチ島（macOS）またはタスクバーエリア（Windows）のキャラクターアニメーションを駆動し、展開パネルでセッション詳細、チャット履歴、メトリクスを表示します。
+OC-Claw は OpenClaw のセッションファイルをポーリングしてエージェントの活動を検出し、インストールされた Hook/プラグインを通じて Claude Code、Codex、Cursor、Gemini CLI、Google Antigravity、Hermes Agent をリッスンします。活動状態がノッチ島（macOS）またはタスクバーエリア（Windows）のキャラクターアニメーションを駆動し、展開パネルでセッション詳細、チャット履歴、メトリクスを表示します。
 
 ## 技術スタック
 

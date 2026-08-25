@@ -17,8 +17,8 @@
 
 <p align="center">
   <b>编程模式</b><br/>
-  <sub>macOS：OpenClaw、Claude Code、Cursor、Codex、OpenCode、Gemini CLI、Hermes Agent</sub><br/>
-  <sub>Windows：OpenClaw、Claude Code、Cursor、Codex、OpenCode、Gemini CLI、Hermes Agent（远程 SSH）</sub>
+  <sub>macOS：OpenClaw、Claude Code、Cursor、Codex、OpenCode、Gemini CLI、Google Antigravity、Hermes Agent</sub><br/>
+  <sub>Windows：OpenClaw、Claude Code、Cursor、Codex、OpenCode、Gemini CLI、Google Antigravity、Hermes Agent（远程 SSH）</sub>
 </p>
 <p align="center">
   <img src="https://github.com/user-attachments/assets/74b8bbf8-ddcf-4149-a91e-d18d5c24fec6" width="600" />
@@ -32,11 +32,11 @@
 
 ## 功能
 
-- 实时响应 OpenClaw / Claude Code / Codex / Cursor / Gemini CLI / Hermes Agent 活动状态（工作、空闲、等待）
+- 实时响应 OpenClaw / Claude Code / Codex / Cursor / Gemini CLI / Google Antigravity / Hermes Agent 活动状态（工作、空闲、等待）
 - 桌面宠物角色，工作时播放动画，休息时打盹（macOS 刘海或 Windows 任务栏）
 - **macOS**：鼠标悬停刘海区域展开 session 详情面板
 - 自动发现本地 OpenClaw agent，显示 session 列表、聊天记录、调用量/token 统计图表
-- 通过 Hook 监听本地 Claude Code、Codex、Cursor 和 Gemini CLI 会话，查看实时对话
+- 通过 Hook 监听本地 Claude Code、Codex、Cursor、Gemini CLI 和 Google Antigravity 会话，查看实时对话
 - Gemini CLI token 用量统计（基于本地遥测）
 - 通过 SSH 连接远程服务器上的 OpenClaw / Hermes Agent 实例
 - 自定义角色动画，将不同 agent 配对不同角色
@@ -46,22 +46,23 @@
 ## 前置条件
 
 - macOS 或 Windows
-- 已安装 [OpenClaw](https://github.com/nicepkg/openclaw)、[Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、[Cursor](https://www.cursor.com)、[Gemini CLI](https://github.com/google-gemini/gemini-cli) 和/或 [Hermes Agent](https://github.com/NousResearch/hermes-agent)
+- 已安装 [OpenClaw](https://github.com/nicepkg/openclaw)、[Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、[Cursor](https://www.cursor.com)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)、[Google Antigravity](https://antigravity.google) 和/或 [Hermes Agent](https://github.com/NousResearch/hermes-agent)
 
 ## 工作原理
 
 ```
-OpenClaw Agents ──→ JSONL session 文件 ──→ 健康轮询 ──→ 活动状态
-Claude Code     ──→ Hooks ──→ 事件解析 ──→ 活动状态
-Codex           ──→ Hooks ──→ 事件解析 ──→ 活动状态
-Cursor          ──→ Hooks ──→ 事件解析 ──→ 活动状态
-Gemini CLI      ──→ Hooks ──→ 事件解析 ──→ 活动状态
-Hermes Agent    ──→ Plugin ──→ 事件解析 ──→ 活动状态
+OpenClaw Agents    ──→ JSONL session 文件 ──→ 健康轮询 ──→ 活动状态
+Claude Code        ──→ Hooks ──→ 事件解析 ──→ 活动状态
+Codex              ──→ Hooks ──→ 事件解析 ──→ 活动状态
+Cursor             ──→ Hooks ──→ 事件解析 ──→ 活动状态
+Gemini CLI         ──→ Hooks ──→ 事件解析 ──→ 活动状态
+Google Antigravity ──→ Hooks ──→ 事件解析 ──→ 活动状态
+Hermes Agent       ──→ Plugin ──→ 事件解析 ──→ 活动状态
                                               ↓
                           角色动画 ← 状态机 ← 提示音效
 ```
 
-OC-Claw 通过轮询 OpenClaw session 文件检测 agent 活动，并通过安装的 Hook/插件监听 Claude Code、Codex、Cursor、Gemini CLI 和 Hermes Agent。活动状态驱动刘海岛屿（macOS）或任务栏区域（Windows）上的角色动画，可展开面板查看 session 详情、聊天记录和统计数据。
+OC-Claw 通过轮询 OpenClaw session 文件检测 agent 活动，并通过安装的 Hook/插件监听 Claude Code、Codex、Cursor、Gemini CLI、Google Antigravity 和 Hermes Agent。活动状态驱动刘海岛屿（macOS）或任务栏区域（Windows）上的角色动画，可展开面板查看 session 详情、聊天记录和统计数据。
 
 ## 技术栈
 

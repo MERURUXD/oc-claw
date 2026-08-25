@@ -116,7 +116,7 @@ const MASCOT_BASE_SIZE = 43
 const SESSION_SPRITE_DISPLAY_MULTIPLIER = 0.88
 
 type PetState = 'idle' | 'working' | 'compacting' | 'waiting'
-type ClaudeStatsSource = 'cc' | 'codex' | 'cursor' | 'gemini' | 'hermes' | 'opencode'
+type ClaudeStatsSource = 'cc' | 'codex' | 'cursor' | 'gemini' | 'hermes' | 'opencode' | 'antigravity'
 const TRANSIENT_PET_ACTIONS: PetAction[] = ['eat', 'headpat', 'dance', 'farewell', 'angry', 'spin', 'milktea', 'walkout']
 
 // Priority: higher number = harder to interrupt
@@ -384,6 +384,7 @@ export default function Mini() {
     if (source === 'gemini') return 'gemini'
     if (source === 'hermes') return 'hermes'
     if (source === 'opencode') return 'opencode'
+    if (source === 'antigravity') return 'antigravity'
     return 'cc'
   }, [])
   const resolveClaudeStatsSourceBySession = useCallback(
@@ -406,6 +407,7 @@ export default function Mini() {
   const [enableCursor, setEnableCursor] = useState(true)
   const [enableGemini, setEnableGemini] = useState(true)
   const [enableOpencode, setEnableOpencode] = useState(true)
+  const [enableAntigravity, setEnableAntigravity] = useState(true)
   const [hermesConns, setHermesConns] = useState<{ id: string; type: 'local' | 'remote'; host?: string; user?: string }[]>([])
   // Hermes is enabled whenever at least one connection is configured, mirroring
   // the OpenClaw model (presence of a connection implies it is enabled).
@@ -416,6 +418,7 @@ export default function Mini() {
   const [geminiSoundEnabled, setGeminiSoundEnabled] = useState(true)
   const [opencodeSoundEnabled, setOpencodeSoundEnabled] = useState(true)
   const [hermesSoundEnabled, setHermesSoundEnabled] = useState(false)
+  const [antigravitySoundEnabled, setAntigravitySoundEnabled] = useState(true)
   const [notifySound, setNotifySound] = useState<'default' | 'manbo'>('default')
   const [waitingSound, setWaitingSound] = useState(false)
   const [autoCloseCompletion, setAutoCloseCompletion] = useState(false)
@@ -1949,6 +1952,10 @@ export default function Mini() {
       const ocEnabled = oc !== false
       setEnableOpencode(ocEnabled)
       if (ocEnabled) invoke('install_opencode_hooks').catch(() => {})
+      const agy = await store.get('enable_antigravity')
+      const agyEnabled = agy !== false
+      setEnableAntigravity(agyEnabled)
+      if (agyEnabled) invoke('install_antigravity_hooks').catch(() => {})
       // Hermes plugin install is user-triggered only (restarts gateway).
       // Enablement now follows whether any connection is configured.
       const hermConns = await store.get('hermes_connections') as { id: string; type: 'local' | 'remote'; host?: string; user?: string }[] | null
@@ -1983,6 +1990,8 @@ export default function Mini() {
       if (typeof ocsnd === 'boolean') setOpencodeSoundEnabled(ocsnd)
       const hsnd = await store.get('hermes_sound_enabled')
       if (typeof hsnd === 'boolean') setHermesSoundEnabled(hsnd)
+      const agysnd = await store.get('antigravity_sound_enabled')
+      if (typeof agysnd === 'boolean') setAntigravitySoundEnabled(agysnd)
       const ns = (await store.get('notify_sound')) as string
       if (ns === 'default' || ns === 'manbo') setNotifySound(ns)
       const ws = await store.get('waiting_sound')
@@ -2054,7 +2063,7 @@ export default function Mini() {
       invoke('set_mascot_bubble_visible', { visible: false }).catch(() => {})
       return
     }
-    if (!(enableClaudeCode || enableClaudeDesktop || enableCodex || enableCursor || enableGemini || enableOpencode || enableHermes)) {
+    if (!(enableClaudeCode || enableClaudeDesktop || enableCodex || enableCursor || enableGemini || enableOpencode || enableHermes || enableAntigravity)) {
       setClaudeSessions([])
       invoke('set_mascot_bubble_visible', { visible: false }).catch(() => {})
       return
@@ -2267,7 +2276,7 @@ export default function Mini() {
     poll()
     const t = setInterval(poll, 2000)
     return () => clearInterval(t)
-  }, [enableClaudeCode, enableClaudeDesktop, enableCodex, enableCursor, enableGemini, enableOpencode, enableHermes, hermesConns, appMode])
+  }, [enableClaudeCode, enableClaudeDesktop, enableCodex, enableCursor, enableGemini, enableOpencode, enableHermes, enableAntigravity, hermesConns, appMode])
 
   // Listen for Claude/Codex/Cursor task completion → play sound
   const soundEnabledRef = useRef(soundEnabled)
@@ -2282,6 +2291,8 @@ export default function Mini() {
   opencodeSoundEnabledRef.current = opencodeSoundEnabled
   const hermesSoundEnabledRef = useRef(hermesSoundEnabled)
   hermesSoundEnabledRef.current = hermesSoundEnabled
+  const antigravitySoundEnabledRef = useRef(antigravitySoundEnabled)
+  antigravitySoundEnabledRef.current = antigravitySoundEnabled
   const notifySoundRef = useRef(notifySound)
   notifySoundRef.current = notifySound
   const waitingSoundRef = useRef(waitingSound)
@@ -2298,7 +2309,7 @@ export default function Mini() {
   enableClaudeDesktopRef.current = enableClaudeDesktop
   useEffect(() => {
     if (appMode !== 'coding') return
-    if (!(enableClaudeCode || enableClaudeDesktop || enableCodex || enableCursor || enableGemini || enableOpencode || enableHermes)) return
+    if (!(enableClaudeCode || enableClaudeDesktop || enableCodex || enableCursor || enableGemini || enableOpencode || enableHermes || enableAntigravity)) return
     const unlisten = listen('claude-task-complete', (ev: any) => {
       const currentSession = claudeSessionsRef.current.find((s) => s.sessionId === ev.payload?.sessionId)
       const isCursor = ev.payload?.source === 'cursor' || currentSession?.source === 'cursor'
@@ -2306,9 +2317,10 @@ export default function Mini() {
       const isGemini = ev.payload?.source === 'gemini' || currentSession?.source === 'gemini'
       const isOpencode = ev.payload?.source === 'opencode' || currentSession?.source === 'opencode'
       const isHermes = ev.payload?.source === 'hermes' || currentSession?.source === 'hermes'
+      const isAntigravity = ev.payload?.source === 'antigravity' || currentSession?.source === 'antigravity'
       const hostTerminal = ev.payload?.hostTerminal || currentSession?.hostTerminal
-      const isClaudeDesktop = !isCursor && !isCodex && !isGemini && !isOpencode && !isHermes && hostTerminal === 'Claude Desktop'
-      const isClaudeCli = !isCursor && !isCodex && !isGemini && !isOpencode && !isHermes && !isClaudeDesktop
+      const isClaudeDesktop = !isCursor && !isCodex && !isGemini && !isOpencode && !isHermes && !isAntigravity && hostTerminal === 'Claude Desktop'
+      const isClaudeCli = !isCursor && !isCodex && !isGemini && !isOpencode && !isHermes && !isAntigravity && !isClaudeDesktop
       // Drop the event entirely if the matching listener toggle is off, so
       // muted streams never trigger auto-expand or completion popups either.
       if (isClaudeDesktop && !enableClaudeDesktopRef.current) return
@@ -2327,7 +2339,7 @@ export default function Mini() {
           expandFnRef.current()
         }
       }
-      const shouldSound = isCursor ? cursorSoundEnabledRef.current : isCodex ? codexSoundEnabledRef.current : isGemini ? geminiSoundEnabledRef.current : isOpencode ? opencodeSoundEnabledRef.current : isHermes ? hermesSoundEnabledRef.current : soundEnabledRef.current
+      const shouldSound = isCursor ? cursorSoundEnabledRef.current : isCodex ? codexSoundEnabledRef.current : isGemini ? geminiSoundEnabledRef.current : isOpencode ? opencodeSoundEnabledRef.current : isHermes ? hermesSoundEnabledRef.current : isAntigravity ? antigravitySoundEnabledRef.current : soundEnabledRef.current
       if (!shouldSound) return
       if (ev.payload?.waiting && !waitingSoundRef.current) return
       if (notifySoundRef.current === 'manbo') {
@@ -2339,7 +2351,7 @@ export default function Mini() {
     return () => {
       unlisten.then((fn) => fn())
     }
-  }, [enableClaudeCode, enableClaudeDesktop, enableCodex, enableCursor, enableGemini, enableOpencode, enableHermes, appMode])
+  }, [enableClaudeCode, enableClaudeDesktop, enableCodex, enableCursor, enableGemini, enableOpencode, enableHermes, enableAntigravity, appMode])
 
   // Fetch OpenClaw session messages when selected
   useEffect(() => {
@@ -2444,6 +2456,7 @@ export default function Mini() {
     if (cs.source === 'gemini') return enableGemini
     if (cs.source === 'opencode') return enableOpencode
     if (cs.source === 'hermes') return enableHermes
+    if (cs.source === 'antigravity') return enableAntigravity
     const isDesktop = cs.hostTerminal === 'Claude Desktop'
     return isDesktop ? enableClaudeDesktop : enableClaudeCode
   })
@@ -3415,6 +3428,8 @@ export default function Mini() {
           setEnableGemini(gem !== false)
           const oc = await store.get('enable_opencode')
           setEnableOpencode(oc !== false)
+          const agy = await store.get('enable_antigravity')
+          setEnableAntigravity(agy !== false)
           const hcn = await store.get('hermes_connections') as { id: string; type: 'local' | 'remote'; host?: string; user?: string }[] | null
           if (hcn) setHermesConns(hcn)
         } catch {}
@@ -3725,6 +3740,8 @@ export default function Mini() {
         setEnableGemini(gem !== false)
         const oc = await store.get('enable_opencode')
         setEnableOpencode(oc !== false)
+        const agy = await store.get('enable_antigravity')
+        setEnableAntigravity(agy !== false)
         const hcn2 = await store.get('hermes_connections') as { id: string; type: 'local' | 'remote'; host?: string; user?: string }[] | null
         if (hcn2) setHermesConns(hcn2)
         fetchAgents()
@@ -4872,6 +4889,7 @@ export default function Mini() {
                                 ...(enableGemini ? ['Gemini'] : []),
                                 ...(enableOpencode ? ['opencode'] : []),
                                 ...(enableHermes ? ['Hermes'] : []),
+                                ...(enableAntigravity ? ['Antigravity'] : []),
                               ]
                               return (
                                 <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="text-center py-10 px-4 flex flex-col items-center gap-2.5">
@@ -5113,9 +5131,10 @@ export default function Mini() {
                                 const isGeminiSource = cs.source === 'gemini'
                                 const isOpencodeSource = cs.source === 'opencode'
                                 const isHermesSource = cs.source === 'hermes'
+                                const isAntigravitySource = cs.source === 'antigravity'
                                 const isRemoteHermes = isHermesSource && cs.sessionId?.startsWith('ssh:')
-                                const sourceLabel = isCursorSource ? 'Cursor' : isCodexSource ? 'Codex' : isGeminiSource ? 'Gemini' : isOpencodeSource ? 'opencode' : isHermesSource ? 'Hermes' : 'Claude'
-                                const sourceBadgeClass = isCursorSource ? 'bg-[#1a2f3f] text-[#5eb5f7]' : isCodexSource ? 'bg-[#1d2f26] text-[#6dd29c]' : isGeminiSource ? 'bg-[#1d2736] text-[#8ab4f8]' : isOpencodeSource ? 'bg-[#2a2616] text-[#e6c07b]' : isHermesSource ? 'bg-[#2d1f3f] text-[#c084fc]' : 'bg-[#3f211d] text-[#e87a65]'
+                                const sourceLabel = isCursorSource ? 'Cursor' : isCodexSource ? 'Codex' : isGeminiSource ? 'Gemini' : isOpencodeSource ? 'opencode' : isHermesSource ? 'Hermes' : isAntigravitySource ? 'Antigravity' : 'Claude'
+                                const sourceBadgeClass = isCursorSource ? 'bg-[#1a2f3f] text-[#5eb5f7]' : isCodexSource ? 'bg-[#1d2f26] text-[#6dd29c]' : isGeminiSource ? 'bg-[#1d2736] text-[#8ab4f8]' : isOpencodeSource ? 'bg-[#2a2616] text-[#e6c07b]' : isHermesSource ? 'bg-[#2d1f3f] text-[#c084fc]' : isAntigravitySource ? 'bg-[#251f47] text-[#b388ff]' : 'bg-[#3f211d] text-[#e87a65]'
                                 const openClaudeDetail = () => {
                                   setSelectedAgentId(null)
                                   setSelectedSessionKey(null)
@@ -5143,6 +5162,10 @@ export default function Mini() {
                                     transition={{ duration: 0.2, delay: index * 0.05 }}
                                     data-no-drag
                                     onClick={() => {
+                                      if (isAntigravitySource) {
+                                        invoke('activate_app', { appName: 'Antigravity' }).catch(() => {})
+                                        return
+                                      }
                                       if (isHermesSource) {
                                         const p = (cs.platform || '').toLowerCase()
                                         const appName = p.includes('feishu') || p.includes('lark') ? 'Lark'
@@ -5165,7 +5188,7 @@ export default function Mini() {
                                         }
                                       }
                                     }}
-                                    className={`group hover:bg-white/[0.04] transition-colors ${(!isWaiting || isGeminiSource || isOpencodeSource || isHermesSource) ? 'cursor-pointer' : ''}`}
+                                    className={`group hover:bg-white/[0.04] transition-colors ${(!isWaiting || isGeminiSource || isOpencodeSource || isHermesSource || isAntigravitySource) ? 'cursor-pointer' : ''}`}
                                     style={{ padding: '10px 16px' }}
                                   >
                                     <div className="flex min-w-0 w-full items-center gap-3">
@@ -5383,10 +5406,10 @@ export default function Mini() {
                                               hoverExpandedRef.current = false
                                               collapse()
                                             }
-                                            // Codex / Gemini approval should be made in their own UI.
-                                            // oc-claw only surfaces a reminder and a jump action
-                                            // so the user can approve there.
-                                            if (cs.source === 'codex' || cs.source === 'gemini' || cs.source === 'opencode' || cs.source === 'hermes') {
+                                            // Codex / Gemini / OpenCode / Hermes, and Antigravity interactive questions,
+                                            // require approval / input in their own UI.
+                                            // Regular Antigravity tool approvals can be directly approved/denied via oc-claw.
+                                            if (cs.source === 'codex' || cs.source === 'gemini' || cs.source === 'opencode' || cs.source === 'hermes' || cs.source === 'antigravity') {
                                               const hermesPlatLabel = (() => {
                                                 if (cs.source !== 'hermes' || !cs.platform) return ''
                                                 const p = (cs.platform || '').toLowerCase()
@@ -5410,6 +5433,8 @@ export default function Mini() {
                                                 ? t('mini.viewInGemini', '前往 Gemini')
                                                 : cs.source === 'opencode'
                                                 ? t('mini.viewInOpencode', '前往 opencode')
+                                                : cs.source === 'antigravity'
+                                                ? t('mini.viewInAntigravity', '前往 Antigravity')
                                                 : t('mini.viewInCodex', '前往 Codex')
                                               return (
                                                 <>
@@ -5417,7 +5442,9 @@ export default function Mini() {
                                                     data-no-drag
                                                     onClick={(e) => {
                                                       e.stopPropagation()
-                                                      if (cs.source === 'hermes' && cs.platform) {
+                                                      if (cs.source === 'antigravity') {
+                                                        invoke('activate_app', { appName: 'Antigravity' }).catch(() => {})
+                                                      } else if (cs.source === 'hermes' && cs.platform) {
                                                         const p = (cs.platform || '').toLowerCase()
                                                         const appName =
                                                           p.includes('feishu') || p.includes('lark') ? 'Lark'
@@ -5526,7 +5553,9 @@ export default function Mini() {
                                             // completionSessionId) avoids the flash where the panel
                                             // stays open re-rendered with the full session list
                                             // until focus blur eventually triggers a close.
-                                            if (cs.source === 'cursor') {
+                                            if (cs.source === 'antigravity') {
+                                              invoke('activate_app', { appName: 'Antigravity' }).catch(() => {})
+                                            } else if (cs.source === 'cursor') {
                                               invoke('focus_cursor_terminal', { sessionId: cs.sessionId }).catch((err: unknown) => console.warn('focus cursor failed:', err))
                                             } else if (!(isWindowsPlatform && cs.source === 'gemini')) {
                                               // Gemini on Windows runs in a terminal whose window can't be
@@ -5550,7 +5579,7 @@ export default function Mini() {
                                           <span className="text-[11px] px-1.5 py-0.5 rounded bg-emerald-900/50 text-emerald-400 shrink-0 ml-2">{t('mini.done', '完成')}</span>
                                         </div>
                                         <div className="px-3 py-2 max-h-[160px] overflow-y-auto scrollbar-thin text-[12px] text-slate-400 leading-[1.6] markdown-content">
-                                          {(cs.source === 'cursor' || cs.source === 'codex' || cs.source === 'gemini' || cs.source === 'opencode') && cs.lastResponse === '✓' ? (
+                                          {(cs.source === 'cursor' || cs.source === 'codex' || cs.source === 'gemini' || cs.source === 'opencode' || cs.source === 'antigravity') && cs.lastResponse === '✓' ? (
                                             <p>
                                               {cs.source === 'codex'
                                                 ? t('mini.codeDone', 'Code has finished working. Click to view.')
@@ -5560,7 +5589,9 @@ export default function Mini() {
                                                       : t('mini.geminiDone', 'Gemini has finished working. Click to view.'))
                                                   : cs.source === 'opencode'
                                                     ? t('mini.opencodeDone', 'opencode has finished working. Click to view.')
-                                                    : t('mini.cursorDone', 'Cursor has finished working. Click to view.')}
+                                                    : cs.source === 'antigravity'
+                                                      ? t('mini.antigravityDone', 'Antigravity has finished working. Click to view.')
+                                                      : t('mini.cursorDone', 'Cursor has finished working. Click to view.')}
                                             </p>
                                           ) : (
                                             <ReactMarkdown>{cs.lastResponse}</ReactMarkdown>
@@ -5815,6 +5846,7 @@ export default function Mini() {
                               ...(enableGemini ? ['Gemini'] : []),
                               ...(enableOpencode ? ['opencode'] : []),
                               ...(enableHermes ? ['Hermes'] : []),
+                              ...(enableAntigravity ? ['Antigravity'] : []),
                             ]
                             return targets.length > 0 ? <p className="text-slate-500 text-sm font-medium">{t('mini.startTracking', { targets: targets.join(' / ') })}</p> : null
                           })()}
@@ -6322,6 +6354,13 @@ export default function Mini() {
                           setHermesSoundEnabled(v)
                           const store = await getStore()
                           await store.set('hermes_sound_enabled', v)
+                          await store.save()
+                        }}
+                        antigravitySoundEnabled={antigravitySoundEnabled}
+                        onToggleAntigravitySoundEnabled={async (v) => {
+                          setAntigravitySoundEnabled(v)
+                          const store = await getStore()
+                          await store.set('antigravity_sound_enabled', v)
                           await store.save()
                         }}
                         waitingSound={waitingSound}
