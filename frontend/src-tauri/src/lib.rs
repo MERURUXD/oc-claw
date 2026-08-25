@@ -7510,6 +7510,106 @@ fn find_antigravity_session_file(session_id: &str) -> Option<PathBuf> {
     None
 }
 
+fn clean_antigravity_user_text(raw: &str) -> String {
+    let mut text = raw.to_string();
+    if let Some(start) = text.find("<USER_REQUEST>") {
+        if let Some(end) = text.find("</USER_REQUEST>") {
+            text = text[start + "<USER_REQUEST>".len()..end].to_string();
+        }
+    }
+    // Remove other XML blocks
+    while let Some(start) = text.find('<') {
+        if let Some(end) = text[start..].find('>') {
+            let tag = &text[start..start + end + 1];
+            text = text.replace(tag, "");
+        } else {
+            break;
+        }
+    }
+    text.trim().to_string()
+}
+
+fn extract_antigravity_subagent_role(prompt: &str) -> Option<String> {
+    let p = prompt.trim();
+    if let Some(rest) = p.strip_prefix("You are the ") {
+        let role = rest.split(|c| c == '\n' || c == '.' || c == ',' || c == ':').next().unwrap_or("").trim();
+        let role = role.strip_suffix(" for oc-claw").or_else(|| role.strip_suffix(" for")).unwrap_or(role).trim();
+        if !role.is_empty() && role.len() < 50 {
+            return Some(role.to_string());
+        }
+    } else if let Some(rest) = p.strip_prefix("You are a ") {
+        let role = rest.split(|c| c == '\n' || c == '.' || c == ',' || c == ':').next().unwrap_or("").trim();
+        if !role.is_empty() && role.len() < 50 {
+            return Some(role.to_string());
+        }
+    }
+    None
+}
+
+/// Parse Antigravity transcript.jsonl to populate clean user_prompt, last_response, subagent role,
+/// and check if the latest model step is an intermediate step (e.g. still has pending tool calls).
+fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bool {
+    let path = match find_antigravity_session_file(&session.session_id) {
+        Some(p) => p,
+        None => return false,
+    };
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    let mut latest_user_prompt: Option<String> = None;
+    let mut latest_model_content: Option<String> = None;
+    let mut is_intermediate_tool_turn = false;
+    let mut subagent_role: Option<String> = None;
+
+    for line in content.lines().rev().take(120) {
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
+        let source_field = parsed.get("source").and_then(|v| v.as_str()).unwrap_or("");
+        let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        if source_field == "MODEL" && msg_type == "PLANNER_RESPONSE" {
+            if latest_model_content.is_none() {
+                if let Some(content_str) = parsed.get("content").and_then(|c| c.as_str()) {
+                    let trimmed = content_str.trim();
+                    if !trimmed.is_empty() {
+                        latest_model_content = Some(trimmed.to_string());
+                    }
+                }
+                if let Some(tools) = parsed.get("tool_calls").and_then(|t| t.as_array()) {
+                    if !tools.is_empty() {
+                        is_intermediate_tool_turn = true;
+                    }
+                }
+            }
+        } else if source_field == "USER_EXPLICIT" && msg_type == "USER_INPUT" {
+            if latest_user_prompt.is_none() {
+                if let Some(raw) = parsed.get("content").and_then(|c| c.as_str()) {
+                    if subagent_role.is_none() {
+                        subagent_role = extract_antigravity_subagent_role(raw);
+                    }
+                    let clean = clean_antigravity_user_text(raw);
+                    if !clean.is_empty() {
+                        latest_user_prompt = Some(clean);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(p) = latest_user_prompt {
+        session.user_prompt = Some(p);
+    }
+    if let Some(r) = latest_model_content {
+        session.last_response = Some(r);
+    }
+    if let Some(role) = subagent_role {
+        session.cursor_workspace_name = Some(role);
+    }
+
+    is_intermediate_tool_turn
+}
+
 fn resolve_session_jsonl_path(session_id: &str, cwd: Option<&str>) -> Option<PathBuf> {
     // Prefer Claude's deterministic path when cwd is known, then fall back to
     // directory scans. This keeps existing behavior fast while adding Codex
@@ -8168,6 +8268,7 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
             continue;
         }
         if s.source == "antigravity" {
+            update_antigravity_session_from_transcript(s);
             s.is_active_tab = frontmost == "Antigravity"
                 || frontmost == "Antigravity IDE"
                 || frontmost == "agy"
@@ -12332,13 +12433,7 @@ async fn get_claude_conversation(session_id: String) -> Result<Vec<ChatMessage>,
         let source_field = parsed.get("source").and_then(|v| v.as_str()).unwrap_or("");
         if source_field == "USER_EXPLICIT" && msg_type == "USER_INPUT" {
             let raw_content = parsed.get("content").and_then(|c| c.as_str()).unwrap_or("");
-            let text = raw_content
-                .replace("<USER_REQUEST>\n", "")
-                .replace("<USER_REQUEST>", "")
-                .replace("\n</USER_REQUEST>", "")
-                .replace("</USER_REQUEST>", "")
-                .trim()
-                .to_string();
+            let text = clean_antigravity_user_text(raw_content);
             if !text.is_empty() {
                 let timestamp = parsed.get("created_at")
                     .or_else(|| parsed.get("timestamp"))
@@ -13795,16 +13890,6 @@ fn is_codex_internal_utility_session(session: &ClaudeSession) -> bool {
         || last_lower.starts_with("# memory")
 }
 
-fn is_antigravity_modifying_tool(tool: &str) -> bool {
-    let t = tool.to_ascii_lowercase();
-    t == "run_command"
-        || t == "write_to_file"
-        || t == "replace_file_content"
-        || t == "multi_replace_file_content"
-        || t == "edit_file"
-        || t == "create_file"
-}
-
 /// Process a Claude hook event (shared logic between Unix socket and TCP server).
 /// Returns Some((session_id, hook_event)) if the event needs further handling
 /// (e.g. PermissionRequest requires blocking the connection for a response).
@@ -13915,7 +14000,7 @@ fn process_claude_event(
         let claude_status = event.get("claudeStatus").or_else(|| event.get("status"))
             .and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
 
-        let is_processing = claude_status != "waiting_for_input";
+        let mut is_processing = claude_status != "waiting_for_input";
 
         let user_prompt = event.get("userPrompt").or_else(|| event.get("prompt"))
             .and_then(|v| v.as_str()).unwrap_or("");
@@ -13943,7 +14028,7 @@ fn process_claude_event(
                 // Hermes adds `clarify`/`ask_user`/`confirm` which block the
                 // agent waiting for the user to reply via the chat platform.
                 let is_agy_wait = source_override == Some("antigravity")
-                    && (tool == "AskUserQuestion" || tool == "AskQuestion" || tool == "ask_question" || is_antigravity_modifying_tool(tool));
+                    && (tool == "AskUserQuestion" || tool == "AskQuestion" || tool == "ask_question");
                 if tool == "AskUserQuestion" || tool == "AskQuestion" || tool == "ask_question"
                     || is_interactive_tool(tool)
                     || pretool_needs_waiting
@@ -14058,8 +14143,8 @@ fn process_claude_event(
                 }
 
                 // Track pending sub-agents:
-                // - PreToolUse with tool=Agent → a sub-agent is being launched
-                // - SubagentStop → a sub-agent has completed
+                // - PreToolUse with tool=Agent / invoke_subagent → a sub-agent is being launched
+                // - SubagentStop / PostToolUse(invoke_subagent) → a sub-agent has completed
                 // Sound only plays on Stop when pending_agents == 0 (all agents done).
                 let tool_name = event.get("tool")
                     .or_else(|| event.get("tool_name"))
@@ -14070,11 +14155,11 @@ fn process_claude_event(
                     // New user prompt = fresh start. Reset counter in case previous
                     // agents were killed or SubagentStop was never delivered.
                     session.pending_agents = 0;
-                } else if (hook_event == "PreToolUse" && tool_name == "Agent") || raw_hook_event == "subagentStart" {
+                } else if (hook_event == "PreToolUse" && (tool_name == "Agent" || tool_name == "invoke_subagent")) || raw_hook_event == "subagentStart" {
                     session.pending_agents += 1;
                     log::info!("[claude_event] session={} Agent launched, pending_agents={}",
                         &session_id[..session_id.len().min(8)], session.pending_agents);
-                } else if hook_event == "SubagentStop" {
+                } else if hook_event == "SubagentStop" || (hook_event == "PostToolUse" && tool_name == "invoke_subagent") {
                     session.pending_agents = session.pending_agents.saturating_sub(1);
                     log::info!("[claude_event] session={} SubagentStop, pending_agents={}",
                         &session_id[..session_id.len().min(8)], session.pending_agents);
@@ -14298,6 +14383,22 @@ fn process_claude_event(
                     let is_tab_active = user_looking_at_session_tab(session);
                     if is_tab_active || interrupted {
                         session.last_response = None;
+                    } else if session.source == "antigravity" {
+                        let is_intermediate = update_antigravity_session_from_transcript(session);
+                        if is_intermediate || session.pending_agents > 0 || session.tool.is_some() {
+                            // Intermediate step: keep status as processing/tool_running, suppress completion popup and sound
+                            session.status = if session.tool.is_some() { "tool_running".to_string() } else { "processing".to_string() };
+                            session.is_processing = true;
+                            status = session.status.clone();
+                            is_processing = true;
+                        } else {
+                            session.status = "stopped".to_string();
+                            session.is_processing = false;
+                            status = "stopped".to_string();
+                            is_processing = false;
+                            session.tool = None;
+                            session.tool_input = None;
+                        }
                     } else if session.source == "hermes" {
                         // Hermes sessions: preserve lastResponse for inline preview
                         // in the session list, but the completion popup is suppressed
@@ -14322,11 +14423,10 @@ fn process_claude_event(
                         if resp_from_event.is_some() {
                             session.last_response = resp_from_event;
                         } else if session.last_response.is_none()
-                            && (session.source == "cursor" || session.source == "codex" || session.source == "gemini" || session.source == "opencode" || session.source == "antigravity")
+                            && (session.source == "cursor" || session.source == "codex" || session.source == "gemini" || session.source == "opencode")
                         {
-                            // Gemini/opencode/Antigravity hooks carry no assistant text, so fall
-                            // back to a placeholder like Cursor/Codex so the completion
-                            // popup still triggers. The frontend renders "✓" specially.
+                            // Gemini/opencode/Cursor/Codex hooks carry no assistant text, so fall
+                            // back to a placeholder so the completion popup still triggers.
                             session.last_response = Some("✓".to_string());
                         }
                         // else: keep existing last_response from afterAgentResponse
@@ -14374,7 +14474,7 @@ fn process_claude_event(
             // Suppress the waiting popup when the user is already looking at the
             // session's terminal tab (same focus rule as the completion popup).
             && !wait_tab_active;
-        let is_completion_stop = hook_event == "Stop" && pending_agents == 0 && !stop_was_interrupted;
+        let is_completion_stop = hook_event == "Stop" && status == "stopped" && pending_agents == 0 && !stop_was_interrupted;
         if was_processing && !was_compacting
             && (is_completion_stop || is_wait_event) {
             let is_waiting = is_wait_event;
