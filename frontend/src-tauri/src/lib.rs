@@ -104,8 +104,8 @@ fn ssh_backoff_remaining(host_key: &str) -> Option<u64> {
     let map = ssh_backoff_map().lock().unwrap_or_else(|e| e.into_inner());
     let state = map.get(host_key)?;
     if state.fail_count == 0 { return None; }
-    let exp = std::cmp::min(state.fail_count.saturating_sub(1), 6);
-    let cooldown = std::cmp::min(10u64.saturating_mul(2u64.pow(exp)), 60);
+    let exp = std::cmp::min(state.fail_count.saturating_sub(1), 3);
+    let cooldown = std::cmp::min(5u64.saturating_mul(2u64.pow(exp)), 30);
     let elapsed = unix_now().saturating_sub(state.fail_epoch);
     if elapsed < cooldown { Some(cooldown - elapsed) } else { None }
 }
@@ -8236,8 +8236,8 @@ fn is_interactive_tool(tool: &str) -> bool {
     matches!(tool, "clarify" | "ask_user" | "confirm")
 }
 
-/// Find the latest Stop and UserPromptSubmit timestamps for a session.
-/// Stop event = end of an assistant turn; UserPromptSubmit = start of a turn.
+/// Find the latest Stop, SessionEnd, and UserPromptSubmit timestamps for a session.
+/// Stop / SessionEnd event = end of an assistant turn; UserPromptSubmit = start of a turn.
 /// Used as a safety net: any event after the most recent Stop is housekeeping.
 fn session_turn_boundary(events: &[serde_json::Value]) -> (f64, f64) {
     let mut last_stop_ts = 0.0_f64;
@@ -8245,7 +8245,7 @@ fn session_turn_boundary(events: &[serde_json::Value]) -> (f64, f64) {
     for e in events {
         let ts = e.get("timestamp").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let ev = e.get("event").and_then(|v| v.as_str()).unwrap_or("");
-        if ev == "Stop" && ts > last_stop_ts { last_stop_ts = ts; }
+        if (ev == "Stop" || ev == "SessionEnd") && ts > last_stop_ts { last_stop_ts = ts; }
         if ev == "UserPromptSubmit" && ts > last_user_ts { last_user_ts = ts; }
     }
     (last_stop_ts, last_user_ts)
@@ -8255,8 +8255,9 @@ fn session_turn_boundary(events: &[serde_json::Value]) -> (f64, f64) {
 /// Returns a map of session_id -> effective claudeStatus.
 ///
 /// A session is considered completed (status = waiting_for_input) when EITHER:
-///   1. Last Stop event is newer than last UserPromptSubmit (turn officially ended), OR
-///   2. The last non-internal event reports a non-active status
+///   1. Last Stop/SessionEnd event is newer than or equal to last UserPromptSubmit, OR
+///   2. No event has arrived within 180s (staleness timeout), OR
+///   3. The last non-internal event reports a non-active status
 ///
 /// Internal-tool events (skill_view, skill_manage, skills_list, memory_*, etc.)
 /// are skipped when picking the last status, so framework housekeeping during a
@@ -8264,24 +8265,17 @@ fn session_turn_boundary(events: &[serde_json::Value]) -> (f64, f64) {
 fn load_ooclaw_status(hermes_dir: &std::path::Path) -> HashMap<String, String> {
     let mut result = HashMap::new();
     let status_path = hermes_dir.join("ooclaw-status.json");
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
     if let Ok(data) = std::fs::read_to_string(&status_path) {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
             if let Some(obj) = parsed.as_object() {
                 for (sid, events) in obj {
                     if let Some(arr) = events.as_array() {
-                        // Skip delegate_task sub-agents: they only emit PostToolUse
-                        // + SubagentStop, never UserPromptSubmit / SessionStart / Stop.
-                        // The 30-event buffer is large enough that a real user turn
-                        // will always retain at least one of these markers.
-                        let is_user_facing = arr.iter().any(|e| {
-                            e.get("event").and_then(|v| v.as_str())
-                                .map(|s| s == "UserPromptSubmit" || s == "SessionStart" || s == "Stop")
-                                .unwrap_or(false)
-                        });
-                        if !is_user_facing { continue; }
+                        if arr.is_empty() { continue; }
                         let (stop_ts, user_ts) = session_turn_boundary(arr);
-                        let status = if stop_ts > 0.0 && stop_ts > user_ts {
-                            // Safety net: turn officially ended via Stop event.
+                        let status = if stop_ts > 0.0 && stop_ts >= user_ts {
+                            // Safety net: turn officially ended via Stop or SessionEnd event.
                             "waiting_for_input".to_string()
                         } else {
                             // Pick the latest non-internal event's status.
@@ -8291,13 +8285,16 @@ fn load_ooclaw_status(hermes_dir: &std::path::Path) -> HashMap<String, String> {
                             }).or_else(|| arr.last());
                             last_non_internal
                                 .map(|e| {
+                                    let ts = e.get("timestamp").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                    // Staleness timeout: if no event within 180s, session is stopped
+                                    if ts > 0.0 && (now_secs - ts) > 180.0 {
+                                        return "waiting_for_input".to_string();
+                                    }
                                     let tool = e.get("tool").and_then(|v| v.as_str()).unwrap_or("");
                                     let event_type = e.get("event").and_then(|v| v.as_str()).unwrap_or("");
-                                    // Agent is blocked waiting for user response:
-                                    //   - PreToolUse(clarify/ask_user/confirm) — interactive tool in flight
-                                    //   - PermissionRequest — waiting for approval card click
-                                    // Use a distinct sentinel so the caller can render
-                                    // the waiting pet (different from a finished turn).
+                                    if event_type == "SessionEnd" || event_type == "Stop" {
+                                        return "waiting_for_input".to_string();
+                                    }
                                     if event_type == "PermissionRequest"
                                         || (event_type == "PreToolUse" && is_interactive_tool(tool))
                                     {
@@ -8451,17 +8448,19 @@ fn load_recent_hermes_sessions_from_db() -> Result<Vec<ClaudeSession>, String> {
         // agent is paused waiting for user reply (PermissionRequest or an
         // interactive tool like clarify). UI maps that to the waiting pet,
         // while plain "waiting_for_input" means the turn cleanly ended.
-        let status = match claude_status.as_str() {
+        let mut status = match claude_status.as_str() {
             "processing" | "running_tool" | "waiting" => "processing".to_string(),
             "blocked_on_user" => "waiting".to_string(),
             _ => "stopped".to_string(),
         };
-        let is_active = status == "processing";
 
         let mut user_prompt: Option<String> = None;
         let mut asst_response: Option<String> = None;
         let mut updated_at_ms = now_ms;
         let mut platform = String::new();
+        let mut db_ended_at: Option<f64> = None;
+        let mut db_user_ts: f64 = 0.0;
+        let mut db_asst_ts: f64 = 0.0;
 
         // Read userPrompt/lastResponse from plugin status
         if let Some((up, lr)) = load_ooclaw_session_detail(&hermes_dir, sid) {
@@ -8476,11 +8475,30 @@ fn load_recent_hermes_sessions_from_db() -> Result<Vec<ClaudeSession>, String> {
             ) {
                 platform = src;
             }
+            if let Ok(ended) = db.query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1", rusqlite::params![sid], |r| r.get::<_, Option<f64>>(0)
+            ) {
+                db_ended_at = ended;
+            }
             if let Ok(Some(ts)) = db.query_row(
                 "SELECT MAX(timestamp) FROM messages WHERE session_id = ?1 AND role NOT IN ('session_meta','system','metadata')",
                 rusqlite::params![sid], |r| r.get::<_, Option<f64>>(0)
             ) {
                 updated_at_ms = (ts * 1000.0) as u64;
+            }
+            if let Ok((u_content, u_ts)) = db.query_row(
+                "SELECT substr(content, 1, 200), timestamp FROM messages WHERE session_id = ?1 AND role = 'user' ORDER BY timestamp DESC LIMIT 1",
+                rusqlite::params![sid], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+            ) {
+                if user_prompt.is_none() { user_prompt = Some(u_content); }
+                db_user_ts = u_ts;
+            }
+            if let Ok((a_content, a_ts)) = db.query_row(
+                "SELECT substr(content, 1, 200), timestamp FROM messages WHERE session_id = ?1 AND role = 'assistant' AND content IS NOT NULL AND content <> '' ORDER BY timestamp DESC LIMIT 1",
+                rusqlite::params![sid], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+            ) {
+                if asst_response.is_none() { asst_response = Some(a_content); }
+                db_asst_ts = a_ts;
             }
         }
         // Plugin event timestamps lead state.db by several seconds (especially
@@ -8491,24 +8509,17 @@ fn load_recent_hermes_sessions_from_db() -> Result<Vec<ClaudeSession>, String> {
         if evt_max_ms > updated_at_ms {
             updated_at_ms = evt_max_ms;
         }
-        if let Some(ref db) = conn {
-            if user_prompt.is_none() {
-                if let Ok(p) = db.query_row(
-                    "SELECT substr(content, 1, 200) FROM messages WHERE session_id = ?1 AND role = 'user' ORDER BY timestamp DESC LIMIT 1",
-                    rusqlite::params![sid], |r| r.get::<_, String>(0)
-                ) {
-                    user_prompt = Some(p);
-                }
-            }
-            if asst_response.is_none() {
-                if let Ok(r) = db.query_row(
-                    "SELECT substr(content, 1, 200) FROM messages WHERE session_id = ?1 AND role = 'assistant' ORDER BY timestamp DESC LIMIT 1",
-                    rusqlite::params![sid], |r| r.get::<_, String>(0)
-                ) {
-                    asst_response = Some(r);
-                }
-            }
+
+        // Cross-check state.db completion:
+        // 1. If ended_at is set, session is stopped.
+        // 2. If assistant response timestamp >= user prompt timestamp and latest event timestamp <= assistant timestamp,
+        //    the assistant has already replied to the prompt and the turn is done.
+        if db_ended_at.is_some() {
+            status = "stopped".to_string();
+        } else if db_asst_ts > 0.0 && db_asst_ts >= db_user_ts && ((evt_max_ms as f64 / 1000.0) <= db_asst_ts + 5.0) {
+            status = "stopped".to_string();
         }
+        let is_active = status == "processing";
 
         // Skip CLI sessions
         if platform == "cli" || platform == "terminal" {
@@ -15046,7 +15057,7 @@ def _status_file_path():
         return os.path.join(hermes_home, "profiles", profile, "ooclaw-status.json")
     return os.path.join(hermes_home, "ooclaw-status.json")
 
-_MAX_EVENTS_PER_SESSION = 30
+_MAX_EVENTS_PER_SESSION = 100
 _MAX_SESSIONS = 20
 
 def _write_status(payload):
@@ -15727,12 +15738,9 @@ for _pdir in profile_dirs:
                 _filtered = {}
                 for _sid, _evts in _st.items():
                     if isinstance(_evts, list) and _evts:
-                        # Skip sub-agents (only emit PostToolUse + SubagentStop).
-                        # PreToolUse is also a user-session marker: a long-running
-                        # real turn can rotate UserPromptSubmit/Stop out of the
-                        # 30-event buffer and look like a subagent, so accept it.
-                        _has_user = any(_e.get('event') in ('UserPromptSubmit', 'SessionStart', 'Stop', 'PreToolUse') for _e in _evts)
-                        if not _has_user: continue
+                        # Skip pure sub-agents (only emit SubagentStop).
+                        _is_subagent_only = all(_e.get('event') == 'SubagentStop' for _e in _evts)
+                        if _is_subagent_only: continue
                         _filtered[_sid] = _evts
                         _all_known_sids.add(_sid)
                 if _filtered:
@@ -15740,13 +15748,13 @@ for _pdir in profile_dirs:
     except: pass
 
 def _turn_boundary(evts):
-    """Return (last Stop ts, last UserPromptSubmit ts)."""
+    """Return (last Stop/SessionEnd ts, last UserPromptSubmit ts)."""
     _stop_ts = 0.0
     _user_ts = 0.0
     for _e in evts:
         _ts = _e.get('timestamp', 0) or 0
         _ev = _e.get('event', '')
-        if _ev == 'Stop' and _ts > _stop_ts: _stop_ts = _ts
+        if _ev in ('Stop', 'SessionEnd') and _ts > _stop_ts: _stop_ts = _ts
         if _ev == 'UserPromptSubmit' and _ts > _user_ts: _user_ts = _ts
     return _stop_ts, _user_ts
 
@@ -15758,10 +15766,12 @@ _INTERACTIVE_TOOLS = ('clarify', 'ask_user', 'confirm')
 def _is_interactive_tool(t):
     """Tools that block the agent waiting for user reply (clarify, etc)."""
     return t in _INTERACTIVE_TOOLS
+
 # No plugin data at all → return empty
 if not _all_known_sids:
     print(json.dumps([]))
     import sys; sys.exit(0)
+
 for _pdir in profile_dirs:
     sj = os.path.join(_pdir, 'sessions', 'sessions.json')
     db = os.path.join(_pdir, 'state.db')
@@ -15772,6 +15782,7 @@ for _pdir in profile_dirs:
             import sqlite3
             db_conn = sqlite3.connect(db)
         except: pass
+
     def _find_latest_session(sid):
         """Resolve newest session id for this logical thread."""
         current = sid
@@ -15779,18 +15790,17 @@ for _pdir in profile_dirs:
             child = db_conn.execute(
                 'SELECT id FROM sessions WHERE parent_session_id=? ORDER BY started_at DESC LIMIT 1',
                 (current,)).fetchone()
-            if not child:
-                break
+            if not child: break
             current = child[0]
         row = db_conn.execute(
             'SELECT id FROM sessions WHERE (id = ? OR id LIKE ? OR id = ? OR id LIKE ?) '
             'ORDER BY started_at DESC LIMIT 1',
             (sid, sid + ':%', current, current + ':%')
         ).fetchone()
-        if row:
-            current = row[0]
+        if row: current = row[0]
         return current
-    def check_status(sid):
+
+    def check_status(sid, db_ended_at=None, db_user_ts=0, db_asst_ts=0):
         """Returns ('stopped' | 'waiting' | 'processing', is_active_bool).
         'waiting' means the agent is blocked on user input (PermissionRequest
         or an interactive tool like clarify) — distinct from 'processing' so
@@ -15800,9 +15810,12 @@ for _pdir in profile_dirs:
         _sid_events = _prof_status.get(sid, [])
         if not _sid_events:
             return ('stopped', False)
-        # Safety net: completed when last Stop is newer than last UserPromptSubmit.
+        # Check if session ended in state.db
+        if db_ended_at is not None:
+            return ('stopped', False)
+        # Safety net 1: completed when last Stop/SessionEnd is newer than or equal to last UserPromptSubmit.
         _stop_ts, _user_ts = _turn_boundary(_sid_events)
-        if _stop_ts > 0 and _stop_ts > _user_ts:
+        if _stop_ts > 0 and _stop_ts >= _user_ts:
             return ('stopped', False)
         # Pick last non-internal event (skip skill_*/memor_* housekeeping).
         _last_evt = None
@@ -15812,7 +15825,19 @@ for _pdir in profile_dirs:
                 break
         if _last_evt is None:
             _last_evt = _sid_events[-1]
+
+        _last_ts = _last_evt.get('timestamp', 0) or 0
+        # Safety net 2: Staleness timeout (180s without any event = stopped)
+        if _last_ts > 0 and (now - _last_ts) > 180:
+            return ('stopped', False)
+
+        # Safety net 3: Assistant message already completed in state.db
+        if db_asst_ts > 0 and db_asst_ts >= db_user_ts and _last_ts <= (db_asst_ts + 5.0):
+            return ('stopped', False)
+
         _ev = _last_evt.get('event', '')
+        if _ev in ('SessionEnd', 'Stop'):
+            return ('stopped', False)
         if _ev == 'PermissionRequest':
             return ('waiting', False)
         if _ev == 'PreToolUse' and _is_interactive_tool(_last_evt.get('tool', '')):
@@ -15821,32 +15846,39 @@ for _pdir in profile_dirs:
         if st in ('processing', 'running_tool', 'waiting'):
             return ('processing', True)
         return ('stopped', False)
-    def check_active(sid):
-        return check_status(sid)[1]
+
     _pfx = '' if _profile_name == 'default' else _profile_name + ':'
-    def _fetch_prompt_response(_real_sid):
-        """Fetch latest user prompt + assistant response from state.db.
-        Falls back across descendant sessions (compaction children)."""
-        if not (db_conn and _real_sid): return ('', '')
-        _up = ''
-        _lr = ''
+    def _fetch_db_info(_real_sid):
+        """Fetch latest user prompt + assistant response + timestamps from state.db."""
+        if not (db_conn and _real_sid): return ('', '', None, 0.0, 0.0)
+        _up, _lr = '', ''
+        _ended_at = None
+        _u_ts, _a_ts = 0.0, 0.0
+        try:
+            row = db_conn.execute("SELECT ended_at FROM sessions WHERE id=?", (_real_sid,)).fetchone()
+            if row: _ended_at = row[0]
+        except: pass
         try:
             row = db_conn.execute(
-                "SELECT substr(content,1,200) FROM messages WHERE session_id=? AND role='user' "
+                "SELECT substr(content,1,200), timestamp FROM messages WHERE session_id=? AND role='user' "
                 "ORDER BY timestamp DESC LIMIT 1", (_real_sid,)).fetchone()
-            if row and row[0]: _up = row[0]
+            if row:
+                if row[0]: _up = row[0]
+                if row[1]: _u_ts = float(row[1])
         except: pass
         try:
             row = db_conn.execute(
-                "SELECT substr(content,1,200) FROM messages WHERE session_id=? AND role='assistant' "
+                "SELECT substr(content,1,200), timestamp FROM messages WHERE session_id=? AND role='assistant' "
                 "AND content IS NOT NULL AND content <> '' ORDER BY timestamp DESC LIMIT 1", (_real_sid,)).fetchone()
-            if row and row[0]: _lr = row[0]
+            if row:
+                if row[0]: _lr = row[0]
+                if row[1]: _a_ts = float(row[1])
         except: pass
-        return (_up, _lr)
+        return (_up, _lr, _ended_at, _u_ts, _a_ts)
+
     def _scan_ooclaw_text(sid):
         """Scan ooclaw events backward for latest non-empty userPrompt/lastResponse."""
-        _up = ''
-        _lr = ''
+        _up, _lr = '', ''
         for _e in reversed(_ooclaw_status.get(_profile_name, {}).get(sid, [])):
             if not _up:
                 _v = _e.get('userPrompt') or ''
@@ -15856,42 +15888,38 @@ for _pdir in profile_dirs:
                 if _v: _lr = _v
             if _up and _lr: break
         return (_up, _lr)
+
     if os.path.exists(sj):
         try:
             data = json.load(open(sj))
             for key, v in data.items():
                 sid = v.get('session_id','')
                 if sid: seen.add(_pfx + sid)
-                # Only show sessions known to ooclaw plugin
                 if sid not in _all_known_sids: continue
                 plat = v.get('platform','')
                 if plat in ('cron',): continue
                 updated = v.get('updated_at','')
-                sess_status, active = (check_status(sid) if sid else ('stopped', False))
                 label = plat
                 if _profile_name != 'default': label = _profile_name + ('/' + plat if plat else '')
                 last_ts = now
                 _real_sid = sid
+                _db_up, _db_lr, _db_ended, _db_u_ts, _db_a_ts = ('', '', None, 0.0, 0.0)
                 if db_conn and sid:
                     try:
                         _real_sid = _find_latest_session(sid)
+                        _db_up, _db_lr, _db_ended, _db_u_ts, _db_a_ts = _fetch_db_info(_real_sid)
                         lts = db_conn.execute("SELECT MAX(timestamp) FROM messages WHERE session_id=? AND role NOT IN ('session_meta','system','metadata')", (_real_sid,)).fetchone()[0]
                         if lts: last_ts = lts
                     except: pass
-                # Plugin event timestamps are written synchronously on every
-                # hook, so they reflect activity (UserPromptSubmit, PreToolUse,
-                # PostToolUse...) before state.db has caught up.
+                sess_status, active = check_status(sid, _db_ended, _db_u_ts, _db_a_ts)
                 _evts = _ooclaw_status.get(_profile_name, {}).get(sid, [])
                 if _evts:
                     _evt_max = max((_e.get('timestamp', 0) or 0) for _e in _evts)
                     if _evt_max and _evt_max > last_ts:
                         last_ts = _evt_max
-                # Prefer ooclaw plugin's recorded prompt/response, fall back to state.db
                 _up, _lr = _scan_ooclaw_text(sid)
-                if not _up or not _lr:
-                    _db_up, _db_lr = _fetch_prompt_response(_real_sid)
-                    if not _up: _up = _db_up
-                    if not _lr: _lr = _db_lr
+                if not _up: _up = _db_up
+                if not _lr: _lr = _db_lr
                 results.append({'sessionId': _pfx + sid, 'platform': label, 'updatedAt': updated,
                                 'displayName': v.get('display_name',''), 'active': active,
                                 'status': sess_status, 'source': 'hermes',
@@ -15899,11 +15927,9 @@ for _pdir in profile_dirs:
                                 'userPrompt': _up, 'lastResponse': _lr,
                                 'ooclaw': _ooclaw_status.get(_profile_name, {}).get(sid)})
         except: pass
+
     if db_conn:
         try:
-            # Fetch sessions the ooclaw plugin knows about (recent activity) by
-            # id — NOT by started_at. The old `started_at > now-7200` cutoff
-            # dropped long-running sessions that are still active.
             if _all_known_sids:
                 _ph = ','.join('?' * len(_all_known_sids))
                 cur = db_conn.execute(
@@ -15916,13 +15942,14 @@ for _pdir in profile_dirs:
             for r in _rows:
                 sid = r[0]
                 if (_pfx + sid) in seen: continue
-                # Only show sessions known to ooclaw plugin
                 if sid not in _all_known_sids: continue
                 plat_db = r[1] or ''
                 if plat_db in ('cron',): continue
                 seen.add(_pfx + sid)
                 latest_sid = _find_latest_session(sid)
-                sess_status, active = check_status(sid)
+                _db_up, _db_lr, _db_ended, _db_u_ts, _db_a_ts = _fetch_db_info(latest_sid)
+                if _db_ended is None and r[4] is not None: _db_ended = r[4]
+                sess_status, active = check_status(sid, _db_ended, _db_u_ts, _db_a_ts)
                 label = plat_db
                 if _profile_name != 'default': label = _profile_name + ('/' + plat_db if plat_db else '')
                 db_last_ts = r[3]
@@ -15930,17 +15957,14 @@ for _pdir in profile_dirs:
                     lts = db_conn.execute("SELECT MAX(timestamp) FROM messages WHERE session_id=? AND role NOT IN ('session_meta','system','metadata')", (latest_sid,)).fetchone()[0]
                     if lts: db_last_ts = lts
                 except: pass
-                # Prefer freshest ooclaw plugin event timestamp over state.db.
                 _evts2 = _ooclaw_status.get(_profile_name, {}).get(sid, [])
                 if _evts2:
                     _evt_max2 = max((_e.get('timestamp', 0) or 0) for _e in _evts2)
                     if _evt_max2 and (not db_last_ts or _evt_max2 > db_last_ts):
                         db_last_ts = _evt_max2
                 _up, _lr = _scan_ooclaw_text(sid)
-                if not _up or not _lr:
-                    _db_up, _db_lr = _fetch_prompt_response(latest_sid)
-                    if not _up: _up = _db_up
-                    if not _lr: _lr = _db_lr
+                if not _up: _up = _db_up
+                if not _lr: _lr = _db_lr
                 results.append({'sessionId': _pfx + sid, 'platform': label, 'model': r[2] or '',
                                 'userPrompt': _up, 'lastResponse': _lr,
                                 'startedAt': db_last_ts, 'messageCount': r[5] or 0,
@@ -16083,15 +16107,15 @@ def _send(payload):
 
     let init_py = format!(r##"# ooclaw plugin for Hermes Agent - forwards events to oc-claw.
 from __future__ import annotations
-import json, os, socket, time
+import json, os, socket, time, threading
 from typing import Any, Dict, Tuple
 from pathlib import Path
 
 {connect_code}
 
-# Track the last session_id so we can detect context-compaction rollovers
-# and emit a synthetic SessionEnd for the old session.
-_last_session_id: str = ""
+# Track the last session_id per thread so we can detect context-compaction
+# rollovers and emit a synthetic SessionEnd for the old session.
+_thread_local = threading.local()
 
 HOOK_TO_EVENT: Dict[str, Tuple[str, str]] = {{
     "on_session_start": ("waiting_for_input", "SessionStart"),
@@ -16114,7 +16138,7 @@ def _status_file_path():
         return os.path.join(hermes_home, "profiles", profile, "ooclaw-status.json")
     return os.path.join(hermes_home, "ooclaw-status.json")
 
-_MAX_EVENTS_PER_SESSION = 30
+_MAX_EVENTS_PER_SESSION = 100
 _MAX_SESSIONS = 20
 
 def _write_status(payload):
@@ -16147,7 +16171,6 @@ def _write_status(payload):
         pass
 
 def _handle(event_name, **kwargs):
-    global _last_session_id
     mapping = HOOK_TO_EVENT.get(event_name)
     if not mapping:
         return
@@ -16158,12 +16181,8 @@ def _handle(event_name, **kwargs):
             (isinstance(result.get("exit_code"), int) and result["exit_code"] != 0)):
             status, cc_event = "processing", "PostToolUse"
     session_id = kwargs.get("session_id", "") or kwargs.get("conversation_id", "")
-    # Some Hermes hooks (pre_tool_call, pre_approval_request,
-    # post_approval_response) don't pass session_id. Fall back to the last
-    # session_id seen this process (set during pre_llm_call earlier in the
-    # same agent turn).
     if not session_id:
-        session_id = _last_session_id or ""
+        session_id = getattr(_thread_local, "last_session_id", "") or ""
     if not session_id:
         return
     tool_name = ""
@@ -16177,12 +16196,11 @@ def _handle(event_name, **kwargs):
     if not cwd:
         cwd = os.path.expanduser("~/.hermes")
 
-    # Detect context-compaction session rollover: if session_id changed from
-    # a previous value (same process), emit a synthetic SessionEnd for the old
-    # session so oc-claw stops showing it as active.
-    if _last_session_id and _last_session_id != session_id:
+    # Detect context-compaction session rollover
+    last_sid = getattr(_thread_local, "last_session_id", "")
+    if last_sid and last_sid != session_id:
         end_payload = {{
-            "sessionId": _last_session_id,
+            "sessionId": last_sid,
             "cwd": cwd,
             "event": "SessionEnd",
             "claudeStatus": "ended",
@@ -16193,7 +16211,7 @@ def _handle(event_name, **kwargs):
         }}
         _send(end_payload)
         _write_status(end_payload)
-    _last_session_id = session_id
+    _thread_local.last_session_id = session_id
 
     payload = {{
         "sessionId": session_id,

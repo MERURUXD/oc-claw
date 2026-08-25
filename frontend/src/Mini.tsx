@@ -1952,7 +1952,25 @@ export default function Mini() {
       // Hermes plugin install is user-triggered only (restarts gateway).
       // Enablement now follows whether any connection is configured.
       const hermConns = await store.get('hermes_connections') as { id: string; type: 'local' | 'remote'; host?: string; user?: string }[] | null
-      if (hermConns) setHermesConns(hermConns)
+      if (hermConns && Array.isArray(hermConns) && hermConns.length > 0) {
+        setHermesConns(hermConns)
+      } else {
+        const oldSsh = await store.get<{ host: string; user: string }[]>('hermes_ssh_connections')
+        if (oldSsh && oldSsh.length > 0) {
+          const migrated: { id: string; type: 'local' | 'remote'; host?: string; user?: string }[] = oldSsh.map(c => ({
+            id: crypto.randomUUID(),
+            type: 'remote',
+            host: c.host,
+            user: c.user,
+          }))
+          setHermesConns(migrated)
+          await store.set('hermes_connections', migrated)
+        } else {
+          const defaultConn: { id: string; type: 'local' | 'remote'; host?: string; user?: string }[] = [{ id: crypto.randomUUID(), type: isWindowsPlatform ? 'remote' : 'local' }]
+          setHermesConns(defaultConn)
+          await store.set('hermes_connections', defaultConn)
+        }
+      }
       const snd = await store.get('sound_enabled')
       if (typeof snd === 'boolean') setSoundEnabled(snd)
       const codsnd = await store.get('codex_sound_enabled')
@@ -2045,7 +2063,10 @@ export default function Mini() {
     // Track previously logged session statuses so we only emit a backend log
     // line when something actually changes — keeps oc-claw.log readable.
     const lastLoggedStatus = new Map<string, string>()
+    const isPollingRef = { current: false }
     const poll = async () => {
+      if (isPollingRef.current) return
+      isPollingRef.current = true
       try {
         const sessions = (await invoke('get_claude_sessions')) as any[]
         // Diagnostic (dev only): log the state of every claude session on
@@ -2239,6 +2260,8 @@ export default function Mini() {
         }
       } catch {
         /* ignore */
+      } finally {
+        isPollingRef.current = false
       }
     }
     poll()
