@@ -17,8 +17,8 @@
 
 <p align="center">
   <b>Mode Code</b><br/>
-  <sub>macOS : OpenClaw, Claude Code, Cursor, Codex, OpenCode, Gemini CLI, Hermes Agent</sub><br/>
-  <sub>Windows : OpenClaw, Claude Code, Cursor, Codex, OpenCode, Gemini CLI, Hermes Agent (SSH distant)</sub>
+  <sub>macOS : OpenClaw, Claude Code, Cursor, Codex, OpenCode, Gemini CLI, Google Antigravity, Hermes Agent</sub><br/>
+  <sub>Windows : OpenClaw, Claude Code, Cursor, Codex, OpenCode, Gemini CLI, Google Antigravity, Hermes Agent (SSH distant)</sub>
 </p>
 <p align="center">
   <img src="https://github.com/user-attachments/assets/74b8bbf8-ddcf-4149-a91e-d18d5c24fec6" width="600" />
@@ -32,11 +32,11 @@
 
 ## Fonctionnalités
 
-- Réagit en temps réel à l'activité des agents OpenClaw / Claude Code / Codex / Cursor / Gemini CLI / Hermes Agent (en cours, inactif, en attente)
+- Réagit en temps réel à l'activité des agents OpenClaw / Claude Code / Codex / Cursor / Gemini CLI / Google Antigravity / Hermes Agent (en cours, inactif, en attente)
 - Un personnage vit sur votre bureau (macOS / Windows), s'anime quand les agents travaillent et dort quand ils sont inactifs
 - **macOS** : survolez la zone de l'encoche pour afficher le panneau de détails de session
 - Détecte automatiquement les agents OpenClaw locaux, affiche les listes de sessions, l'historique des conversations et les graphiques d'appels/tokens quotidiens
-- Écoute les sessions locales de Claude Code, Codex, Cursor et Gemini CLI via des hooks, visualise les conversations en direct
+- Écoute les sessions locales de Claude Code, Codex, Cursor, Gemini CLI et Google Antigravity via des hooks, visualise les conversations en direct
 - Statistiques d'utilisation des tokens Gemini CLI via la télémétrie locale
 - Connexion aux instances OpenClaw / Hermes Agent sur des serveurs distants via SSH
 - Animations personnalisées, associez différents agents à différents personnages
@@ -46,22 +46,23 @@
 ## Prérequis
 
 - macOS ou Windows
-- [OpenClaw](https://github.com/nicepkg/openclaw), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex), [Cursor](https://www.cursor.com), [Gemini CLI](https://github.com/google-gemini/gemini-cli) et/ou [Hermes Agent](https://github.com/NousResearch/hermes-agent) installé
+- [OpenClaw](https://github.com/nicepkg/openclaw), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex), [Cursor](https://www.cursor.com), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [Google Antigravity](https://antigravity.google) et/ou [Hermes Agent](https://github.com/NousResearch/hermes-agent) installé
 
 ## Comment ça marche
 
 ```
-OpenClaw Agents ──→ Fichiers de session JSONL ──→ Sondage de santé ──→ État d'activité
-Claude Code     ──→ Hooks ──→ Parseur d'événements ──→ État d'activité
-Codex           ──→ Hooks ──→ Parseur d'événements ──→ État d'activité
-Cursor          ──→ Hooks ──→ Parseur d'événements ──→ État d'activité
-Gemini CLI      ──→ Hooks ──→ Parseur d'événements ──→ État d'activité
-Hermes Agent    ──→ Plugin ──→ Parseur d'événements ──→ État d'activité
+OpenClaw Agents    ──→ Fichiers de session JSONL ──→ Sondage de santé ──→ État d'activité
+Claude Code        ──→ Hooks ──→ Parseur d'événements ──→ État d'activité
+Codex              ──→ Hooks ──→ Parseur d'événements ──→ État d'activité
+Cursor             ──→ Hooks ──→ Parseur d'événements ──→ État d'activité
+Gemini CLI         ──→ Hooks ──→ Parseur d'événements ──→ État d'activité
+Google Antigravity ──→ Hooks ──→ Parseur d'événements ──→ État d'activité
+Hermes Agent       ──→ Plugin ──→ Parseur d'événements ──→ État d'activité
                                                             ↓
                      Sprites animés ← Machine à états ← Effets sonores
 ```
 
-OC-Claw sonde les fichiers de session OpenClaw pour détecter l'activité des agents, et écoute Claude Code, Codex, Cursor, Gemini CLI et Hermes Agent via les hooks/plugins installés. Les états d'activité pilotent les animations de personnages sur l'île de l'encoche (macOS) ou la zone de la barre des tâches (Windows), avec un panneau extensible pour les détails de session, l'historique des conversations et les métriques.
+OC-Claw sonde les fichiers de session OpenClaw pour détecter l'activité des agents, et écoute Claude Code, Codex, Cursor, Gemini CLI, Google Antigravity et Hermes Agent via les hooks/plugins installés. Les états d'activité pilotent les animations de personnages sur l'île de l'encoche (macOS) ou la zone de la barre des tâches (Windows), avec un panneau extensible pour les détails de session, l'historique des conversations et les métriques.
 
 ## Stack Technique
 

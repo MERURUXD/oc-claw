@@ -67,6 +67,9 @@ export async function loadCharacters(): Promise<CharacterMeta[]> {
   const claudeChar = (await store.get('claude_char')) as string
   if (claudeChar && !validNames.has(claudeChar)) await store.set('claude_char', DEFAULT_CHAR_NAME)
 
+  const antigravityChar = (await store.get('antigravity_char')) as string
+  if (antigravityChar && !validNames.has(antigravityChar)) await store.set('antigravity_char', DEFAULT_CHAR_NAME)
+
   const miniChar = (await store.get('mini_character')) as string
   if (miniChar && !validNames.has(miniChar)) await store.set('mini_character', DEFAULT_CHAR_NAME)
 
@@ -87,6 +90,9 @@ export async function loadCharacters(): Promise<CharacterMeta[]> {
     }
     if (!claudeChar && typeof configDefaults.claude_char === 'string' && validNames.has(configDefaults.claude_char)) {
       await store.set('claude_char', configDefaults.claude_char)
+    }
+    if (!antigravityChar && typeof configDefaults.antigravity_char === 'string' && validNames.has(configDefaults.antigravity_char)) {
+      await store.set('antigravity_char', configDefaults.antigravity_char)
     }
     if (Array.isArray(configDefaults.char_queue)) {
       const defaultQueue = (configDefaults.char_queue as string[]).filter((n) => validNames.has(n))
