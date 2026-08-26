@@ -68,8 +68,6 @@ When modifying the codebase:
   ```powershell
   $env:HTTP_PROXY='http://127.0.0.1:63106'; $env:HTTPS_PROXY='http://127.0.0.1:63106'
   ```
-- **PR & Merge Flow**:
-  - Create branch $\rightarrow$ Commit $\rightarrow$ Push to `origin <branch>`.
-  - Create PR: `gh pr create --title "..." --body "..." --base main --head <branch>`
-  - Merge PR: `gh pr merge <PR_NUMBER> --squash --admin`
-  - Fetch latest `main`: `git fetch origin main`
+- **Commit & PR Strategy**:
+  - **Small Fixes & Quick Tweaks**: Commit directly and push to `main` (no PR required).
+  - **Major Features & Large Work**: Create branch $\rightarrow$ Commit $\rightarrow$ Push to `origin <branch>` $\rightarrow$ `gh pr create` $\rightarrow$ `gh pr merge <PR_NUMBER> --squash --admin` $\rightarrow$ `git fetch origin main`.
