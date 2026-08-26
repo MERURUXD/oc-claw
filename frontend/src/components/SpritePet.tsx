@@ -24,14 +24,21 @@ interface SpritePetProps {
   style?: React.CSSProperties
 }
 
-// Render a single 192x208 cell from a hatch-pet style 8x9 atlas, advancing
+// Render a single 192x208 cell from a hatch-pet style 8x9 / 8x11 atlas, advancing
 // frames at SPRITE_FPS via requestAnimationFrame. Looping states cycle
 // indefinitely; one-shot states (currently `jumping`) hold the last frame
 // and notify the parent via onOneShotEnd.
 const ONE_SHOT_STATES: ReadonlySet<CodexPetState> = new Set(['jumping'])
 
 export function SpritePet({ pet, state, size, onOneShotEnd, loop, className, style }: SpritePetProps) {
+  const [prevState, setPrevState] = useState(state)
   const [frameIndex, setFrameIndex] = useState(0)
+
+  if (prevState !== state) {
+    setPrevState(state)
+    setFrameIndex(0)
+  }
+
   const stateRef = useRef(state)
   const loopRef = useRef(loop ?? false)
   const onOneShotEndRef = useRef(onOneShotEnd)
@@ -44,7 +51,6 @@ export function SpritePet({ pet, state, size, onOneShotEnd, loop, className, sty
     stateRef.current = state
     oneShotFiredRef.current = false
     restUntilRef.current = 0
-    setFrameIndex(0)
   }, [state])
 
   useEffect(() => {
@@ -135,7 +141,6 @@ export function SpritePet({ pet, state, size, onOneShotEnd, loop, className, sty
   const renderH = size * aspect
   const scale = renderW / ATLAS.cellW
   const totalW = ATLAS.cellW * ATLAS.cols * scale
-  const totalH = ATLAS.cellH * ATLAS.rows * scale
   const bgX = -frame * ATLAS.cellW * scale
   const bgY = -row.row * ATLAS.cellH * scale
 
@@ -147,7 +152,7 @@ export function SpritePet({ pet, state, size, onOneShotEnd, loop, className, sty
         height: renderH,
         backgroundImage: `url("${pet.spritesheetUrl}")`,
         backgroundRepeat: 'no-repeat',
-        backgroundSize: `${totalW}px ${totalH}px`,
+        backgroundSize: `${totalW}px auto`,
         backgroundPosition: `${bgX}px ${bgY}px`,
         imageRendering: 'pixelated',
         ...style,
