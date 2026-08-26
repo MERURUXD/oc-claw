@@ -146,6 +146,27 @@ fn hide_window_tokio_cmd(cmd: &mut tokio::process::Command) {
     cmd.creation_flags(CREATE_NO_WINDOW);
 }
 
+/// Detect whether PowerShell 7 (`pwsh.exe`) is available on Windows.
+/// Prefers modern PowerShell 7 (`pwsh.exe`) and falls back to `powershell.exe` (Windows PowerShell 5.1).
+#[cfg(windows)]
+fn get_powershell_executable() -> &'static str {
+    static PS_EXE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    *PS_EXE.get_or_init(|| {
+        if let Ok(paths) = std::env::var("PATH") {
+            for p in std::env::split_paths(&paths) {
+                if p.join("pwsh.exe").is_file() {
+                    return "pwsh.exe";
+                }
+            }
+        }
+        if std::path::Path::new(r"C:\Program Files\PowerShell\7\pwsh.exe").is_file()
+            || std::path::Path::new(r"C:\Program Files (x86)\PowerShell\7\pwsh.exe").is_file() {
+            return "pwsh.exe";
+        }
+        "powershell.exe"
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Windows SSH multiplexer — a persistent `ssh -T` subprocess per host
 // that serialises commands over stdin/stdout, avoiding the per-exec overhead
@@ -1324,10 +1345,8 @@ async fn get_status(_gateway_url: String, _token: String, agent_id: String) -> R
     }
     #[cfg(windows)]
     {
-        // On Windows, openclaw gateway runs as a node.exe process (not a separate
-        // openclaw-gateway.exe binary).  Check whether anything is listening on
-        // the default gateway port (18789) instead.
-        let mut ps_cmd = tokio::process::Command::new("powershell");
+        let ps_exe = get_powershell_executable();
+        let mut ps_cmd = tokio::process::Command::new(ps_exe);
         ps_cmd.args([
                 "-NoProfile",
                 "-Command",
@@ -1338,7 +1357,7 @@ async fn get_status(_gateway_url: String, _token: String, agent_id: String) -> R
         hide_window_tokio_cmd(&mut ps_cmd);
         let listening = ps_cmd.output()
             .await
-            .map_err(|e| format!("powershell: {}", e))?;
+            .map_err(|e| format!("{}: {}", ps_exe, e))?;
         let count_str = String::from_utf8_lossy(&listening.stdout).trim().to_string();
         let count: u32 = count_str.parse().unwrap_or(0);
         if count == 0 {
@@ -12359,7 +12378,8 @@ if ($appPath) {{
         );
         std::fs::write(&helper_path, &script).map_err(|e| format!("failed to write helper script: {e}"))?;
 
-        let mut update_cmd = std::process::Command::new("powershell");
+        let ps_exe = get_powershell_executable();
+        let mut update_cmd = std::process::Command::new(ps_exe);
         update_cmd.args(["-ExecutionPolicy", "Bypass", "-File"])
             .arg(&helper_path)
             .stdout(std::process::Stdio::null())
@@ -13400,10 +13420,11 @@ try {
     };
 
     // On Windows, Claude Code runs hooks via bash (Git Bash), so the command
-    // must be bash-compatible. We call powershell.exe with forward-slash path.
+    // must be bash-compatible. We call powershell/pwsh with forward-slash path.
     #[cfg(windows)]
     let hook_path_str = format!(
-        "powershell.exe -NoProfile -ExecutionPolicy Bypass -File '{}'",
+        "{} -NoProfile -ExecutionPolicy Bypass -File '{}'",
+        get_powershell_executable(),
         hook_path.to_string_lossy().replace('\\', "/")
     );
     #[cfg(not(windows))]
@@ -13682,7 +13703,8 @@ except:
 
     #[cfg(windows)]
     let hook_command_windows_base = format!(
-        "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
+        "{} -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
+        get_powershell_executable(),
         hook_path.to_string_lossy().replace('\\', "/"),
     );
     #[cfg(not(windows))]
@@ -14809,7 +14831,8 @@ try {
 
     #[cfg(windows)]
     let hook_command = format!(
-        "powershell.exe -NoProfile -ExecutionPolicy Bypass -File '{}'",
+        "{} -NoProfile -ExecutionPolicy Bypass -File '{}'",
+        get_powershell_executable(),
         hook_path.to_string_lossy().replace('\\', "/"),
     );
     #[cfg(not(windows))]
@@ -15053,7 +15076,7 @@ try {
         } else {
             hook_path_str
         };
-        format!("powershell.exe -NoProfile -ExecutionPolicy Bypass -File {}", quoted_path)
+        format!("{} -NoProfile -ExecutionPolicy Bypass -File {}", get_powershell_executable(), quoted_path)
     };
     #[cfg(not(windows))]
     let hook_command = hook_path.to_string_lossy().to_string();
@@ -17159,7 +17182,8 @@ try {
     #[cfg(unix)]
     let hook_command = hooks_dir.join("occlaw-cursor-hook.sh").to_string_lossy().to_string();
     #[cfg(windows)]
-    let hook_command = format!("powershell.exe -NoProfile -ExecutionPolicy Bypass -File '{}'",
+    let hook_command = format!("{} -NoProfile -ExecutionPolicy Bypass -File '{}'",
+        get_powershell_executable(),
         hooks_dir.join("occlaw-cursor-hook.ps1").to_string_lossy());
 
     // Cursor's actual supported hook events (as of 2026-04):
