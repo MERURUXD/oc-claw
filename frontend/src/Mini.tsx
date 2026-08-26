@@ -2583,17 +2583,24 @@ export default function Mini() {
   }, [syncExpandedWindowLayout])
   expandFnRef.current = expand
 
-  // Coding-mode multi-mascot: a tap on any extra mascot window broadcasts
-  // `extra-mascot-activate`; mirror the primary mascot's click by expanding the
-  // main session panel. No-op in pet mode (no panel) or when already expanded.
+  // Coding-mode multi-mascot & status bubble: a tap on any extra mascot window
+  // or the status bubble broadcasts an activation event; mirror the primary
+  // mascot's click by expanding the main session panel. No-op in pet mode
+  // (no panel) or when already expanded.
   useEffect(() => {
-    const unlisten = listen('extra-mascot-activate', () => {
+    const unlistenExtra = listen('extra-mascot-activate', () => {
+      if (appModeRef.current === 'pet') return
+      if (expandedRef.current || expandingRef.current) return
+      void expandFnRef.current?.()
+    })
+    const unlistenBubble = listen('mascot-bubble-click', () => {
       if (appModeRef.current === 'pet') return
       if (expandedRef.current || expandingRef.current) return
       void expandFnRef.current?.()
     })
     return () => {
-      unlisten.then((fn) => fn())
+      unlistenExtra.then((fn) => fn())
+      unlistenBubble.then((fn) => fn())
     }
   }, [])
 
