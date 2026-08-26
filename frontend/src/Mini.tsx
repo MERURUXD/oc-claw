@@ -5111,11 +5111,18 @@ export default function Mini() {
                               } else {
                                 const cs = item.data
                                 const isHermesSrc = cs.source === 'hermes'
+                                const isAntigravitySrc = cs.source === 'antigravity'
                                 // Hermes title mirrors OpenClaw: a stable identity + sequence,
                                 // never the question (which only goes to the subtitle below).
                                 const hermesTitle = `Hermes #${getHermesSeq(cs.sessionId)}`
-                                const defaultProjectName = isHermesSrc ? hermesTitle : (cs.cwd ? cs.cwd.replace(/\\/g, '/').split('/').pop() : 'unknown')
+                                const folderName = cs.cwd ? cs.cwd.replace(/\\/g, '/').replace(/\/+$/, '').split('/').filter(Boolean).pop() || '' : ''
+                                const defaultProjectName = isHermesSrc
+                                  ? hermesTitle
+                                  : folderName || (isAntigravitySrc ? (cs.cursorWorkspaceName || 'Antigravity') : 'unknown')
                                 const projectName = sessionNicknames[cs.sessionId] || defaultProjectName
+                                const displayTitle = isAntigravitySrc && cs.cursorWorkspaceName && folderName
+                                  ? `[${cs.cursorWorkspaceName}] ${projectName}`
+                                  : projectName
                                 const isActive = item.active
                                 const isWaiting = cs.status === 'waiting'
                                 const isCompacting = cs.status === 'compacting'
@@ -5289,7 +5296,7 @@ export default function Mini() {
                                               setEditingSessionTitle(cs.sessionId)
                                             }}
                                           >
-                                            {cs.source === 'antigravity' && cs.cursorWorkspaceName ? `[${cs.cursorWorkspaceName}] ${projectName}` : projectName}
+                                            {displayTitle}
                                           </span>
                                         )}
                                         {subtitle && <span className="min-w-0 max-w-[28%] truncate text-[13px] font-normal text-slate-500">· {subtitle}</span>}
@@ -5932,7 +5939,14 @@ export default function Mini() {
                                 // Hermes title mirrors OpenClaw: stable identity + sequence,
                                 // never the question (the question is appended separately below).
                                 const hermesTitle = `Hermes #${getHermesSeq(cs.sessionId)}`
-                                const projectName = cs.source === 'hermes' ? hermesTitle : (cs.cwd ? cs.cwd.replace(/\\/g, '/').split('/').pop() : 'unknown')
+                                const folderName = cs.cwd ? cs.cwd.replace(/\\/g, '/').replace(/\/+$/, '').split('/').filter(Boolean).pop() || '' : ''
+                                const defaultProjectName = cs.source === 'hermes'
+                                  ? hermesTitle
+                                  : folderName || (cs.source === 'antigravity' ? (cs.cursorWorkspaceName || 'Antigravity') : 'unknown')
+                                const projectName = sessionNicknames[cs.sessionId] || defaultProjectName
+                                const displayTitle = cs.source === 'antigravity' && cs.cursorWorkspaceName && folderName
+                                  ? `[${cs.cursorWorkspaceName}] ${projectName}`
+                                  : projectName
                                 const isActive = item.active
                                 const isWaiting = cs.status === 'waiting'
                                 const statusText = cs.tool
@@ -5948,7 +5962,7 @@ export default function Mini() {
                                           : cs.status === 'compacting'
                                             ? t('mini.compacting')
                                             : cs.status
-                                const label = `${projectName}${cs.userPrompt ? ` - ${cs.userPrompt}` : ` - ${statusText}`}`
+                                const label = `${displayTitle}${cs.userPrompt ? ` - ${cs.userPrompt}` : ` - ${statusText}`}`
                                 return (
                                   <motion.div
                                     key={`claude-${cs.sessionId}`}

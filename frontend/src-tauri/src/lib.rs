@@ -7607,6 +7607,45 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
         session.cursor_workspace_name = Some(role);
     }
 
+    if session.cwd.is_empty() {
+        for line in content.lines() {
+            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
+            if let Some(tools) = parsed.get("tool_calls").and_then(|t| t.as_array()) {
+                for tc in tools {
+                    if let Some(args) = tc.get("args") {
+                        let candidate = args.get("Cwd")
+                            .or_else(|| args.get("cwd"))
+                            .or_else(|| args.get("SearchDirectory"))
+                            .or_else(|| args.get("DirectoryPath"))
+                            .or_else(|| args.get("SearchPath"))
+                            .and_then(|v| v.as_str().map(|s| s.trim().trim_matches('"').to_string()));
+                        if let Some(c) = candidate {
+                            if !c.is_empty() {
+                                session.cwd = c.trim_end_matches(['/', '\\']).to_string();
+                                break;
+                            }
+                        }
+                        if let Some(target_file) = args.get("TargetFile")
+                            .or_else(|| args.get("AbsolutePath"))
+                            .and_then(|v| v.as_str().map(|s| s.trim().trim_matches('"').to_string())) {
+                            let p = std::path::Path::new(&target_file);
+                            if let Some(parent) = p.parent() {
+                                let s = parent.to_string_lossy().trim_end_matches(['/', '\\']).to_string();
+                                if !s.is_empty() {
+                                    session.cwd = s;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if !session.cwd.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+
     is_intermediate_tool_turn
 }
 
@@ -14174,9 +14213,13 @@ fn process_claude_event(
                     .unwrap_or("")
                     .to_string();
                 if incoming_cwd.is_empty() {
-                    if let Some(paths) = event.get("workspacePaths").or_else(|| event.get("workspace_paths")).and_then(|v| v.as_array()) {
-                        if let Some(first) = paths.first().and_then(|v| v.as_str()) {
-                            incoming_cwd = first.to_string();
+                    if let Some(paths) = event.get("workspacePaths").or_else(|| event.get("workspace_paths")) {
+                        if let Some(s) = paths.as_str() {
+                            incoming_cwd = s.to_string();
+                        } else if let Some(arr) = paths.as_array() {
+                            if let Some(first) = arr.first().and_then(|v| v.as_str()) {
+                                incoming_cwd = first.to_string();
+                            }
                         }
                     }
                 }
@@ -14211,6 +14254,7 @@ fn process_claude_event(
                         }
                     }
                 }
+                let incoming_cwd = incoming_cwd.trim_end_matches(['/', '\\']).to_string();
                 if !incoming_cwd.is_empty() || session.cwd.is_empty() {
                     session.cwd = incoming_cwd;
                 }
@@ -14876,6 +14920,12 @@ event_arg = '$EVENT_ARG'
 hook_event = event_arg or data.get('event') or data.get('hook_event_name') or ''
 data['event'] = hook_event
 data['source'] = 'antigravity'
+if not data.get('cwd') and data.get('workspacePaths'):
+    wp = data.get('workspacePaths')
+    if isinstance(wp, (list, tuple)) and len(wp) > 0:
+        data['cwd'] = str(wp[0])
+    elif isinstance(wp, str):
+        data['cwd'] = wp
 
 payload = json.dumps(data)
 
@@ -14932,8 +14982,20 @@ try {
     $output = @{}
     if ($obj.conversationId) { $output['conversationId'] = [string]$obj.conversationId }
     if ($obj.session_id) { $output['sessionId'] = [string]$obj.session_id }
-    if ($obj.workspacePaths) { $output['workspacePaths'] = $obj.workspacePaths }
-    if ($obj.cwd) { $output['cwd'] = [string]$obj.cwd }
+    if ($obj.workspacePaths) {
+        $output['workspacePaths'] = $obj.workspacePaths
+        if ($obj.workspacePaths -is [System.Collections.IEnumerable] -and -not ($obj.workspacePaths -is [string])) {
+            foreach ($p in $obj.workspacePaths) {
+                if (-not [string]::IsNullOrWhiteSpace($p)) {
+                    $output['cwd'] = [string]$p
+                    break
+                }
+            }
+        } elseif ($obj.workspacePaths -is [string] -and -not [string]::IsNullOrWhiteSpace($obj.workspacePaths)) {
+            $output['cwd'] = [string]$obj.workspacePaths
+        }
+    }
+    if (-not $output['cwd'] -and $obj.cwd) { $output['cwd'] = [string]$obj.cwd }
     if ($obj.toolCall) { $output['toolCall'] = $obj.toolCall }
     if ($obj.tool_call) { $output['tool_call'] = $obj.tool_call }
     if ($obj.tool_name) { $output['tool_name'] = [string]$obj.tool_name }
