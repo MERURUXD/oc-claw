@@ -6468,6 +6468,8 @@ export default function Mini() {
                     <div className="h-full overflow-y-auto bg-[#151515] scrollbar-hidden">
                       <PetGallery
                         miniPetId={miniPet?.id ?? null}
+                        queueIds={petQueue}
+                        onChangeQueue={savePetQueue}
                         onEquip={async (pet) => {
                           setMiniPet(pet)
                           await saveMiniPetId(pet.id)
