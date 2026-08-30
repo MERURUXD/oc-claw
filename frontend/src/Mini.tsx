@@ -279,6 +279,7 @@ export default function Mini() {
   // Value is the wall-clock ms at dismiss time; a session revives if newer
   // activity arrives after that.
   const remoteDismissedRef = useRef<Map<string, number>>(new Map())
+  const remoteHermesSessionsRef = useRef<any[]>([])
 
   // Agent detail
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null)
@@ -2054,7 +2055,7 @@ export default function Mini() {
     })()
   }, [])
 
-  // Poll Claude/Codex/Cursor sessions
+  // Poll Claude/Codex/Cursor/Hermes sessions
   useEffect(() => {
     if (appMode !== 'coding') {
       setClaudeSessions([])
@@ -2073,6 +2074,76 @@ export default function Mini() {
     // line when something actually changes — keeps oc-claw.log readable.
     const lastLoggedStatus = new Map<string, string>()
     const isPollingRef = { current: false }
+    const isRemotePollingRef = { current: false }
+
+    const pollRemoteHermes = async () => {
+      const remoteHermesConns = hermesConns.filter(c => c.type === 'remote' && c.host && c.user)
+      if (!enableHermes || remoteHermesConns.length === 0) {
+        if (remoteHermesSessionsRef.current.length > 0) {
+          remoteHermesSessionsRef.current = []
+          poll()
+        }
+        return
+      }
+      if (isRemotePollingRef.current) return
+      isRemotePollingRef.current = true
+      try {
+        const remoteResults = await Promise.allSettled(
+          remoteHermesConns.map(c => invoke('get_hermes_remote_sessions', { sshHost: c.host, sshUser: c.user }) as Promise<any[]>)
+        )
+        const remoteSessions: any[] = []
+        for (let ci = 0; ci < remoteResults.length; ci++) {
+          const r = remoteResults[ci]
+          if (r.status !== 'fulfilled' || !Array.isArray(r.value)) continue
+          const conn = remoteHermesConns[ci]
+          const label = `${conn.user}@${conn.host}`
+          for (const rs of r.value) {
+            if (!rs.active && !rs.updatedAt && !rs.startedAt) continue
+            // Respect frontend dismissal for remote sessions (backend
+            // dismissed never sees these). Revive only when newer activity
+            // arrives after the dismiss time.
+            const sshSid = `ssh:${conn.host}:${rs.sessionId}`
+            const remoteDismissedAt = remoteDismissedRef.current.get(sshSid)
+            if (remoteDismissedAt !== undefined) {
+              const rsMs = rs.updatedAt ? Date.parse(rs.updatedAt) : (rs.startedAt ? rs.startedAt * 1000 : 0)
+              if (rsMs > remoteDismissedAt) {
+                remoteDismissedRef.current.delete(sshSid)
+              } else {
+                continue
+              }
+            }
+            const userPrompt = rs.userPrompt || (rs.messageCount ? `${rs.messageCount} msgs` : '')
+            // Prefer explicit status from remote (distinguishes waiting from stopped),
+            // fall back to active flag for older remote scripts.
+            const remoteStatus: string = rs.status || (rs.active ? 'processing' : 'stopped')
+            remoteSessions.push({
+              sessionId: sshSid,
+              status: remoteStatus,
+              source: 'hermes',
+              platform: rs.platform || '',
+              cwd: '',
+              tool: '',
+              model: rs.model || '',
+              hostTerminal: label,
+              updatedAt: rs.startedAt ? new Date(rs.startedAt * 1000).toISOString() : rs.updatedAt || '',
+              // Set both shapes: backend Rust uses camelCase via serde rename,
+              // but a few frontend sites still read snake_case for fallback titles.
+              userPrompt,
+              user_prompt: userPrompt,
+              lastResponse: rs.lastResponse || '',
+              isActiveTab: false,
+            })
+          }
+        }
+        remoteHermesSessionsRef.current = remoteSessions
+        poll()
+      } catch (e) {
+        console.warn('[hermes-remote] poll error:', e)
+      } finally {
+        isRemotePollingRef.current = false
+      }
+    }
+
     const poll = async () => {
       if (isPollingRef.current) return
       isPollingRef.current = true
@@ -2173,59 +2244,9 @@ export default function Mini() {
             }
           }
         }
-        // Merge remote Hermes sessions from SSH connections
-        const remoteHermesConns = hermesConns.filter(c => c.type === 'remote' && c.host && c.user)
-        if (enableHermes && remoteHermesConns.length > 0) {
-          try {
-            const remoteResults = await Promise.allSettled(
-              remoteHermesConns.map(c => invoke('get_hermes_remote_sessions', { sshHost: c.host, sshUser: c.user }) as Promise<any[]>)
-            )
-            for (let ci = 0; ci < remoteResults.length; ci++) {
-              const r = remoteResults[ci]
-              if (r.status !== 'fulfilled' || !Array.isArray(r.value)) continue
-              const conn = remoteHermesConns[ci]
-              const label = `${conn.user}@${conn.host}`
-              for (const rs of r.value) {
-                if (!rs.active && !rs.updatedAt && !rs.startedAt) continue
-                // Respect frontend dismissal for remote sessions (backend
-                // dismissed never sees these). Revive only when newer activity
-                // arrives after the dismiss time.
-                const sshSid = `ssh:${conn.host}:${rs.sessionId}`
-                const remoteDismissedAt = remoteDismissedRef.current.get(sshSid)
-                if (remoteDismissedAt !== undefined) {
-                  const rsMs = rs.updatedAt ? Date.parse(rs.updatedAt) : (rs.startedAt ? rs.startedAt * 1000 : 0)
-                  if (rsMs > remoteDismissedAt) {
-                    remoteDismissedRef.current.delete(sshSid)
-                  } else {
-                    continue
-                  }
-                }
-                const userPrompt = rs.userPrompt || (rs.messageCount ? `${rs.messageCount} msgs` : '')
-                // Prefer explicit status from remote (distinguishes waiting from stopped),
-                // fall back to active flag for older remote scripts.
-                const remoteStatus: string = rs.status || (rs.active ? 'processing' : 'stopped')
-                sessions.push({
-                  sessionId: sshSid,
-                  status: remoteStatus,
-                  source: 'hermes',
-                  platform: rs.platform || '',
-                  cwd: '',
-                  tool: '',
-                  model: rs.model || '',
-                  hostTerminal: label,
-                  updatedAt: rs.startedAt ? new Date(rs.startedAt * 1000).toISOString() : rs.updatedAt || '',
-                  // Set both shapes: backend Rust uses camelCase via serde rename,
-                  // but a few frontend sites still read snake_case for fallback titles.
-                  userPrompt,
-                  user_prompt: userPrompt,
-                  lastResponse: rs.lastResponse || '',
-                  isActiveTab: false,
-                })
-              }
-            }
-          } catch (e) {
-            console.warn('[hermes-remote] poll error:', e)
-          }
+        // Merge cached remote Hermes sessions from SSH connections (decoupled from local poll loop)
+        if (enableHermes && remoteHermesSessionsRef.current.length > 0) {
+          sessions.push(...remoteHermesSessionsRef.current)
         }
 
         // If the completion popup's session disappeared from the poll results,
@@ -2274,8 +2295,22 @@ export default function Mini() {
       }
     }
     poll()
+    pollRemoteHermes()
     const t = setInterval(poll, 2000)
-    return () => clearInterval(t)
+    const tRemote = setInterval(pollRemoteHermes, 3000)
+
+    let unlistenUpdate: (() => void) | undefined
+    listen('claude-session-update', () => {
+      poll()
+    }).then((un) => {
+      unlistenUpdate = un
+    }).catch(() => {})
+
+    return () => {
+      clearInterval(t)
+      clearInterval(tRemote)
+      unlistenUpdate?.()
+    }
   }, [enableClaudeCode, enableClaudeDesktop, enableCodex, enableCursor, enableGemini, enableOpencode, enableHermes, enableAntigravity, hermesConns, appMode])
 
   // Listen for Claude/Codex/Cursor task completion → play sound
