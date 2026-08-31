@@ -13,7 +13,7 @@ import { CreateCharacterModal } from './components/CreateCharacterModal'
 import { ClaudeStatsView } from './components/ClaudeStatsView'
 import { ChatList } from './components/ChatList'
 import { getStore, DEFAULT_CHAR, DEFAULT_CHAR_NAME, loadCharacters, loadOcConnections, saveOcConnections } from './lib/store'
-import type { AgentMetrics, BubbleSessionDetail, BubbleStyle, MascotBubblePayload, OcConnection } from './lib/types'
+import type { AgentMetrics, BubbleSessionDetail, BubbleStyle, MascotBubblePayload, OcConnection, SubagentDetail } from './lib/types'
 import { OnboardingModal } from './components/OnboardingModal'
 import { PetContextMenu, PomodoroOverlay } from './components/PetContextMenu'
 import {
@@ -2317,12 +2317,12 @@ export default function Mini() {
           const folderName = s.cwd ? s.cwd.replace(/\\/g, '/').replace(/\/+$/, '').split('/').filter(Boolean).pop() || '' : ''
           
           let topic = ''
-          if (sessionNicknames[s.sessionId]) {
+          if (s.customTitle) {
+            topic = s.customTitle
+          } else if (sessionNicknames[s.sessionId]) {
             topic = sessionNicknames[s.sessionId]
           } else if (isHermesSrc) {
             topic = `Hermes #${getHermesSeq(s.sessionId)}`
-          } else if (s.customTitle) {
-            topic = s.customTitle
           } else if (isAntigravitySrc) {
             topic = folderName || (s.userPrompt ? s.userPrompt.slice(0, 80) : '') || 'Antigravity'
           } else {
@@ -2330,7 +2330,10 @@ export default function Mini() {
           }
           topic = stripLeadingSlashCommand(topic)
 
-          const role = s.cursorWorkspaceName || s.role || s.subagentRole
+          const hasActiveSubagents = Boolean(s.activeSubagents && s.activeSubagents.length > 0)
+          const role = (hasActiveSubagents || isAntigravitySrc)
+            ? (s.source === 'cursor' ? s.cursorWorkspaceName : undefined)
+            : (s.cursorWorkspaceName || s.role || s.subagentRole)
           const displayTitle = (role && !topic.startsWith(`[${role}]`))
             ? `[${role}] ${topic}`
             : topic
@@ -2401,6 +2404,13 @@ export default function Mini() {
             actionText = s.userPrompt || ''
           }
 
+          if (s.activeSubagents && s.activeSubagents.length > 0) {
+            const activeRoles = s.activeSubagents.map((a: any) => a.role).filter(Boolean)
+            if (activeRoles.length > 0) {
+              actionText = `[${activeRoles.join(', ')}]`
+            }
+          }
+
           return {
             sessionId: s.sessionId,
             title: displayTitle,
@@ -2413,6 +2423,8 @@ export default function Mini() {
             toolInput: s.toolInput || undefined,
             userPrompt: s.userPrompt || undefined,
             questionText: qText || undefined,
+            customTitle: s.customTitle || undefined,
+            activeSubagents: s.activeSubagents || undefined,
             otherCount: Math.max(0, totalActive - 1),
           }
         }
@@ -5354,8 +5366,8 @@ export default function Mini() {
                                 const defaultProjectName = isHermesSrc
                                   ? hermesTitle
                                   : cs.customTitle || folderName || (isAntigravitySrc ? (cs.cursorWorkspaceName || 'Antigravity') : 'unknown')
-                                const projectName = sessionNicknames[cs.sessionId] || defaultProjectName
-                                const displayTitle = isAntigravitySrc && cs.cursorWorkspaceName && !projectName.startsWith(`[${cs.cursorWorkspaceName}]`)
+                                const projectName = sessionNicknames[cs.sessionId] || cs.customTitle || defaultProjectName
+                                const displayTitle = isAntigravitySrc && cs.cursorWorkspaceName && !projectName.startsWith(`[${cs.cursorWorkspaceName}]`) && (!cs.activeSubagents || cs.activeSubagents.length === 0)
                                   ? `[${cs.cursorWorkspaceName}] ${projectName}`
                                   : projectName
                                 const isActive = item.active
@@ -5559,6 +5571,28 @@ export default function Mini() {
                                         </div>
                                       </div>
                                     </div>
+                                    {cs.activeSubagents && cs.activeSubagents.length > 0 && (
+                                      <div className="flex flex-wrap items-center gap-1.5 mt-2 pl-[52px]">
+                                        {cs.activeSubagents.map((sub: SubagentDetail) => {
+                                          const isSubWorking = sub.status === 'tool_running' || sub.status === 'processing'
+                                          return (
+                                            <div
+                                              key={sub.id}
+                                              className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-purple-500/15 text-purple-200 border border-purple-500/30 backdrop-blur-sm shadow-sm"
+                                            >
+                                              <span className="text-[11px]">🤖</span>
+                                              <span className="text-[11px] font-semibold text-purple-100">[{sub.role}]</span>
+                                              {isSubWorking && (
+                                                <span className="relative flex h-2 w-2">
+                                                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+                                                  <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
+                                                </span>
+                                              )}
+                                            </div>
+                                          )
+                                        })}
+                                      </div>
+                                    )}
                                     {/* ── 提醒弹窗 (Reminder Popup) ──
                                        在效率模式下，当 CC session 需要用户批准
                                        (PermissionRequest → isWaiting) 且该 session
@@ -6178,8 +6212,8 @@ export default function Mini() {
                                 const defaultProjectName = cs.source === 'hermes'
                                   ? hermesTitle
                                   : cs.customTitle || folderName || (cs.source === 'antigravity' ? (cs.cursorWorkspaceName || 'Antigravity') : 'unknown')
-                                const projectName = sessionNicknames[cs.sessionId] || defaultProjectName
-                                const displayTitle = cs.source === 'antigravity' && cs.cursorWorkspaceName && !projectName.startsWith(`[${cs.cursorWorkspaceName}]`)
+                                const projectName = sessionNicknames[cs.sessionId] || cs.customTitle || defaultProjectName
+                                const displayTitle = cs.source === 'antigravity' && cs.cursorWorkspaceName && !projectName.startsWith(`[${cs.cursorWorkspaceName}]`) && (!cs.activeSubagents || cs.activeSubagents.length === 0)
                                   ? `[${cs.cursorWorkspaceName}] ${projectName}`
                                   : projectName
                                 const isActive = item.active

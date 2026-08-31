@@ -80,6 +80,18 @@ function getSessionLine2(
     }
   }
 
+  if (session.activeSubagents && session.activeSubagents.length > 0) {
+    const roles = session.activeSubagents.map((s) => s.role).filter(Boolean)
+    if (roles.length > 0) {
+      return {
+        actionPrefix: null,
+        actionContent: `[${roles.join(', ')}]`,
+        isWaiting: false,
+        isProcessing: session.status === 'processing',
+      }
+    }
+  }
+
   if (isToolRunning && session.tool) {
     const param = extractToolParam(session.toolInput)
     return {
@@ -252,10 +264,25 @@ export default function MascotBubble() {
                 </div>
 
                 {/* Line 2: Current Action / Status */}
-                <div className={`mascot-bubble-action-line ${isWaiting ? 'is-waiting' : ''} ${isProcessing ? 'is-processing' : ''}`}>
-                  {actionPrefix && <span className="mascot-bubble-tool-prefix">{actionPrefix}: </span>}
-                  <span className="mascot-bubble-action-text">{actionContent || (actionPrefix ? '' : t('mini.working', 'working...'))}</span>
-                </div>
+                {session.activeSubagents && session.activeSubagents.length > 0 ? (
+                  <div className="mascot-bubble-subagents-row">
+                    <span className="mascot-bubble-subagent-robot">🤖</span>
+                    {session.activeSubagents.map((sub, sIdx) => {
+                      const isSubWorking = sub.status === 'tool_running' || sub.status === 'processing'
+                      return (
+                        <span key={sub.id || sIdx} className="mascot-bubble-subagent-chip">
+                          <span className="mascot-bubble-subagent-role">[{sub.role}]</span>
+                          {isSubWorking && <span className="mascot-bubble-subagent-dot" />}
+                        </span>
+                      )
+                    })}
+                  </div>
+                ) : (
+                  <div className={`mascot-bubble-action-line ${isWaiting ? 'is-waiting' : ''} ${isProcessing ? 'is-processing' : ''}`}>
+                    {actionPrefix && <span className="mascot-bubble-tool-prefix">{actionPrefix}: </span>}
+                    <span className="mascot-bubble-action-text">{actionContent || (actionPrefix ? '' : t('mini.working', 'working...'))}</span>
+                  </div>
+                )}
               </div>
 
               {/* Right side indicator: Spinner or Pulsing Dot + Badge */}

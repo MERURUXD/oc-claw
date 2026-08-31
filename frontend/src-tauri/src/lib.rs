@@ -6857,6 +6857,15 @@ async fn play_sound(name: String) -> Result<(), String> {
 // ─── Claude Code session state ───
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SubagentDetail {
+    pub id: String,
+    pub role: String,
+    pub status: String, // "tool_running", "processing", "stopped"
+    #[serde(rename = "updatedAt")]
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ClaudeSession {
     #[serde(rename = "sessionId")]
     pub session_id: String,
@@ -6911,7 +6920,7 @@ pub struct ClaudeSession {
     pub host_terminal: Option<String>,
     /// Hermes platform identifier (e.g. "feishu", "slack", "discord").
     /// Used to decide which application to activate on session click.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "platform", skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
     /// Bound Cursor extension port for this session.
     /// Unlike `pid`, this is stable for the lifetime of a Cursor window.
@@ -6931,6 +6940,9 @@ pub struct ClaudeSession {
     /// share the same workspace root.
     #[serde(skip)]
     pub cursor_native_handle: Option<String>,
+    /// Active subagents spawned by this session (e.g. Antigravity invoke_subagent).
+    #[serde(rename = "activeSubagents", skip_serializing_if = "Option::is_none")]
+    pub active_subagents: Option<Vec<SubagentDetail>>,
 }
 
 type PendingPermissions = Arc<Mutex<HashMap<String, std::sync::mpsc::Sender<String>>>>;
@@ -7511,45 +7523,189 @@ fn ensure_codex_hooks_feature_enabled(codex_dir: &std::path::Path) -> Result<(),
     Ok(())
 }
 
-fn find_antigravity_title_from_proto(session_id: &str) -> Option<String> {
-    let home = dirs::home_dir()?;
-    let pb_path = home.join(".gemini").join("antigravity").join("agyhub_summaries_proto.pb");
-    let data = std::fs::read(&pb_path).ok()?;
-    let pattern = format!("\n${}", session_id);
-    let pattern_bytes = pattern.as_bytes();
-    let pos = data.windows(pattern_bytes.len()).position(|w| w == pattern_bytes)?;
-    let after = &data[pos + pattern_bytes.len()..];
-    if after.is_empty() || after[0] != 0x12 {
-        return None;
-    }
-    let mut i = 1;
-    while i < after.len() && (after[i] & 0x80) != 0 {
-        i += 1;
-    }
-    i += 1; // past field 2 length varint
-    if i < after.len() && after[i] == 0x0A {
-        i += 1;
-        let mut str_len: usize = 0;
-        let mut shift = 0;
-        while i < after.len() {
-            let b = after[i];
-            i += 1;
-            str_len |= ((b & 0x7F) as usize) << shift;
-            if (b & 0x80) == 0 {
-                break;
-            }
-            shift += 7;
+#[derive(Debug, Clone)]
+pub struct AgpSummaryMeta {
+    pub session_id: String,
+    pub title: String,
+    pub updated_at_ms: u64,
+    pub cwd: Option<String>,
+}
+
+fn read_proto_varint(data: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut val: u64 = 0;
+    let mut shift = 0;
+    while *pos < data.len() {
+        let b = data[*pos];
+        *pos += 1;
+        val |= ((b & 0x7F) as u64) << shift;
+        if (b & 0x80) == 0 {
+            return Some(val);
         }
-        if str_len > 0 && i + str_len <= after.len() {
-            if let Ok(s) = std::str::from_utf8(&after[i..i + str_len]) {
-                let trimmed = s.trim();
-                if !trimmed.is_empty() {
-                    return Some(trimmed.chars().take(80).collect());
+        shift += 7;
+        if shift >= 64 {
+            return None;
+        }
+    }
+    None
+}
+
+fn parse_proto_fields<'a>(data: &'a [u8]) -> Vec<(u32, u8, &'a [u8], u64)> {
+    let mut fields = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        let tag = match read_proto_varint(data, &mut pos) {
+            Some(t) => t,
+            None => break,
+        };
+        let field_num = (tag >> 3) as u32;
+        let wire_type = (tag & 0x07) as u8;
+        match wire_type {
+            0 => {
+                let val = match read_proto_varint(data, &mut pos) {
+                    Some(v) => v,
+                    None => break,
+                };
+                fields.push((field_num, wire_type, &data[0..0], val));
+            }
+            2 => {
+                let len = match read_proto_varint(data, &mut pos) {
+                    Some(l) => l as usize,
+                    None => break,
+                };
+                if pos + len > data.len() {
+                    break;
+                }
+                let bytes = &data[pos..pos + len];
+                pos += len;
+                fields.push((field_num, wire_type, bytes, 0));
+            }
+            1 => {
+                if pos + 8 > data.len() { break; }
+                let bytes = &data[pos..pos + 8];
+                pos += 8;
+                fields.push((field_num, wire_type, bytes, 0));
+            }
+            5 => {
+                if pos + 4 > data.len() { break; }
+                let bytes = &data[pos..pos + 4];
+                pos += 4;
+                fields.push((field_num, wire_type, bytes, 0));
+            }
+            _ => break,
+        }
+    }
+    fields
+}
+
+fn uri_to_path(uri: &str) -> Option<String> {
+    let decoded = percent_decode_str(uri).decode_utf8().ok()?;
+    let stripped = decoded.strip_prefix("file://")?;
+    #[cfg(windows)]
+    {
+        let clean = stripped.trim_start_matches('/');
+        Some(clean.replace('/', "\\"))
+    }
+    #[cfg(not(windows))]
+    {
+        Some(stripped.to_string())
+    }
+}
+
+pub fn parse_agyhub_summaries_pb() -> HashMap<String, AgpSummaryMeta> {
+    let mut map = HashMap::new();
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return map,
+    };
+    let pb_path = home.join(".gemini").join("antigravity").join("agyhub_summaries_proto.pb");
+    let data = match std::fs::read(&pb_path) {
+        Ok(d) => d,
+        Err(_) => return map,
+    };
+
+    let top_fields = parse_proto_fields(&data);
+    for (fn_num, wt, bytes, _) in top_fields {
+        if fn_num == 1 && wt == 2 {
+            let entry_fields = parse_proto_fields(bytes);
+            let mut session_id = None;
+            let mut sub_msg_bytes = None;
+            for (efn, ewt, ebytes, _) in entry_fields {
+                if efn == 1 && ewt == 2 {
+                    if let Ok(sid) = std::str::from_utf8(ebytes) {
+                        session_id = Some(sid.trim().to_string());
+                    }
+                } else if efn == 2 && ewt == 2 {
+                    sub_msg_bytes = Some(ebytes);
+                }
+            }
+
+            if let (Some(sid), Some(sub_bytes)) = (session_id, sub_msg_bytes) {
+                if sid.is_empty() { continue; }
+                let sub_fields = parse_proto_fields(sub_bytes);
+                let mut title = String::new();
+                let mut updated_at_ms: u64 = 0;
+                let mut cwd: Option<String> = None;
+
+                for (sfn, swt, sbytes, _) in sub_fields {
+                    if sfn == 1 && swt == 2 {
+                        if let Ok(t) = std::str::from_utf8(sbytes) {
+                            let trimmed = t.trim();
+                            if !trimmed.is_empty() {
+                                title = trimmed.to_string();
+                            }
+                        }
+                    } else if (sfn == 3 || sfn == 7 || sfn == 10) && swt == 2 {
+                        let ts_fields = parse_proto_fields(sbytes);
+                        let mut secs: u64 = 0;
+                        let mut nanos: u64 = 0;
+                        for (tfn, twt, _, tval) in ts_fields {
+                            if tfn == 1 && twt == 0 {
+                                secs = tval;
+                            } else if tfn == 2 && twt == 0 {
+                                nanos = tval;
+                            }
+                        }
+                        if secs > 0 {
+                            let ms = secs.saturating_mul(1000).saturating_add(nanos / 1_000_000);
+                            if ms > updated_at_ms {
+                                updated_at_ms = ms;
+                            }
+                        }
+                    } else if (sfn == 9 || sfn == 17) && swt == 2 {
+                        let ws_fields = parse_proto_fields(sbytes);
+                        for (_wfn, wwt, wbytes, _) in ws_fields {
+                            if wwt == 2 {
+                                if let Ok(s) = std::str::from_utf8(wbytes) {
+                                    if s.starts_with("file://") {
+                                        if let Some(path) = uri_to_path(s) {
+                                            if !path.is_empty() && cwd.is_none() {
+                                                cwd = Some(path);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !title.is_empty() || updated_at_ms > 0 {
+                    map.insert(sid.clone(), AgpSummaryMeta {
+                        session_id: sid,
+                        title,
+                        updated_at_ms,
+                        cwd,
+                    });
                 }
             }
         }
     }
-    None
+    map
+}
+
+fn find_antigravity_title_from_proto(session_id: &str) -> Option<String> {
+    let summaries = parse_agyhub_summaries_pb();
+    summaries.get(session_id).and_then(|m| if m.title.is_empty() { None } else { Some(m.title.clone()) })
 }
 
 fn find_antigravity_session_file(session_id: &str) -> Option<PathBuf> {
@@ -7588,17 +7744,23 @@ fn clean_antigravity_user_text(raw: &str) -> String {
 }
 
 fn extract_antigravity_subagent_role(prompt: &str) -> Option<String> {
-    let p = prompt.trim();
-    if let Some(rest) = p.strip_prefix("You are the ") {
-        let role = rest.split(|c| c == '\n' || c == '.' || c == ',' || c == ':').next().unwrap_or("").trim();
-        let role = role.strip_suffix(" for oc-claw").or_else(|| role.strip_suffix(" for")).unwrap_or(role).trim();
-        if !role.is_empty() && role.len() < 50 {
-            return Some(role.to_string());
-        }
-    } else if let Some(rest) = p.strip_prefix("You are a ") {
-        let role = rest.split(|c| c == '\n' || c == '.' || c == ',' || c == ':').next().unwrap_or("").trim();
-        if !role.is_empty() && role.len() < 50 {
-            return Some(role.to_string());
+    let cleaned = clean_antigravity_user_text(prompt);
+    for text_src in [&cleaned, prompt] {
+        for line in text_src.lines() {
+            let l = line.trim().trim_start_matches('#').trim();
+            if let Some(rest) = l.strip_prefix("You are the ") {
+                let role = rest.split(|c| c == '\n' || c == '.' || c == ',' || c == ':').next().unwrap_or("").trim();
+                let role = role.strip_suffix(" for oc-claw").or_else(|| role.strip_suffix(" for")).unwrap_or(role).trim();
+                if !role.is_empty() && role.len() < 60 {
+                    return Some(role.to_string());
+                }
+            } else if let Some(rest) = l.strip_prefix("You are a ") {
+                let role = rest.split(|c| c == '\n' || c == '.' || c == ',' || c == ':').next().unwrap_or("").trim();
+                let role = role.strip_suffix(" for oc-claw").or_else(|| role.strip_suffix(" for")).unwrap_or(role).trim();
+                if !role.is_empty() && role.len() < 60 {
+                    return Some(role.to_string());
+                }
+            }
         }
     }
     None
@@ -7655,8 +7817,156 @@ fn extract_antigravity_title(raw: &str) -> Option<String> {
     text.lines().map(|l| l.trim()).find(|l| !l.is_empty()).map(|l| strip_leading_slash_command(l).chars().take(80).collect())
 }
 
+fn is_uuid_str(s: &str) -> bool {
+    if s.len() != 36 { return false; }
+    let b = s.as_bytes();
+    if b[8] != b'-' || b[13] != b'-' || b[18] != b'-' || b[23] != b'-' {
+        return false;
+    }
+    s.chars().enumerate().all(|(i, c)| {
+        if i == 8 || i == 13 || i == 18 || i == 23 {
+            c == '-'
+        } else {
+            c.is_ascii_hexdigit()
+        }
+    })
+}
+
+fn extract_uuids_from_text(text: &str) -> Vec<String> {
+    let mut uuids = Vec::new();
+    let mut i = 0;
+    let b = text.as_bytes();
+    while i + 36 <= b.len() {
+        let slice = &text[i..i + 36];
+        if is_uuid_str(slice) {
+            let u = slice.to_string();
+            if !uuids.contains(&u) {
+                uuids.push(u);
+            }
+            i += 36;
+        } else {
+            i += 1;
+        }
+    }
+    uuids
+}
+
+fn extract_subagent_roles_from_tool_call(args: &serde_json::Value) -> Vec<String> {
+    let mut roles = Vec::new();
+    let subagents_val = args.get("Subagents").or_else(|| args.get("subagents"));
+    let array_opt: Option<Vec<serde_json::Value>> = match subagents_val {
+        Some(serde_json::Value::String(s)) => serde_json::from_str(s).ok(),
+        Some(serde_json::Value::Array(arr)) => Some(arr.clone()),
+        _ => None,
+    };
+    if let Some(arr) = array_opt {
+        for item in arr {
+            if let Some(role_str) = item.get("Role").or_else(|| item.get("role")).and_then(|v| v.as_str()) {
+                let trimmed = role_str.trim();
+                if !trimmed.is_empty() {
+                    roles.push(trimmed.to_string());
+                    continue;
+                }
+            }
+            let prompt = item.get("Prompt")
+                .or_else(|| item.get("prompt"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if let Some(role) = extract_antigravity_subagent_role(prompt) {
+                roles.push(role);
+            } else {
+                roles.push("Subagent".to_string());
+            }
+        }
+    }
+    roles
+}
+
+fn get_subagent_status(subagent_id: &str) -> (String, u64) {
+    let path = match find_antigravity_session_file(subagent_id) {
+        Some(p) => p,
+        None => return ("stopped".to_string(), 0),
+    };
+    let meta = std::fs::metadata(&path).ok();
+    let updated_at = meta
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return ("stopped".to_string(), updated_at),
+    };
+
+    let last_meaningful = content.lines().rev().find(|l| {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(l) else { return false; };
+        let t = v.get("type").and_then(|s| s.as_str()).unwrap_or("");
+        t == "PLANNER_RESPONSE" || t == "GENERIC" || t == "USER_INPUT"
+    });
+
+    let Some(line) = last_meaningful else {
+        return ("stopped".to_string(), updated_at);
+    };
+
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) else {
+        return ("stopped".to_string(), updated_at);
+    };
+
+    let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if msg_type == "PLANNER_RESPONSE" {
+        if let Some(tools) = parsed.get("tool_calls").and_then(|t| t.as_array()) {
+            if !tools.is_empty() {
+                return ("tool_running".to_string(), updated_at);
+            }
+        }
+        return ("stopped".to_string(), updated_at);
+    } else if msg_type == "GENERIC" || msg_type == "USER_INPUT" {
+        return ("processing".to_string(), updated_at);
+    }
+
+    ("stopped".to_string(), updated_at)
+}
+
+fn is_subagent_transcript_file(path: &std::path::Path) -> bool {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    for line in content.lines().take(10) {
+        let text_opt = if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) {
+            parsed.get("content")
+                .or_else(|| parsed.get("text"))
+                .or_else(|| parsed.get("message"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        } else {
+            None
+        };
+        let text = text_opt.as_deref().unwrap_or(line);
+        let cleaned = clean_antigravity_user_text(text);
+        if extract_antigravity_subagent_role(&cleaned).is_some()
+            || cleaned.contains("You are the ")
+            || cleaned.contains("You are a ")
+            || text.contains("You are the ")
+            || text.contains("You are a ")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_antigravity_subagent_session(session_id: &str) -> bool {
+    if let Some(path) = find_antigravity_session_file(session_id) {
+        is_subagent_transcript_file(&path)
+    } else {
+        false
+    }
+}
+
 /// Parse Antigravity transcript.jsonl to populate clean user_prompt, custom_title, last_response, subagent role,
-/// and check if the latest model step is an intermediate step (e.g. still has pending tool calls).
+/// active subagent details, and check if the latest model step is an intermediate step.
 fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bool {
     // 1. Try extracting title from agyhub_summaries_proto.pb first
     let mut custom_title = find_antigravity_title_from_proto(&session.session_id);
@@ -7715,8 +8025,10 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
     let mut is_intermediate_tool_turn = false;
     let mut subagent_role: Option<String> = None;
 
+    let lines: Vec<&str> = content.lines().collect();
+
     // Scan forward from start for first prompt and subagent role
-    for line in content.lines() {
+    for line in &lines {
         let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
         let source_field = parsed.get("source").and_then(|v| v.as_str()).unwrap_or("");
         let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -7747,7 +8059,7 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
     }
 
     // Scan backward for latest turn state
-    for line in content.lines().rev().take(120) {
+    for line in lines.iter().rev().take(120) {
         let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
         let source_field = parsed.get("source").and_then(|v| v.as_str()).unwrap_or("");
         let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -7792,7 +8104,7 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
     }
 
     if session.cwd.is_empty() {
-        for line in content.lines() {
+        for line in &lines {
             let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
             if let Some(tools) = parsed.get("tool_calls").and_then(|t| t.as_array()) {
                 for tc in tools {
@@ -7830,7 +8142,200 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
         }
     }
 
-    is_intermediate_tool_turn
+    // 4. Scan transcript for subagent invocations
+    let mut invoked_subagents: Vec<(String, String, usize)> = Vec::new(); // (subagent_id, role, step_idx)
+    for (idx, line) in lines.iter().enumerate() {
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
+        if let Some(tools) = parsed.get("tool_calls").and_then(|t| t.as_array()) {
+            for tc in tools {
+                if tc.get("name").and_then(|v| v.as_str()) == Some("invoke_subagent") {
+                    let roles = tc.get("args").map(extract_subagent_roles_from_tool_call).unwrap_or_default();
+                    for next_line in lines.iter().skip(idx + 1).take(5) {
+                        let Ok(next_parsed) = serde_json::from_str::<serde_json::Value>(next_line) else { continue; };
+                        let c = next_parsed.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                        if c.contains("Created the following subagents") || c.contains("conversationId") {
+                            let uuids = extract_uuids_from_text(c);
+                            for (u_idx, u) in uuids.into_iter().enumerate() {
+                                let mut role = roles.get(u_idx).cloned().unwrap_or_else(|| "Subagent".to_string());
+                                if role == "Subagent" {
+                                    if let Some(sub_path) = find_antigravity_session_file(&u) {
+                                        if let Ok(sub_content) = std::fs::read_to_string(&sub_path) {
+                                            for sub_line in sub_content.lines().take(10) {
+                                                if let Ok(sub_parsed) = serde_json::from_str::<serde_json::Value>(sub_line) {
+                                                    let sub_text = sub_parsed.get("content")
+                                                        .or_else(|| sub_parsed.get("text"))
+                                                        .or_else(|| sub_parsed.get("message"))
+                                                        .and_then(|v| v.as_str());
+                                                    if let Some(st) = sub_text {
+                                                        if let Some(r) = extract_antigravity_subagent_role(st) {
+                                                            role = r;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if !invoked_subagents.iter().any(|(id, _, _)| id == &u) {
+                                    invoked_subagents.push((u, role, idx));
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut active_subs = Vec::new();
+    for (sub_id, mut role, sub_created_idx) in invoked_subagents {
+        let finished_in_main = lines.iter().skip(sub_created_idx + 1).any(|l| {
+            l.contains(&format!("sender={}", sub_id)) || l.contains(&format!("sender=\"{}\"", sub_id))
+        });
+        if finished_in_main {
+            continue;
+        }
+
+        let (sub_status, sub_updated_at) = get_subagent_status(&sub_id);
+        if sub_status != "stopped" {
+            if role == "Subagent" {
+                if let Some(sub_path) = find_antigravity_session_file(&sub_id) {
+                    if let Ok(sub_content) = std::fs::read_to_string(&sub_path) {
+                        for sub_line in sub_content.lines().take(10) {
+                            if let Ok(sub_parsed) = serde_json::from_str::<serde_json::Value>(sub_line) {
+                                let sub_text = sub_parsed.get("content")
+                                    .or_else(|| sub_parsed.get("text"))
+                                    .or_else(|| sub_parsed.get("message"))
+                                    .and_then(|v| v.as_str());
+                                if let Some(st) = sub_text {
+                                    if let Some(r) = extract_antigravity_subagent_role(st) {
+                                        role = r;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            active_subs.push(SubagentDetail {
+                id: sub_id,
+                role,
+                status: sub_status,
+                updated_at: sub_updated_at,
+            });
+        }
+    }
+
+    let has_active_subs = !active_subs.is_empty();
+    if has_active_subs {
+        let any_tool_running = active_subs.iter().any(|s| s.status == "tool_running");
+        session.status = if any_tool_running {
+            "tool_running".to_string()
+        } else {
+            "processing".to_string()
+        };
+        session.is_processing = true;
+        session.active_subagents = Some(active_subs);
+        session.last_response = None;
+    } else {
+        session.active_subagents = None;
+    }
+
+    is_intermediate_tool_turn || has_active_subs
+}
+
+pub fn load_recent_antigravity_sessions() -> Vec<ClaudeSession> {
+    let summaries = parse_agyhub_summaries_pb();
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return Vec::new(),
+    };
+    let brain_dir = home.join(".gemini").join("antigravity").join("brain");
+
+    let mut candidate_ids: HashMap<String, u64> = HashMap::new();
+
+    for (sid, meta) in &summaries {
+        candidate_ids.insert(sid.clone(), meta.updated_at_ms);
+    }
+
+    if brain_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&brain_dir) {
+            for entry in entries.flatten() {
+                if !entry.path().is_dir() { continue; }
+                let sid = entry.file_name().to_string_lossy().to_string();
+                if !is_uuid_str(&sid) { continue; }
+                let transcript_path = entry.path().join(".system_generated").join("logs").join("transcript.jsonl");
+                if transcript_path.is_file() {
+                    let mtime = std::fs::metadata(&transcript_path)
+                        .and_then(|m| m.modified())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)))
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let cur = candidate_ids.entry(sid).or_insert(0);
+                    if mtime > *cur {
+                        *cur = mtime;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut top_candidates: Vec<(String, u64)> = candidate_ids
+        .into_iter()
+        .filter(|(sid, _)| !is_antigravity_subagent_session(sid))
+        .collect();
+
+    top_candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    top_candidates.truncate(15);
+
+    let mut result = Vec::new();
+    for (sid, updated_at) in top_candidates {
+        let meta = summaries.get(&sid);
+        let mut session = ClaudeSession {
+            session_id: sid.clone(),
+            status: "stopped".to_string(),
+            source: "antigravity".to_string(),
+            cwd: meta.and_then(|m| m.cwd.clone()).unwrap_or_default(),
+            tool: None,
+            tool_input: None,
+            user_prompt: None,
+            custom_title: meta.and_then(|m| if m.title.is_empty() { None } else { Some(m.title.clone()) }),
+            interactive: false,
+            updated_at,
+            is_processing: false,
+            pid: None,
+            pending_agents: 0,
+            permission_suggestions: None,
+            last_response: None,
+            is_active_tab: false,
+            terminal_id: None,
+            host_terminal: None,
+            platform: None,
+            cursor_port: None,
+            cursor_workspace_root: None,
+            cursor_workspace_name: None,
+            cursor_native_handle: None,
+            active_subagents: None,
+        };
+
+        update_antigravity_session_from_transcript(&mut session);
+        if let Some(m) = meta {
+            if !m.title.is_empty() {
+                session.custom_title = Some(m.title.clone());
+            }
+        }
+        if session.active_subagents.is_none() {
+            session.status = "stopped".to_string();
+            session.is_processing = false;
+        }
+
+        result.push(session);
+    }
+
+    result
 }
 
 fn resolve_session_jsonl_path(session_id: &str, cwd: Option<&str>) -> Option<PathBuf> {
@@ -8046,6 +8551,64 @@ static SESSION_WATCHERS: std::sync::LazyLock<Mutex<HashMap<String, notify::Recom
 /// Debounce interval matching notchi's syncDebounce (100ms)
 const WATCHER_DEBOUNCE_MS: u64 = 200;
 
+fn start_subagent_file_watcher(
+    parent_session_id: String,
+    subagent_id: String,
+    subagent_path: PathBuf,
+    sessions: Arc<Mutex<HashMap<String, ClaudeSession>>>,
+    app: tauri::AppHandle,
+) {
+    let watcher_key = format!("subagent:{}:{}", parent_session_id, subagent_id);
+    {
+        let watchers = SESSION_WATCHERS.lock().unwrap();
+        if watchers.contains_key(&watcher_key) {
+            return;
+        }
+    }
+
+    let parent_sid = parent_session_id.clone();
+    let subagent_path_clone = subagent_path.clone();
+
+    let watcher_result = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+        if let Ok(event) = res {
+            if !event.kind.is_modify() { return; }
+
+            let sessions2 = sessions.clone();
+            let app2 = app.clone();
+            let parent_sid2 = parent_sid.clone();
+
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(WATCHER_DEBOUNCE_MS));
+
+                let mut sessions_guard = sessions2.lock().unwrap();
+                let session = match sessions_guard.get_mut(&parent_sid2) {
+                    Some(s) => s,
+                    None => return,
+                };
+
+                let _ = update_antigravity_session_from_transcript(session);
+                session.updated_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+                let _ = app2.emit("claude-session-update", &parent_sid2);
+            });
+        }
+    });
+
+    match watcher_result {
+        Ok(mut watcher) => {
+            if let Err(e) = watcher.watch(&subagent_path_clone, RecursiveMode::NonRecursive) {
+                log::error!("Failed to watch subagent transcript {:?}: {}", subagent_path_clone, e);
+                return;
+            }
+            log::info!("Started subagent file watcher for {} (subagent {})", parent_session_id, subagent_id);
+            SESSION_WATCHERS.lock().unwrap().insert(watcher_key, watcher);
+        }
+        Err(e) => {
+            log::error!("Failed to create subagent file watcher: {}", e);
+        }
+    }
+}
+
 fn start_session_file_watcher(
     session_id: String,
     jsonl_path: PathBuf,
@@ -8106,6 +8669,24 @@ fn start_session_file_watcher(
                         session.is_processing = true;
                         changed = true;
                     }
+                } else if session.source == "antigravity" {
+                    let _ = update_antigravity_session_from_transcript(session);
+                    if let Some(ref subagents) = session.active_subagents {
+                        for sub in subagents {
+                            if sub.status != "stopped" {
+                                if let Some(spath) = find_antigravity_session_file(&sub.id) {
+                                    start_subagent_file_watcher(
+                                        sid2.clone(),
+                                        sub.id.clone(),
+                                        spath,
+                                        sessions2.clone(),
+                                        app2.clone(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    changed = true;
                 }
 
                 // Interruption detection: active/waiting but file shows interrupted
@@ -8149,10 +8730,12 @@ fn start_session_file_watcher(
 }
 
 fn stop_session_file_watcher(session_id: &str) {
-    if let Some(_watcher) = SESSION_WATCHERS.lock().unwrap().remove(session_id) {
+    let mut watchers = SESSION_WATCHERS.lock().unwrap();
+    if let Some(_watcher) = watchers.remove(session_id) {
         log::info!("Stopped file watcher for session {}", session_id);
-        // Watcher is dropped, which stops it
     }
+    let sub_prefix = format!("subagent:{}:", session_id);
+    watchers.retain(|k, _| !k.starts_with(&sub_prefix));
 }
 
 /// Check whether a process with the given PID is still alive.
@@ -8439,6 +9022,7 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
         .filter(|s| !is_codex_internal_utility_session(s))
         .cloned()
         .collect();
+    list.retain(|s| s.source != "antigravity" || !is_antigravity_subagent_session(&s.session_id));
     // Mark sessions' active tab:
     // - Ghostty: match by terminal ID
     // - CC running inside Cursor's integrated terminal: check if Cursor is frontmost
@@ -8579,6 +9163,39 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
             } else {
                 list.push(dbs);
             }
+        }
+    }
+
+    let live_agy_ids: std::collections::HashSet<String> = list.iter()
+        .filter(|s| s.source == "antigravity")
+        .map(|s| s.session_id.clone())
+        .collect();
+    let agy_sessions = load_recent_antigravity_sessions();
+    for agys in agy_sessions {
+        if dismissed.contains(&agys.session_id) {
+            continue;
+        }
+        if live_agy_ids.contains(&agys.session_id) {
+            if let Some(live) = list.iter_mut().find(|s| s.source == "antigravity" && s.session_id == agys.session_id) {
+                if live.custom_title.is_none() || live.custom_title.as_deref() == Some("") {
+                    if let Some(ref title) = agys.custom_title {
+                        live.custom_title = Some(title.clone());
+                    }
+                }
+                if live.cwd.is_empty() && !agys.cwd.is_empty() {
+                    live.cwd = agys.cwd.clone();
+                }
+                if live.user_prompt.is_none() || live.user_prompt.as_deref() == Some("") {
+                    if let Some(ref prompt) = agys.user_prompt {
+                        live.user_prompt = Some(prompt.clone());
+                    }
+                }
+                if live.last_response.is_none() {
+                    live.last_response = agys.last_response.clone();
+                }
+            }
+        } else {
+            list.push(agys);
         }
     }
 
@@ -8888,6 +9505,7 @@ fn load_recent_hermes_sessions_from_db() -> Result<Vec<ClaudeSession>, String> {
             cursor_workspace_root: None,
             cursor_workspace_name: None,
             cursor_native_handle: None,
+            active_subagents: None,
         });
     }
 
@@ -14183,6 +14801,21 @@ fn process_claude_event(
             return None;
         }
 
+        let is_agy_source = source_override == Some("antigravity")
+            || event.get("source").and_then(|v| v.as_str()) == Some("antigravity");
+        if is_agy_source && is_antigravity_subagent_session(&session_id) {
+            if let Ok(mut sessions) = state.lock() {
+                sessions.remove(&session_id);
+            }
+            stop_session_file_watcher(&session_id);
+            log::info!(
+                "[claude_event] ignore antigravity subagent session={} event={}",
+                session_id,
+                hook_event
+            );
+            return None;
+        }
+
         let claude_status = event.get("claudeStatus").or_else(|| event.get("status"))
             .and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
 
@@ -14307,6 +14940,7 @@ fn process_claude_event(
                     cursor_workspace_root: None,
                     cursor_workspace_name: None,
                     cursor_native_handle: None,
+                    active_subagents: None,
                 });
                 // Only upgrade source, never downgrade:
                 // cc < codex < gemini < cursor.
@@ -14577,9 +15211,11 @@ fn process_claude_event(
                         session.last_response = None;
                     } else if session.source == "antigravity" {
                         let is_intermediate = update_antigravity_session_from_transcript(session);
-                        if is_intermediate || session.pending_agents > 0 || session.tool.is_some() {
+                        let has_active_subagents = session.active_subagents.as_ref().map(|s| !s.is_empty()).unwrap_or(false);
+                        if is_intermediate || has_active_subagents || session.pending_agents > 0 || session.tool.is_some() {
                             // Intermediate step: keep status as processing/tool_running, suppress completion popup and sound
-                            session.status = if session.tool.is_some() { "tool_running".to_string() } else { "processing".to_string() };
+                            let any_tool_running = session.tool.is_some() || session.active_subagents.as_ref().map(|s| s.iter().any(|sub| sub.status == "tool_running")).unwrap_or(false);
+                            session.status = if any_tool_running { "tool_running".to_string() } else { "processing".to_string() };
                             session.is_processing = true;
                             status = session.status.clone();
                             is_processing = true;
@@ -14709,7 +15345,28 @@ fn process_claude_event(
                     );
                 }
             }
-        } else if hook_event == "Stop" || hook_event == "SubagentStop" || hook_event == "SessionEnd" {
+        }
+        if session_source == "antigravity" {
+            let sessions = state.lock().unwrap();
+            if let Some(session) = sessions.get(&session_id) {
+                if let Some(ref subagents) = session.active_subagents {
+                    for sub in subagents {
+                        if sub.status != "stopped" {
+                            if let Some(spath) = find_antigravity_session_file(&sub.id) {
+                                start_subagent_file_watcher(
+                                    session_id.clone(),
+                                    sub.id.clone(),
+                                    spath,
+                                    state.clone(),
+                                    app.clone(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if hook_event == "SessionEnd" || (hook_event == "Stop" && status == "stopped" && session_source != "antigravity") || (session_source == "antigravity" && status == "stopped" && pending_agents == 0) {
             stop_session_file_watcher(&session_id);
         }
 
