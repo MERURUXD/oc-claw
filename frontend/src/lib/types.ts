@@ -6,6 +6,13 @@ export type ClaudeStatsSource = 'cc' | 'codex' | 'cursor' | 'gemini' | 'hermes' 
 
 export type BubbleStyle = 'compact' | 'detailed'
 
+export interface SubagentDetail {
+  id: string
+  role: string
+  status: string // "tool_running" | "processing" | "stopped"
+  updatedAt?: number
+}
+
 export interface BubbleSessionDetail {
   sessionId: string
   title: string
@@ -18,6 +25,8 @@ export interface BubbleSessionDetail {
   toolInput?: string
   userPrompt?: string
   questionText?: string
+  customTitle?: string
+  activeSubagents?: SubagentDetail[]
   otherCount?: number
 }
 

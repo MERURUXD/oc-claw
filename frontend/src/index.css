@@ -456,3 +456,52 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
   font-family: ui-monospace, SFMono-Regular, monospace;
 }
 
+.mascot-bubble-subagents-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  overflow: hidden;
+  margin-top: 1px;
+}
+
+.mascot-bubble-subagent-robot {
+  font-size: 11px;
+  flex: none;
+}
+
+.mascot-bubble-subagent-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 9999px;
+  background: rgba(168, 85, 247, 0.18);
+  color: #e9d5ff;
+  border: 1px solid rgba(192, 132, 252, 0.35);
+  box-shadow: 0 0 10px rgba(168, 85, 247, 0.2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 140px;
+}
+
+.mascot-bubble-subagent-role {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mascot-bubble-subagent-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #10b981;
+  box-shadow: 0 0 6px #10b981;
+  flex: none;
+  animation: mascot-beacon-pulse 1.6s ease-in-out infinite;
+}
+
+
