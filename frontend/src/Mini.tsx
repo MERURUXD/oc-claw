@@ -13,7 +13,7 @@ import { CreateCharacterModal } from './components/CreateCharacterModal'
 import { ClaudeStatsView } from './components/ClaudeStatsView'
 import { ChatList } from './components/ChatList'
 import { getStore, DEFAULT_CHAR, DEFAULT_CHAR_NAME, loadCharacters, loadOcConnections, saveOcConnections } from './lib/store'
-import type { AgentMetrics, OcConnection } from './lib/types'
+import type { AgentMetrics, BubbleSessionDetail, BubbleStyle, MascotBubblePayload, OcConnection } from './lib/types'
 import { OnboardingModal } from './components/OnboardingModal'
 import { PetContextMenu, PomodoroOverlay } from './components/PetContextMenu'
 import {
@@ -211,6 +211,17 @@ function getAlternateLargeVideoUrl(url: string): string | undefined {
   return undefined
 }
 
+
+function stripLeadingSlashCommand(title: string): string {
+  if (!title) return ''
+  let cleaned = title.trim()
+  while (/^\/[a-zA-Z0-9_-]+(\s+|$)/.test(cleaned)) {
+    const next = cleaned.replace(/^\/[a-zA-Z0-9_-]+(\s+|$)/, '').trim()
+    if (!next) break
+    cleaned = next
+  }
+  return cleaned || title.trim()
+}
 
 type OcParams = { mode?: string; url?: string; token?: string; sshHost?: string; sshUser?: string }
 
@@ -454,6 +465,11 @@ export default function Mini() {
   const [islandBg, setIslandBg] = useState('__anime__')
   const [uiScale, setUiScale] = useState(1.0)
   const [bgPos, setBgPos] = useState({ x: 50, y: 50 })
+  const [bubbleStyle, setBubbleStyle] = useState<BubbleStyle>('compact')
+  const bubbleStyleRef = useRef<BubbleStyle>('compact')
+  bubbleStyleRef.current = bubbleStyle
+  const lastActiveSessionRef = useRef<any>(null)
+  const lastBubblePayloadRef = useRef<MascotBubblePayload>({ style: 'compact', running: 0, waiting: 0, activeSession: null })
 
   // Settings mode: native window grows, then a separate settings card animates in.
   const [settingsMode, setSettingsMode] = useState(false)
@@ -2047,6 +2063,11 @@ export default function Mini() {
       if (bp) setBgPos(bp)
       const queue = (await store.get('char_queue')) as string[] | null
       if (queue && queue.length) setCharQueue(queue)
+      const bs = ((await store.get('bubble_style')) as BubbleStyle) || 'compact'
+      if (bs === 'compact' || bs === 'detailed') {
+        setBubbleStyle(bs)
+        bubbleStyleRef.current = bs
+      }
       invoke('get_ui_scale')
         .then((s) => {
           if (typeof s === 'number' && s > 0) setUiScale(s)
@@ -2265,22 +2286,149 @@ export default function Mini() {
         // React batches them: the panel's first render after expand already
         // has the filtered single-session view, no full-list flash.
         setClaudeSessions(sessions)
-        // Mascot status bubble: derive a one-line summary from the merged
-        // session list (single source of truth — same list the panel shows,
-        // including merged remote Hermes sessions). Show it only while the
-        // panel is collapsed and at least one session is active.
+        // Mascot status bubble: derive a summary and active session detail from
+        // the merged session list. Show it only while the panel is collapsed
+        // and at least one session is active.
         let bubbleRunning = 0
         let bubbleWaiting = 0
+        const waitingSessions: any[] = []
+        const runningSessions: any[] = []
         for (const s of sessions) {
           const st = s.status
-          if (st === 'processing' || st === 'tool_running' || st === 'compacting') bubbleRunning++
-          else if (st === 'waiting') bubbleWaiting++
+          if (st === 'processing' || st === 'tool_running' || st === 'compacting') {
+            bubbleRunning++
+            runningSessions.push(s)
+          } else if (st === 'waiting') {
+            bubbleWaiting++
+            waitingSessions.push(s)
+          }
         }
+        const getSessionTimestamp = (s: any) => {
+          if (!s.updatedAt) return 0
+          return typeof s.updatedAt === 'string' ? new Date(s.updatedAt).getTime() : Number(s.updatedAt)
+        }
+        waitingSessions.sort((a, b) => getSessionTimestamp(b) - getSessionTimestamp(a))
+        runningSessions.sort((a, b) => getSessionTimestamp(b) - getSessionTimestamp(a))
+        const topSession = waitingSessions[0] || runningSessions[0] || null
+
+        let activeSessionDetail: BubbleSessionDetail | null = null
+        if (topSession) {
+          const isHermesSrc = topSession.source === 'hermes'
+          const isAntigravitySrc = topSession.source === 'antigravity'
+          const folderName = topSession.cwd ? topSession.cwd.replace(/\\/g, '/').replace(/\/+$/, '').split('/').filter(Boolean).pop() || '' : ''
+          
+          let topic = ''
+          if (sessionNicknames[topSession.sessionId]) {
+            topic = sessionNicknames[topSession.sessionId]
+          } else if (isHermesSrc) {
+            topic = `Hermes #${getHermesSeq(topSession.sessionId)}`
+          } else if (topSession.customTitle) {
+            topic = topSession.customTitle
+          } else if (isAntigravitySrc) {
+            topic = folderName || (topSession.userPrompt ? topSession.userPrompt.slice(0, 80) : '') || 'Antigravity'
+          } else {
+            topic = folderName || (topSession.source === 'cursor' ? 'Cursor' : topSession.source === 'codex' ? 'Codex' : 'Claude')
+          }
+          topic = stripLeadingSlashCommand(topic)
+
+          const role = topSession.cursorWorkspaceName || topSession.role || topSession.subagentRole
+          const displayTitle = (role && !topic.startsWith(`[${role}]`))
+            ? `[${role}] ${topic}`
+            : topic
+
+          let qText = ''
+          if (topSession.toolInput) {
+            try {
+              const input = typeof topSession.toolInput === 'string' ? JSON.parse(topSession.toolInput) : topSession.toolInput
+              if (typeof input === 'object' && input !== null) {
+                if (Array.isArray(input.questions) && input.questions.length > 0) {
+                  const firstQ = input.questions[0]
+                  if (typeof firstQ === 'object' && firstQ !== null && typeof firstQ.question === 'string' && firstQ.question.trim()) {
+                    qText = firstQ.question.trim()
+                  } else if (typeof firstQ === 'string' && firstQ.trim()) {
+                    qText = firstQ.trim()
+                  }
+                } else if (typeof input.question === 'string' && input.question.trim()) {
+                  qText = input.question.trim()
+                } else if (typeof input.justification === 'string' && input.justification.trim()) {
+                  qText = input.justification.trim()
+                } else if (input.command || input.CommandLine) {
+                  qText = input.command || input.CommandLine
+                } else if (input.toolAction) {
+                  qText = input.toolAction
+                } else if (input.toolSummary) {
+                  qText = input.toolSummary
+                } else if (input.Query || input.query) {
+                  qText = input.Query || input.query
+                } else if (input.Pattern || input.pattern) {
+                  qText = input.Pattern || input.pattern
+                } else if (input.file_path || input.TargetFile || input.AbsolutePath) {
+                  const fp = input.file_path || input.TargetFile || input.AbsolutePath
+                  const fname = fp.replace(/\\/g, '/').split('/').pop() || fp
+                  qText = fname
+                } else if (input.DirectoryPath || input.SearchPath || input.SearchDirectory) {
+                  const sp = input.DirectoryPath || input.SearchPath || input.SearchDirectory
+                  const dname = sp.replace(/\\/g, '/').split('/').pop() || sp
+                  qText = dname
+                } else if (input.description || input.Description) {
+                  qText = input.description || input.Description
+                } else if (input.prompt || input.Prompt) {
+                  qText = input.prompt || input.Prompt
+                } else if (input.content) {
+                  qText = typeof input.content === 'string' ? input.content : ''
+                }
+              } else if (typeof input === 'string') {
+                qText = input
+              }
+            } catch {
+              qText = typeof topSession.toolInput === 'string' ? topSession.toolInput : ''
+            }
+          }
+
+          let actionText = ''
+          if (topSession.status === 'waiting') {
+            actionText = qText || topSession.questionText || topSession.userPrompt || ''
+          } else if (topSession.tool) {
+            if (qText) {
+              actionText = `${topSession.tool}: ${qText}`
+            } else {
+              actionText = topSession.tool
+            }
+          } else if (topSession.status === 'compacting') {
+            actionText = 'compacting...'
+          } else {
+            actionText = topSession.userPrompt || ''
+          }
+
+          activeSessionDetail = {
+            sessionId: topSession.sessionId,
+            title: displayTitle,
+            subtitle: actionText,
+            actionText,
+            role: topSession.role || topSession.subagentRole || undefined,
+            source: topSession.source || 'cc',
+            status: topSession.status,
+            tool: topSession.tool || undefined,
+            toolInput: topSession.toolInput || undefined,
+            userPrompt: topSession.userPrompt || undefined,
+            questionText: qText || undefined,
+            otherCount: Math.max(0, (bubbleRunning + bubbleWaiting) - 1),
+          }
+        }
+        lastActiveSessionRef.current = topSession
+
         const bubbleActive = bubbleRunning + bubbleWaiting > 0
         const bubbleShouldShow = !expandedRef.current && bubbleActive
+        const bubblePayload: MascotBubblePayload = {
+          style: bubbleStyleRef.current,
+          running: bubbleRunning,
+          waiting: bubbleWaiting,
+          activeSession: activeSessionDetail,
+        }
+        lastBubblePayloadRef.current = bubblePayload
         invoke('set_mascot_bubble_visible', { visible: bubbleShouldShow }).catch(() => {})
         if (bubbleShouldShow) {
-          emit('mascot-bubble-summary', { running: bubbleRunning, waiting: bubbleWaiting }).catch(() => {})
+          emit('mascot-bubble-summary', bubblePayload).catch(() => {})
         }
         if (completionCandidate) {
           shownCompletionsRef.current.add(completionCandidate.sessionId)
@@ -2630,6 +2778,34 @@ export default function Mini() {
     })
     const unlistenBubble = listen('mascot-bubble-click', () => {
       if (appModeRef.current === 'pet') return
+      const active = lastActiveSessionRef.current
+      if (bubbleStyleRef.current === 'detailed' && active && active.status === 'waiting') {
+        const src = active.source
+        if (src === 'antigravity') {
+          invoke('activate_app', { appName: 'Antigravity' }).catch(() => {})
+          return
+        }
+        if (src === 'hermes') {
+          const p = (active.platform || '').toLowerCase()
+          const appName = p.includes('feishu') || p.includes('lark') ? 'Lark'
+            : p.includes('telegram') ? 'Telegram'
+            : p.includes('discord') ? 'Discord'
+            : p.includes('slack') ? 'Slack'
+            : p.includes('wechat') || p.includes('weixin') ? 'WeChat'
+            : p.includes('whatsapp') ? 'WhatsApp'
+            : null
+          if (appName) {
+            invoke('activate_app', { appName }).catch(() => {})
+            return
+          }
+        }
+        if (src === 'cursor') {
+          invoke('focus_cursor_terminal', { sessionId: active.sessionId }).catch((err: unknown) => console.warn('focus cursor failed:', err))
+          return
+        }
+        invoke('jump_to_claude_terminal', { sessionId: active.sessionId }).catch((err: unknown) => console.warn('jump failed:', err))
+        return
+      }
       if (expandedRef.current || expandingRef.current) return
       void expandFnRef.current?.()
     })
@@ -5160,9 +5336,9 @@ export default function Mini() {
                                 const folderName = cs.cwd ? cs.cwd.replace(/\\/g, '/').replace(/\/+$/, '').split('/').filter(Boolean).pop() || '' : ''
                                 const defaultProjectName = isHermesSrc
                                   ? hermesTitle
-                                  : folderName || (isAntigravitySrc ? (cs.cursorWorkspaceName || 'Antigravity') : 'unknown')
+                                  : cs.customTitle || folderName || (isAntigravitySrc ? (cs.cursorWorkspaceName || 'Antigravity') : 'unknown')
                                 const projectName = sessionNicknames[cs.sessionId] || defaultProjectName
-                                const displayTitle = isAntigravitySrc && cs.cursorWorkspaceName && folderName
+                                const displayTitle = isAntigravitySrc && cs.cursorWorkspaceName && !projectName.startsWith(`[${cs.cursorWorkspaceName}]`)
                                   ? `[${cs.cursorWorkspaceName}] ${projectName}`
                                   : projectName
                                 const isActive = item.active
@@ -5984,9 +6160,9 @@ export default function Mini() {
                                 const folderName = cs.cwd ? cs.cwd.replace(/\\/g, '/').replace(/\/+$/, '').split('/').filter(Boolean).pop() || '' : ''
                                 const defaultProjectName = cs.source === 'hermes'
                                   ? hermesTitle
-                                  : folderName || (cs.source === 'antigravity' ? (cs.cursorWorkspaceName || 'Antigravity') : 'unknown')
+                                  : cs.customTitle || folderName || (cs.source === 'antigravity' ? (cs.cursorWorkspaceName || 'Antigravity') : 'unknown')
                                 const projectName = sessionNicknames[cs.sessionId] || defaultProjectName
-                                const displayTitle = cs.source === 'antigravity' && cs.cursorWorkspaceName && folderName
+                                const displayTitle = cs.source === 'antigravity' && cs.cursorWorkspaceName && !projectName.startsWith(`[${cs.cursorWorkspaceName}]`)
                                   ? `[${cs.cursorWorkspaceName}] ${projectName}`
                                   : projectName
                                 const isActive = item.active
@@ -6361,6 +6537,20 @@ export default function Mini() {
                   {settingsNav === 'settings' && (
                     <div className="h-full overflow-y-auto bg-[#151515] scrollbar-hidden">
                       <SettingsTab
+                        bubbleStyle={bubbleStyle}
+                        onChangeBubbleStyle={async (v) => {
+                          setBubbleStyle(v)
+                          bubbleStyleRef.current = v
+                          const store = await getStore()
+                          await store.set('bubble_style', v)
+                          await store.save()
+                          const nextPayload: MascotBubblePayload = {
+                            ...lastBubblePayloadRef.current,
+                            style: v,
+                          }
+                          lastBubblePayloadRef.current = nextPayload
+                          emit('mascot-bubble-summary', nextPayload).catch(() => {})
+                        }}
                         notifySound={notifySound}
                         onChangeNotifySound={async (v) => {
                           setNotifySound(v)
