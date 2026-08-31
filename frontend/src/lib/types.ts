@@ -26,6 +26,7 @@ export interface MascotBubblePayload {
   running: number
   waiting: number
   activeSession?: BubbleSessionDetail | null
+  activeSessions?: BubbleSessionDetail[]
 }
 
 export interface SessionInfo {

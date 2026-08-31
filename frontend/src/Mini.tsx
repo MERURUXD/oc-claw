@@ -469,7 +469,7 @@ export default function Mini() {
   const bubbleStyleRef = useRef<BubbleStyle>('compact')
   bubbleStyleRef.current = bubbleStyle
   const lastActiveSessionRef = useRef<any>(null)
-  const lastBubblePayloadRef = useRef<MascotBubblePayload>({ style: 'compact', running: 0, waiting: 0, activeSession: null })
+  const lastBubblePayloadRef = useRef<MascotBubblePayload>({ style: 'compact', running: 0, waiting: 0, activeSession: null, activeSessions: [] })
 
   // Settings mode: native window grows, then a separate settings card animates in.
   const [settingsMode, setSettingsMode] = useState(false)
@@ -2309,37 +2309,36 @@ export default function Mini() {
         }
         waitingSessions.sort((a, b) => getSessionTimestamp(b) - getSessionTimestamp(a))
         runningSessions.sort((a, b) => getSessionTimestamp(b) - getSessionTimestamp(a))
-        const topSession = waitingSessions[0] || runningSessions[0] || null
 
-        let activeSessionDetail: BubbleSessionDetail | null = null
-        if (topSession) {
-          const isHermesSrc = topSession.source === 'hermes'
-          const isAntigravitySrc = topSession.source === 'antigravity'
-          const folderName = topSession.cwd ? topSession.cwd.replace(/\\/g, '/').replace(/\/+$/, '').split('/').filter(Boolean).pop() || '' : ''
+        const totalActive = bubbleRunning + bubbleWaiting
+        const buildBubbleSessionDetail = (s: any): BubbleSessionDetail => {
+          const isHermesSrc = s.source === 'hermes'
+          const isAntigravitySrc = s.source === 'antigravity'
+          const folderName = s.cwd ? s.cwd.replace(/\\/g, '/').replace(/\/+$/, '').split('/').filter(Boolean).pop() || '' : ''
           
           let topic = ''
-          if (sessionNicknames[topSession.sessionId]) {
-            topic = sessionNicknames[topSession.sessionId]
+          if (sessionNicknames[s.sessionId]) {
+            topic = sessionNicknames[s.sessionId]
           } else if (isHermesSrc) {
-            topic = `Hermes #${getHermesSeq(topSession.sessionId)}`
-          } else if (topSession.customTitle) {
-            topic = topSession.customTitle
+            topic = `Hermes #${getHermesSeq(s.sessionId)}`
+          } else if (s.customTitle) {
+            topic = s.customTitle
           } else if (isAntigravitySrc) {
-            topic = folderName || (topSession.userPrompt ? topSession.userPrompt.slice(0, 80) : '') || 'Antigravity'
+            topic = folderName || (s.userPrompt ? s.userPrompt.slice(0, 80) : '') || 'Antigravity'
           } else {
-            topic = folderName || (topSession.source === 'cursor' ? 'Cursor' : topSession.source === 'codex' ? 'Codex' : 'Claude')
+            topic = folderName || (s.source === 'cursor' ? 'Cursor' : s.source === 'codex' ? 'Codex' : 'Claude')
           }
           topic = stripLeadingSlashCommand(topic)
 
-          const role = topSession.cursorWorkspaceName || topSession.role || topSession.subagentRole
+          const role = s.cursorWorkspaceName || s.role || s.subagentRole
           const displayTitle = (role && !topic.startsWith(`[${role}]`))
             ? `[${role}] ${topic}`
             : topic
 
           let qText = ''
-          if (topSession.toolInput) {
+          if (s.toolInput) {
             try {
-              const input = typeof topSession.toolInput === 'string' ? JSON.parse(topSession.toolInput) : topSession.toolInput
+              const input = typeof s.toolInput === 'string' ? JSON.parse(s.toolInput) : s.toolInput
               if (typeof input === 'object' && input !== null) {
                 if (Array.isArray(input.questions) && input.questions.length > 0) {
                   const firstQ = input.questions[0]
@@ -2381,49 +2380,57 @@ export default function Mini() {
                 qText = input
               }
             } catch {
-              qText = typeof topSession.toolInput === 'string' ? topSession.toolInput : ''
+              qText = typeof s.toolInput === 'string' ? s.toolInput : ''
             }
           }
 
           let actionText = ''
-          if (topSession.status === 'waiting') {
-            actionText = qText || topSession.questionText || topSession.userPrompt || ''
-          } else if (topSession.tool) {
+          if (s.status === 'waiting') {
+            actionText = qText || s.questionText || s.userPrompt || ''
+          } else if (s.status === 'tool_running' && s.tool) {
             if (qText) {
-              actionText = `${topSession.tool}: ${qText}`
+              actionText = `${s.tool}: ${qText}`
             } else {
-              actionText = topSession.tool
+              actionText = s.tool
             }
-          } else if (topSession.status === 'compacting') {
+          } else if (s.status === 'compacting') {
             actionText = 'compacting...'
+          } else if (s.status === 'processing') {
+            actionText = 'thinking...'
           } else {
-            actionText = topSession.userPrompt || ''
+            actionText = s.userPrompt || ''
           }
 
-          activeSessionDetail = {
-            sessionId: topSession.sessionId,
+          return {
+            sessionId: s.sessionId,
             title: displayTitle,
             subtitle: actionText,
             actionText,
-            role: topSession.role || topSession.subagentRole || undefined,
-            source: topSession.source || 'cc',
-            status: topSession.status,
-            tool: topSession.tool || undefined,
-            toolInput: topSession.toolInput || undefined,
-            userPrompt: topSession.userPrompt || undefined,
+            role: s.role || s.subagentRole || undefined,
+            source: s.source || 'cc',
+            status: s.status,
+            tool: s.tool || undefined,
+            toolInput: s.toolInput || undefined,
+            userPrompt: s.userPrompt || undefined,
             questionText: qText || undefined,
-            otherCount: Math.max(0, (bubbleRunning + bubbleWaiting) - 1),
+            otherCount: Math.max(0, totalActive - 1),
           }
         }
+
+        const activeRawSessions = [...waitingSessions, ...runningSessions].slice(0, 3)
+        const activeSessionDetails: BubbleSessionDetail[] = activeRawSessions.map(buildBubbleSessionDetail)
+        const topSession = activeRawSessions[0] || null
+        const activeSessionDetail = activeSessionDetails[0] || null
         lastActiveSessionRef.current = topSession
 
-        const bubbleActive = bubbleRunning + bubbleWaiting > 0
+        const bubbleActive = totalActive > 0
         const bubbleShouldShow = !expandedRef.current && bubbleActive
         const bubblePayload: MascotBubblePayload = {
           style: bubbleStyleRef.current,
           running: bubbleRunning,
           waiting: bubbleWaiting,
           activeSession: activeSessionDetail,
+          activeSessions: activeSessionDetails,
         }
         lastBubblePayloadRef.current = bubblePayload
         invoke('set_mascot_bubble_visible', { visible: bubbleShouldShow }).catch(() => {})
@@ -2776,17 +2783,20 @@ export default function Mini() {
       if (expandedRef.current || expandingRef.current) return
       void expandFnRef.current?.()
     })
-    const unlistenBubble = listen('mascot-bubble-click', () => {
+    const handleBubbleClick = (payload?: { sessionId?: string }) => {
       if (appModeRef.current === 'pet') return
-      const active = lastActiveSessionRef.current
-      if (bubbleStyleRef.current === 'detailed' && active && active.status === 'waiting') {
-        const src = active.source
+      const sid = payload?.sessionId
+      const targetSession = (sid && claudeSessionsRef.current)
+        ? claudeSessionsRef.current.find((s: any) => s.sessionId === sid) || lastActiveSessionRef.current
+        : lastActiveSessionRef.current
+      if (bubbleStyleRef.current === 'detailed' && targetSession && targetSession.status === 'waiting') {
+        const src = targetSession.source
         if (src === 'antigravity') {
           invoke('activate_app', { appName: 'Antigravity' }).catch(() => {})
           return
         }
         if (src === 'hermes') {
-          const p = (active.platform || '').toLowerCase()
+          const p = (targetSession.platform || '').toLowerCase()
           const appName = p.includes('feishu') || p.includes('lark') ? 'Lark'
             : p.includes('telegram') ? 'Telegram'
             : p.includes('discord') ? 'Discord'
@@ -2800,18 +2810,25 @@ export default function Mini() {
           }
         }
         if (src === 'cursor') {
-          invoke('focus_cursor_terminal', { sessionId: active.sessionId }).catch((err: unknown) => console.warn('focus cursor failed:', err))
+          invoke('focus_cursor_terminal', { sessionId: targetSession.sessionId }).catch((err: unknown) => console.warn('focus cursor failed:', err))
           return
         }
-        invoke('jump_to_claude_terminal', { sessionId: active.sessionId }).catch((err: unknown) => console.warn('jump failed:', err))
+        invoke('jump_to_claude_terminal', { sessionId: targetSession.sessionId }).catch((err: unknown) => console.warn('jump failed:', err))
         return
       }
       if (expandedRef.current || expandingRef.current) return
       void expandFnRef.current?.()
+    }
+    const unlistenBubble = listen<{ sessionId?: string } | undefined>('mascot-bubble-click', (e) => {
+      handleBubbleClick(e.payload)
+    })
+    const unlistenBubbleSession = listen<{ sessionId?: string } | undefined>('mascot-bubble-session-click', (e) => {
+      handleBubbleClick(e.payload)
     })
     return () => {
       unlistenExtra.then((fn) => fn())
       unlistenBubble.then((fn) => fn())
+      unlistenBubbleSession.then((fn) => fn())
     }
   }, [])
 
