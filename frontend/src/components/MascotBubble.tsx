@@ -2,18 +2,130 @@ import { useEffect, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { emit, listen } from '@tauri-apps/api/event'
 import { useTranslation } from 'react-i18next'
-import type { MascotBubblePayload } from '../lib/types'
+import type { BubbleSessionDetail, MascotBubblePayload } from '../lib/types'
+
+function extractToolParam(toolInput: unknown): string | null {
+  if (!toolInput) return null
+  try {
+    const inp = typeof toolInput === 'string' ? JSON.parse(toolInput) : toolInput
+    if (typeof inp === 'object' && inp !== null) {
+      let rawVal = ''
+      if (Array.isArray(inp.questions) && inp.questions.length > 0) {
+        const firstQ = inp.questions[0]
+        if (typeof firstQ === 'object' && firstQ !== null && typeof firstQ.question === 'string' && firstQ.question.trim()) {
+          rawVal = firstQ.question.trim()
+        } else if (typeof firstQ === 'string' && firstQ.trim()) {
+          rawVal = firstQ.trim()
+        }
+      } else if (typeof inp.question === 'string' && inp.question.trim()) {
+        rawVal = inp.question.trim()
+      } else if (typeof inp.justification === 'string' && inp.justification.trim()) {
+        rawVal = inp.justification.trim()
+      } else {
+        rawVal =
+          inp.command ||
+          inp.CommandLine ||
+          inp.toolAction ||
+          inp.toolSummary ||
+          inp.Query ||
+          inp.query ||
+          inp.Pattern ||
+          inp.pattern ||
+          inp.file_path ||
+          inp.TargetFile ||
+          inp.AbsolutePath ||
+          inp.DirectoryPath ||
+          inp.SearchPath ||
+          inp.SearchDirectory ||
+          inp.description ||
+          inp.Description ||
+          inp.prompt ||
+          inp.Prompt ||
+          (typeof inp === 'string' ? inp : '')
+      }
+      if (typeof rawVal === 'string' && rawVal.trim()) {
+        let cleanVal = rawVal.trim()
+        if (cleanVal.includes('/') || cleanVal.includes('\\')) {
+          const parts = cleanVal.split(/[/\\]/)
+          if (parts.length > 1 && !cleanVal.includes(' ')) {
+            cleanVal = parts[parts.length - 1] || cleanVal
+          }
+        }
+        return cleanVal
+      }
+    } else if (typeof inp === 'string') {
+      return inp
+    }
+  } catch {
+    return typeof toolInput === 'string' ? toolInput : null
+  }
+  return null
+}
+
+function getSessionLine2(
+  session: BubbleSessionDetail,
+  t: any
+): { actionPrefix: string | null; actionContent: string; isWaiting: boolean; isProcessing: boolean } {
+  const isWaiting = session.status === 'waiting'
+  const isToolRunning = session.status === 'tool_running' && !!session.tool
+  const isCompacting = session.status === 'compacting'
+  const isProcessing = session.status === 'processing'
+
+  if (isWaiting) {
+    return {
+      actionPrefix: null,
+      actionContent: session.questionText || session.userPrompt || t('settings.bubbleJumpToTerminal', 'Waiting for input...'),
+      isWaiting: true,
+      isProcessing: false,
+    }
+  }
+
+  if (isToolRunning && session.tool) {
+    const param = extractToolParam(session.toolInput)
+    return {
+      actionPrefix: session.tool,
+      actionContent: param || session.actionText || '',
+      isWaiting: false,
+      isProcessing: false,
+    }
+  }
+
+  if (isCompacting) {
+    return {
+      actionPrefix: null,
+      actionContent: t('mini.compacting', 'compacting...'),
+      isWaiting: false,
+      isProcessing: false,
+    }
+  }
+
+  if (isProcessing) {
+    return {
+      actionPrefix: null,
+      actionContent: t('mini.thinking', '思考中...'),
+      isWaiting: false,
+      isProcessing: true,
+    }
+  }
+
+  return {
+    actionPrefix: null,
+    actionContent: session.actionText || session.subtitle || session.userPrompt || t('mini.working', 'working...'),
+    isWaiting: false,
+    isProcessing: false,
+  }
+}
 
 /**
- * Mascot status bubble — an interactive status capsule/card for the `mascot-bubble` window
+ * Mascot status bubble — an interactive status capsule/card stack for the `mascot-bubble` window
  * (`index.html#/mascot-bubble`).
  *
  *   1. Listens for `mascot-bubble-summary` events emitted by Mini.tsx and
- *      renders either a compact glassmorphism capsule or a rich detailed status card.
+ *      renders either a compact glassmorphism capsule or a rich detailed status card stack.
  *   2. Measures its own content size with a ResizeObserver and reports it to
  *      Rust via `sync_mascot_bubble` so the window can be positioned next to
  *      the primary mascot.
- *   3. Allows clicking on the bubble card to interact
+ *   3. Allows clicking on individual bubble cards to interact
  *      (jump to terminal or expand panel).
  *   4. Renders nothing when no summary has arrived yet or no active sessions exist.
  */
@@ -65,19 +177,23 @@ export default function MascotBubble() {
   const hasWaiting = summary.waiting > 0
   if (!hasRunning && !hasWaiting) return <div className="mascot-bubble-root" />
 
-  const handleClick = () => {
-    emit('mascot-bubble-click').catch(() => {})
+  const handleClick = (sessionId?: string) => {
+    emit('mascot-bubble-click', { sessionId }).catch(() => {})
+    emit('mascot-bubble-session-click', { sessionId }).catch(() => {})
   }
 
-  const isDetailed = summary.style === 'detailed' && !!summary.activeSession
-  const active = summary.activeSession
+  const sessionsToRender = (summary.activeSessions && summary.activeSessions.length > 0)
+    ? summary.activeSessions
+    : (summary.activeSession ? [summary.activeSession] : [])
 
-  if (!isDetailed || !active) {
+  const isDetailed = summary.style === 'detailed' && sessionsToRender.length > 0
+
+  if (!isDetailed) {
     return (
       <div className="mascot-bubble-root" ref={contentRef}>
         <div
           className="mascot-bubble-card"
-          onClick={handleClick}
+          onClick={() => handleClick()}
           role="button"
           tabIndex={0}
         >
@@ -109,124 +225,61 @@ export default function MascotBubble() {
     )
   }
 
-  // Detailed View (Clean 2-line Card with side spinner / pulsing beacon)
-  const isWaiting = active.status === 'waiting'
-  const isToolRunning = active.status === 'tool_running'
-  const isCompacting = active.status === 'compacting'
-
-  // Dynamic Line 2 action / status text & prefix
-  let actionPrefix: string | null = null
-  let actionContent: string | null = null
-
-  if (isWaiting) {
-    actionContent = active.questionText || active.userPrompt || t('settings.bubbleJumpToTerminal', 'Waiting for input...')
-  } else if (isToolRunning && active.tool) {
-    actionPrefix = active.tool
-    if (active.toolInput) {
-      try {
-        const inp = typeof active.toolInput === 'string' ? JSON.parse(active.toolInput) : active.toolInput
-        if (typeof inp === 'object' && inp !== null) {
-          let rawVal = ''
-          if (Array.isArray(inp.questions) && inp.questions.length > 0) {
-            const firstQ = inp.questions[0]
-            if (typeof firstQ === 'object' && firstQ !== null && typeof firstQ.question === 'string' && firstQ.question.trim()) {
-              rawVal = firstQ.question.trim()
-            } else if (typeof firstQ === 'string' && firstQ.trim()) {
-              rawVal = firstQ.trim()
-            }
-          } else if (typeof inp.question === 'string' && inp.question.trim()) {
-            rawVal = inp.question.trim()
-          } else if (typeof inp.justification === 'string' && inp.justification.trim()) {
-            rawVal = inp.justification.trim()
-          } else {
-            rawVal =
-              inp.command ||
-              inp.CommandLine ||
-              inp.toolAction ||
-              inp.toolSummary ||
-              inp.Query ||
-              inp.query ||
-              inp.Pattern ||
-              inp.pattern ||
-              inp.file_path ||
-              inp.TargetFile ||
-              inp.AbsolutePath ||
-              inp.DirectoryPath ||
-              inp.SearchPath ||
-              inp.SearchDirectory ||
-              inp.description ||
-              inp.Description ||
-              inp.prompt ||
-              inp.Prompt ||
-              (typeof inp === 'string' ? inp : '')
-          }
-          if (typeof rawVal === 'string' && rawVal.trim()) {
-            let cleanVal = rawVal.trim()
-            if (cleanVal.includes('/') || cleanVal.includes('\\')) {
-              const parts = cleanVal.split(/[/\\]/)
-              if (parts.length > 1 && !cleanVal.includes(' ')) {
-                cleanVal = parts[parts.length - 1] || cleanVal
-              }
-            }
-            actionContent = cleanVal
-          }
-        } else if (typeof inp === 'string') {
-          actionContent = inp
-        }
-      } catch {
-        actionContent = typeof active.toolInput === 'string' ? active.toolInput : null
-      }
-    }
-  } else if (isCompacting) {
-    actionContent = t('mini.compacting', 'compacting...')
-  } else {
-    actionContent = active.actionText || active.subtitle || active.userPrompt || t('mini.working', 'working...')
-  }
-
-  const otherCount = active.otherCount ?? ((summary.running + summary.waiting) - 1)
+  const totalActive = summary.running + summary.waiting
 
   return (
     <div className="mascot-bubble-root" ref={contentRef}>
-      {/* Main status bubble card */}
-      <div
-        className={`mascot-bubble-detailed ${isWaiting ? 'is-waiting-card' : ''}`}
-        onClick={handleClick}
-        role="button"
-        tabIndex={0}
-        title={active.title}
-      >
-        <div className="mascot-bubble-content">
-          {/* Line 1: Session Title / Topic */}
-          <div className="mascot-bubble-title-line">
-            <span className="mascot-bubble-main-title">{active.title}</span>
-          </div>
+      <div className="mascot-bubble-stack">
+        {sessionsToRender.map((session, idx) => {
+          const { actionPrefix, actionContent, isWaiting, isProcessing } = getSessionLine2(session, t)
+          const isLast = idx === sessionsToRender.length - 1
+          const remainingOthers = Math.max(0, totalActive - sessionsToRender.length)
+          const showBadge = isLast && remainingOthers > 0
 
-          {/* Line 2: Current Action / Status */}
-          <div className={`mascot-bubble-action-line ${isWaiting ? 'is-waiting' : ''}`}>
-            {actionPrefix && <span className="mascot-bubble-tool-prefix">{actionPrefix}: </span>}
-            <span className="mascot-bubble-action-text">{actionContent || (actionPrefix ? '' : t('mini.working', 'working...'))}</span>
-          </div>
-        </div>
-
-        {/* Right side indicator: Spinner or Pulsing Dot + Badge */}
-        <div className="mascot-bubble-status-area">
-          {otherCount > 0 && (
-            <span
-              className="mascot-bubble-badge"
-              title={t('settings.bubbleActiveOthers', { count: otherCount })}
+          return (
+            <div
+              key={session.sessionId || idx}
+              className={`mascot-bubble-detailed ${isWaiting ? 'is-waiting-card' : ''}`}
+              onClick={() => handleClick(session.sessionId)}
+              role="button"
+              tabIndex={0}
+              title={session.title}
             >
-              +{otherCount}
-            </span>
-          )}
-          {isWaiting ? (
-            <span className="mascot-bubble-beacon">
-              <span className="mascot-bubble-beacon-ring is-waiting" />
-              <span className="mascot-bubble-beacon-dot is-waiting" />
-            </span>
-          ) : (
-            <span className="mascot-bubble-spinner" />
-          )}
-        </div>
+              <div className="mascot-bubble-content">
+                {/* Line 1: Session Title / Topic */}
+                <div className="mascot-bubble-title-line">
+                  <span className="mascot-bubble-main-title">{session.title}</span>
+                </div>
+
+                {/* Line 2: Current Action / Status */}
+                <div className={`mascot-bubble-action-line ${isWaiting ? 'is-waiting' : ''} ${isProcessing ? 'is-processing' : ''}`}>
+                  {actionPrefix && <span className="mascot-bubble-tool-prefix">{actionPrefix}: </span>}
+                  <span className="mascot-bubble-action-text">{actionContent || (actionPrefix ? '' : t('mini.working', 'working...'))}</span>
+                </div>
+              </div>
+
+              {/* Right side indicator: Spinner or Pulsing Dot + Badge */}
+              <div className="mascot-bubble-status-area">
+                {showBadge && (
+                  <span
+                    className="mascot-bubble-badge"
+                    title={t('settings.bubbleActiveOthers', { count: remainingOthers })}
+                  >
+                    +{remainingOthers}
+                  </span>
+                )}
+                {isWaiting ? (
+                  <span className="mascot-bubble-beacon">
+                    <span className="mascot-bubble-beacon-ring is-waiting" />
+                    <span className="mascot-bubble-beacon-dot is-waiting" />
+                  </span>
+                ) : (
+                  <span className="mascot-bubble-spinner" />
+                )}
+              </div>
+            </div>
+          )
+        })}
       </div>
     </div>
   )

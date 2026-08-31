@@ -111,12 +111,22 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
  * A sleek transparent always-on-top capsule anchored next to the primary mascot.
  * ------------------------------------------------------------------------- */
 .mascot-bubble-root {
-  display: inline-flex;
+  display: flex;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-end;
   width: fit-content;
   height: fit-content;
   padding: 4px 8px;
+  box-sizing: border-box;
+}
+
+.mascot-bubble-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: stretch;
+  width: max-content;
+  max-width: 320px;
   box-sizing: border-box;
 }
 
@@ -280,6 +290,7 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+  width: 100%;
   min-width: 140px;
   max-width: 320px;
   padding: 6px 11px;
@@ -403,6 +414,10 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
 
 .mascot-bubble-action-line.is-waiting .mascot-bubble-action-text {
   color: #fde68a;
+}
+
+.mascot-bubble-action-line.is-processing .mascot-bubble-action-text {
+  color: #94a3b8;
 }
 
 .mascot-bubble-status-area {
