@@ -62,7 +62,12 @@ When modifying the codebase:
 
 ## 3. GitHub & Proxy Environment (Windows)
 
-- **GitHub CLI Path**: `C:\Program Files\GitHub CLI\gh.exe`
+- **GitHub MCP Tools (Recommended)**:
+  - You can use the `github` MCP server directly via `call_mcp_tool`:
+    - Create PR: `ToolName: "create_pull_request"`, Arguments: `{"owner": "MERURUXD", "repo": "oc-claw", "title": "...", "head": "branch_name", "base": "main", "body": "..."}`
+    - Merge PR: `ToolName: "merge_pull_request"`, Arguments: `{"owner": "MERURUXD", "repo": "oc-claw", "pull_number": <N>, "merge_method": "squash"}`
+    - Issue & PR query: `list_pull_requests`, `get_pull_request`, `list_issues`, `create_issue`, etc.
+- **GitHub CLI Path (Fallback)**: `C:\Program Files\GitHub CLI\gh.exe`
 - **Proxy Configuration**:
   Network calls on Windows (such as `gh pr create` / `gh pr merge` / `git push`) require local proxy environment variables:
   ```powershell
@@ -70,4 +75,4 @@ When modifying the codebase:
   ```
 - **Commit & PR Strategy**:
   - **Small Fixes & Quick Tweaks**: Commit directly and push to `main` (no PR required).
-  - **Major Features & Large Work**: Create branch $\rightarrow$ Commit $\rightarrow$ Push to `origin <branch>` $\rightarrow$ `gh pr create` $\rightarrow$ `gh pr merge <PR_NUMBER> --squash --admin` $\rightarrow$ `git fetch origin main`.
+  - **Major Features & Large Work**: Create branch $\rightarrow$ Commit $\rightarrow$ Push to `origin <branch>` $\rightarrow$ Create PR (via GitHub MCP or `gh`) $\rightarrow$ Squash merge $\rightarrow$ `git fetch origin main`.
