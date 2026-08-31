@@ -3244,11 +3244,7 @@ const MASCOT_TOP_INSET: f64 = 120.0;
 const MASCOT_SCALE_MIN: f64 = 1.0;
 const MASCOT_SCALE_MAX: f64 = 3.0;
 const LARGE_MASCOT_SIZE_MULTIPLIER: f64 = 3.0;
-/// Horizontal inset (logical px) between the primary mascot and its status
-/// bubble when the bubble is anchored to the mascot's right side.
-const MASCOT_BUBBLE_INSET: f64 = 8.0;
-/// Vertical gap (logical px) between the primary mascot and its status bubble
-/// when the bubble is stacked above/below the mascot.
+/// Gap (logical px) between the primary mascot and its status bubble.
 const MASCOT_BUBBLE_GAP: f64 = 6.0;
 
 fn sanitized_mascot_scale(scale: Option<f64>) -> f64 {
@@ -6871,6 +6867,8 @@ pub struct ClaudeSession {
     pub tool_input: Option<String>,
     #[serde(rename = "userPrompt")]
     pub user_prompt: Option<String>,
+    #[serde(rename = "customTitle", skip_serializing_if = "Option::is_none")]
+    pub custom_title: Option<String>,
     pub interactive: bool,
     #[serde(rename = "updatedAt")]
     pub updated_at: u64,
@@ -7513,6 +7511,47 @@ fn ensure_codex_hooks_feature_enabled(codex_dir: &std::path::Path) -> Result<(),
     Ok(())
 }
 
+fn find_antigravity_title_from_proto(session_id: &str) -> Option<String> {
+    let home = dirs::home_dir()?;
+    let pb_path = home.join(".gemini").join("antigravity").join("agyhub_summaries_proto.pb");
+    let data = std::fs::read(&pb_path).ok()?;
+    let pattern = format!("\n${}", session_id);
+    let pattern_bytes = pattern.as_bytes();
+    let pos = data.windows(pattern_bytes.len()).position(|w| w == pattern_bytes)?;
+    let after = &data[pos + pattern_bytes.len()..];
+    if after.is_empty() || after[0] != 0x12 {
+        return None;
+    }
+    let mut i = 1;
+    while i < after.len() && (after[i] & 0x80) != 0 {
+        i += 1;
+    }
+    i += 1; // past field 2 length varint
+    if i < after.len() && after[i] == 0x0A {
+        i += 1;
+        let mut str_len: usize = 0;
+        let mut shift = 0;
+        while i < after.len() {
+            let b = after[i];
+            i += 1;
+            str_len |= ((b & 0x7F) as usize) << shift;
+            if (b & 0x80) == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        if str_len > 0 && i + str_len <= after.len() {
+            if let Ok(s) = std::str::from_utf8(&after[i..i + str_len]) {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.chars().take(80).collect());
+                }
+            }
+        }
+    }
+    None
+}
+
 fn find_antigravity_session_file(session_id: &str) -> Option<PathBuf> {
     let home = dirs::home_dir()?;
     let path = home
@@ -7565,23 +7604,149 @@ fn extract_antigravity_subagent_role(prompt: &str) -> Option<String> {
     None
 }
 
-/// Parse Antigravity transcript.jsonl to populate clean user_prompt, last_response, subagent role,
+fn strip_leading_slash_command(s: &str) -> String {
+    let mut cur = s.trim();
+    while cur.starts_with('/') {
+        if let Some(space_idx) = cur.find(char::is_whitespace) {
+            let cmd = &cur[1..space_idx];
+            if !cmd.is_empty() && cmd.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+                cur = cur[space_idx..].trim();
+                continue;
+            }
+        }
+        break;
+    }
+    if cur.is_empty() {
+        s.trim().to_string()
+    } else {
+        cur.to_string()
+    }
+}
+
+fn extract_antigravity_title(raw: &str) -> Option<String> {
+    let text = clean_antigravity_user_text(raw);
+    if let Some(obj_idx) = text.find("# USER Objective:") {
+        let after = &text[obj_idx + "# USER Objective:".len()..];
+        if let Some(line) = after.lines().map(|l| l.trim()).find(|l| !l.is_empty()) {
+            if !line.is_empty() {
+                let cleaned = strip_leading_slash_command(line);
+                if !cleaned.is_empty() {
+                    return Some(cleaned.chars().take(80).collect());
+                }
+            }
+        }
+    }
+    for line in text.lines() {
+        let trimmed = line.trim().trim_start_matches('#').trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("You are the ") || trimmed.starts_with("You are a ") {
+            continue;
+        }
+        if trimmed.starts_with("Your job is ") || trimmed.starts_with("Your task is ") {
+            continue;
+        }
+        let cleaned = strip_leading_slash_command(trimmed);
+        if !cleaned.is_empty() {
+            return Some(cleaned.chars().take(80).collect());
+        }
+    }
+    text.lines().map(|l| l.trim()).find(|l| !l.is_empty()).map(|l| strip_leading_slash_command(l).chars().take(80).collect())
+}
+
+/// Parse Antigravity transcript.jsonl to populate clean user_prompt, custom_title, last_response, subagent role,
 /// and check if the latest model step is an intermediate step (e.g. still has pending tool calls).
 fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bool {
+    // 1. Try extracting title from agyhub_summaries_proto.pb first
+    let mut custom_title = find_antigravity_title_from_proto(&session.session_id);
+
     let path = match find_antigravity_session_file(&session.session_id) {
         Some(p) => p,
-        None => return false,
+        None => {
+            if let Some(t) = custom_title {
+                session.custom_title = Some(t);
+            }
+            return false;
+        }
     };
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(_) => return false,
+        Err(_) => {
+            if let Some(t) = custom_title {
+                session.custom_title = Some(t);
+            }
+            return false;
+        }
     };
 
+    // 2. Scan transcript.jsonl across ALL lines (including CHECKPOINT lines) for `# USER Objective:`
+    if custom_title.is_none() {
+        for line in content.lines() {
+            if !line.contains("# USER Objective:") {
+                continue;
+            }
+            let text_candidate = if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) {
+                parsed.get("content")
+                    .or_else(|| parsed.get("text"))
+                    .or_else(|| parsed.get("message"))
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.to_string())
+            } else {
+                None
+            };
+            let text = text_candidate.as_deref().unwrap_or(line);
+            if let Some(obj_idx) = text.find("# USER Objective:") {
+                let after = &text[obj_idx + "# USER Objective:".len()..];
+                if let Some(first_line) = after.lines().map(|l| l.trim().trim_matches(['\\', '"', '\'']).trim()).find(|l| !l.is_empty()) {
+                    let cleaned = strip_leading_slash_command(first_line);
+                    if !cleaned.is_empty() {
+                        custom_title = Some(cleaned.chars().take(80).collect());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut first_user_prompt: Option<String> = None;
     let mut latest_user_prompt: Option<String> = None;
     let mut latest_model_content: Option<String> = None;
     let mut is_intermediate_tool_turn = false;
     let mut subagent_role: Option<String> = None;
 
+    // Scan forward from start for first prompt and subagent role
+    for line in content.lines() {
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
+        let source_field = parsed.get("source").and_then(|v| v.as_str()).unwrap_or("");
+        let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        if (source_field == "USER_EXPLICIT" || source_field == "USER") && (msg_type == "USER_INPUT" || msg_type == "user") {
+            if let Some(raw) = parsed.get("content").and_then(|c| c.as_str()) {
+                if subagent_role.is_none() {
+                    subagent_role = extract_antigravity_subagent_role(raw);
+                }
+                if first_user_prompt.is_none() {
+                    let clean = clean_antigravity_user_text(raw);
+                    if !clean.is_empty() {
+                        first_user_prompt = Some(clean);
+                    }
+                }
+                if subagent_role.is_some() && first_user_prompt.is_some() {
+                    break;
+                }
+            }
+        }
+    }
+
+    // 3. Fall back to extract_antigravity_title on first user prompt
+    if custom_title.is_none() {
+        if let Some(ref prompt) = first_user_prompt {
+            custom_title = extract_antigravity_title(prompt);
+        }
+    }
+
+    // Scan backward for latest turn state
     for line in content.lines().rev().take(120) {
         let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
         let source_field = parsed.get("source").and_then(|v| v.as_str()).unwrap_or("");
@@ -7601,12 +7766,9 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
                     }
                 }
             }
-        } else if source_field == "USER_EXPLICIT" && msg_type == "USER_INPUT" {
+        } else if (source_field == "USER_EXPLICIT" || source_field == "USER") && (msg_type == "USER_INPUT" || msg_type == "user") {
             if latest_user_prompt.is_none() {
                 if let Some(raw) = parsed.get("content").and_then(|c| c.as_str()) {
-                    if subagent_role.is_none() {
-                        subagent_role = extract_antigravity_subagent_role(raw);
-                    }
                     let clean = clean_antigravity_user_text(raw);
                     if !clean.is_empty() {
                         latest_user_prompt = Some(clean);
@@ -7616,7 +7778,10 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
         }
     }
 
-    if let Some(p) = latest_user_prompt {
+    if let Some(t) = custom_title {
+        session.custom_title = Some(t);
+    }
+    if let Some(p) = latest_user_prompt.or(first_user_prompt) {
         session.user_prompt = Some(p);
     }
     if let Some(r) = latest_model_content {
@@ -8707,6 +8872,7 @@ fn load_recent_hermes_sessions_from_db() -> Result<Vec<ClaudeSession>, String> {
             tool: None,
             tool_input: None,
             user_prompt,
+            custom_title: None,
             interactive: false,
             updated_at: updated_at_ms,
             is_processing: is_active,
@@ -9800,13 +9966,12 @@ fn spawn_mascot_bubble(app: tauri::AppHandle) -> Result<(), String> {
 /// `width`/`height` are the bubble's content size in logical pixels, measured
 /// by the frontend via ResizeObserver.
 ///
-/// Anchor: horizontally right-aligned to the mini with a small inset (flipping
-/// to the mini's left side when the right side would overflow the monitor),
-/// vertically stacked above the mascot by default and flipped below when there
-/// is no room. Coordinate axes differ per platform — macOS uses the NSWindow
-/// frame (bottom-left origin) while Windows uses screen coordinates
-/// (top-left origin), so both the fit test and the actual positioning call
-/// are platform-specific.
+/// Anchor: horizontally right-aligned to the mascot (clamped to monitor margins),
+/// vertically stacked directly above the mascot's head by default and flipped
+/// below when there is no room above. Coordinate axes differ per platform —
+/// macOS uses the NSWindow frame (bottom-left origin) while Windows uses
+/// screen coordinates (top-left origin), so both the fit test and the actual
+/// positioning call are platform-specific.
 #[tauri::command]
 async fn sync_mascot_bubble(app: tauri::AppHandle, width: f64, height: f64) -> Result<(), String> {
     *BUBBLE_SIZE.lock().unwrap() = (width, height);
@@ -9895,41 +10060,26 @@ async fn sync_mascot_bubble(app: tauri::AppHandle, width: f64, height: f64) -> R
     let bubble_w = width.max(8.0);
     let bubble_h = height.max(8.0);
 
-    // Horizontal: left-align the bubble to the mascot with a small inset,
-    // flipping to the mascot's right side when it would overflow the monitor,
-    // then clamp into the monitor with a margin.
-    let mut x = mini_x - MASCOT_BUBBLE_INSET;
-    if x < mon_x + margin {
-        x = mini_x + mini_w + MASCOT_BUBBLE_INSET;
-    }
+    // Horizontal Alignment: Mascot's right edge aligns with the bubble's right edge
+    let x = mini_x + mini_w - bubble_w;
     let x_min = mon_x + margin;
     let x_max = (mon_x + mon_w - bubble_w - margin).max(x_min);
     let x = x.clamp(x_min, x_max);
 
-    // Vertical: prefer stacking above the mascot, flip below when there is
-    // not enough room on that side. Axis-aware (see fn docs).
+    // Vertical Alignment: Directly above the mascot's head (flip below if no room above)
     #[cfg(target_os = "macos")]
-    let y = {
-        let above_y = mini_y + mini_h + MASCOT_BUBBLE_GAP;
-        let fits_above = above_y + bubble_h <= mon_y + mon_h - margin;
-        if fits_above {
-            above_y
-        } else {
-            mini_y - bubble_h - MASCOT_BUBBLE_GAP
-        }
-    };
-    #[cfg(target_os = "windows")]
-    let y = {
-        let above_y = mini_y - bubble_h - MASCOT_BUBBLE_GAP;
-        let fits_above = above_y >= mon_y + margin;
-        if fits_above {
-            above_y
-        } else {
-            mini_y + mini_h + MASCOT_BUBBLE_GAP
-        }
-    };
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let y = mini_y;
+    let mut y = mini_y + mini_h + MASCOT_BUBBLE_GAP;
+    #[cfg(target_os = "macos")]
+    if y + bubble_h > mon_y + mon_h - margin {
+        y = mini_y - bubble_h - MASCOT_BUBBLE_GAP;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    let mut y = mini_y - bubble_h - MASCOT_BUBBLE_GAP;
+    #[cfg(not(target_os = "macos"))]
+    if y < mon_y + margin {
+        y = mini_y + mini_h + MASCOT_BUBBLE_GAP;
+    }
 
     let y_min = mon_y + margin;
     let y_max = (mon_y + mon_h - bubble_h - margin).max(y_min);
@@ -14140,6 +14290,7 @@ fn process_claude_event(
                     tool: None,
                     tool_input: None,
                     user_prompt: None,
+                    custom_title: None,
                     interactive: true,
                     updated_at: 0,
                     is_processing: false,

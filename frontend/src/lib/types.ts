@@ -4,6 +4,30 @@ export type { ChromaKeyOptions, Offset }
 
 export type ClaudeStatsSource = 'cc' | 'codex' | 'cursor' | 'gemini' | 'hermes' | 'opencode' | 'antigravity'
 
+export type BubbleStyle = 'compact' | 'detailed'
+
+export interface BubbleSessionDetail {
+  sessionId: string
+  title: string
+  subtitle?: string
+  actionText?: string
+  role?: string
+  source: string
+  status: string
+  tool?: string
+  toolInput?: string
+  userPrompt?: string
+  questionText?: string
+  otherCount?: number
+}
+
+export interface MascotBubblePayload {
+  style: BubbleStyle
+  running: number
+  waiting: number
+  activeSession?: BubbleSessionDetail | null
+}
+
 export interface SessionInfo {
   id: string
   label?: string

@@ -10,7 +10,7 @@ import { Loader2, Check, ChevronDown, Copy, Plus, Trash2, Sparkles, RefreshCw } 
 import { AnimatePresence, motion } from 'motion/react'
 import { useTranslation } from 'react-i18next'
 import { getStore, loadOcConnections, saveOcConnections } from '../lib/store'
-import type { OcConnection } from '../lib/types'
+import type { BubbleStyle, OcConnection } from '../lib/types'
 
 type UpdateProgressPayload = {
   stage: string
@@ -680,7 +680,7 @@ function HermesSection({ hermesHookStatus, t }: {
   )
 }
 
-export function SettingsTab({ notifySound, onChangeNotifySound, waitingSound, onToggleWaitingSound, soundEnabled, onToggleSoundEnabled, codexSoundEnabled, onToggleCodexSoundEnabled, cursorSoundEnabled, onToggleCursorSoundEnabled, geminiSoundEnabled, onToggleGeminiSoundEnabled, opencodeSoundEnabled, onToggleOpencodeSoundEnabled, hermesSoundEnabled, onToggleHermesSoundEnabled, antigravitySoundEnabled, onToggleAntigravitySoundEnabled, autoCloseCompletion, onToggleAutoCloseCompletion, autoExpandOnTask, onToggleAutoExpandOnTask, islandBg, onChangeIslandBg, bgPos, onChangeBgPos, panelMaxHeight, onChangePanelMaxHeight, hoverDelay, onChangeHoverDelay, largeMascotScale, onChangeLargeMascotScale, appMode, onChangeAppMode, petSfxEnabled, onTogglePetSfxEnabled, petIdleIntervalMin, onChangePetIdleIntervalMin }: { notifySound: 'default' | 'manbo'; onChangeNotifySound: (v: 'default' | 'manbo') => void; waitingSound: boolean; onToggleWaitingSound: (v: boolean) => void; soundEnabled: boolean; onToggleSoundEnabled: (v: boolean) => void; codexSoundEnabled: boolean; onToggleCodexSoundEnabled: (v: boolean) => void; cursorSoundEnabled: boolean; onToggleCursorSoundEnabled: (v: boolean) => void; geminiSoundEnabled: boolean; onToggleGeminiSoundEnabled: (v: boolean) => void; opencodeSoundEnabled: boolean; onToggleOpencodeSoundEnabled: (v: boolean) => void; hermesSoundEnabled: boolean; onToggleHermesSoundEnabled: (v: boolean) => void; antigravitySoundEnabled?: boolean; onToggleAntigravitySoundEnabled?: (v: boolean) => void; autoCloseCompletion: boolean; onToggleAutoCloseCompletion: (v: boolean) => void; autoExpandOnTask: boolean; onToggleAutoExpandOnTask: (v: boolean) => void; islandBg: string; onChangeIslandBg: (v: string) => void; bgPos: { x: number; y: number }; onChangeBgPos: (v: { x: number; y: number }) => void; panelMaxHeight: number; onChangePanelMaxHeight: (v: number) => void; hoverDelay: number; onChangeHoverDelay: (v: number) => void; largeMascotScale: number; onChangeLargeMascotScale: (v: number) => void; appMode?: 'coding' | 'pet' | null; onChangeAppMode?: (v: 'coding' | 'pet') => void; petSfxEnabled?: boolean; onTogglePetSfxEnabled?: (v: boolean) => void; petIdleIntervalMin?: number; onChangePetIdleIntervalMin?: (v: number) => void }) {
+export function SettingsTab({ bubbleStyle, onChangeBubbleStyle, notifySound, onChangeNotifySound, waitingSound, onToggleWaitingSound, soundEnabled, onToggleSoundEnabled, codexSoundEnabled, onToggleCodexSoundEnabled, cursorSoundEnabled, onToggleCursorSoundEnabled, geminiSoundEnabled, onToggleGeminiSoundEnabled, opencodeSoundEnabled, onToggleOpencodeSoundEnabled, hermesSoundEnabled, onToggleHermesSoundEnabled, antigravitySoundEnabled, onToggleAntigravitySoundEnabled, autoCloseCompletion, onToggleAutoCloseCompletion, autoExpandOnTask, onToggleAutoExpandOnTask, islandBg, onChangeIslandBg, bgPos, onChangeBgPos, panelMaxHeight, onChangePanelMaxHeight, hoverDelay, onChangeHoverDelay, largeMascotScale, onChangeLargeMascotScale, appMode, onChangeAppMode, petSfxEnabled, onTogglePetSfxEnabled, petIdleIntervalMin, onChangePetIdleIntervalMin }: { bubbleStyle?: BubbleStyle; onChangeBubbleStyle?: (v: BubbleStyle) => void; notifySound: 'default' | 'manbo'; onChangeNotifySound: (v: 'default' | 'manbo') => void; waitingSound: boolean; onToggleWaitingSound: (v: boolean) => void; soundEnabled: boolean; onToggleSoundEnabled: (v: boolean) => void; codexSoundEnabled: boolean; onToggleCodexSoundEnabled: (v: boolean) => void; cursorSoundEnabled: boolean; onToggleCursorSoundEnabled: (v: boolean) => void; geminiSoundEnabled: boolean; onToggleGeminiSoundEnabled: (v: boolean) => void; opencodeSoundEnabled: boolean; onToggleOpencodeSoundEnabled: (v: boolean) => void; hermesSoundEnabled: boolean; onToggleHermesSoundEnabled: (v: boolean) => void; antigravitySoundEnabled?: boolean; onToggleAntigravitySoundEnabled?: (v: boolean) => void; autoCloseCompletion: boolean; onToggleAutoCloseCompletion: (v: boolean) => void; autoExpandOnTask: boolean; onToggleAutoExpandOnTask: (v: boolean) => void; islandBg: string; onChangeIslandBg: (v: string) => void; bgPos: { x: number; y: number }; onChangeBgPos: (v: { x: number; y: number }) => void; panelMaxHeight: number; onChangePanelMaxHeight: (v: number) => void; hoverDelay: number; onChangeHoverDelay: (v: number) => void; largeMascotScale: number; onChangeLargeMascotScale: (v: number) => void; appMode?: 'coding' | 'pet' | null; onChangeAppMode?: (v: 'coding' | 'pet') => void; petSfxEnabled?: boolean; onTogglePetSfxEnabled?: (v: boolean) => void; petIdleIntervalMin?: number; onChangePetIdleIntervalMin?: (v: number) => void }) {
   const { t, i18n } = useTranslation()
   const [connections, setConnections] = useState<OcConnection[]>([])
   const [enableClaudeCode, setEnableClaudeCode] = useState(true)
@@ -1286,6 +1286,60 @@ export function SettingsTab({ notifySound, onChangeNotifySound, waitingSound, on
       <section className="flex flex-col gap-4">
         <h2 className="text-lg font-medium text-white">{t('settings.display')}</h2>
         <div className="bg-[#0f0f0f] border border-white/5 rounded-2xl overflow-hidden">
+          {/* Mascot Bubble Style */}
+          <div className="p-4 border-b border-white/5">
+            <div className="flex flex-col gap-1 mb-3">
+              <span className="text-sm font-medium text-white/90">{t('settings.bubbleStyle', '气泡显示模式')}</span>
+              <span className="text-xs text-white/40">{t('settings.bubbleStyleDesc', '桌面宠物状态气泡的展示样式')}</span>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <button
+                type="button"
+                onClick={() => onChangeBubbleStyle?.('compact')}
+                className={`flex flex-col gap-1.5 p-3 rounded-xl border text-left transition-all ${
+                  (bubbleStyle ?? 'compact') === 'compact'
+                    ? 'bg-white/10 border-white/20 shadow-sm'
+                    : 'bg-white/[0.02] border-white/5 hover:bg-white/[0.05] hover:border-white/10'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className={`text-xs font-semibold ${(bubbleStyle ?? 'compact') === 'compact' ? 'text-white' : 'text-white/70'}`}>
+                    {t('settings.bubbleStyleCompact', '简洁')}
+                  </span>
+                  <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-black/40 border border-white/10 text-[10px] text-cyan-400">
+                    <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse" />
+                    <span>1 running</span>
+                  </div>
+                </div>
+                <span className="text-[11px] text-white/40 leading-relaxed">
+                  {t('settings.bubbleStyleCompactDesc', '仅展示运行与等待数量的精致胶囊')}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => onChangeBubbleStyle?.('detailed')}
+                className={`flex flex-col gap-1.5 p-3 rounded-xl border text-left transition-all ${
+                  bubbleStyle === 'detailed'
+                    ? 'bg-white/10 border-white/20 shadow-sm'
+                    : 'bg-white/[0.02] border-white/5 hover:bg-white/[0.05] hover:border-white/10'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className={`text-xs font-semibold ${bubbleStyle === 'detailed' ? 'text-white' : 'text-white/70'}`}>
+                    {t('settings.bubbleStyleDetailed', '详细')}
+                  </span>
+                  <div className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-300 text-[10px] font-mono">
+                    AGY
+                  </div>
+                </div>
+                <span className="text-[11px] text-white/40 leading-relaxed">
+                  {t('settings.bubbleStyleDetailedDesc', '展示活跃会话名称、角色、工具状态与输入提醒')}
+                </span>
+              </button>
+            </div>
+          </div>
+
           <div className="flex items-center justify-between p-4 border-b border-white/5">
             <div className="flex flex-col gap-1">
               <span className="text-sm font-medium text-white/90">{t('settings.autoExpandOnTask', 'Auto Popup')}</span>

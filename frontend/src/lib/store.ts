@@ -1,10 +1,21 @@
 import { invoke } from '@tauri-apps/api/core'
 import { emit } from '@tauri-apps/api/event'
 import { load } from '@tauri-apps/plugin-store'
-import type { CharacterMeta, OcConnection } from './types'
+import type { BubbleStyle, CharacterMeta, OcConnection } from './types'
 
 export async function getStore() {
   return load('settings.json', { defaults: {}, autoSave: true })
+}
+
+export async function getBubbleStyle(): Promise<BubbleStyle> {
+  const store = await getStore()
+  return ((await store.get('bubble_style')) as BubbleStyle) || 'compact'
+}
+
+export async function setBubbleStyle(style: BubbleStyle) {
+  const store = await getStore()
+  await store.set('bubble_style', style)
+  await store.save()
 }
 
 // On Windows, WebView2 maps custom URI schemes to http://<scheme>.localhost/
