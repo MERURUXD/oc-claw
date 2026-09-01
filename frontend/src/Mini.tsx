@@ -223,6 +223,62 @@ function stripLeadingSlashCommand(title: string): string {
   return cleaned || title.trim()
 }
 
+function formatHermesPlatform(platform?: string): string {
+  if (!platform) return ''
+  const parts = platform.split('/')
+  const plat = (parts.pop() || '').toLowerCase()
+  const profile = parts.join('/')
+  const platMap: Record<string, string> = {
+    feishu: 'Feishu',
+    lark: 'Feishu',
+    telegram: 'Telegram',
+    discord: 'Discord',
+    slack: 'Slack',
+    wechat: 'WeChat',
+    weixin: 'WeChat',
+    whatsapp: 'WhatsApp',
+    terminal: 'Terminal',
+    cli: 'Terminal',
+    web: 'Web',
+  }
+  const platName = platMap[plat] || (plat ? plat.charAt(0).toUpperCase() + plat.slice(1) : '')
+  if (profile && profile !== 'default') {
+    return platName ? `${profile} / ${platName}` : profile
+  }
+  return platName
+}
+
+function getHermesTitle(
+  s: { sessionId: string; customTitle?: string; displayName?: string; platform?: string; cwd?: string; userPrompt?: string; user_prompt?: string },
+  getSeq: (sid: string) => number
+): string {
+  const prompt = s.userPrompt || s.user_prompt || ''
+  if (s.customTitle && (!prompt || !isSubtitleDuplicate(s.customTitle, prompt))) {
+    return s.customTitle
+  }
+  const plat = formatHermesPlatform(s.platform)
+  if (s.displayName) {
+    if (plat && !s.displayName.toLowerCase().includes(plat.toLowerCase())) {
+      return `${plat}: ${s.displayName}`
+    }
+    return s.displayName
+  }
+  if (plat) return plat
+  return `Hermes #${getSeq(s.sessionId)}`
+}
+
+function isSubtitleDuplicate(displayTitle?: string, subtitle?: string): boolean {
+  if (!displayTitle || !subtitle) return false
+  const t = displayTitle.trim().toLowerCase()
+  const s = subtitle.trim().toLowerCase()
+  if (t === s) return true
+  const minLen = Math.min(t.length, s.length, 25)
+  if (minLen >= 10 && (t.startsWith(s.slice(0, minLen)) || s.startsWith(t.slice(0, minLen)))) {
+    return true
+  }
+  return false
+}
+
 type OcParams = { mode?: string; url?: string; token?: string; sshHost?: string; sshUser?: string }
 
 // Returns null for incomplete remote connections (missing host/user)
@@ -2115,8 +2171,13 @@ export default function Mini() {
         const remoteSessions: any[] = []
         for (let ci = 0; ci < remoteResults.length; ci++) {
           const r = remoteResults[ci]
-          if (r.status !== 'fulfilled' || !Array.isArray(r.value)) continue
           const conn = remoteHermesConns[ci]
+          if (r.status !== 'fulfilled' || !Array.isArray(r.value)) {
+            // Keep previously cached sessions for this connection on transient network error
+            const prevForConn = remoteHermesSessionsRef.current.filter(s => s.sessionId?.startsWith(`ssh:${conn.host}:`))
+            remoteSessions.push(...prevForConn)
+            continue
+          }
           const label = `${conn.user}@${conn.host}`
           for (const rs of r.value) {
             if (!rs.active && !rs.updatedAt && !rs.startedAt) continue
@@ -2137,6 +2198,8 @@ export default function Mini() {
             // Prefer explicit status from remote (distinguishes waiting from stopped),
             // fall back to active flag for older remote scripts.
             const remoteStatus: string = rs.status || (rs.active ? 'processing' : 'stopped')
+            const customTitle = rs.customTitle || rs.title || undefined
+            const displayName = rs.displayName || undefined
             remoteSessions.push({
               sessionId: sshSid,
               status: remoteStatus,
@@ -2152,6 +2215,8 @@ export default function Mini() {
               userPrompt,
               user_prompt: userPrompt,
               lastResponse: rs.lastResponse || '',
+              customTitle,
+              displayName,
               isActiveTab: false,
             })
           }
@@ -2317,12 +2382,12 @@ export default function Mini() {
           const folderName = s.cwd ? s.cwd.replace(/\\/g, '/').replace(/\/+$/, '').split('/').filter(Boolean).pop() || '' : ''
           
           let topic = ''
-          if (s.customTitle) {
-            topic = s.customTitle
-          } else if (sessionNicknames[s.sessionId]) {
+          if (sessionNicknames[s.sessionId]) {
             topic = sessionNicknames[s.sessionId]
           } else if (isHermesSrc) {
-            topic = `Hermes #${getHermesSeq(s.sessionId)}`
+            topic = getHermesTitle(s, getHermesSeq)
+          } else if (s.customTitle) {
+            topic = s.customTitle
           } else if (isAntigravitySrc) {
             topic = folderName || (s.userPrompt ? s.userPrompt.slice(0, 80) : '') || 'Antigravity'
           } else {
@@ -5359,14 +5424,11 @@ export default function Mini() {
                                 const cs = item.data
                                 const isHermesSrc = cs.source === 'hermes'
                                 const isAntigravitySrc = cs.source === 'antigravity'
-                                // Hermes title mirrors OpenClaw: a stable identity + sequence,
-                                // never the question (which only goes to the subtitle below).
-                                const hermesTitle = `Hermes #${getHermesSeq(cs.sessionId)}`
                                 const folderName = cs.cwd ? cs.cwd.replace(/\\/g, '/').replace(/\/+$/, '').split('/').filter(Boolean).pop() || '' : ''
                                 const defaultProjectName = isHermesSrc
-                                  ? hermesTitle
+                                  ? getHermesTitle(cs, getHermesSeq)
                                   : cs.customTitle || folderName || (isAntigravitySrc ? (cs.cursorWorkspaceName || 'Antigravity') : 'unknown')
-                                const projectName = sessionNicknames[cs.sessionId] || cs.customTitle || defaultProjectName
+                                const projectName = sessionNicknames[cs.sessionId] || defaultProjectName
                                 const displayTitle = isAntigravitySrc && cs.cursorWorkspaceName && !projectName.startsWith(`[${cs.cursorWorkspaceName}]`) && (!cs.activeSubagents || cs.activeSubagents.length === 0)
                                   ? `[${cs.cursorWorkspaceName}] ${projectName}`
                                   : projectName
@@ -5546,7 +5608,9 @@ export default function Mini() {
                                             {displayTitle}
                                           </span>
                                         )}
-                                        {subtitle && <span className="min-w-0 max-w-[28%] truncate text-[13px] font-normal text-slate-500">· {subtitle}</span>}
+                                        {subtitle && !isSubtitleDuplicate(displayTitle, subtitle) && (
+                                          <span className="min-w-0 max-w-[28%] truncate text-[13px] font-normal text-slate-500">· {subtitle}</span>
+                                        )}
                                         {cs.lastResponse && cs.lastResponse !== '✓' && <span className="min-w-0 max-w-[32%] truncate text-[11px] text-white/40">· {cs.lastResponse}</span>}
                                       </div>
                                       <div className="flex items-center gap-2 shrink-0 ml-auto">
@@ -6205,15 +6269,14 @@ export default function Mini() {
                                 )
                               } else {
                                 const cs = item.data
-                                // Hermes title mirrors OpenClaw: stable identity + sequence,
-                                // never the question (the question is appended separately below).
-                                const hermesTitle = `Hermes #${getHermesSeq(cs.sessionId)}`
+                                const isHermesSrc = cs.source === 'hermes'
+                                const isAntigravitySrc = cs.source === 'antigravity'
                                 const folderName = cs.cwd ? cs.cwd.replace(/\\/g, '/').replace(/\/+$/, '').split('/').filter(Boolean).pop() || '' : ''
-                                const defaultProjectName = cs.source === 'hermes'
-                                  ? hermesTitle
-                                  : cs.customTitle || folderName || (cs.source === 'antigravity' ? (cs.cursorWorkspaceName || 'Antigravity') : 'unknown')
-                                const projectName = sessionNicknames[cs.sessionId] || cs.customTitle || defaultProjectName
-                                const displayTitle = cs.source === 'antigravity' && cs.cursorWorkspaceName && !projectName.startsWith(`[${cs.cursorWorkspaceName}]`) && (!cs.activeSubagents || cs.activeSubagents.length === 0)
+                                const defaultProjectName = isHermesSrc
+                                  ? getHermesTitle(cs, getHermesSeq)
+                                  : cs.customTitle || folderName || (isAntigravitySrc ? (cs.cursorWorkspaceName || 'Antigravity') : 'unknown')
+                                const projectName = sessionNicknames[cs.sessionId] || defaultProjectName
+                                const displayTitle = isAntigravitySrc && cs.cursorWorkspaceName && !projectName.startsWith(`[${cs.cursorWorkspaceName}]`) && (!cs.activeSubagents || cs.activeSubagents.length === 0)
                                   ? `[${cs.cursorWorkspaceName}] ${projectName}`
                                   : projectName
                                 const isActive = item.active
@@ -6231,7 +6294,8 @@ export default function Mini() {
                                           : cs.status === 'compacting'
                                             ? t('mini.compacting')
                                             : cs.status
-                                const label = `${displayTitle}${cs.userPrompt ? ` - ${cs.userPrompt}` : ` - ${statusText}`}`
+                                const showPromptInLabel = cs.userPrompt && !isSubtitleDuplicate(displayTitle, cs.userPrompt)
+                                const label = `${displayTitle}${showPromptInLabel ? ` - ${cs.userPrompt}` : ` - ${statusText}`}`
                                 return (
                                   <motion.div
                                     key={`claude-${cs.sessionId}`}
