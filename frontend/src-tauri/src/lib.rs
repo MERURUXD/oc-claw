@@ -7894,6 +7894,18 @@ fn get_subagent_status(subagent_id: &str) -> (String, u64) {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+    let age_ms = now_ms.saturating_sub(updated_at);
+    // If subagent transcript hasn't been modified in 30s, it has finished or been stopped
+    if age_ms > 30_000 {
+        return ("stopped".to_string(), updated_at);
+    }
+
+    if check_interrupted(&path) {
+        return ("stopped".to_string(), updated_at);
+    }
+
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(_) => return ("stopped".to_string(), updated_at),
@@ -7989,6 +8001,18 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
             return false;
         }
     };
+
+    let is_interrupted = check_interrupted(&path);
+    let meta = std::fs::metadata(&path).ok();
+    let file_mtime = meta
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+    let file_age_ms = now_ms.saturating_sub(file_mtime);
+    let is_file_stale = file_age_ms > 30_000;
 
     // 2. Scan transcript.jsonl across ALL lines (including CHECKPOINT lines) for `# USER Objective:`
     if custom_title.is_none() {
@@ -8229,6 +8253,22 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
         }
     }
 
+    let is_active_session = session.status == "processing"
+        || session.status == "tool_running"
+        || session.status == "waiting";
+
+    if is_interrupted || is_file_stale || !is_active_session {
+        session.active_subagents = None;
+        if session.status != "waiting" && (is_interrupted || is_file_stale) {
+            session.status = "stopped".to_string();
+            session.is_processing = false;
+            session.pending_agents = 0;
+            session.tool = None;
+            session.tool_input = None;
+        }
+        return false;
+    }
+
     let has_active_subs = !active_subs.is_empty();
     if has_active_subs {
         let any_tool_running = active_subs.iter().any(|s| s.status == "tool_running");
@@ -8327,10 +8367,11 @@ pub fn load_recent_antigravity_sessions() -> Vec<ClaudeSession> {
                 session.custom_title = Some(m.title.clone());
             }
         }
-        if session.active_subagents.is_none() {
-            session.status = "stopped".to_string();
-            session.is_processing = false;
-        }
+        session.status = "stopped".to_string();
+        session.is_processing = false;
+        session.active_subagents = None;
+        session.tool = None;
+        session.tool_input = None;
 
         result.push(session);
     }
@@ -8521,6 +8562,36 @@ fn stop_event_was_interrupted(event: &serde_json::Value, session_source: &str, c
         }
     }
 
+    let term_reason = event.get("terminationReason")
+        .or_else(|| event.get("termination_reason"))
+        .or_else(|| event.get("reason"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if term_reason.contains("abort")
+        || term_reason.contains("cancel")
+        || term_reason.contains("interrupt")
+        || term_reason.contains("user_stop")
+        || term_reason.contains("manual")
+        || term_reason.contains("error")
+        || term_reason.contains("kill")
+    {
+        return true;
+    }
+
+    if let Some(err) = event.get("error").and_then(|v| v.as_str()) {
+        let err_lower = err.to_ascii_lowercase();
+        if !err_lower.is_empty()
+            && (err_lower.contains("abort")
+                || err_lower.contains("cancel")
+                || err_lower.contains("interrupt")
+                || err_lower.contains("stopped by user")
+                || err_lower.contains("kill"))
+        {
+            return true;
+        }
+    }
+
     let stop_message = event.get("lastResponse")
         .or_else(|| event.get("last_assistant_message"))
         .or_else(|| event.get("codex_last_assistant_message"))
@@ -8535,6 +8606,7 @@ fn stop_event_was_interrupted(event: &serde_json::Value, session_source: &str, c
     }
 
     event.get("transcript_path")
+        .or_else(|| event.get("transcriptPath"))
         .and_then(|v| v.as_str())
         .filter(|p| !p.is_empty())
         .map(|p| check_interrupted(std::path::Path::new(p)))
@@ -8981,6 +9053,27 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
                         }
                     }
                 }
+                if session.source == "antigravity" {
+                    if session.status != "waiting" {
+                        if let Some(path) = find_antigravity_session_file(&session.session_id) {
+                            let mtime = std::fs::metadata(&path)
+                                .and_then(|m| m.modified())
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)))
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            let f_age = now_ms.saturating_sub(mtime);
+                            if f_age > 30_000 || check_interrupted(&path) {
+                                session.status = "stopped".to_string();
+                                session.is_processing = false;
+                                session.pending_agents = 0;
+                                session.active_subagents = None;
+                                session.tool = None;
+                                session.tool_input = None;
+                                continue;
+                            }
+                        }
+                    }
+                }
                 // Cursor/Codex/opencode/Antigravity/CC Desktop: timeout-based staleness (120s without any event update, 300s for waiting permissions).
                 // Hook PIDs are not stable enough for PID-alive checks in these environments.
                 let age_ms = now_ms.saturating_sub(session.updated_at);
@@ -8998,7 +9091,11 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
                         session.status
                     );
                     session.status = "stopped".to_string();
+                    session.is_processing = false;
                     session.pending_agents = 0;
+                    session.active_subagents = None;
+                    session.tool = None;
+                    session.tool_input = None;
                 }
             } else {
                 // CC: PID-alive check
@@ -15261,55 +15358,72 @@ fn process_claude_event(
                     let is_tab_active = user_looking_at_session_tab(session);
                     if is_tab_active || interrupted {
                         session.last_response = None;
-                    } else if session.source == "antigravity" {
-                        let is_intermediate = update_antigravity_session_from_transcript(session);
-                        let has_active_subagents = session.active_subagents.as_ref().map(|s| !s.is_empty()).unwrap_or(false);
-                        if is_intermediate || has_active_subagents || session.pending_agents > 0 || session.tool.is_some() {
-                            // Intermediate step: keep status as processing/tool_running, suppress completion popup and sound
-                            let any_tool_running = session.tool.is_some() || session.active_subagents.as_ref().map(|s| s.iter().any(|sub| sub.status == "tool_running")).unwrap_or(false);
-                            session.status = if any_tool_running { "tool_running".to_string() } else { "processing".to_string() };
-                            session.is_processing = true;
-                            status = session.status.clone();
-                            is_processing = true;
-                        } else {
+                    }
+                    if session.source == "antigravity" {
+                        if interrupted {
                             session.status = "stopped".to_string();
                             session.is_processing = false;
-                            status = "stopped".to_string();
-                            is_processing = false;
+                            session.pending_agents = 0;
+                            session.active_subagents = None;
                             session.tool = None;
                             session.tool_input = None;
+                            session.last_response = None;
+                            status = "stopped".to_string();
+                            is_processing = false;
+                        } else {
+                            let is_intermediate = update_antigravity_session_from_transcript(session);
+                            let has_active_subagents = session.active_subagents.as_ref().map(|s| !s.is_empty()).unwrap_or(false);
+                            if is_intermediate || has_active_subagents || session.pending_agents > 0 || session.tool.is_some() {
+                                // Intermediate step: keep status as processing/tool_running, suppress completion popup and sound
+                                let any_tool_running = session.tool.is_some() || session.active_subagents.as_ref().map(|s| s.iter().any(|sub| sub.status == "tool_running")).unwrap_or(false);
+                                session.status = if any_tool_running { "tool_running".to_string() } else { "processing".to_string() };
+                                session.is_processing = true;
+                                status = session.status.clone();
+                                is_processing = true;
+                            } else {
+                                session.status = "stopped".to_string();
+                                session.is_processing = false;
+                                status = "stopped".to_string();
+                                is_processing = false;
+                                session.tool = None;
+                                session.tool_input = None;
+                            }
                         }
                     } else if session.source == "hermes" {
                         // Hermes sessions: preserve lastResponse for inline preview
                         // in the session list, but the completion popup is suppressed
                         // on the frontend side (s.source !== 'hermes' guard).
-                        let resp_from_event = event.get("lastResponse")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                        if resp_from_event.is_some() {
-                            session.last_response = resp_from_event;
+                        if !is_tab_active && !interrupted {
+                            let resp_from_event = event.get("lastResponse")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            if resp_from_event.is_some() {
+                                session.last_response = resp_from_event;
+                            }
+                            // else: keep existing last_response from post_llm_call
                         }
-                        // else: keep existing last_response from post_llm_call
                     } else {
                         // Prefer lastResponse from the event itself (CC's Stop has it),
                         // then fall back to any value pre-stored by afterAgentResponse,
                         // then use a placeholder for Cursor/Codex so the popup
                         // still triggers when stop payload omits assistant text.
-                        let resp_from_event = event.get("lastResponse")
-                            .or_else(|| event.get("last_assistant_message"))
-                            .or_else(|| event.get("codex_last_assistant_message"))
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                        if resp_from_event.is_some() {
-                            session.last_response = resp_from_event;
-                        } else if session.last_response.is_none()
-                            && (session.source == "cursor" || session.source == "codex" || session.source == "gemini" || session.source == "opencode")
-                        {
-                            // Gemini/opencode/Cursor/Codex hooks carry no assistant text, so fall
-                            // back to a placeholder so the completion popup still triggers.
-                            session.last_response = Some("✓".to_string());
+                        if !is_tab_active && !interrupted {
+                            let resp_from_event = event.get("lastResponse")
+                                .or_else(|| event.get("last_assistant_message"))
+                                .or_else(|| event.get("codex_last_assistant_message"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            if resp_from_event.is_some() {
+                                session.last_response = resp_from_event;
+                            } else if session.last_response.is_none()
+                                && (session.source == "cursor" || session.source == "codex" || session.source == "gemini" || session.source == "opencode")
+                            {
+                                // Gemini/opencode/Cursor/Codex hooks carry no assistant text, so fall
+                                // back to a placeholder so the completion popup still triggers.
+                                session.last_response = Some("✓".to_string());
+                            }
+                            // else: keep existing last_response from afterAgentResponse
                         }
-                        // else: keep existing last_response from afterAgentResponse
                     }
                     stop_was_interrupted = interrupted;
                 } else if hook_event == "UserPromptSubmit" {
@@ -15838,7 +15952,10 @@ try {
     if (-not $hookEvent -and $obj.hook_event_name) { $hookEvent = [string]$obj.hook_event_name }
 
     $output = @{}
-    if ($obj.conversationId) { $output['conversationId'] = [string]$obj.conversationId }
+    if ($obj) {
+        $obj.psobject.properties | ForEach-Object { $output[$_.Name] = $_.Value }
+    }
+    if ($obj.conversationId) { $output['sessionId'] = [string]$obj.conversationId; $output['conversationId'] = [string]$obj.conversationId }
     if ($obj.session_id) { $output['sessionId'] = [string]$obj.session_id }
     if ($obj.workspacePaths) {
         $output['workspacePaths'] = $obj.workspacePaths
@@ -15854,17 +15971,8 @@ try {
         }
     }
     if (-not $output['cwd'] -and $obj.cwd) { $output['cwd'] = [string]$obj.cwd }
-    if ($obj.toolCall) { $output['toolCall'] = $obj.toolCall }
-    if ($obj.tool_call) { $output['tool_call'] = $obj.tool_call }
-    if ($obj.tool_name) { $output['tool_name'] = [string]$obj.tool_name }
-    if ($obj.tool) { $output['tool'] = [string]$obj.tool }
-    if ($obj.tool_input) { $output['tool_input'] = $obj.tool_input }
-    if ($obj.toolInput) { $output['toolInput'] = $obj.toolInput }
-    if ($obj.tool_args) { $output['tool_args'] = $obj.tool_args }
-    if ($obj.arguments) { $output['arguments'] = $obj.arguments }
-    if ($obj.parameters) { $output['parameters'] = $obj.parameters }
-    if ($obj.userPrompt) { $output['userPrompt'] = [string]$obj.userPrompt }
-    if ($obj.prompt) { $output['prompt'] = [string]$obj.prompt }
+    if ($obj.terminationReason) { $output['terminationReason'] = [string]$obj.terminationReason }
+    if ($obj.error) { $output['error'] = [string]$obj.error }
     $output['event'] = $hookEvent
     $output['source'] = 'antigravity'
 
