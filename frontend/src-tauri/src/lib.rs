@@ -9018,7 +9018,7 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
     let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
     let active_tid = get_active_ghostty_terminal_id();
     let mut list: Vec<ClaudeSession> = sessions.values()
-        .filter(|s| !s.cwd.is_empty() || s.source == "cursor" || s.source == "opencode" || s.source == "antigravity")
+        .filter(|s| !s.cwd.is_empty() || s.source == "cursor" || s.source == "opencode" || s.source == "antigravity" || s.source == "hermes")
         .filter(|s| !is_codex_internal_utility_session(s))
         .cloned()
         .collect();
@@ -9107,7 +9107,7 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
         }
     }
     // Load ooclaw plugin status to filter hermes sessions.
-    // Only hermes sessions present in ooclaw-status.json are shown.
+    // Only hermes sessions present in ooclaw-status.json are shown (unless currently active in-memory).
     let hermes_dir = dirs::home_dir().map(|h| h.join(".hermes"));
     let mut ooclaw_known_sids: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(ref hd) = hermes_dir {
@@ -9127,8 +9127,12 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
             }
         }
     }
-    // Remove live hermes sessions not in ooclaw-status.json
-    list.retain(|s| s.source != "hermes" || ooclaw_known_sids.contains(&s.session_id));
+    // Remove live hermes sessions not in ooclaw-status.json unless they are actively running in memory
+    list.retain(|s| {
+        if s.source != "hermes" { return true; }
+        let live_is_active = s.status == "processing" || s.status == "tool_running" || s.status == "waiting";
+        live_is_active || ooclaw_known_sids.contains(&s.session_id)
+    });
 
     let dismissed = state.dismissed.lock().map(|d| d.clone()).unwrap_or_default();
     let live_hermes_ids: std::collections::HashSet<String> = list.iter()
@@ -9142,15 +9146,24 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
             }
             if live_hermes_ids.contains(&dbs.session_id) {
                 if let Some(live) = list.iter_mut().find(|s| s.source == "hermes" && s.session_id == dbs.session_id) {
-                    // Update active status from plugin only if live in-memory session is not newer/active
-                    let live_is_active = live.status == "processing" || live.status == "tool_running" || live.status == "waiting";
-                    if !live_is_active || dbs.updated_at > live.updated_at {
+                    if dbs.updated_at >= live.updated_at {
                         live.status = dbs.status.clone();
                         live.is_processing = dbs.is_processing;
+                    } else if live.status == "processing" || live.status == "tool_running" {
+                        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+                        if now_ms.saturating_sub(live.updated_at) > 5000 && dbs.status == "stopped" {
+                            live.status = "stopped".to_string();
+                            live.is_processing = false;
+                        }
                     }
                     if live.user_prompt.is_none() || live.user_prompt.as_deref() == Some("") {
                         if let Some(ref prompt) = dbs.user_prompt {
                             live.user_prompt = Some(prompt.clone());
+                        }
+                    }
+                    if live.custom_title.is_none() || live.custom_title.as_deref() == Some("") {
+                        if let Some(ref title) = dbs.custom_title {
+                            live.custom_title = Some(title.clone());
                         }
                     }
                     if live.last_response.is_none() {
@@ -9249,8 +9262,8 @@ fn load_ooclaw_status(hermes_dir: &std::path::Path) -> HashMap<String, String> {
                         let status = last_non_internal
                             .map(|e| {
                                 let ts = e.get("timestamp").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                // Staleness timeout: if no event within 180s, session is stopped
-                                if ts > 0.0 && (now_secs - ts) > 180.0 {
+                                // Staleness timeout: if no event within 60s, session is stopped
+                                if ts > 0.0 && (now_secs - ts) > 60.0 {
                                     return "waiting_for_input".to_string();
                                 }
                                 let tool = e.get("tool").and_then(|v| v.as_str()).unwrap_or("");
@@ -9419,9 +9432,12 @@ fn load_recent_hermes_sessions_from_db() -> Result<Vec<ClaudeSession>, String> {
 
         let mut user_prompt: Option<String> = None;
         let mut asst_response: Option<String> = None;
-        let mut updated_at_ms = now_ms;
+        let mut custom_title: Option<String> = None;
+        let mut updated_at_ms = 0u64;
         let mut platform = String::new();
         let mut db_ended_at: Option<f64> = None;
+        let mut db_u_ts: Option<f64> = None;
+        let mut db_a_ts: Option<f64> = None;
 
         // Read userPrompt/lastResponse from plugin status
         if let Some((up, lr)) = load_ooclaw_session_detail(&hermes_dir, sid) {
@@ -9436,6 +9452,16 @@ fn load_recent_hermes_sessions_from_db() -> Result<Vec<ClaudeSession>, String> {
             ) {
                 platform = src;
             }
+            if let Ok(t) = db.query_row(
+                "SELECT title FROM sessions WHERE id = ?1", rusqlite::params![sid], |r| r.get::<_, Option<String>>(0)
+            ) {
+                if let Some(t_val) = t {
+                    let trimmed = t_val.trim();
+                    if !trimmed.is_empty() {
+                        custom_title = Some(trimmed.to_string());
+                    }
+                }
+            }
             if let Ok(ended) = db.query_row(
                 "SELECT ended_at FROM sessions WHERE id = ?1", rusqlite::params![sid], |r| r.get::<_, Option<f64>>(0)
             ) {
@@ -9447,17 +9473,19 @@ fn load_recent_hermes_sessions_from_db() -> Result<Vec<ClaudeSession>, String> {
             ) {
                 updated_at_ms = (ts * 1000.0) as u64;
             }
-            if let Ok((u_content, _u_ts)) = db.query_row(
+            if let Ok((u_content, u_ts)) = db.query_row(
                 "SELECT substr(content, 1, 200), timestamp FROM messages WHERE session_id = ?1 AND role = 'user' ORDER BY timestamp DESC LIMIT 1",
                 rusqlite::params![sid], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
             ) {
                 if user_prompt.is_none() { user_prompt = Some(u_content); }
+                db_u_ts = Some(u_ts);
             }
-            if let Ok((a_content, _a_ts)) = db.query_row(
+            if let Ok((a_content, a_ts)) = db.query_row(
                 "SELECT substr(content, 1, 200), timestamp FROM messages WHERE session_id = ?1 AND role = 'assistant' AND content IS NOT NULL AND content <> '' ORDER BY timestamp DESC LIMIT 1",
                 rusqlite::params![sid], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
             ) {
                 if asst_response.is_none() { asst_response = Some(a_content); }
+                db_a_ts = Some(a_ts);
             }
         }
         // Plugin event timestamps lead state.db by several seconds (especially
@@ -9468,11 +9496,22 @@ fn load_recent_hermes_sessions_from_db() -> Result<Vec<ClaudeSession>, String> {
         if evt_max_ms > updated_at_ms {
             updated_at_ms = evt_max_ms;
         }
+        if updated_at_ms == 0 {
+            updated_at_ms = now_ms;
+        }
 
         // Cross-check state.db completion:
         // If ended_at is set in sessions table, session is explicitly stopped.
+        // If assistant has already replied to user in state.db (a_ts >= u_ts) and no newer UserPromptSubmit event, session is stopped.
         if db_ended_at.is_some() {
             status = "stopped".to_string();
+        } else if let (Some(u_ts), Some(a_ts)) = (db_u_ts, db_a_ts) {
+            if a_ts >= u_ts {
+                let a_ts_ms = (a_ts * 1000.0) as u64;
+                if evt_max_ms <= a_ts_ms + 2000 {
+                    status = "stopped".to_string();
+                }
+            }
         }
         let is_active = status == "processing";
 
@@ -9489,7 +9528,7 @@ fn load_recent_hermes_sessions_from_db() -> Result<Vec<ClaudeSession>, String> {
             tool: None,
             tool_input: None,
             user_prompt,
-            custom_title: None,
+            custom_title,
             interactive: false,
             updated_at: updated_at_ms,
             is_processing: is_active,
@@ -15118,6 +15157,19 @@ fn process_claude_event(
                     .and_then(|v| v.as_str()) {
                     if !t.is_empty() { session.user_prompt = Some(t.to_string()); }
                 }
+                if session.custom_title.is_none() || session.custom_title.as_deref() == Some("") {
+                    if let Some(t) = event.get("customTitle")
+                        .or_else(|| event.get("custom_title"))
+                        .or_else(|| event.get("title"))
+                        .or_else(|| event.get("displayName"))
+                        .or_else(|| event.get("display_name"))
+                        .and_then(|v| v.as_str()) {
+                        let t_trim = t.trim();
+                        if !t_trim.is_empty() {
+                            session.custom_title = Some(t_trim.to_string());
+                        }
+                    }
+                }
                 // Store CC process PID from hook event for stale-session detection
                 if let Some(p) = event.get("pid").and_then(|v| v.as_u64()) {
                     let pid_u32 = p as u32;
@@ -17141,7 +17193,7 @@ for _pdir in profile_dirs:
         if row: current = row[0]
         return current
 
-    def check_status(sid, db_ended_at=None):
+    def check_status(sid, db_ended_at=None, db_u_ts=0.0, db_a_ts=0.0):
         """Returns ('stopped' | 'waiting' | 'processing', is_active_bool).
         'waiting' means the agent is blocked on user input (PermissionRequest
         or an interactive tool like clarify) — distinct from 'processing' so
@@ -17165,8 +17217,8 @@ for _pdir in profile_dirs:
             _last_evt = _sid_events[-1]
 
         _last_ts = _last_evt.get('timestamp', 0) or 0
-        # Staleness timeout: 180s without any event = stopped
-        if _last_ts > 0 and (now - _last_ts) > 180:
+        # Staleness timeout: 60s without any event = stopped
+        if _last_ts > 0 and (now - _last_ts) > 60:
             return ('stopped', False)
 
         _ev = _last_evt.get('event', '')
@@ -17176,6 +17228,17 @@ for _pdir in profile_dirs:
             return ('waiting', False)
         if _ev == 'PreToolUse' and _is_interactive_tool(_last_evt.get('tool', '')):
             return ('waiting', False)
+
+        # If assistant has already replied to user prompt in state.db and no new prompt was submitted after, turn is finished.
+        if db_a_ts > 0 and db_a_ts >= db_u_ts:
+            _last_user_submit = 0.0
+            for _e in reversed(_sid_events):
+                if _e.get('event') == 'UserPromptSubmit':
+                    _last_user_submit = _e.get('timestamp', 0) or 0
+                    break
+            if _last_user_submit <= (db_a_ts + 2.0):
+                return ('stopped', False)
+
         st = _last_evt.get('claudeStatus', '')
         if st in ('processing', 'running_tool', 'waiting'):
             return ('processing', True)
@@ -17245,7 +17308,7 @@ for _pdir in profile_dirs:
                         lts = db_conn.execute("SELECT MAX(timestamp) FROM messages WHERE session_id=? AND role NOT IN ('session_meta','system','metadata')", (_real_sid,)).fetchone()[0]
                         if lts: last_ts = lts
                     except: pass
-                sess_status, active = check_status(sid, _db_ended)
+                sess_status, active = check_status(sid, _db_ended, _db_u_ts, _db_a_ts)
                 _evts = _ooclaw_status.get(_profile_name, {}).get(sid, [])
                 if _evts:
                     _evt_max = max((_e.get('timestamp', 0) or 0) for _e in _evts)
@@ -17254,8 +17317,11 @@ for _pdir in profile_dirs:
                 _up, _lr = _scan_ooclaw_text(sid)
                 if not _up: _up = _db_up
                 if not _lr: _lr = _db_lr
+                _custom_title = v.get('title') or ''
+                _disp_name = v.get('display_name') or ''
                 results.append({'sessionId': _pfx + sid, 'platform': label, 'updatedAt': updated,
-                                'displayName': v.get('display_name',''), 'active': active,
+                                'displayName': _disp_name, 'customTitle': _custom_title,
+                                'active': active,
                                 'status': sess_status, 'source': 'hermes',
                                 'startedAt': last_ts,
                                 'userPrompt': _up, 'lastResponse': _lr,
@@ -17283,7 +17349,7 @@ for _pdir in profile_dirs:
                 latest_sid = _find_latest_session(sid)
                 _db_up, _db_lr, _db_ended, _db_u_ts, _db_a_ts = _fetch_db_info(latest_sid)
                 if _db_ended is None and r[4] is not None: _db_ended = r[4]
-                sess_status, active = check_status(sid, _db_ended)
+                sess_status, active = check_status(sid, _db_ended, _db_u_ts, _db_a_ts)
                 label = plat_db
                 if _profile_name != 'default': label = _profile_name + ('/' + plat_db if plat_db else '')
                 db_last_ts = r[3]
@@ -17300,6 +17366,7 @@ for _pdir in profile_dirs:
                 if not _up: _up = _db_up
                 if not _lr: _lr = _db_lr
                 results.append({'sessionId': _pfx + sid, 'platform': label, 'model': r[2] or '',
+                                'customTitle': '',
                                 'userPrompt': _up, 'lastResponse': _lr,
                                 'startedAt': db_last_ts, 'messageCount': r[5] or 0,
                                 'inputTokens': r[6] or 0, 'outputTokens': r[7] or 0,
@@ -17522,6 +17589,8 @@ def _handle(event_name, **kwargs):
     tool_name = ""
     if event_name in ("pre_tool_call", "post_tool_call", "pre_approval_request"):
         tool_name = kwargs.get("tool_name", "") or kwargs.get("tool", "") or ""
+        if tool_name and (tool_name.startswith("skill") or tool_name.startswith("memor")):
+            return
     platform = kwargs.get("platform", "") or ""
     try:
         cwd = os.getcwd()
