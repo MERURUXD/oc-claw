@@ -8438,10 +8438,14 @@ fn check_interrupted(path: &std::path::Path) -> bool {
             if line.contains("\"type\":\"event_msg\"") && line.contains("\"type\":\"turn_aborted\"") {
                 return true;
             }
-            // Codex: tool call rejected by user (skip/deny).
-            if line.contains("\"type\":\"function_call_output\"") {
+            // Codex: tool call rejected by user (skip/deny/cancel).
+            if line.contains("\"type\":\"function_call_output\"")
+                || line.contains("\"type\":\"custom_tool_call_output\"")
+            {
                 if line.contains("rejected by user")
                     || line.contains("Rejected(\\\"rejected by user\\\")")
+                    || line.contains("canceled by user")
+                    || line.contains("cancelled by user")
                 {
                     return true;
                 }
@@ -8460,6 +8464,68 @@ fn check_interrupted(path: &std::path::Path) -> bool {
         }
     }
     false
+}
+
+fn parse_codex_tool_args(val: Option<&serde_json::Value>) -> serde_json::Value {
+    let Some(val) = val else {
+        return serde_json::json!({});
+    };
+    if val.is_object() {
+        return val.clone();
+    }
+    let Some(raw) = val.as_str() else {
+        return serde_json::json!({});
+    };
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) {
+        if parsed.is_object() {
+            return parsed;
+        }
+    }
+    // Codex may emit input wrapped in JavaScript: const r = await tools.xxx({ ... });
+    if let Some(start) = raw.find('{') {
+        if let Some(end) = raw.rfind('}') {
+            if end > start {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw[start..=end]) {
+                    if parsed.is_object() {
+                        return parsed;
+                    }
+                }
+            }
+        }
+    }
+    serde_json::json!({})
+}
+
+fn read_last_codex_assistant_message(path: &std::path::Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    for line in content.lines().rev().take(120) {
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if parsed.get("type").and_then(|v| v.as_str()) != Some("response_item") {
+            continue;
+        }
+        let Some(payload) = parsed.get("payload") else {
+            continue;
+        };
+        if payload.get("type").and_then(|v| v.as_str()) == Some("message")
+            && payload.get("role").and_then(|v| v.as_str()) == Some("assistant")
+        {
+            if let Some(content_arr) = payload.get("content").and_then(|v| v.as_array()) {
+                let mut text = String::new();
+                for item in content_arr {
+                    if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
+                        text.push_str(t);
+                    }
+                }
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 fn codex_pending_approval(path: &std::path::Path) -> Option<(String, String)> {
@@ -8504,18 +8570,7 @@ fn codex_pending_approval(path: &std::path::Path) -> Option<(String, String)> {
                     continue;
                 }
 
-                let args = payload
-                    .get("arguments")
-                    .or_else(|| payload.get("input"))
-                    .and_then(|v| {
-                        if v.is_object() {
-                            Some(v.clone())
-                        } else {
-                            v.as_str()
-                                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-                        }
-                    })
-                    .unwrap_or_else(|| serde_json::json!({}));
+                let args = parse_codex_tool_args(payload.get("arguments").or_else(|| payload.get("input")));
 
                 let sandbox_permissions = payload
                     .get("sandbox_permissions")
@@ -8541,26 +8596,20 @@ fn codex_pending_approval(path: &std::path::Path) -> Option<(String, String)> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("Tool")
                     .to_string();
-                let non_shell_call_waiting = tool != "shell_command"
-                    && status.is_empty()
-                    && parsed
-                        .get("timestamp")
-                        .and_then(|v| v.as_str())
-                        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
-                        .map(|ts| {
-                            chrono::Utc::now()
-                                .signed_duration_since(ts.with_timezone(&chrono::Utc))
-                                .num_milliseconds()
-                                >= 1_000
-                        })
-                        .unwrap_or(false);
-                if !status_needs_approval && !args_need_approval && !non_shell_call_waiting {
+
+                let is_user_input = tool == "request_user_input" || tool == "requestUserInput";
+
+                if !status_needs_approval && !args_need_approval && !is_user_input {
                     continue;
                 }
 
                 let command = args
-                    .get("command")
+                    .get("cmd")
+                    .or_else(|| args.get("command"))
+                    .or_else(|| args.get("prompt"))
+                    .or_else(|| args.get("message"))
                     .or_else(|| args.get("url"))
+                    .or_else(|| args.get("path"))
                     .or_else(|| args.get("target"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
@@ -9901,6 +9950,7 @@ async fn get_claude_stats(source: Option<String>) -> Result<ClaudeStats, String>
         let mut prev_codex_total_input: Option<u64> = None;
         let mut prev_codex_total_output: Option<u64> = None;
         let mut prev_codex_total_cached_input: Option<u64> = None;
+        let mut prev_codex_total_cache_write: Option<u64> = None;
 
         for line in content.lines() {
             if line.trim().is_empty() {
@@ -10002,6 +10052,7 @@ async fn get_claude_stats(source: Option<String>) -> Result<ClaudeStats, String>
                 let total_input_now = total_usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
                 let total_output_now = total_usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
                 let total_cached_now = total_usage.get("cached_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                let total_cache_write_now = total_usage.get("cache_write_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
 
                 let delta_input = match prev_codex_total_input {
                     Some(prev) => total_input_now.saturating_sub(prev),
@@ -10015,13 +10066,18 @@ async fn get_claude_stats(source: Option<String>) -> Result<ClaudeStats, String>
                     Some(prev) => total_cached_now.saturating_sub(prev),
                     None => total_cached_now,
                 };
+                let delta_cache_write = match prev_codex_total_cache_write {
+                    Some(prev) => total_cache_write_now.saturating_sub(prev),
+                    None => total_cache_write_now,
+                };
 
                 prev_codex_total_input = Some(total_input_now);
                 prev_codex_total_output = Some(total_output_now);
                 prev_codex_total_cached_input = Some(total_cached_now);
+                prev_codex_total_cache_write = Some(total_cache_write_now);
 
                 // Same cumulative snapshot can be emitted multiple times.
-                if delta_input == 0 && delta_output == 0 && delta_cached == 0 {
+                if delta_input == 0 && delta_output == 0 && delta_cached == 0 && delta_cache_write == 0 {
                     continue;
                 }
 
@@ -10037,6 +10093,7 @@ async fn get_claude_stats(source: Option<String>) -> Result<ClaudeStats, String>
                 total_input += delta_input;
                 total_output += delta_output;
                 total_cache_read += delta_cached;
+                total_cache_write += delta_cache_write;
                 total_messages += 1;
 
                 if !session_counted {
@@ -10057,6 +10114,7 @@ async fn get_claude_stats(source: Option<String>) -> Result<ClaudeStats, String>
                     entry.input_tokens += delta_input;
                     entry.output_tokens += delta_output;
                     entry.cache_read_tokens += delta_cached;
+                    entry.cache_write_tokens += delta_cache_write;
                     entry.messages += 1;
                 }
             }
@@ -14724,7 +14782,8 @@ fn codex_requires_escalation(event: &serde_json::Value) -> bool {
     // unambiguously a Codex event so the function name and behaviour
     // stay aligned, no matter what gets added inside it later.
     let is_codex_event = event.get("turn_id").is_some()
-        || read_string(event, &["source"]).unwrap_or("").eq_ignore_ascii_case("codex");
+        || read_string(event, &["source"]).unwrap_or("").eq_ignore_ascii_case("codex")
+        || event.get("source").map(|v| v.is_object()).unwrap_or(false);
     if !is_codex_event {
         return false;
     }
@@ -14787,6 +14846,15 @@ fn is_codex_internal_utility_event(event: &serde_json::Value) -> bool {
     // Codex internal auto-review runner
     if model == "codex-auto-review" {
         return true;
+    }
+
+    // Check if source payload is an object indicating guardian safety review
+    if let Some(src_obj) = event.get("source").and_then(|v| v.as_object()) {
+        if let Some(subagent) = src_obj.get("subagent") {
+            if subagent.get("other").and_then(|v| v.as_str()) == Some("guardian") {
+                return true;
+            }
+        }
     }
 
     // Codex background utility runs (title generation, ambient suggestions,
@@ -14974,6 +15042,96 @@ mod codex_adapter_tests {
             active_subagents: None,
         };
         assert!(is_codex_internal_utility_session(&session));
+    }
+
+    #[test]
+    fn guardian_subagent_source_is_filtered() {
+        let event = serde_json::json!({
+            "hook_event_name": "SessionStart",
+            "source": {
+                "subagent": {
+                    "other": "guardian"
+                }
+            },
+            "transcript_path": "C:/Users/test/.codex/sessions/rollout-guardian.jsonl",
+        });
+        assert!(is_codex_internal_utility_event(&event));
+    }
+
+    #[test]
+    fn parse_codex_tool_args_extracts_from_js_wrapper() {
+        let js_input = serde_json::json!(
+            "const r = await tools.exec_command({\"cmd\":\"cargo test\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"Need cargo access\"});\ntext(JSON.stringify(r));"
+        );
+        let parsed = parse_codex_tool_args(Some(&js_input));
+        assert_eq!(parsed.get("cmd").and_then(|v| v.as_str()), Some("cargo test"));
+        assert_eq!(parsed.get("sandbox_permissions").and_then(|v| v.as_str()), Some("require_escalated"));
+        assert_eq!(parsed.get("justification").and_then(|v| v.as_str()), Some("Need cargo access"));
+    }
+
+    #[test]
+    fn codex_pending_approval_detects_escalated_and_user_input() {
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join("test_codex_pending.jsonl");
+
+        // 1. Normal execution without escalation (must NOT be pending)
+        std::fs::write(&path, concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"id\":\"call1\",\"name\":\"exec\",\"input\":\"const r = await tools.exec_command({\\\"cmd\\\":\\\"cargo check\\\"});\"}}\n"
+        )).unwrap();
+        assert_eq!(codex_pending_approval(&path), None);
+
+        // 2. Escalated permission required (MUST be pending)
+        std::fs::write(&path, concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"id\":\"call2\",\"name\":\"exec\",\"input\":\"const r = await tools.exec_command({\\\"cmd\\\":\\\"ssh root@vps\\\",\\\"sandbox_permissions\\\":\\\"require_escalated\\\"});\"}}\n"
+        )).unwrap();
+        let pending = codex_pending_approval(&path);
+        assert!(pending.is_some());
+        let (tool, detail) = pending.unwrap();
+        assert_eq!(tool, "exec");
+        assert_eq!(detail, "ssh root@vps");
+
+        // 3. User input prompt (MUST be pending)
+        std::fs::write(&path, concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"id\":\"call3\",\"name\":\"request_user_input\",\"arguments\":{\"prompt\":\"Which option do you prefer?\"}}}\n"
+        )).unwrap();
+        let pending_ui = codex_pending_approval(&path);
+        assert!(pending_ui.is_some());
+        let (tool, detail) = pending_ui.unwrap();
+        assert_eq!(tool, "request_user_input");
+        assert_eq!(detail, "Which option do you prefer?");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn check_interrupted_detects_custom_tool_call_rejection() {
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join("test_codex_interrupted.jsonl");
+
+        std::fs::write(&path, concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\",\"call_id\":\"call_1\",\"content\":\"rejected by user\"}}\n"
+        )).unwrap();
+        assert!(check_interrupted(&path));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_last_codex_assistant_message_extracts_latest_text() {
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join("test_codex_assistant_msg.jsonl");
+
+        std::fs::write(&path, concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"First response\"}]}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Latest response from Codex\"}]}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\"}}\n"
+        )).unwrap();
+        assert_eq!(
+            read_last_codex_assistant_message(&path).as_deref(),
+            Some("Latest response from Codex")
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }
 
@@ -15561,10 +15719,14 @@ fn process_claude_event(
                             .map(|s| s.to_string());
                         if resp_from_event.is_some() {
                             session.last_response = resp_from_event;
+                        } else if session.source == "codex" {
+                            let resp_from_file = find_codex_session_file(&session_id)
+                                .and_then(|p| read_last_codex_assistant_message(&p));
+                            session.last_response = resp_from_file.or_else(|| Some("✓".to_string()));
                         } else if session.last_response.is_none()
-                            && (session.source == "cursor" || session.source == "codex" || session.source == "gemini" || session.source == "opencode")
+                            && (session.source == "cursor" || session.source == "gemini" || session.source == "opencode")
                         {
-                            // Gemini/opencode/Cursor/Codex hooks carry no assistant text, so fall
+                            // Gemini/opencode/Cursor hooks carry no assistant text, so fall
                             // back to a placeholder so the completion popup still triggers.
                             session.last_response = Some("✓".to_string());
                         }
