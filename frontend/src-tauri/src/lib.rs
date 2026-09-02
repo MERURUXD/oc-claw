@@ -7602,6 +7602,8 @@ pub struct AgpSummaryMeta {
     pub title: String,
     pub updated_at_ms: u64,
     pub cwd: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub subagent_role: Option<String>,
 }
 
 fn read_proto_varint(data: &[u8], pos: &mut usize) -> Option<u64> {
@@ -7718,6 +7720,8 @@ pub fn parse_agyhub_summaries_pb() -> HashMap<String, AgpSummaryMeta> {
                 let mut title = String::new();
                 let mut updated_at_ms: u64 = 0;
                 let mut cwd: Option<String> = None;
+                let mut parent_session_id: Option<String> = None;
+                let mut subagent_role: Option<String> = None;
 
                 for (sfn, swt, sbytes, _) in sub_fields {
                     if sfn == 1 && swt == 2 {
@@ -7744,7 +7748,37 @@ pub fn parse_agyhub_summaries_pb() -> HashMap<String, AgpSummaryMeta> {
                                 updated_at_ms = ms;
                             }
                         }
-                    } else if (sfn == 9 || sfn == 17) && swt == 2 {
+                    } else if sfn == 17 && swt == 2 {
+                        let ws_fields = parse_proto_fields(sbytes);
+                        for (wfn, wwt, wbytes, _) in ws_fields {
+                            if wwt == 2 {
+                                if let Ok(s) = std::str::from_utf8(wbytes) {
+                                    if s.starts_with("file://") {
+                                        if let Some(path) = uri_to_path(s) {
+                                            if !path.is_empty() && cwd.is_none() {
+                                                cwd = Some(path);
+                                            }
+                                        }
+                                    } else if wfn == 5 && is_uuid_str(s.trim()) {
+                                        parent_session_id = Some(s.trim().to_string());
+                                    }
+                                }
+                                if wfn == 8 {
+                                    let nested_fields = parse_proto_fields(wbytes);
+                                    for (nfn, nwt, nbytes, _) in nested_fields {
+                                        if nfn == 2 && nwt == 2 {
+                                            if let Ok(r) = std::str::from_utf8(nbytes) {
+                                                let trimmed = r.trim();
+                                                if !trimmed.is_empty() && subagent_role.is_none() {
+                                                    subagent_role = Some(trimmed.to_string());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if sfn == 9 && swt == 2 {
                         let ws_fields = parse_proto_fields(sbytes);
                         for (_wfn, wwt, wbytes, _) in ws_fields {
                             if wwt == 2 {
@@ -7768,6 +7802,8 @@ pub fn parse_agyhub_summaries_pb() -> HashMap<String, AgpSummaryMeta> {
                         title,
                         updated_at_ms,
                         cwd,
+                        parent_session_id,
+                        subagent_role,
                     });
                 }
             }
@@ -7924,6 +7960,54 @@ fn extract_uuids_from_text(text: &str) -> Vec<String> {
     uuids
 }
 
+/// Global registry of known Antigravity subagents: subagent_id -> (parent_id, role)
+static KNOWN_ANTIGRAVITY_SUBAGENTS: std::sync::LazyLock<Mutex<HashMap<String, (String, String)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub fn register_antigravity_subagent(subagent_id: &str, parent_id: &str, role: &str) {
+    if !is_uuid_str(subagent_id) { return; }
+    let mut map = KNOWN_ANTIGRAVITY_SUBAGENTS.lock().unwrap();
+    let r = if role.is_empty() || role == "Subagent" {
+        map.get(subagent_id).map(|(_, existing_role)| existing_role.clone()).unwrap_or_else(|| "Subagent".to_string())
+    } else {
+        role.to_string()
+    };
+    map.insert(subagent_id.to_string(), (parent_id.to_string(), r));
+}
+
+pub fn get_antigravity_subagent_info(subagent_id: &str) -> Option<(String, String)> {
+    if !is_uuid_str(subagent_id) { return None; }
+    if let Some(info) = KNOWN_ANTIGRAVITY_SUBAGENTS.lock().unwrap().get(subagent_id).cloned() {
+        return Some(info);
+    }
+    // Fall back to protobuf summaries
+    let summaries = parse_agyhub_summaries_pb();
+    if let Some(meta) = summaries.get(subagent_id) {
+        if let Some(ref pid) = meta.parent_session_id {
+            let role = meta.subagent_role.clone().unwrap_or_else(|| "Subagent".to_string());
+            register_antigravity_subagent(subagent_id, pid, &role);
+            return Some((pid.clone(), role));
+        }
+    }
+    None
+}
+
+pub fn is_known_antigravity_subagent(subagent_id: &str) -> bool {
+    if !is_uuid_str(subagent_id) { return false; }
+    if KNOWN_ANTIGRAVITY_SUBAGENTS.lock().unwrap().contains_key(subagent_id) {
+        return true;
+    }
+    let summaries = parse_agyhub_summaries_pb();
+    if let Some(meta) = summaries.get(subagent_id) {
+        if let Some(ref pid) = meta.parent_session_id {
+            let role = meta.subagent_role.clone().unwrap_or_else(|| "Subagent".to_string());
+            register_antigravity_subagent(subagent_id, pid, &role);
+            return true;
+        }
+    }
+    false
+}
+
 fn extract_subagent_roles_from_tool_call(args: &serde_json::Value) -> Vec<String> {
     let mut roles = Vec::new();
     let subagents_val = args.get("Subagents").or_else(|| args.get("subagents"));
@@ -7952,6 +8036,36 @@ fn extract_subagent_roles_from_tool_call(args: &serde_json::Value) -> Vec<String
             }
         }
     }
+    // Fallback if JSON parsing failed (e.g. truncated JSON in transcript.jsonl)
+    if roles.is_empty() {
+        let text_to_scan = match subagents_val {
+            Some(serde_json::Value::String(s)) => s.as_str(),
+            _ => args.as_str().unwrap_or(""),
+        };
+        let raw_args = if text_to_scan.is_empty() {
+            serde_json::to_string(args).unwrap_or_default()
+        } else {
+            text_to_scan.to_string()
+        };
+
+        let mut cur = raw_args.as_str();
+        while let Some(pos) = cur.find(r#""Role""#).or_else(|| cur.find(r#""role""#)) {
+            let after = &cur[pos + 6..];
+            if let Some(colon) = after.find(':') {
+                let after_colon = after[colon + 1..].trim_start();
+                if after_colon.starts_with('"') {
+                    let val_str = &after_colon[1..];
+                    if let Some(quote) = val_str.find('"') {
+                        let role = &val_str[..quote];
+                        if !role.is_empty() && role.len() < 60 {
+                            roles.push(role.to_string());
+                        }
+                    }
+                }
+            }
+            cur = &cur[pos + 6..];
+        }
+    }
     roles
 }
 
@@ -7970,8 +8084,8 @@ fn get_subagent_status(subagent_id: &str) -> (String, u64) {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
     let age_ms = now_ms.saturating_sub(updated_at);
-    // If subagent transcript hasn't been modified in 30s, it has finished or been stopped
-    if age_ms > 30_000 {
+    // If subagent transcript hasn't been modified in 120s, it has finished or been stopped
+    if age_ms > 120_000 {
         return ("stopped".to_string(), updated_at);
     }
 
@@ -8000,10 +8114,10 @@ fn get_subagent_status(subagent_id: &str) -> (String, u64) {
 
     let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
     if msg_type == "PLANNER_RESPONSE" {
-        if let Some(tools) = parsed.get("tool_calls").and_then(|t| t.as_array()) {
-            if !tools.is_empty() {
-                return ("tool_running".to_string(), updated_at);
-            }
+        let has_tools = parsed.get("tool_calls").and_then(|t| t.as_array()).map(|t| !t.is_empty()).unwrap_or(false)
+            || parsed.get("truncated_fields").and_then(|t| t.as_array()).map(|arr| arr.iter().any(|v| v == "tool_calls")).unwrap_or(false);
+        if has_tools {
+            return ("tool_running".to_string(), updated_at);
         }
         return ("stopped".to_string(), updated_at);
     } else if msg_type == "GENERIC" || msg_type == "USER_INPUT" {
@@ -8018,7 +8132,7 @@ fn is_subagent_transcript_file(path: &std::path::Path) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
-    for line in content.lines().take(10) {
+    for line in content.lines().take(15) {
         let text_opt = if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) {
             parsed.get("content")
                 .or_else(|| parsed.get("text"))
@@ -8035,6 +8149,14 @@ fn is_subagent_transcript_file(path: &std::path::Path) -> bool {
             || cleaned.contains("You are a ")
             || text.contains("You are the ")
             || text.contains("You are a ")
+            || cleaned.contains("你负责")
+            || text.contains("你负责")
+            || cleaned.contains("Your task is")
+            || text.contains("Your task is")
+            || cleaned.contains("Your role is")
+            || text.contains("Your role is")
+            || cleaned.contains("作为子代理")
+            || text.contains("作为子代理")
         {
             return true;
         }
@@ -8043,11 +8165,22 @@ fn is_subagent_transcript_file(path: &std::path::Path) -> bool {
 }
 
 fn is_antigravity_subagent_session(session_id: &str) -> bool {
-    if let Some(path) = find_antigravity_session_file(session_id) {
-        is_subagent_transcript_file(&path)
-    } else {
-        false
+    if !is_uuid_str(session_id) {
+        return false;
     }
+    // 1. Check in-memory registry or protobuf
+    if is_known_antigravity_subagent(session_id) {
+        return true;
+    }
+
+    // 2. Check if this session's transcript indicates it's a subagent
+    if let Some(path) = find_antigravity_session_file(session_id) {
+        if is_subagent_transcript_file(&path) {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Parse Antigravity transcript.jsonl to populate clean user_prompt, custom_title, last_response, subagent role,
@@ -8255,9 +8388,16 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
                             for (u_idx, u) in uuids.into_iter().enumerate() {
                                 let mut role = roles.get(u_idx).cloned().unwrap_or_else(|| "Subagent".to_string());
                                 if role == "Subagent" {
+                                    if let Some(info) = get_antigravity_subagent_info(&u) {
+                                        if !info.1.is_empty() && info.1 != "Subagent" {
+                                            role = info.1;
+                                        }
+                                    }
+                                }
+                                if role == "Subagent" {
                                     if let Some(sub_path) = find_antigravity_session_file(&u) {
                                         if let Ok(sub_content) = std::fs::read_to_string(&sub_path) {
-                                            for sub_line in sub_content.lines().take(10) {
+                                            for sub_line in sub_content.lines().take(15) {
                                                 if let Ok(sub_parsed) = serde_json::from_str::<serde_json::Value>(sub_line) {
                                                     let sub_text = sub_parsed.get("content")
                                                         .or_else(|| sub_parsed.get("text"))
@@ -8274,6 +8414,7 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
                                         }
                                     }
                                 }
+                                register_antigravity_subagent(&u, &session.session_id, &role);
                                 if !invoked_subagents.iter().any(|(id, _, _)| id == &u) {
                                     invoked_subagents.push((u, role, idx));
                                 }
@@ -8298,9 +8439,16 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
         let (sub_status, sub_updated_at) = get_subagent_status(&sub_id);
         if sub_status != "stopped" {
             if role == "Subagent" {
+                if let Some(info) = get_antigravity_subagent_info(&sub_id) {
+                    if !info.1.is_empty() && info.1 != "Subagent" {
+                        role = info.1;
+                    }
+                }
+            }
+            if role == "Subagent" {
                 if let Some(sub_path) = find_antigravity_session_file(&sub_id) {
                     if let Ok(sub_content) = std::fs::read_to_string(&sub_path) {
-                        for sub_line in sub_content.lines().take(10) {
+                        for sub_line in sub_content.lines().take(15) {
                             if let Ok(sub_parsed) = serde_json::from_str::<serde_json::Value>(sub_line) {
                                 let sub_text = sub_parsed.get("content")
                                     .or_else(|| sub_parsed.get("text"))
@@ -8317,6 +8465,7 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
                     }
                 }
             }
+            register_antigravity_subagent(&sub_id, &session.session_id, &role);
             active_subs.push(SubagentDetail {
                 id: sub_id,
                 role,
@@ -8324,22 +8473,6 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
                 updated_at: sub_updated_at,
             });
         }
-    }
-
-    let is_active_session = session.status == "processing"
-        || session.status == "tool_running"
-        || session.status == "waiting";
-
-    if is_interrupted || is_file_stale || !is_active_session {
-        session.active_subagents = None;
-        if session.status != "waiting" && (is_interrupted || is_file_stale) {
-            session.status = "stopped".to_string();
-            session.is_processing = false;
-            session.pending_agents = 0;
-            session.tool = None;
-            session.tool_input = None;
-        }
-        return false;
     }
 
     let has_active_subs = !active_subs.is_empty();
@@ -8351,13 +8484,26 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
             "processing".to_string()
         };
         session.is_processing = true;
+        session.pending_agents = active_subs.iter().filter(|s| s.status != "stopped").count() as u32;
         session.active_subagents = Some(active_subs);
         session.last_response = None;
+        return true;
     } else {
         session.active_subagents = None;
     }
 
-    is_intermediate_tool_turn || has_active_subs
+    if is_interrupted || is_file_stale {
+        if session.status != "waiting" {
+            session.status = "stopped".to_string();
+            session.is_processing = false;
+            session.pending_agents = 0;
+            session.tool = None;
+            session.tool_input = None;
+        }
+        return false;
+    }
+
+    is_intermediate_tool_turn
 }
 
 pub fn load_recent_antigravity_sessions() -> Vec<ClaudeSession> {
@@ -8440,11 +8586,12 @@ pub fn load_recent_antigravity_sessions() -> Vec<ClaudeSession> {
                 session.custom_title = Some(m.title.clone());
             }
         }
-        session.status = "stopped".to_string();
-        session.is_processing = false;
-        session.active_subagents = None;
-        session.tool = None;
-        session.tool_input = None;
+        if session.active_subagents.is_none() {
+            session.status = "stopped".to_string();
+            session.is_processing = false;
+            session.tool = None;
+            session.tool_input = None;
+        }
 
         result.push(session);
     }
@@ -9177,21 +9324,26 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
                 }
                 if session.source == "antigravity" {
                     if session.status != "waiting" {
-                        if let Some(path) = find_antigravity_session_file(&session.session_id) {
-                            let mtime = std::fs::metadata(&path)
-                                .and_then(|m| m.modified())
-                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)))
-                                .map(|d| d.as_millis() as u64)
-                                .unwrap_or(0);
-                            let f_age = now_ms.saturating_sub(mtime);
-                            if f_age > 30_000 || check_interrupted(&path) {
-                                session.status = "stopped".to_string();
-                                session.is_processing = false;
-                                session.pending_agents = 0;
-                                session.active_subagents = None;
-                                session.tool = None;
-                                session.tool_input = None;
-                                continue;
+                        let has_running_subs = session.active_subagents.as_ref()
+                            .map(|subs| subs.iter().any(|s| s.status != "stopped"))
+                            .unwrap_or(false);
+                        if !has_running_subs {
+                            if let Some(path) = find_antigravity_session_file(&session.session_id) {
+                                let mtime = std::fs::metadata(&path)
+                                    .and_then(|m| m.modified())
+                                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)))
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0);
+                                let f_age = now_ms.saturating_sub(mtime);
+                                if f_age > 30_000 || check_interrupted(&path) {
+                                    session.status = "stopped".to_string();
+                                    session.is_processing = false;
+                                    session.pending_agents = 0;
+                                    session.active_subagents = None;
+                                    session.tool = None;
+                                    session.tool_input = None;
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -9207,6 +9359,8 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
                     30 * 60_000
                 } else if session.status == "waiting" && session.source == "antigravity" {
                     300_000
+                } else if session.source == "antigravity" && session.active_subagents.as_ref().map(|s| !s.is_empty()).unwrap_or(false) {
+                    15 * 60_000
                 } else {
                     120_000
                 };
@@ -15230,6 +15384,27 @@ mod codex_adapter_tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn test_antigravity_subagent_detection_and_parent_attribution() {
+        // Test subagent role extraction fallback with truncated json
+        let truncated_args_str = r#"{"Subagents":[{"Prompt":"task 1","Role":"Frontend Master"},{"Prompt":"task 2","Role":"Backend Rust Expert"},<truncated 500 bytes>"#;
+        let val: serde_json::Value = serde_json::Value::String(truncated_args_str.to_string());
+        let roles = extract_subagent_roles_from_tool_call(&val);
+        assert_eq!(roles, vec!["Frontend Master", "Backend Rust Expert"]);
+
+        // Test real Antigravity subagent session detection from disk protobuf
+        let sub_id = "c0701ccf-8c6e-4f20-b7f5-71436912d0e5";
+        let parent_id = "1052b449-c1f7-4133-8c65-8d6975fd6909";
+        if let Some(info) = get_antigravity_subagent_info(sub_id) {
+            assert_eq!(info.0, parent_id);
+            assert_eq!(info.1, "Shell & Navigation Engineer");
+            assert!(is_antigravity_subagent_session(sub_id));
+        }
+
+        // Parent session must NOT be detected as subagent
+        assert!(!is_antigravity_subagent_session(parent_id));
+    }
 }
 
 /// Process a Claude hook event (shared logic between Unix socket and TCP server).
@@ -15347,6 +15522,57 @@ fn process_claude_event(
                 sessions.remove(&session_id);
             }
             stop_session_file_watcher(&session_id);
+
+            // Attribute event to parent session and update active_subagents
+            if let Some((parent_id, role)) = get_antigravity_subagent_info(&session_id) {
+                let sub_status = match hook_event.as_str() {
+                    "PreToolUse" => "tool_running",
+                    "UserPromptSubmit" | "PostToolUse" | "PreInvocation" => "processing",
+                    "Stop" => {
+                        let (st, _) = get_subagent_status(&session_id);
+                        if st == "stopped" { "stopped" } else { "processing" }
+                    }
+                    _ => "processing",
+                };
+
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+
+                if let Ok(mut sessions_guard) = state.lock() {
+                    if let Some(parent_session) = sessions_guard.get_mut(&parent_id) {
+                        let mut subs = parent_session.active_subagents.take().unwrap_or_default();
+                        if let Some(existing) = subs.iter_mut().find(|s| s.id == session_id) {
+                            existing.status = sub_status.to_string();
+                            existing.updated_at = now_ms;
+                            if (existing.role == "Subagent" || existing.role.is_empty()) && role != "Subagent" {
+                                existing.role = role.clone();
+                            }
+                        } else {
+                            subs.push(SubagentDetail {
+                                id: session_id.clone(),
+                                role: role.clone(),
+                                status: sub_status.to_string(),
+                                updated_at: now_ms,
+                            });
+                        }
+
+                        let any_active = subs.iter().any(|s| s.status != "stopped");
+                        if any_active {
+                            let any_running = subs.iter().any(|s| s.status == "tool_running");
+                            parent_session.status = if any_running { "tool_running".to_string() } else { "processing".to_string() };
+                            parent_session.is_processing = true;
+                            parent_session.pending_agents = subs.iter().filter(|s| s.status != "stopped").count() as u32;
+                            parent_session.last_response = None;
+                            parent_session.active_subagents = Some(subs);
+                        } else {
+                            let _ = update_antigravity_session_from_transcript(parent_session);
+                        }
+                        parent_session.updated_at = now_ms;
+                        let _ = app.emit("claude-session-update", &parent_id);
+                    }
+                }
+            }
+
             log::info!(
                 "[claude_event] ignore antigravity subagent session={} event={}",
                 session_id,
@@ -15533,7 +15759,7 @@ fn process_claude_event(
                     session.pending_agents += 1;
                     log::info!("[claude_event] session={} Agent launched, pending_agents={}",
                         &session_id[..session_id.len().min(8)], session.pending_agents);
-                } else if hook_event == "SubagentStop" || (hook_event == "PostToolUse" && tool_name == "invoke_subagent") {
+                } else if hook_event == "SubagentStop" {
                     session.pending_agents = session.pending_agents.saturating_sub(1);
                     log::info!("[claude_event] session={} SubagentStop, pending_agents={}",
                         &session_id[..session_id.len().min(8)], session.pending_agents);
