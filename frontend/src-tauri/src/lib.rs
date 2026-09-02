@@ -7442,6 +7442,79 @@ fn collect_codex_session_jsonl_files() -> Vec<PathBuf> {
     out
 }
 
+fn parse_codex_thread_titles(content: &str) -> HashMap<String, String> {
+    let mut titles = HashMap::new();
+    for line in content.lines() {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(session_id) = entry.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(title) = entry.get("thread_name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let title = title.trim();
+        if !session_id.is_empty() && !title.is_empty() {
+            // The index is append-only. A later entry for the same id is a
+            // rename, so inserting in file order intentionally keeps the last
+            // title exactly as Codex currently displays it.
+            titles.insert(session_id.to_string(), title.to_string());
+        }
+    }
+    titles
+}
+
+fn load_codex_thread_titles() -> HashMap<String, String> {
+    let Some(home) = dirs::home_dir() else {
+        return HashMap::new();
+    };
+    let mut titles = HashMap::new();
+
+    // 1. Primary: ~/.codex/session_index.jsonl (append-only JSONL, fast & lock-free)
+    let paths = [
+        home.join(".codex").join("session_index.jsonl"),
+        home.join(".Codex").join("session_index.jsonl"),
+    ];
+    for path in paths {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let parsed = parse_codex_thread_titles(&content);
+            if !parsed.is_empty() {
+                titles.extend(parsed);
+                return titles;
+            }
+        }
+    }
+
+    // 2. Fallback: ~/.codex/sqlite/codex-dev.db (table local_thread_catalog)
+    let db_paths = [
+        home.join(".codex").join("sqlite").join("codex-dev.db"),
+        home.join(".Codex").join("sqlite").join("codex-dev.db"),
+    ];
+    for db_path in db_paths {
+        if db_path.exists() {
+            if let Ok(conn) = rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) {
+                if let Ok(mut stmt) = conn.prepare("SELECT thread_id, display_title FROM local_thread_catalog WHERE display_title IS NOT NULL") {
+                    if let Ok(rows) = stmt.query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    }) {
+                        for item in rows.flatten() {
+                            if !item.0.is_empty() && !item.1.trim().is_empty() {
+                                titles.insert(item.0, item.1.trim().to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            if !titles.is_empty() {
+                return titles;
+            }
+        }
+    }
+
+    titles
+}
+
 fn find_claude_session_file(session_id: &str) -> Option<PathBuf> {
     let target = format!("{}.jsonl", session_id);
     for path in collect_claude_project_jsonl_files() {
@@ -8406,10 +8479,14 @@ fn check_interrupted(path: &std::path::Path) -> bool {
             if line.contains("\"type\":\"event_msg\"") && line.contains("\"type\":\"turn_aborted\"") {
                 return true;
             }
-            // Codex: tool call rejected by user (skip/deny).
-            if line.contains("\"type\":\"function_call_output\"") {
+            // Codex: tool call rejected by user (skip/deny/cancel).
+            if line.contains("\"type\":\"function_call_output\"")
+                || line.contains("\"type\":\"custom_tool_call_output\"")
+            {
                 if line.contains("rejected by user")
                     || line.contains("Rejected(\\\"rejected by user\\\")")
+                    || line.contains("canceled by user")
+                    || line.contains("cancelled by user")
                 {
                     return true;
                 }
@@ -8428,6 +8505,68 @@ fn check_interrupted(path: &std::path::Path) -> bool {
         }
     }
     false
+}
+
+fn parse_codex_tool_args(val: Option<&serde_json::Value>) -> serde_json::Value {
+    let Some(val) = val else {
+        return serde_json::json!({});
+    };
+    if val.is_object() {
+        return val.clone();
+    }
+    let Some(raw) = val.as_str() else {
+        return serde_json::json!({});
+    };
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) {
+        if parsed.is_object() {
+            return parsed;
+        }
+    }
+    // Codex may emit input wrapped in JavaScript: const r = await tools.xxx({ ... });
+    if let Some(start) = raw.find('{') {
+        if let Some(end) = raw.rfind('}') {
+            if end > start {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw[start..=end]) {
+                    if parsed.is_object() {
+                        return parsed;
+                    }
+                }
+            }
+        }
+    }
+    serde_json::json!({})
+}
+
+fn read_last_codex_assistant_message(path: &std::path::Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    for line in content.lines().rev().take(120) {
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if parsed.get("type").and_then(|v| v.as_str()) != Some("response_item") {
+            continue;
+        }
+        let Some(payload) = parsed.get("payload") else {
+            continue;
+        };
+        if payload.get("type").and_then(|v| v.as_str()) == Some("message")
+            && payload.get("role").and_then(|v| v.as_str()) == Some("assistant")
+        {
+            if let Some(content_arr) = payload.get("content").and_then(|v| v.as_array()) {
+                let mut text = String::new();
+                for item in content_arr {
+                    if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
+                        text.push_str(t);
+                    }
+                }
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 fn codex_pending_approval(path: &std::path::Path) -> Option<(String, String)> {
@@ -8472,18 +8611,7 @@ fn codex_pending_approval(path: &std::path::Path) -> Option<(String, String)> {
                     continue;
                 }
 
-                let args = payload
-                    .get("arguments")
-                    .or_else(|| payload.get("input"))
-                    .and_then(|v| {
-                        if v.is_object() {
-                            Some(v.clone())
-                        } else {
-                            v.as_str()
-                                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-                        }
-                    })
-                    .unwrap_or_else(|| serde_json::json!({}));
+                let args = parse_codex_tool_args(payload.get("arguments").or_else(|| payload.get("input")));
 
                 let sandbox_permissions = payload
                     .get("sandbox_permissions")
@@ -8509,26 +8637,20 @@ fn codex_pending_approval(path: &std::path::Path) -> Option<(String, String)> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("Tool")
                     .to_string();
-                let non_shell_call_waiting = tool != "shell_command"
-                    && status.is_empty()
-                    && parsed
-                        .get("timestamp")
-                        .and_then(|v| v.as_str())
-                        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
-                        .map(|ts| {
-                            chrono::Utc::now()
-                                .signed_duration_since(ts.with_timezone(&chrono::Utc))
-                                .num_milliseconds()
-                                >= 1_000
-                        })
-                        .unwrap_or(false);
-                if !status_needs_approval && !args_need_approval && !non_shell_call_waiting {
+
+                let is_user_input = tool == "request_user_input" || tool == "requestUserInput";
+
+                if !status_needs_approval && !args_need_approval && !is_user_input {
                     continue;
                 }
 
                 let command = args
-                    .get("command")
+                    .get("cmd")
+                    .or_else(|| args.get("command"))
+                    .or_else(|| args.get("prompt"))
+                    .or_else(|| args.get("message"))
                     .or_else(|| args.get("url"))
+                    .or_else(|| args.get("path"))
                     .or_else(|| args.get("target"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
@@ -9074,10 +9196,16 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
                         }
                     }
                 }
-                // Cursor/Codex/opencode/Antigravity/CC Desktop: timeout-based staleness (120s without any event update, 300s for waiting permissions).
-                // Hook PIDs are not stable enough for PID-alive checks in these environments.
+                // Hook PIDs are not stable enough for PID-alive checks in these
+                // environments, so keep a timeout as a crash-recovery fallback.
+                // Codex can legitimately reason for several minutes without a
+                // hook event; its explicit Stop/SessionEnd hooks are the normal
+                // completion boundary, so it needs a much wider fallback than
+                // terminal-style clients.
                 let age_ms = now_ms.saturating_sub(session.updated_at);
-                let timeout_limit = if session.status == "waiting" && session.source == "antigravity" {
+                let timeout_limit = if session.source == "codex" {
+                    30 * 60_000
+                } else if session.status == "waiting" && session.source == "antigravity" {
                     300_000
                 } else {
                     120_000
@@ -9114,11 +9242,28 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
 
     let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
     let active_tid = get_active_ghostty_terminal_id();
+    let codex_titles = load_codex_thread_titles();
     let mut list: Vec<ClaudeSession> = sessions.values()
         .filter(|s| !s.cwd.is_empty() || s.source == "cursor" || s.source == "opencode" || s.source == "antigravity" || s.source == "hermes")
-        .filter(|s| !is_codex_internal_utility_session(s))
+        .filter(|s| {
+            // A title-index entry confirms this is a user-visible Codex thread.
+            // This also prevents a real thread whose prompt happens to resemble
+            // an internal utility prompt from being hidden.
+            s.source != "codex"
+                || codex_titles.contains_key(&s.session_id)
+                || !is_codex_internal_utility_session(s)
+        })
         .cloned()
         .collect();
+    for session in &mut list {
+        if session.source == "codex" {
+            if let Some(title) = codex_titles.get(&session.session_id) {
+                // session_index.jsonl is Codex's own title index and is more
+                // authoritative than prompt-derived or hook-provided labels.
+                session.custom_title = Some(title.clone());
+            }
+        }
+    }
     list.retain(|s| s.source != "antigravity" || !is_antigravity_subagent_session(&s.session_id));
     // Mark sessions' active tab:
     // - Ghostty: match by terminal ID
@@ -9902,6 +10047,7 @@ async fn get_claude_stats(source: Option<String>) -> Result<ClaudeStats, String>
         let mut prev_codex_total_input: Option<u64> = None;
         let mut prev_codex_total_output: Option<u64> = None;
         let mut prev_codex_total_cached_input: Option<u64> = None;
+        let mut prev_codex_total_cache_write: Option<u64> = None;
 
         for line in content.lines() {
             if line.trim().is_empty() {
@@ -10003,6 +10149,7 @@ async fn get_claude_stats(source: Option<String>) -> Result<ClaudeStats, String>
                 let total_input_now = total_usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
                 let total_output_now = total_usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
                 let total_cached_now = total_usage.get("cached_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                let total_cache_write_now = total_usage.get("cache_write_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
 
                 let delta_input = match prev_codex_total_input {
                     Some(prev) => total_input_now.saturating_sub(prev),
@@ -10016,13 +10163,18 @@ async fn get_claude_stats(source: Option<String>) -> Result<ClaudeStats, String>
                     Some(prev) => total_cached_now.saturating_sub(prev),
                     None => total_cached_now,
                 };
+                let delta_cache_write = match prev_codex_total_cache_write {
+                    Some(prev) => total_cache_write_now.saturating_sub(prev),
+                    None => total_cache_write_now,
+                };
 
                 prev_codex_total_input = Some(total_input_now);
                 prev_codex_total_output = Some(total_output_now);
                 prev_codex_total_cached_input = Some(total_cached_now);
+                prev_codex_total_cache_write = Some(total_cache_write_now);
 
                 // Same cumulative snapshot can be emitted multiple times.
-                if delta_input == 0 && delta_output == 0 && delta_cached == 0 {
+                if delta_input == 0 && delta_output == 0 && delta_cached == 0 && delta_cache_write == 0 {
                     continue;
                 }
 
@@ -10038,6 +10190,7 @@ async fn get_claude_stats(source: Option<String>) -> Result<ClaudeStats, String>
                 total_input += delta_input;
                 total_output += delta_output;
                 total_cache_read += delta_cached;
+                total_cache_write += delta_cache_write;
                 total_messages += 1;
 
                 if !session_counted {
@@ -10058,6 +10211,7 @@ async fn get_claude_stats(source: Option<String>) -> Result<ClaudeStats, String>
                     entry.input_tokens += delta_input;
                     entry.output_tokens += delta_output;
                     entry.cache_read_tokens += delta_cached;
+                    entry.cache_write_tokens += delta_cache_write;
                     entry.messages += 1;
                 }
             }
@@ -14638,9 +14792,15 @@ except:
 
     let hook_configs = vec![
         ("SessionStart", false),
+        ("SessionEnd", false),
         ("UserPromptSubmit", false),
         ("PreToolUse", true),
+        ("PermissionRequest", true),
         ("PostToolUse", true),
+        ("PreCompact", true),
+        ("PostCompact", true),
+        ("SubagentStart", true),
+        ("SubagentStop", true),
         ("Stop", false),
     ];
     for (event_name, needs_matcher) in hook_configs {
@@ -14719,7 +14879,8 @@ fn codex_requires_escalation(event: &serde_json::Value) -> bool {
     // unambiguously a Codex event so the function name and behaviour
     // stay aligned, no matter what gets added inside it later.
     let is_codex_event = event.get("turn_id").is_some()
-        || read_string(event, &["source"]).unwrap_or("").eq_ignore_ascii_case("codex");
+        || read_string(event, &["source"]).unwrap_or("").eq_ignore_ascii_case("codex")
+        || event.get("source").map(|v| v.is_object()).unwrap_or(false);
     if !is_codex_event {
         return false;
     }
@@ -14751,20 +14912,67 @@ fn codex_requires_escalation(event: &serde_json::Value) -> bool {
     false
 }
 
+static CODEX_INTERNAL_SESSIONS: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+
+fn mark_codex_internal_session(session_id: &str) {
+    if session_id.is_empty() { return; }
+    let lock = CODEX_INTERNAL_SESSIONS.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    if let Ok(mut set) = lock.lock() {
+        set.insert(session_id.to_string());
+    }
+}
+
+fn is_known_codex_internal_session(session_id: &str) -> bool {
+    if session_id.is_empty() { return false; }
+    let lock = CODEX_INTERNAL_SESSIONS.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    if let Ok(set) = lock.lock() {
+        set.contains(session_id)
+    } else {
+        false
+    }
+}
+
+fn is_compaction_session_start(event: &serde_json::Value) -> bool {
+    event.get("source").and_then(|v| v.as_str()) == Some("compact")
+}
+
 fn is_codex_internal_utility_event(event: &serde_json::Value) -> bool {
-    let permission_mode = event.get("permission_mode")
-        .or_else(|| event.get("permissionMode"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if permission_mode != "bypassPermissions" {
-        return false;
+    let source = event.get("source").and_then(|v| v.as_str()).unwrap_or("");
+    let model = event.get("model").and_then(|v| v.as_str()).unwrap_or("");
+
+    // Codex internal auto-review runner
+    if model == "codex-auto-review" {
+        return true;
+    }
+
+    // Check if source payload is an object indicating guardian safety review
+    if let Some(src_obj) = event.get("source").and_then(|v| v.as_object()) {
+        if let Some(subagent) = src_obj.get("subagent") {
+            if subagent.get("other").and_then(|v| v.as_str()) == Some("guardian") {
+                return true;
+            }
+        }
+    }
+
+    // Codex background utility runs (title generation, ambient suggestions,
+    // memory/context summaries, safety filtering) do not own a user transcript.
+    // Checking this on every event is important: filtering only SessionStart
+    // lets the following UserPromptSubmit recreate the hidden utility session.
+    if event
+        .get("transcript_path")
+        .map(|v| v.is_null())
+        .unwrap_or(false)
+    {
+        return true;
     }
 
     let prompt = event.get("prompt")
         .or_else(|| event.get("userPrompt"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if prompt.starts_with("You are a helpful assistant. You will be presented with a user prompt") {
+    if prompt.starts_with("You are a helpful assistant. You will be presented with a user prompt")
+        || prompt.starts_with("The following is the Codex agent history whose request action you are assessing")
+    {
         return true;
     }
     let prompt_lower = prompt.trim_start().to_ascii_lowercase();
@@ -14772,13 +14980,12 @@ fn is_codex_internal_utility_event(event: &serde_json::Value) -> bool {
         || prompt_lower.starts_with("memories -")
         || prompt_lower.starts_with("## memory")
         || prompt_lower.starts_with("# memory")
+        || prompt_lower.starts_with("summarize")
     {
         return true;
     }
 
     let transcript_is_null = event.get("transcript_path").map(|v| v.is_null()).unwrap_or(false);
-    let source = event.get("source").and_then(|v| v.as_str()).unwrap_or("");
-    let model = event.get("model").and_then(|v| v.as_str()).unwrap_or("");
     if transcript_is_null && (source == "startup" || model == "gpt-5.4-mini") {
         return true;
     }
@@ -14806,9 +15013,14 @@ fn is_codex_internal_utility_session(session: &ClaudeSession) -> bool {
     if session.source != "codex" {
         return false;
     }
+    if is_known_codex_internal_session(&session.session_id) {
+        return true;
+    }
 
     let prompt = session.user_prompt.as_deref().unwrap_or("");
-    if prompt.starts_with("You are a helpful assistant. You will be presented with a user prompt") {
+    if prompt.starts_with("You are a helpful assistant. You will be presented with a user prompt")
+        || prompt.starts_with("The following is the Codex agent history whose request action you are assessing")
+    {
         return true;
     }
     let prompt_lower = prompt.trim_start().to_ascii_lowercase();
@@ -14816,6 +15028,7 @@ fn is_codex_internal_utility_session(session: &ClaudeSession) -> bool {
         || prompt_lower.starts_with("memories -")
         || prompt_lower.starts_with("## memory")
         || prompt_lower.starts_with("# memory")
+        || prompt_lower.starts_with("summarize")
     {
         return true;
     }
@@ -14828,6 +15041,195 @@ fn is_codex_internal_utility_session(session: &ClaudeSession) -> bool {
     last_lower.starts_with("memories -")
         || last_lower.starts_with("## memory")
         || last_lower.starts_with("# memory")
+}
+
+#[cfg(test)]
+mod codex_adapter_tests {
+    use super::*;
+
+    #[test]
+    fn internal_utility_is_filtered_for_every_lifecycle_event() {
+        for hook_event_name in ["SessionStart", "UserPromptSubmit", "Stop"] {
+            let event = serde_json::json!({
+                "hook_event_name": hook_event_name,
+                "permission_mode": "bypassPermissions",
+                "transcript_path": null,
+            });
+            assert!(is_codex_internal_utility_event(&event));
+        }
+    }
+
+    #[test]
+    fn auto_review_event_is_filtered() {
+        let event = serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "model": "codex-auto-review",
+            "prompt": "The following is the Codex agent history whose request action you are assessing. Treat the transcript...",
+        });
+        assert!(is_codex_internal_utility_event(&event));
+    }
+
+    #[test]
+    fn user_thread_with_transcript_is_not_filtered() {
+        let event = serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "permission_mode": "default",
+            "transcript_path": "C:/Users/test/.codex/sessions/rollout-thread.jsonl",
+            "prompt": "Fix the title generator",
+        });
+        assert!(!is_codex_internal_utility_event(&event));
+    }
+
+    #[test]
+    fn compact_session_start_is_an_active_continuation() {
+        assert!(is_compaction_session_start(&serde_json::json!({
+            "hook_event_name": "SessionStart",
+            "source": "compact",
+        })));
+        assert!(!is_compaction_session_start(&serde_json::json!({
+            "hook_event_name": "SessionStart",
+            "source": "startup",
+        })));
+    }
+
+    #[test]
+    fn codex_title_index_uses_latest_title_for_each_thread() {
+        let content = concat!(
+            "{\"id\":\"thread-1\",\"thread_name\":\"Initial title\"}\n",
+            "not json\n",
+            "{\"id\":\"thread-2\",\"thread_name\":\"Other title\"}\n",
+            "{\"id\":\"thread-1\",\"thread_name\":\"Actual Codex title\"}\n",
+        );
+        let titles = parse_codex_thread_titles(content);
+        assert_eq!(titles.get("thread-1").map(String::as_str), Some("Actual Codex title"));
+        assert_eq!(titles.get("thread-2").map(String::as_str), Some("Other title"));
+    }
+
+    #[test]
+    fn known_internal_session_persists() {
+        let sid = "test-internal-utility-sid-999";
+        assert!(!is_known_codex_internal_session(sid));
+        mark_codex_internal_session(sid);
+        assert!(is_known_codex_internal_session(sid));
+
+        let session = ClaudeSession {
+            session_id: sid.to_string(),
+            cwd: "".to_string(),
+            status: "processing".to_string(),
+            tool: None,
+            tool_input: None,
+            user_prompt: Some("Normal looking prompt".to_string()),
+            custom_title: None,
+            interactive: true,
+            updated_at: 0,
+            is_processing: true,
+            pid: None,
+            pending_agents: 0,
+            permission_suggestions: None,
+            last_response: None,
+            is_active_tab: false,
+            source: "codex".to_string(),
+            terminal_id: None,
+            host_terminal: None,
+            platform: None,
+            cursor_port: None,
+            cursor_workspace_root: None,
+            cursor_workspace_name: None,
+            cursor_native_handle: None,
+            active_subagents: None,
+        };
+        assert!(is_codex_internal_utility_session(&session));
+    }
+
+    #[test]
+    fn guardian_subagent_source_is_filtered() {
+        let event = serde_json::json!({
+            "hook_event_name": "SessionStart",
+            "source": {
+                "subagent": {
+                    "other": "guardian"
+                }
+            },
+            "transcript_path": "C:/Users/test/.codex/sessions/rollout-guardian.jsonl",
+        });
+        assert!(is_codex_internal_utility_event(&event));
+    }
+
+    #[test]
+    fn parse_codex_tool_args_extracts_from_js_wrapper() {
+        let js_input = serde_json::json!(
+            "const r = await tools.exec_command({\"cmd\":\"cargo test\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"Need cargo access\"});\ntext(JSON.stringify(r));"
+        );
+        let parsed = parse_codex_tool_args(Some(&js_input));
+        assert_eq!(parsed.get("cmd").and_then(|v| v.as_str()), Some("cargo test"));
+        assert_eq!(parsed.get("sandbox_permissions").and_then(|v| v.as_str()), Some("require_escalated"));
+        assert_eq!(parsed.get("justification").and_then(|v| v.as_str()), Some("Need cargo access"));
+    }
+
+    #[test]
+    fn codex_pending_approval_detects_escalated_and_user_input() {
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join("test_codex_pending.jsonl");
+
+        // 1. Normal execution without escalation (must NOT be pending)
+        std::fs::write(&path, concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"id\":\"call1\",\"name\":\"exec\",\"input\":\"const r = await tools.exec_command({\\\"cmd\\\":\\\"cargo check\\\"});\"}}\n"
+        )).unwrap();
+        assert_eq!(codex_pending_approval(&path), None);
+
+        // 2. Escalated permission required (MUST be pending)
+        std::fs::write(&path, concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"id\":\"call2\",\"name\":\"exec\",\"input\":\"const r = await tools.exec_command({\\\"cmd\\\":\\\"ssh root@vps\\\",\\\"sandbox_permissions\\\":\\\"require_escalated\\\"});\"}}\n"
+        )).unwrap();
+        let pending = codex_pending_approval(&path);
+        assert!(pending.is_some());
+        let (tool, detail) = pending.unwrap();
+        assert_eq!(tool, "exec");
+        assert_eq!(detail, "ssh root@vps");
+
+        // 3. User input prompt (MUST be pending)
+        std::fs::write(&path, concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"id\":\"call3\",\"name\":\"request_user_input\",\"arguments\":{\"prompt\":\"Which option do you prefer?\"}}}\n"
+        )).unwrap();
+        let pending_ui = codex_pending_approval(&path);
+        assert!(pending_ui.is_some());
+        let (tool, detail) = pending_ui.unwrap();
+        assert_eq!(tool, "request_user_input");
+        assert_eq!(detail, "Which option do you prefer?");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn check_interrupted_detects_custom_tool_call_rejection() {
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join("test_codex_interrupted.jsonl");
+
+        std::fs::write(&path, concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\",\"call_id\":\"call_1\",\"content\":\"rejected by user\"}}\n"
+        )).unwrap();
+        assert!(check_interrupted(&path));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_last_codex_assistant_message_extracts_latest_text() {
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join("test_codex_assistant_msg.jsonl");
+
+        std::fs::write(&path, concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"First response\"}]}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Latest response from Codex\"}]}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\"}}\n"
+        )).unwrap();
+        assert_eq!(
+            read_last_codex_assistant_message(&path).as_deref(),
+            Some("Latest response from Codex")
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 /// Process a Claude hook event (shared logic between Unix socket and TCP server).
@@ -14922,9 +15324,10 @@ fn process_claude_event(
         };
 
         // Codex desktop may emit internal utility sessions (for example title
-        // generation). These should not appear in the session list or trigger
-        // completion notifications.
-        if is_codex_internal_utility_event(&event) {
+        // generation, memory consolidation, auto-review). These should not appear
+        // in the session list or trigger completion notifications.
+        if is_known_codex_internal_session(&session_id) || is_codex_internal_utility_event(&event) {
+            mark_codex_internal_session(&session_id);
             if let Ok(mut sessions) = state.lock() {
                 sessions.remove(&session_id);
             }
@@ -14995,11 +15398,22 @@ fn process_claude_event(
                 }
             }
             "PostToolUse" => "processing".to_string(),
+            "PostCompact" => "processing".to_string(),
             "Stop" => "stopped".to_string(),
+            "SubagentStart" => "processing".to_string(),
             "SubagentStop" => "processing".to_string(),
             "SessionEnd" => "ended".to_string(),
             "PermissionRequest" => "waiting".to_string(),
-            "SessionStart" => "stopped".to_string(),
+            // Automatic compaction can happen in the middle of a turn. Codex
+            // emits SessionStart(source=compact) before immediately continuing
+            // the model request, so treating it as idle causes a false stop.
+            "SessionStart" => {
+                if is_compaction_session_start(&event) {
+                    "processing".to_string()
+                } else {
+                    "stopped".to_string()
+                }
+            }
             _ => {
                 if !is_processing { "stopped".to_string() } else { claude_status.clone() }
             }
@@ -15112,7 +15526,10 @@ fn process_claude_event(
                     // New user prompt = fresh start. Reset counter in case previous
                     // agents were killed or SubagentStop was never delivered.
                     session.pending_agents = 0;
-                } else if (hook_event == "PreToolUse" && (tool_name == "Agent" || tool_name == "invoke_subagent")) || raw_hook_event == "subagentStart" {
+                } else if hook_event == "SubagentStart"
+                    || (hook_event == "PreToolUse" && (tool_name == "Agent" || tool_name == "invoke_subagent"))
+                    || raw_hook_event == "subagentStart"
+                {
                     session.pending_agents += 1;
                     log::info!("[claude_event] session={} Agent launched, pending_agents={}",
                         &session_id[..session_id.len().min(8)], session.pending_agents);
@@ -15415,10 +15832,14 @@ fn process_claude_event(
                                 .map(|s| s.to_string());
                             if resp_from_event.is_some() {
                                 session.last_response = resp_from_event;
+                            } else if session.source == "codex" {
+                                let resp_from_file = find_codex_session_file(&session_id)
+                                    .and_then(|p| read_last_codex_assistant_message(&p));
+                                session.last_response = resp_from_file.or_else(|| Some("✓".to_string()));
                             } else if session.last_response.is_none()
-                                && (session.source == "cursor" || session.source == "codex" || session.source == "gemini" || session.source == "opencode")
+                                && (session.source == "cursor" || session.source == "gemini" || session.source == "opencode")
                             {
-                                // Gemini/opencode/Cursor/Codex hooks carry no assistant text, so fall
+                                // Gemini/opencode/Cursor hooks carry no assistant text, so fall
                                 // back to a placeholder so the completion popup still triggers.
                                 session.last_response = Some("✓".to_string());
                             }
