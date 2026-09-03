@@ -1,11 +1,11 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/core'
-import { Zap, Sparkles, Clock, RotateCw } from 'lucide-react'
+import { Zap, Clock, RotateCw } from 'lucide-react'
 import { motion, AnimatePresence } from 'motion/react'
 import type { HarnessQuotaSummary, QuotaWindow } from '../lib/types'
 
 // Module-level cache and subscriber registry so all components viewing
-// the active harness (e.g. top bar capsule + stats view) stay synchronized.
+// the active harness (e.g. side rail + bubble + stats view) stay synchronized.
 type QuotaSubscriber = (data: HarnessQuotaSummary | null) => void
 
 const subscribers: {
@@ -155,7 +155,7 @@ export function formatCountdown(
 
   const diffMs = target - now
   if (diffMs <= 0) {
-    return options?.short ? '0s' : 'Reset'
+    return options?.short ? '0s' : '已重置'
   }
 
   const totalSeconds = Math.floor(diffMs / 1000)
@@ -171,10 +171,10 @@ export function formatCountdown(
     return `${seconds}s`
   }
 
-  if (days > 0) return `${days}d ${hours}h ${minutes}m`
-  if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`
-  if (minutes > 0) return `${minutes}m ${seconds}s`
-  return `${seconds}s`
+  if (days > 0) return `${days}天 ${hours}小时 ${minutes}分`
+  if (hours > 0) return `${hours}小时 ${minutes}分 ${seconds}秒`
+  if (minutes > 0) return `${minutes}分 ${seconds}秒`
+  return `${seconds}秒`
 }
 
 /**
@@ -201,49 +201,52 @@ export function formatResetTime(resetsAt: string | null | undefined): string | n
 export function formatUpdatedAgo(updatedAt: number, now: number): string {
   const ms = updatedAt < 1e11 ? updatedAt * 1000 : updatedAt
   const diffSec = Math.max(0, Math.floor((now - ms) / 1000))
-  if (diffSec < 60) return 'just now'
+  if (diffSec < 60) return '刚刚'
   const diffMin = Math.floor(diffSec / 60)
-  if (diffMin < 60) return `${diffMin}m ago`
+  if (diffMin < 60) return `${diffMin}分钟前`
   const diffHours = Math.floor(diffMin / 60)
-  return `${diffHours}h ago`
+  return `${diffHours}小时前`
 }
 
 /**
- * Color ladder helper based on percent:
- * - < 75%: Cyan/Blue
- * - 75% - 90%: Amber
- * - > 90% / 100%: Rose (with pulse)
+ * Color ladder based on REMAINING percent (剩余量):
+ * - >= 30%: Healthy (Emerald / Cyan)
+ * - 15% - 30%: Warning (Amber)
+ * - < 15%: Critical (Rose with pulse)
  */
-export function getQuotaColorLadder(percent: number) {
-  if (percent > 90) {
+export function getQuotaColorLadder(remainingPercent: number) {
+  if (remainingPercent < 15) {
     return {
       ladder: 'rose' as const,
       capsule: 'bg-rose-500/15 text-rose-400 border-rose-500/30 animate-pulse',
+      card: 'bg-rose-500/10 text-rose-400 border-rose-500/30 animate-pulse',
       bar: 'bg-rose-500',
       text: 'text-rose-400',
-      badge: 'bg-rose-500/15 text-rose-400 border-rose-500/30',
+      badge: 'bg-rose-500/15 text-rose-400 border-rose-500/30 animate-pulse',
     }
   }
-  if (percent >= 75) {
+  if (remainingPercent <= 30) {
     return {
       ladder: 'amber' as const,
       capsule: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
-      bar: 'bg-amber-500',
+      card: 'bg-amber-500/10 text-amber-400 border-amber-500/25',
+      bar: 'bg-amber-400',
       text: 'text-amber-400',
       badge: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
     }
   }
   return {
-    ladder: 'cyan' as const,
-    capsule: 'bg-cyan-500/10 text-cyan-400 border-cyan-500/20',
-    bar: 'bg-cyan-500',
-    text: 'text-cyan-400',
-    badge: 'bg-cyan-500/10 text-cyan-400 border-cyan-500/20',
+    ladder: 'emerald' as const,
+    capsule: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20',
+    card: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20',
+    bar: 'bg-emerald-400',
+    text: 'text-emerald-400',
+    badge: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20',
   }
 }
 
 /**
- * Standalone Quota Card component (usable both embedded in ClaudeStatsView and in Popover).
+ * Standalone Quota Card component (usable embedded in ClaudeStatsView or in Popover).
  */
 export function QuotaCard({
   harness,
@@ -272,9 +275,13 @@ export function QuotaCard({
   const primaryWindow: QuotaWindow | null =
     data.primary || (data.details.length > 0 ? data.details[0] : null)
   const detailWindows: QuotaWindow[] = data.primary ? data.details : data.details.slice(1)
-  const primaryLadder = primaryWindow
-    ? getQuotaColorLadder(primaryWindow.percent)
-    : getQuotaColorLadder(0)
+
+  // Calculate remaining percentages (100 - used)
+  const primaryRemaining = primaryWindow
+    ? Math.max(0, Math.min(100, Math.round(100 - primaryWindow.percent)))
+    : 100
+  const primaryLadder = getQuotaColorLadder(primaryRemaining)
+
   const primaryResetCountdown = primaryWindow?.resets_at
     ? formatCountdown(primaryWindow.resets_at, now, { short: false })
     : null
@@ -298,60 +305,60 @@ export function QuotaCard({
           <div
             className={`w-6 h-6 rounded-lg flex items-center justify-center border shrink-0 ${
               data.harness === 'codex'
-                ? 'bg-emerald-500/10 border-emerald-500/25 text-emerald-400'
-                : 'bg-purple-500/10 border-purple-500/25 text-purple-400'
+                ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-400'
+                : 'bg-indigo-500/15 border-indigo-500/30 text-indigo-400'
             }`}
           >
-            {data.harness === 'codex' ? <Zap className="w-3.5 h-3.5" /> : <Sparkles className="w-3.5 h-3.5" />}
+            <Zap className="w-3.5 h-3.5" />
           </div>
-          <div className="flex items-center gap-1.5 min-w-0">
-            <span className="text-xs font-semibold text-white tracking-tight truncate">
-              {harnessName}
-            </span>
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="font-bold text-sm truncate tracking-wide">{harnessName}</span>
             {data.plan_label && (
-              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-white/10 text-slate-300 font-medium border border-white/10 shrink-0">
+              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-white/10 border border-white/10 text-white/70 font-medium shrink-0">
                 {data.plan_label}
               </span>
             )}
           </div>
         </div>
 
-        {/* Refresh button & status */}
         {!isPopover && (
           <div className="flex items-center gap-2 shrink-0">
             <span className="text-[11px] text-white/40">
-              Updated {formatUpdatedAgo(data.updated_at, now)}
+              更新于 {formatUpdatedAgo(data.updated_at, now)}
             </span>
             <button
               data-no-drag
               onClick={() => handleRefresh?.()}
               disabled={isRefreshing}
               className="flex items-center gap-1 px-2 py-1 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-colors cursor-pointer disabled:opacity-50 text-xs"
-              title="Refresh quota"
+              title="刷新配额"
             >
-              <RotateCw className={`w-3 h-3 ${isRefreshing ? 'animate-spin text-cyan-400' : ''}`} />
-              <span>Refresh</span>
+              <RotateCw className={`w-3 h-3 ${isRefreshing ? 'animate-spin text-emerald-400' : ''}`} />
+              <span>刷新</span>
             </button>
           </div>
         )}
       </div>
 
-      {/* Primary Window Progress Bar */}
+      {/* Primary Window Progress Bar (showing Remaining) */}
       {primaryWindow ? (
         <div className="flex flex-col gap-1.5">
           <div className="flex items-baseline justify-between gap-2">
             <span className="text-xs font-medium text-slate-300 truncate">
-              {primaryWindow.label || 'Primary Limit'}
+              {primaryWindow.label || '主要限额窗口'}
             </span>
-            <span className={`text-sm font-mono font-bold shrink-0 ${primaryLadder.text}`}>
-              {Math.round(primaryWindow.percent)}%
-            </span>
+            <div className="flex items-baseline gap-1 shrink-0">
+              <span className="text-[10px] text-white/50">剩余</span>
+              <span className={`text-sm font-mono font-bold ${primaryLadder.text}`}>
+                {primaryRemaining}%
+              </span>
+            </div>
           </div>
 
           <div className="h-2 w-full bg-white/10 rounded-full overflow-hidden">
             <div
               className={`h-full rounded-full transition-all duration-500 ${primaryLadder.bar}`}
-              style={{ width: `${Math.min(100, Math.max(0, primaryWindow.percent))}%` }}
+              style={{ width: `${primaryRemaining}%` }}
             />
           </div>
 
@@ -359,29 +366,30 @@ export function QuotaCard({
             <div className="flex items-center justify-between text-[11px] text-slate-400 mt-0.5">
               <span className="flex items-center gap-1 truncate">
                 <Clock className="w-3 h-3 text-slate-500 shrink-0" />
-                Resets at {primaryResetTime}
+                将于 {primaryResetTime} 重置
               </span>
               {primaryResetCountdown && (
                 <span className="font-mono text-slate-300 shrink-0 ml-1">
-                  in {primaryResetCountdown}
+                  倒计时 {primaryResetCountdown}
                 </span>
               )}
             </div>
           )}
         </div>
       ) : (
-        <div className="text-xs text-white/40 italic py-1">No limit data available</div>
+        <div className="text-xs text-white/40 italic py-1">暂无配额数据</div>
       )}
 
-      {/* Details list: other windows / model buckets with small progress bars */}
+      {/* Details list: other windows / model buckets with remaining progress bars */}
       {detailWindows.length > 0 && (
         <div className="flex flex-col gap-2 pt-2 border-t border-white/5">
           <span className="text-[10px] font-semibold uppercase tracking-wider text-white/40">
-            Window Details
+            配额与模型分桶明细
           </span>
           <div className={isPopover ? 'flex flex-col gap-2' : 'grid grid-cols-1 sm:grid-cols-2 gap-2'}>
             {detailWindows.map((win, idx) => {
-              const winLadder = getQuotaColorLadder(win.percent)
+              const winRemaining = Math.max(0, Math.min(100, Math.round(100 - win.percent)))
+              const winLadder = getQuotaColorLadder(winRemaining)
               const winCountdown = win.resets_at
                 ? formatCountdown(win.resets_at, now, { short: true })
                 : null
@@ -397,21 +405,24 @@ export function QuotaCard({
                 >
                   <div className="flex items-center justify-between text-xs gap-2">
                     <span className="text-slate-300 truncate">{win.label}</span>
-                    <span className={`font-mono text-xs font-semibold shrink-0 ${winLadder.text}`}>
-                      {Math.round(win.percent)}%
-                    </span>
+                    <div className="flex items-baseline gap-1 shrink-0">
+                      <span className="text-[9px] text-white/40">剩余</span>
+                      <span className={`font-mono text-xs font-semibold ${winLadder.text}`}>
+                        {winRemaining}%
+                      </span>
+                    </div>
                   </div>
 
                   <div className="h-1.5 w-full bg-white/10 rounded-full overflow-hidden">
                     <div
                       className={`h-full rounded-full transition-all duration-500 ${winLadder.bar}`}
-                      style={{ width: `${Math.min(100, Math.max(0, win.percent))}%` }}
+                      style={{ width: `${winRemaining}%` }}
                     />
                   </div>
 
                   {winCountdown && (
                     <div className="flex items-center justify-end text-[10px] text-slate-400 font-mono">
-                      in {winCountdown}
+                      倒计时 {winCountdown}
                     </div>
                   )}
                 </div>
@@ -424,7 +435,7 @@ export function QuotaCard({
       {/* Popover Footer: "Updated X min ago" + Refresh button */}
       {isPopover && (
         <div className="flex items-center justify-between pt-2 border-t border-white/10 text-[11px] text-slate-400">
-          <span>Updated {formatUpdatedAgo(data.updated_at, now)}</span>
+          <span>更新于 {formatUpdatedAgo(data.updated_at, now)}</span>
           <button
             data-no-drag
             onClick={(e) => {
@@ -433,10 +444,10 @@ export function QuotaCard({
             }}
             disabled={isRefreshing}
             className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-colors cursor-pointer disabled:opacity-50"
-            title="Refresh quota"
+            title="刷新配额"
           >
-            <RotateCw className={`w-3 h-3 ${isRefreshing ? 'animate-spin text-cyan-400' : ''}`} />
-            <span>Refresh</span>
+            <RotateCw className={`w-3 h-3 ${isRefreshing ? 'animate-spin text-emerald-400' : ''}`} />
+            <span>刷新</span>
           </button>
         </div>
       )}
@@ -445,119 +456,8 @@ export function QuotaCard({
 }
 
 /**
- * Top Control Bar Quota Capsule Component.
- * - Shows lightning icon + harness name + primary percent + short countdown (e.g. ⚡ Codex 68% · 1h 45m).
- * - Color ladder:
- *   - < 75%: Cyan/Blue
- *   - 75% - 90%: Amber
- *   - > 90% / 100%: Rose (pulse)
- * - Click toggles the Glassmorphism popover card.
- * - If no data or not connected, completely hidden (returns null).
- */
-export function QuotaCapsule({
-  harness,
-}: {
-  harness?: 'codex' | 'antigravity' | null
-}) {
-  const { data, isRefreshing, refresh } = useHarnessQuota(harness)
-  const now = useQuotaTicker()
-  const [isOpen, setIsOpen] = useState(false)
-  const containerRef = useRef<HTMLDivElement>(null)
-  const popoverRef = useRef<HTMLDivElement>(null)
-
-  // Click outside to close popover
-  useEffect(() => {
-    if (!isOpen) return
-
-    const handlePointerDown = (e: MouseEvent | PointerEvent) => {
-      const target = e.target as Node
-      if (
-        popoverRef.current &&
-        !popoverRef.current.contains(target) &&
-        containerRef.current &&
-        !containerRef.current.contains(target)
-      ) {
-        setIsOpen(false)
-      }
-    }
-
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        setIsOpen(false)
-      }
-    }
-
-    document.addEventListener('pointerdown', handlePointerDown)
-    document.addEventListener('keydown', handleKeyDown)
-    return () => {
-      document.removeEventListener('pointerdown', handlePointerDown)
-      document.removeEventListener('keydown', handleKeyDown)
-    }
-  }, [isOpen])
-
-  // If no data or not connected, completely hidden
-  if (!data || !data.connected) {
-    return null
-  }
-
-  const harnessName = data.harness === 'codex' ? 'Codex' : 'Antigravity'
-  const primaryWindow: QuotaWindow | null =
-    data.primary || (data.details.length > 0 ? data.details[0] : null)
-  const primaryPercent = primaryWindow ? Math.round(primaryWindow.percent) : 0
-  const colorLadder = getQuotaColorLadder(primaryPercent)
-  const shortCountdown = primaryWindow?.resets_at
-    ? formatCountdown(primaryWindow.resets_at, now, { short: true })
-    : null
-
-  return (
-    <div className="relative inline-block shrink-0" ref={containerRef}>
-      {/* Pill Capsule Button */}
-      <button
-        data-no-drag
-        type="button"
-        onClick={(e) => {
-          e.stopPropagation()
-          setIsOpen((prev) => !prev)
-        }}
-        className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full border text-[11px] font-medium transition-all duration-200 hover:brightness-125 active:scale-95 cursor-pointer select-none shadow-sm ${colorLadder.capsule}`}
-        title={`${harnessName} Quota: ${primaryPercent}%${shortCountdown ? ` (Resets in ${shortCountdown})` : ''}. Click for details.`}
-      >
-        <Zap className="w-3 h-3 shrink-0" />
-        <span className="font-sans font-medium whitespace-nowrap">
-          {harnessName} {primaryPercent}%{shortCountdown ? ` · ${shortCountdown}` : ''}
-        </span>
-      </button>
-
-      {/* Glassmorphism Popover Card */}
-      <AnimatePresence>
-        {isOpen && (
-          <motion.div
-            ref={popoverRef}
-            initial={{ opacity: 0, scale: 0.95, y: -4 }}
-            animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.95, y: -4 }}
-            transition={{ duration: 0.15 }}
-            data-no-drag
-            onClick={(e) => e.stopPropagation()}
-            className="absolute top-full left-0 mt-2 z-50 w-76 sm:w-80 max-w-[calc(100vw-32px)] bg-[#18181c]/95 backdrop-blur-xl border border-white/10 shadow-2xl rounded-2xl p-4 select-none cursor-default"
-          >
-            <QuotaCard
-              harness={data.harness}
-              summary={data}
-              isRefreshing={isRefreshing}
-              onRefresh={refresh}
-              variant="popover"
-            />
-          </motion.div>
-        )}
-      </AnimatePresence>
-    </div>
-  )
-}
-
-/**
- * Mini Quota Badge on session cards (e.g. `[⚡ 24%]`).
- * Shows subtle percent badge with color ladder, tooltip with resets countdown.
+ * Mini Quota Badge specifically tailored for MascotBubble.
+ * Shows remaining percentage: [⚡ 76%], with color ladder and reset countdown tooltip.
  */
 export function QuotaMiniBadge({
   harness,
@@ -570,8 +470,8 @@ export function QuotaMiniBadge({
   const primary = data.primary || (data.details.length > 0 ? data.details[0] : null)
   if (!primary) return null
 
-  const pct = Math.round(primary.percent)
-  const ladder = getQuotaColorLadder(pct)
+  const remainingPercent = Math.max(0, Math.min(100, Math.round(100 - primary.percent)))
+  const ladder = getQuotaColorLadder(remainingPercent)
   const countdown = primary.resets_at
     ? formatCountdown(primary.resets_at, now, { short: true })
     : null
@@ -580,19 +480,21 @@ export function QuotaMiniBadge({
   return (
     <span
       className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono font-medium border shrink-0 transition-colors select-none ${ladder.badge}`}
-      title={`${harnessLabel} ${primary.label || 'Quota'}: ${pct}%${countdown ? ` (Resets in ${countdown})` : ''}`}
+      title={`${harnessLabel} ${primary.label || '配额'}: 剩余 ${remainingPercent}%${countdown ? ` (重置倒计时: ${countdown})` : ''}`}
     >
       <Zap className="w-2.5 h-2.5 shrink-0" />
-      <span>{pct}%</span>
+      <span>{remainingPercent}%</span>
     </span>
   )
 }
 
 /**
- * Floating side rail on the right side of the expanded panel.
- * Holds compact vertical pills for all detected harnesses (Antigravity & Codex).
- * Completely decoupled from top session notification area.
- * Clicking a pill slides out the glassmorphic detail popover inwards to the left.
+ * Apple Dynamic Island style companion dock on the right side of the expanded panel.
+ * - Widened pod with unified dark glassmorphic styling
+ * - Displays full recognizable names: "Codex" & "Antigravity"
+ * - Displays remaining quota ("76% 剩余") and mini capacity gauge
+ * - Shows reset countdown ("in 4h 23m")
+ * - Clicking any card slides out the full details popover to the left
  */
 export function QuotaSideRail() {
   const codex = useHarnessQuota('codex')
@@ -633,7 +535,6 @@ export function QuotaSideRail() {
     data: HarnessQuotaSummary
     isRefreshing: boolean
     refresh: () => Promise<void> | void
-    abbr: string
     name: string
   }[] = []
 
@@ -643,7 +544,6 @@ export function QuotaSideRail() {
       data: antigravity.data,
       isRefreshing: antigravity.isRefreshing,
       refresh: antigravity.refresh,
-      abbr: 'Ag',
       name: 'Antigravity',
     })
   }
@@ -653,7 +553,6 @@ export function QuotaSideRail() {
       data: codex.data,
       isRefreshing: codex.isRefreshing,
       refresh: codex.refresh,
-      abbr: 'Cx',
       name: 'Codex',
     })
   }
@@ -665,12 +564,14 @@ export function QuotaSideRail() {
   return (
     <div
       ref={railRef}
-      className="relative shrink-0 flex flex-col items-center gap-1.5 py-3 pr-2 pl-1 border-l border-white/5 select-none z-30"
+      className="relative shrink-0 w-[126px] my-2 mr-2 p-2 flex flex-col gap-2 rounded-2xl bg-[#0c0c10]/85 backdrop-blur-xl border border-white/[0.08] shadow-[0_8px_30px_rgba(0,0,0,0.5)] select-none z-30"
     >
       {items.map((item) => {
         const primary = item.data.primary || item.data.details[0]
-        const pct = primary ? Math.round(primary.percent) : 0
-        const ladder = getQuotaColorLadder(pct)
+        const remainingPercent = primary
+          ? Math.max(0, Math.min(100, Math.round(100 - primary.percent)))
+          : 100
+        const ladder = getQuotaColorLadder(remainingPercent)
         const countdown = primary?.resets_at
           ? formatCountdown(primary.resets_at, now, { short: true })
           : null
@@ -685,14 +586,47 @@ export function QuotaSideRail() {
               e.stopPropagation()
               setActivePopover((prev) => (prev === item.harness ? null : item.harness))
             }}
-            className={`flex flex-col items-center justify-center w-8 py-2 rounded-xl border transition-all duration-200 cursor-pointer shadow-md ${
-              isSelected ? 'ring-2 ring-white/30 scale-105' : 'hover:scale-105 active:scale-95'
-            } ${ladder.capsule}`}
-            title={`${item.name} Quota: ${pct}%${countdown ? ` (Resets in ${countdown})` : ''}. Click for details.`}
+            className={`w-full flex flex-col gap-1.5 p-2 rounded-xl border transition-all duration-200 cursor-pointer text-left ${
+              isSelected
+                ? 'ring-2 ring-white/30 scale-[1.02]'
+                : 'hover:scale-[1.02] hover:brightness-110 active:scale-95'
+            } ${ladder.card}`}
+            title={`${item.name} 剩余配额: ${remainingPercent}%${countdown ? ` (重置倒计时: ${countdown})` : ''}. 点击查看详情.`}
           >
-            <Zap className="w-3.5 h-3.5 mb-0.5 shrink-0" />
-            <span className="text-[9px] font-bold tracking-tight uppercase leading-tight">{item.abbr}</span>
-            <span className="text-[10px] font-mono font-bold leading-tight mt-0.5">{pct}%</span>
+            {/* Row 1: Icon + Full Name */}
+            <div className="flex items-center justify-between gap-1 min-w-0">
+              <div className="flex items-center gap-1.5 min-w-0">
+                <Zap className={`w-3 h-3 shrink-0 ${ladder.text}`} />
+                <span className="text-[11px] font-semibold tracking-tight text-white/90 truncate">
+                  {item.name}
+                </span>
+              </div>
+            </div>
+
+            {/* Row 2: Remaining Percentage */}
+            <div className="flex items-baseline justify-between gap-1">
+              <span className={`text-sm font-mono font-bold leading-none ${ladder.text}`}>
+                {remainingPercent}%
+              </span>
+              <span className="text-[9px] font-normal text-white/40 uppercase tracking-wider">
+                剩余
+              </span>
+            </div>
+
+            {/* Row 3: Slim Remaining Progress Bar */}
+            <div className="w-full h-1 bg-white/10 rounded-full overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-all duration-500 ${ladder.bar}`}
+                style={{ width: `${remainingPercent}%` }}
+              />
+            </div>
+
+            {/* Row 4: Reset Countdown */}
+            {countdown && (
+              <div className="flex items-center justify-end text-[9px] font-mono text-white/40">
+                {countdown}
+              </div>
+            )}
           </button>
         )
       })}
@@ -708,7 +642,7 @@ export function QuotaSideRail() {
             transition={{ duration: 0.15 }}
             data-no-drag
             onClick={(e) => e.stopPropagation()}
-            className="absolute right-full mr-2 top-2 z-50 w-76 sm:w-80 max-w-[calc(100vw-48px)] bg-[#18181c]/95 backdrop-blur-xl border border-white/10 shadow-2xl rounded-2xl p-4 select-none cursor-default"
+            className="absolute right-full mr-2.5 top-0 z-50 w-80 max-w-[calc(100vw-48px)] bg-[#141418]/95 backdrop-blur-2xl border border-white/10 shadow-[0_12px_40px_rgba(0,0,0,0.8)] rounded-2xl p-4 select-none cursor-default"
           >
             <QuotaCard
               harness={activeItem.harness}
@@ -723,4 +657,3 @@ export function QuotaSideRail() {
     </div>
   )
 }
-

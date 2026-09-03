@@ -11,7 +11,7 @@ import { UpdateModal, type UpdateModalInfo, type UpdateModalPhase } from './comp
 import { AgentDetailView } from './components/AgentDetailView'
 import { CreateCharacterModal } from './components/CreateCharacterModal'
 import { ClaudeStatsView } from './components/ClaudeStatsView'
-import { QuotaSideRail, QuotaMiniBadge } from './components/QuotaCapsule'
+import { QuotaSideRail } from './components/QuotaCapsule'
 import { ChatList } from './components/ChatList'
 import { getStore, DEFAULT_CHAR, DEFAULT_CHAR_NAME, loadCharacters, loadOcConnections, saveOcConnections } from './lib/store'
 import type { AgentMetrics, BubbleSessionDetail, BubbleStyle, MascotBubblePayload, OcConnection, SubagentDetail } from './lib/types'
@@ -4508,7 +4508,7 @@ export default function Mini() {
 
   // Panel dimensions — CSS uses fixed base sizes; on Windows high-DPI screens
   // the panel root applies `zoom: uiScale` so all content scales uniformly.
-  const panelW = viewMode === 'efficiency' ? 575 : 475
+  const panelW = viewMode === 'efficiency' ? 700 : 600
   const closedNotchWidth = 44
   const closedNotchHeight = 10
   const openClipPath = 'inset(0 0 0 0 round 0 0 24px 24px)'
@@ -5690,9 +5690,6 @@ export default function Mini() {
                                         {cs.lastResponse && cs.lastResponse !== '✓' && <span className="min-w-0 max-w-[32%] truncate text-[11px] text-white/40">· {cs.lastResponse}</span>}
                                       </div>
                                       <div className="flex items-center gap-2 shrink-0 ml-auto">
-                                        {(isCodexSource || isAntigravitySource) && (
-                                          <QuotaMiniBadge harness={isCodexSource ? 'codex' : 'antigravity'} />
-                                        )}
                                         <span className={`text-[11px] px-2 py-0.5 rounded-md font-normal whitespace-nowrap ${sourceBadgeClass}`}>{sourceLabel}</span>
                                         <div className="w-8 flex items-center justify-center">
                                           <span className="text-[11px] text-slate-500 font-normal group-hover:hidden">{timeAgo}</span>
@@ -6400,9 +6397,6 @@ export default function Mini() {
                                     </div>
                                     <div className="flex items-baseline gap-2 min-w-0 flex-1">
                                       <span className={`text-sm font-bold tracking-wide truncate ${isActive || isWaiting ? 'text-slate-200' : 'text-slate-400'}`}>{label}</span>
-                                      {(cs.source === 'codex' || cs.source === 'antigravity') && (
-                                        <QuotaMiniBadge harness={cs.source} />
-                                      )}
                                     </div>
                                     <button
                                       data-no-drag
