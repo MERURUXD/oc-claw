@@ -2150,6 +2150,9 @@ export default function Mini() {
     // Track previously logged session statuses so we only emit a backend log
     // line when something actually changes — keeps oc-claw.log readable.
     const lastLoggedStatus = new Map<string, string>()
+    // Track first-seen timestamp per session so mascot bubbles sort in a stable,
+    // fixed order rather than jumping around every time updatedAt changes.
+    const sessionFirstSeenMap = new Map<string, number>()
     const isPollingRef = { current: false }
     const isRemotePollingRef = { current: false }
 
@@ -2368,12 +2371,39 @@ export default function Mini() {
             waitingSessions.push(s)
           }
         }
-        const getSessionTimestamp = (s: any) => {
-          if (!s.updatedAt) return 0
-          return typeof s.updatedAt === 'string' ? new Date(s.updatedAt).getTime() : Number(s.updatedAt)
+        const now = Date.now()
+        const getStableSessionTime = (s: Record<string, unknown>) => {
+          if (s.createdAt) {
+            const t = typeof s.createdAt === 'string' ? new Date(s.createdAt).getTime() : Number(s.createdAt)
+            if (!Number.isNaN(t) && t > 0) return t
+          }
+          if (s.startedAt) {
+            const t = typeof s.startedAt === 'string' ? new Date(String(s.startedAt)).getTime() : Number(s.startedAt)
+            if (!Number.isNaN(t) && t > 0) return t
+          }
+          const sid = String(s.sessionId || '')
+          if (!sessionFirstSeenMap.has(sid)) {
+            sessionFirstSeenMap.set(sid, now)
+          }
+          return sessionFirstSeenMap.get(sid) || 0
         }
-        waitingSessions.sort((a, b) => getSessionTimestamp(b) - getSessionTimestamp(a))
-        runningSessions.sort((a, b) => getSessionTimestamp(b) - getSessionTimestamp(a))
+
+        // Clean up stale sessions from sessionFirstSeenMap
+        const activeIds = new Set(sessions.map((s: Record<string, unknown>) => String(s.sessionId || '')))
+        for (const id of sessionFirstSeenMap.keys()) {
+          if (!activeIds.has(id)) {
+            sessionFirstSeenMap.delete(id)
+          }
+        }
+
+        const stableSessionSort = (a: Record<string, unknown>, b: Record<string, unknown>) => {
+          const diff = getStableSessionTime(a) - getStableSessionTime(b)
+          if (diff !== 0) return diff
+          return String(a.sessionId || '').localeCompare(String(b.sessionId || ''))
+        }
+
+        waitingSessions.sort(stableSessionSort)
+        runningSessions.sort(stableSessionSort)
 
         const totalActive = bubbleRunning + bubbleWaiting
         const buildBubbleSessionDetail = (s: any): BubbleSessionDetail => {
