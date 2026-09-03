@@ -4,6 +4,7 @@ import { emit, listen } from '@tauri-apps/api/event'
 import { useTranslation } from 'react-i18next'
 import type { TFunction } from 'i18next'
 import type { BubbleSessionDetail, MascotBubblePayload } from '../lib/types'
+import { QuotaMiniBadge } from './QuotaCapsule'
 
 function hashSessionId(id: string): number {
   let hash = 0
@@ -278,8 +279,11 @@ export default function MascotBubble() {
             >
               <div className="mascot-bubble-content">
                 {/* Line 1: Session Title / Topic */}
-                <div className="mascot-bubble-title-line">
-                  <span className="mascot-bubble-main-title">{session.title}</span>
+                <div className="mascot-bubble-title-line gap-1.5">
+                  <span className="mascot-bubble-main-title truncate">{session.title}</span>
+                  {(session.source === 'codex' || session.source === 'antigravity') && (
+                    <QuotaMiniBadge harness={session.source} />
+                  )}
                 </div>
 
                 {/* Line 2: Current Action / Status */}

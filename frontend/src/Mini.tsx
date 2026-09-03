@@ -11,6 +11,7 @@ import { UpdateModal, type UpdateModalInfo, type UpdateModalPhase } from './comp
 import { AgentDetailView } from './components/AgentDetailView'
 import { CreateCharacterModal } from './components/CreateCharacterModal'
 import { ClaudeStatsView } from './components/ClaudeStatsView'
+import { QuotaSideRail } from './components/QuotaCapsule'
 import { ChatList } from './components/ChatList'
 import { getStore, DEFAULT_CHAR, DEFAULT_CHAR_NAME, loadCharacters, loadOcConnections, saveOcConnections } from './lib/store'
 import type { AgentMetrics, BubbleSessionDetail, BubbleStyle, MascotBubblePayload, OcConnection, SubagentDetail } from './lib/types'
@@ -4496,9 +4497,18 @@ export default function Mini() {
   const inDetailPage = inAgentDetail || selectedClaudeSession !== null || selectedSessionKey !== null || showClaudeStats
   const detailPageMaxHeight = typeof window !== 'undefined' ? Math.max(240, Math.floor(((window.screen?.availHeight || 800) * 0.75) / Math.max(uiScale, 0.01))) : 600
 
+  const activeClaudeSession = selectedClaudeSession ? claudeSessions.find((s) => s.sessionId === selectedClaudeSession) : null
+
+  const activeSessionTitle = activeClaudeSession
+    ? (sessionNicknames[activeClaudeSession.sessionId] ||
+       activeClaudeSession.customTitle ||
+       (activeClaudeSession.cwd ? activeClaudeSession.cwd.replace(/\\/g, '/').replace(/\/+$/, '').split('/').filter(Boolean).pop() : '') ||
+       (activeClaudeSession.source === 'antigravity' ? (activeClaudeSession.cursorWorkspaceName || 'Antigravity') : 'Session'))
+    : null
+
   // Panel dimensions — CSS uses fixed base sizes; on Windows high-DPI screens
   // the panel root applies `zoom: uiScale` so all content scales uniformly.
-  const panelW = viewMode === 'efficiency' ? 575 : 475
+  const panelW = viewMode === 'efficiency' ? 635 : 535
   const closedNotchWidth = 44
   const closedNotchHeight = 10
   const openClipPath = 'inset(0 0 0 0 round 0 0 24px 24px)'
@@ -4557,7 +4567,7 @@ export default function Mini() {
     const ro = new ResizeObserver((entries) => {
       const h = entries[0]?.contentRect.height
       if (h && h > 0) {
-        const limit = inDetailPage ? detailPageMaxHeight : panelMaxHeight
+        const limit = inDetailPage ? detailPageMaxHeight : Math.max(260, panelMaxHeight)
         const clamped = Math.min(h * uiScale, limit * uiScale)
         const prev = lastResizeHeightRef.current || clamped
         const delta = Math.abs(clamped - prev)
@@ -5044,7 +5054,7 @@ export default function Mini() {
             overflowX: 'hidden',
             display: 'flex',
             flexDirection: 'column',
-            background: '#010101',
+            background: '#141414',
             // Keep a real closed notch rectangle at the top-center. This mirrors
             // ping-island's "always-present header" model and makes collapse
             // feel like shrinking inward to the notch, not vanishing upward.
@@ -5065,7 +5075,7 @@ export default function Mini() {
                 height: closedNotchHeight,
                 borderBottomLeftRadius: 8,
                 borderBottomRightRadius: 8,
-                background: '#010101',
+                background: '#141414',
                 pointerEvents: 'none',
                 zIndex: 30,
               }}
@@ -5074,13 +5084,13 @@ export default function Mini() {
 
           {/* Top Control Bar — outside the transform wrapper so sticky works correctly */}
           <div
-            className="flex items-center justify-between px-4 py-2.5 shrink-0 sticky top-0 z-20 bg-black text-white"
+            className="flex items-center justify-between px-4 py-2.5 shrink-0 sticky top-0 z-20 bg-[#141414] text-white"
             style={{
               opacity: showPanel ? 1 : 0,
               transition: panelChromeTransition,
             }}
           >
-            <div className="flex items-center gap-4 min-w-0 flex-1">
+            <div className="flex items-center gap-3 min-w-0 flex-1 mr-2">
               {inAgentDetail || selectedClaudeSession || selectedSessionKey || showClaudeStats ? (
                 <button
                   data-no-drag
@@ -5091,7 +5101,7 @@ export default function Mini() {
                     setSelectedSessionKey(null)
                     setShowClaudeStats(false)
                   }}
-                  className="text-slate-400 hover:text-slate-200 transition-colors"
+                  className="shrink-0 text-slate-400 hover:text-slate-200 transition-colors flex items-center gap-1 text-xs"
                 >
                   <span style={{ fontSize: 13 }}>&lsaquo;</span> {t('common.back')}
                 </button>
@@ -5107,12 +5117,42 @@ export default function Mini() {
                     // so mouse-leave won't auto-close.
                     if (next) hoverExpandedRef.current = false
                   }}
-                  className={`transition-colors ${pinned ? 'text-[#F0D140]' : 'text-slate-400 hover:text-slate-200'}`}
+                  className={`shrink-0 transition-colors ${pinned ? 'text-[#F0D140]' : 'text-slate-400 hover:text-slate-200'}`}
                   title={pinned ? t('mini.unpin') : t('mini.pin')}
                 >
                   <Pin className="w-4 h-4" strokeWidth={2.5} />
                 </button>
               )}
+
+              {/* In conversation / session detail view: display title and status badge */}
+              {selectedClaudeSession && activeClaudeSession && (
+                <div className="flex items-center gap-1.5 min-w-0 max-w-[130px] truncate">
+                  <span className="text-xs font-semibold text-slate-200 truncate" title={activeSessionTitle || undefined}>
+                    {activeSessionTitle}
+                  </span>
+                  {activeClaudeSession.status && (
+                    <span
+                      className={`text-[10px] px-1.5 py-0.5 rounded font-normal shrink-0 ${
+                        activeClaudeSession.status === 'waiting'
+                          ? 'bg-amber-500/20 text-amber-400'
+                          : activeClaudeSession.status === 'processing' || activeClaudeSession.status === 'tool_running'
+                            ? 'bg-emerald-500/20 text-emerald-400'
+                            : 'bg-white/10 text-slate-400'
+                      }`}
+                    >
+                      {activeClaudeSession.status === 'waiting'
+                        ? t('mini.waiting')
+                        : activeClaudeSession.status === 'processing'
+                          ? t('mini.thinking')
+                          : activeClaudeSession.status === 'tool_running'
+                            ? t('mini.working')
+                            : activeClaudeSession.status}
+                    </span>
+                  )}
+                </div>
+              )}
+
+
               <button
                 data-no-drag
                 onClick={async (e) => {
@@ -5178,11 +5218,12 @@ export default function Mini() {
               flex: 1,
               minHeight: 0,
               display: 'flex',
-              flexDirection: 'column',
+              flexDirection: 'row',
             }}
           >
-            {/* ===== Normal content (always rendered when expanded) ===== */}
-            <AnimatePresence mode="wait">
+            <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+              {/* ===== Normal content (always rendered when expanded) ===== */}
+              <AnimatePresence mode="wait">
               {!inAgentDetail && !selectedClaudeSession && !selectedSessionKey && !showClaudeStats ? (
                 viewMode === 'efficiency' ? (
                   /* ===== Efficiency Mode ===== */
@@ -5194,7 +5235,7 @@ export default function Mini() {
                     transition={{ duration: 0.15 }}
                     style={{ position: 'relative', display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}
                   >
-                    <div className="flex flex-col bg-black" style={{ flex: 1, minHeight: 0 }}>
+                    <div className="flex flex-col bg-[#141414]" style={{ flex: 1, minHeight: 0 }}>
                       <div className="overflow-y-auto scrollbar-hidden" style={{ maxHeight: panelMaxHeight - 60 }}>
                         <AnimatePresence mode="popLayout">
                           {(() => {
@@ -6473,6 +6514,10 @@ export default function Mini() {
                 </motion.div>
               )}
             </AnimatePresence>
+            </div>
+
+            {/* Persistent Quota Side Rail */}
+            <QuotaSideRail />
           </div>
         </div>
       )}
