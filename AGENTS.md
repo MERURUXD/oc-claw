@@ -118,3 +118,17 @@ When modifying the codebase:
   - Embedded in `ClaudeStatsView` as a natural stat card (`bg-white/[0.03] border border-white/5`).
 - **Mascot Bubble (`QuotaMiniBadge`)**:
   - Mini pill badge (`[⚡ 76%]`) rendered in `MascotBubble.tsx` beside active session title with hover reset countdown tooltip.
+
+---
+
+## 5. Obsidian Project Note Conventions (D:\OBSI-NEW)
+
+- **Main Note**: `D:\OBSI-NEW\03-项目\occlaw\oc-claw.md`
+- **Daily Note**: `D:\OBSI-NEW\04-日记\YYYY-MM-DD.md`
+- **Specification**: Must strictly follow `D:\OBSI-NEW\00-规范\笔记格式规范.md`.
+- **Curation Workflow (Beyond Raw Git Commits)**:
+  - When completing features, refactors, or when requested to organize notes:
+  - Inspect `git log` and `git diff` to understand architectural intent.
+  - Synthesize cohesive technical summaries under `## 进度与决策` (motivation, key decisions, protocol/IPC changes).
+  - Update `## 任务清单` status (`[x]` and `[ ]`), wikilinks, and `updated` frontmatter.
+  - Sync completed items to today's daily note with `[[oc-claw]]` link.
