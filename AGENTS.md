@@ -76,3 +76,45 @@ When modifying the codebase:
 - **Commit & PR Strategy**:
   - **Small Fixes & Quick Tweaks**: Commit directly and push to `main` (no PR required).
   - **Major Features & Large Work**: Create branch $\rightarrow$ Commit $\rightarrow$ Push to `origin <branch>` $\rightarrow$ Create PR (via GitHub MCP or `gh`) $\rightarrow$ Squash merge $\rightarrow$ `git fetch origin main`.
+
+---
+
+## 4. AI Harness Usage Limits & Quota Tracking
+
+### Architecture & Endpoints
+- **Rust Backend**: [`frontend/src-tauri/src/harness_quota.rs`](file:///C:/Users/Mei_LuLuXD/.gemini/antigravity/worktrees/oc-claw/track_harness_usage_limits/frontend/src-tauri/src/harness_quota.rs)
+  - Exposed Tauri command: `get_harness_quota(harness: String, force_refresh: Option<bool>) -> Result<Option<HarnessQuotaSummary>, String>`.
+  - **OpenAI Codex**:
+    - Credentials: read `$HOME/.codex/auth.json` (`tokens.access_token`, `tokens.account_id`, `tokens.refresh_token`).
+    - Endpoint: `GET https://chatgpt.com/backend-api/wham/usage`.
+    - Auto-refresh: on HTTP 401, exchange `refresh_token` via `POST https://auth.openai.com/oauth/token` (client_id `app_EMoamEEZ73f0CkXaXp7hrann`), update `auth.json`, and retry once.
+  - **Google Antigravity**:
+    - Process discovery: scans for `language_server_windows_x64.exe` / `language_server.exe` / `language_server` (Windows: `Get-CimInstance Win32_Process` + `Get-NetTCPConnection`; macOS: `ps -ax` + `lsof`).
+    - Extracts `--csrf_token` and `--extension_server_port`.
+    - Endpoint: `POST https://127.0.0.1:<port>/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary` (Connect-RPC Protocol v1, with relaxed TLS for self-signed loopback certificate).
+    - Decodes model buckets (Gemini 5h rolling limit, Gemini weekly, Claude/GPT limits).
+  - **Cache & Throttling**:
+    - In-memory cache: 5 minutes TTL per harness.
+    - 429 protection: parses `Retry-After` header and enforces dynamic backoff.
+
+### Frontend Components & Codeburn 1:1 Design
+- **Core Component**: [`frontend/src/components/QuotaCapsule.tsx`](file:///C:/Users/Mei_LuLuXD/.gemini/antigravity/worktrees/oc-claw/track_harness_usage_limits/frontend/src/components/QuotaCapsule.tsx)
+- **Remaining Quota Rule (剩余量准则)**:
+  - All metrics are normalized and presented as **Remaining Quota (剩余量)**: `remaining = 100 - used_percent`.
+  - Health ladder:
+    - $\ge 30\%$: Emerald green (`#10b981`, Healthy).
+    - $15\% \sim 30\%$: Amber yellow (`#f59e0b`, Warning).
+    - $< 15\%$: Rose red (`#f43f5e` + pulse, Critical).
+- **Side Dock (`QuotaSideRail`)**:
+  - Mounted inside the right edge of `#mini-panel` in `Mini.tsx`.
+  - Theme: unified `#141414` background for seamless surface continuity.
+  - Squircle buttons: `44px` `rounded-[14px]` with pure white vector icons (`AntigravityIcon`, `CodexIcon`).
+  - Inlaid progress arc: SVG `rect` with `strokeDasharray` rotated `-90deg` from top center, creating a recessed gauge look directly on the dock.
+  - Clean remaining percentage displayed below each button.
+- **Popover Card (`QuotaCard`)**:
+  - Compact Codeburn layout (~180px height), pure `#141414` background.
+  - Scrollbar hidden: `[scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden`.
+  - Wheel isolation: `onWheel={(e) => e.stopPropagation()}` to prevent scrolling the underlying session list.
+  - Embedded in `ClaudeStatsView` as a natural stat card (`bg-white/[0.03] border border-white/5`).
+- **Mascot Bubble (`QuotaMiniBadge`)**:
+  - Mini pill badge (`[⚡ 76%]`) rendered in `MascotBubble.tsx` beside active session title with hover reset countdown tooltip.
