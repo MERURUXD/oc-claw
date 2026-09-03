@@ -156,36 +156,110 @@ function getSessionLine2(
 export default function MascotBubble() {
   const { t } = useTranslation()
   const [summary, setSummary] = useState<MascotBubblePayload | null>(null)
+  const [isEntering, setIsEntering] = useState(false)
+  const [isExiting, setIsExiting] = useState(false)
+  const lastValidSummaryRef = useRef<MascotBubblePayload | null>(null)
   const contentRef = useRef<HTMLDivElement>(null)
   const lastSizeRef = useRef<{ width: number; height: number } | null>(null)
+  const enteringTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const exitingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const wasActiveRef = useRef(false)
 
+  // Listen for summary updates and close requests
   useEffect(() => {
-    let unlisten: (() => void) | undefined
+    let unlistenSummary: (() => void) | undefined
+    let unlistenClose: (() => void) | undefined
     let disposed = false
-    listen<MascotBubblePayload>('mascot-bubble-summary', (e) => {
+
+    const handleSummary = (payload: MascotBubblePayload) => {
       if (disposed) return
-      setSummary(e.payload)
+      const hasActive = payload.running > 0 || payload.waiting > 0
+
+      if (hasActive) {
+        lastValidSummaryRef.current = payload
+        if (exitingTimerRef.current) {
+          clearTimeout(exitingTimerRef.current)
+          exitingTimerRef.current = null
+        }
+        setIsExiting(false)
+
+        if (!wasActiveRef.current) {
+          wasActiveRef.current = true
+          setIsEntering(true)
+          if (enteringTimerRef.current) clearTimeout(enteringTimerRef.current)
+          enteringTimerRef.current = setTimeout(() => {
+            setIsEntering(false)
+            enteringTimerRef.current = null
+          }, 450)
+        }
+        setSummary(payload)
+      } else {
+        // No active sessions
+        if (wasActiveRef.current) {
+          wasActiveRef.current = false
+          setIsExiting(true)
+          setIsEntering(false)
+          if (exitingTimerRef.current) clearTimeout(exitingTimerRef.current)
+          exitingTimerRef.current = setTimeout(() => {
+            setSummary(null)
+            setIsExiting(false)
+            exitingTimerRef.current = null
+          }, 260)
+        } else {
+          setSummary(null)
+        }
+      }
+    }
+
+    listen<MascotBubblePayload>('mascot-bubble-summary', (e) => {
+      handleSummary(e.payload)
     }).then((fn) => {
       if (disposed) fn()
-      else unlisten = fn
+      else unlistenSummary = fn
     })
+
+    listen('mascot-bubble-close', () => {
+      if (disposed) return
+      if (wasActiveRef.current) {
+        wasActiveRef.current = false
+        setIsExiting(true)
+        setIsEntering(false)
+        if (exitingTimerRef.current) clearTimeout(exitingTimerRef.current)
+        exitingTimerRef.current = setTimeout(() => {
+          setSummary(null)
+          setIsExiting(false)
+          exitingTimerRef.current = null
+        }, 260)
+      }
+    }).then((fn) => {
+      if (disposed) fn()
+      else unlistenClose = fn
+    })
+
     return () => {
       disposed = true
-      unlisten?.()
+      unlistenSummary?.()
+      unlistenClose?.()
+      if (enteringTimerRef.current) clearTimeout(enteringTimerRef.current)
+      if (exitingTimerRef.current) clearTimeout(exitingTimerRef.current)
     }
   }, [])
 
+  // The active payload to render (fallback to lastValidSummary during exiting animation)
+  const displaySummary = summary || (isExiting ? lastValidSummaryRef.current : null)
+
   // Report content size changes to Rust so it can reposition the bubble next
-  // to the mascot.
+  // to the mascot. Use untransformed offsetWidth / offsetHeight so spring
+  // transforms don't cause window resize jitter.
   useEffect(() => {
     const el = contentRef.current
-    if (!el || !summary) return
+    if (!el || !displaySummary) return
     const ro = new ResizeObserver((entries) => {
-      const el = entries[0]?.target as HTMLElement | undefined
-      if (!el) return
-      const rect = el.getBoundingClientRect()
-      const width = Math.ceil(rect.width)
-      const height = Math.ceil(rect.height)
+      const target = entries[0]?.target as HTMLElement | undefined
+      if (!target) return
+      const width = Math.ceil(target.offsetWidth)
+      const height = Math.ceil(target.offsetHeight)
+      if (width <= 0 || height <= 0) return
       const last = lastSizeRef.current
       if (last && last.width === width && last.height === height) return
       lastSizeRef.current = { width, height }
@@ -193,31 +267,31 @@ export default function MascotBubble() {
     })
     ro.observe(el)
     return () => ro.disconnect()
-  }, [summary])
+  }, [displaySummary])
 
-  if (!summary) return <div className="mascot-bubble-root" />
+  if (!displaySummary) return <div className="mascot-bubble-root" />
 
-  const hasRunning = summary.running > 0
-  const hasWaiting = summary.waiting > 0
-  if (!hasRunning && !hasWaiting) return <div className="mascot-bubble-root" />
+  const hasRunning = displaySummary.running > 0
+  const hasWaiting = displaySummary.waiting > 0
+  if (!hasRunning && !hasWaiting && !isExiting) return <div className="mascot-bubble-root" />
 
   const handleClick = (sessionId?: string) => {
     emit('mascot-bubble-click', { sessionId }).catch(() => {})
     emit('mascot-bubble-session-click', { sessionId }).catch(() => {})
   }
 
-  const sessionsToRender = (summary.activeSessions && summary.activeSessions.length > 0)
-    ? summary.activeSessions
-    : (summary.activeSession ? [summary.activeSession] : [])
+  const sessionsToRender = (displaySummary.activeSessions && displaySummary.activeSessions.length > 0)
+    ? displaySummary.activeSessions
+    : (displaySummary.activeSession ? [displaySummary.activeSession] : [])
 
-  const isDetailed = summary.style === 'detailed' && sessionsToRender.length > 0
+  const isDetailed = displaySummary.style === 'detailed' && sessionsToRender.length > 0
 
   if (!isDetailed) {
     return (
       <div className="mascot-bubble-root" ref={contentRef}>
         <div
-          className="mascot-bubble-card"
-          onClick={() => handleClick()}
+          className={`mascot-bubble-card ${isEntering ? 'is-entering' : ''} ${isExiting ? 'is-exiting' : ''}`}
+          onClick={() => !isExiting && handleClick()}
           role="button"
           tabIndex={0}
         >
@@ -227,7 +301,7 @@ export default function MascotBubble() {
                 <span className="mascot-bubble-beacon-ring is-running" />
                 <span className="mascot-bubble-beacon-dot is-running" />
               </span>
-              <span className="mascot-bubble-count is-running">{summary.running}</span>
+              <span className="mascot-bubble-count is-running">{displaySummary.running}</span>
               <span className="mascot-bubble-label">running</span>
             </div>
           )}
@@ -240,7 +314,7 @@ export default function MascotBubble() {
                 <span className="mascot-bubble-beacon-ring is-waiting" />
                 <span className="mascot-bubble-beacon-dot is-waiting" />
               </span>
-              <span className="mascot-bubble-count is-waiting">{summary.waiting}</span>
+              <span className="mascot-bubble-count is-waiting">{displaySummary.waiting}</span>
               <span className="mascot-bubble-label">waiting</span>
             </div>
           )}
@@ -249,7 +323,7 @@ export default function MascotBubble() {
     )
   }
 
-  const totalActive = summary.running + summary.waiting
+  const totalActive = displaySummary.running + displaySummary.waiting
 
   const getThinkingText = (sessionId: string) => {
     const rawPool = t('mini.thinkingPool', { returnObjects: true })
@@ -271,8 +345,8 @@ export default function MascotBubble() {
           return (
             <div
               key={session.sessionId || idx}
-              className={`mascot-bubble-detailed ${isWaiting ? 'is-waiting-card' : ''}`}
-              onClick={() => handleClick(session.sessionId)}
+              className={`mascot-bubble-detailed ${isWaiting ? 'is-waiting-card' : ''} ${isEntering ? 'is-entering' : ''} ${isExiting ? 'is-exiting' : ''}`}
+              onClick={() => !isExiting && handleClick(session.sessionId)}
               role="button"
               tabIndex={0}
               title={session.title}

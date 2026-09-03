@@ -3248,7 +3248,7 @@ const MASCOT_SCALE_MIN: f64 = 1.0;
 const MASCOT_SCALE_MAX: f64 = 3.0;
 const LARGE_MASCOT_SIZE_MULTIPLIER: f64 = 3.0;
 /// Gap (logical px) between the primary mascot and its status bubble.
-const MASCOT_BUBBLE_GAP: f64 = 6.0;
+const MASCOT_BUBBLE_GAP: f64 = 4.0;
 
 fn sanitized_mascot_scale(scale: Option<f64>) -> f64 {
     let scale = scale.unwrap_or(1.0);
