@@ -615,11 +615,6 @@ export function QuotaSideRail() {
             style={{ background: '#141414' }}
             className="absolute right-full mr-3 top-2 z-50 w-[310px] max-h-[260px] overflow-y-auto overscroll-contain border border-white/15 shadow-[0_16px_48px_rgba(0,0,0,0.95)] rounded-2xl p-3.5 select-none cursor-default [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden text-white"
           >
-            {/* Arrow beak pointing right towards active dock button */}
-            <div
-              className="absolute -right-1.5 w-3 h-3 border-t border-r border-white/15 rotate-45 pointer-events-none"
-              style={{ background: '#000000', top: activeIdx === 0 ? 20 : 76 }}
-            />
 
             <QuotaCard
               harness={activeItem.harness}
