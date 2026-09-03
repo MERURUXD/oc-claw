@@ -528,6 +528,8 @@ export default function Mini() {
   const lastActiveSessionRef = useRef<any>(null)
   const lastBubblePayloadRef = useRef<MascotBubblePayload>({ style: 'compact', running: 0, waiting: 0, activeSession: null, activeSessions: [] })
   const bubbleActiveSessionOrderRef = useRef<string[]>([])
+  const bubbleVisibleRef = useRef(false)
+  const bubbleCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // Settings mode: native window grows, then a separate settings card animates in.
   const [settingsMode, setSettingsMode] = useState(false)
@@ -2140,11 +2142,21 @@ export default function Mini() {
       setClaudeSessions([])
       // The status bubble only exists in coding mode — make sure it is
       // hidden when leaving it (pet mode etc.).
+      bubbleVisibleRef.current = false
+      if (bubbleCloseTimerRef.current) {
+        clearTimeout(bubbleCloseTimerRef.current)
+        bubbleCloseTimerRef.current = null
+      }
       invoke('set_mascot_bubble_visible', { visible: false }).catch(() => {})
       return
     }
     if (!(enableClaudeCode || enableClaudeDesktop || enableCodex || enableCursor || enableGemini || enableOpencode || enableHermes || enableAntigravity)) {
       setClaudeSessions([])
+      bubbleVisibleRef.current = false
+      if (bubbleCloseTimerRef.current) {
+        clearTimeout(bubbleCloseTimerRef.current)
+        bubbleCloseTimerRef.current = null
+      }
       invoke('set_mascot_bubble_visible', { visible: false }).catch(() => {})
       return
     }
@@ -2546,9 +2558,29 @@ export default function Mini() {
           activeSessions: activeSessionDetails,
         }
         lastBubblePayloadRef.current = bubblePayload
-        invoke('set_mascot_bubble_visible', { visible: bubbleShouldShow }).catch(() => {})
+
         if (bubbleShouldShow) {
+          if (bubbleCloseTimerRef.current) {
+            clearTimeout(bubbleCloseTimerRef.current)
+            bubbleCloseTimerRef.current = null
+          }
+          if (!bubbleVisibleRef.current) {
+            bubbleVisibleRef.current = true
+            invoke('set_mascot_bubble_visible', { visible: true }).catch(() => {})
+          }
           emit('mascot-bubble-summary', bubblePayload).catch(() => {})
+        } else {
+          if (bubbleVisibleRef.current) {
+            bubbleVisibleRef.current = false
+            emit('mascot-bubble-close').catch(() => {})
+            if (bubbleCloseTimerRef.current) clearTimeout(bubbleCloseTimerRef.current)
+            bubbleCloseTimerRef.current = setTimeout(() => {
+              invoke('set_mascot_bubble_visible', { visible: false }).catch(() => {})
+              bubbleCloseTimerRef.current = null
+            }, 260)
+          } else if (!bubbleCloseTimerRef.current) {
+            invoke('set_mascot_bubble_visible', { visible: false }).catch(() => {})
+          }
         }
         if (completionCandidate) {
           shownCompletionsRef.current.add(completionCandidate.sessionId)
@@ -2976,10 +3008,22 @@ export default function Mini() {
   useEffect(() => {
     if (appMode !== 'coding') return
     invoke('set_extra_mascots_hidden', { hidden: expanded }).catch(() => {})
-    // The status bubble hides immediately when the panel expands (the panel
+    // The status bubble closes with a fast fly-out when the panel expands (the panel
     // already shows the full status); the session poll re-shows it on the
     // next tick once collapsed.
-    if (expanded) invoke('set_mascot_bubble_visible', { visible: false }).catch(() => {})
+    if (expanded) {
+      if (bubbleVisibleRef.current) {
+        bubbleVisibleRef.current = false
+        emit('mascot-bubble-close').catch(() => {})
+        if (bubbleCloseTimerRef.current) clearTimeout(bubbleCloseTimerRef.current)
+        bubbleCloseTimerRef.current = setTimeout(() => {
+          invoke('set_mascot_bubble_visible', { visible: false }).catch(() => {})
+          bubbleCloseTimerRef.current = null
+        }, 220)
+      } else {
+        invoke('set_mascot_bubble_visible', { visible: false }).catch(() => {})
+      }
+    }
   }, [expanded, appMode])
 
   const updateModalWindowAdjustedRef = useRef(false)

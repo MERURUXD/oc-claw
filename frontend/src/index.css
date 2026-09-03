@@ -116,7 +116,7 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
   justify-content: flex-end;
   width: fit-content;
   height: fit-content;
-  padding: 4px 8px;
+  padding: 8px 12px;
   box-sizing: border-box;
 }
 
@@ -500,5 +500,88 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
   flex: none;
   animation: mascot-beacon-pulse 1.6s ease-in-out infinite;
 }
+
+/* ── Mascot Bubble Codex-Style Spring Entry & Exit Animations ── */
+@keyframes mascot-bubble-fly-in {
+  0% {
+    opacity: 0;
+    transform: translateY(10px) scale(0.88);
+    filter: blur(2px);
+  }
+  65% {
+    opacity: 1;
+    transform: translateY(-1.5px) scale(1.02);
+    filter: blur(0px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    filter: blur(0px);
+  }
+}
+
+@keyframes mascot-bubble-fly-out {
+  0% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    filter: blur(0px);
+  }
+  30% {
+    opacity: 0.95;
+    transform: translateY(-1.5px) scale(1.01);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(8px) scale(0.86);
+    filter: blur(2px);
+  }
+}
+
+/* Compact capsule animations */
+.mascot-bubble-card.is-entering {
+  animation: mascot-bubble-fly-in 0.36s cubic-bezier(0.34, 1.35, 0.64, 1) both;
+  transform-origin: bottom right;
+}
+
+.mascot-bubble-card.is-exiting {
+  animation: mascot-bubble-fly-out 0.24s cubic-bezier(0.4, 0, 0.2, 1) both;
+  transform-origin: bottom right;
+  pointer-events: none;
+}
+
+/* Detailed card animations & cascade stagger */
+.mascot-bubble-detailed.is-entering {
+  animation: mascot-bubble-fly-in 0.36s cubic-bezier(0.34, 1.35, 0.64, 1) both;
+  transform-origin: bottom right;
+}
+
+.mascot-bubble-detailed.is-exiting {
+  animation: mascot-bubble-fly-out 0.24s cubic-bezier(0.4, 0, 0.2, 1) both;
+  transform-origin: bottom right;
+  pointer-events: none;
+}
+
+/* Stagger delay for stacked cards on entry */
+.mascot-bubble-stack .mascot-bubble-detailed.is-entering:nth-child(1) {
+  animation-delay: 0ms;
+}
+.mascot-bubble-stack .mascot-bubble-detailed.is-entering:nth-child(2) {
+  animation-delay: 45ms;
+}
+.mascot-bubble-stack .mascot-bubble-detailed.is-entering:nth-child(3) {
+  animation-delay: 90ms;
+}
+
+/* Stagger delay for stacked cards on exit */
+.mascot-bubble-stack .mascot-bubble-detailed.is-exiting:nth-child(3) {
+  animation-delay: 0ms;
+}
+.mascot-bubble-stack .mascot-bubble-detailed.is-exiting:nth-child(2) {
+  animation-delay: 25ms;
+}
+.mascot-bubble-stack .mascot-bubble-detailed.is-exiting:nth-child(1) {
+  animation-delay: 50ms;
+}
+
 
 
