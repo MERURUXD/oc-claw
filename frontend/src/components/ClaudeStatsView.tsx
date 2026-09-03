@@ -5,6 +5,7 @@ import { Loader2 } from 'lucide-react'
 import { motion } from 'motion/react'
 import { formatTokens } from '../lib/agents'
 import { ChatList } from './ChatList'
+import { QuotaCard } from './QuotaCapsule'
 
 interface DailyStats {
   date: string
@@ -339,6 +340,11 @@ export function ClaudeStatsView({ source = 'cc', isActive, channel, sshConn, her
         </div>
         <span className="text-xs text-white/40">{t('claudeStats.last14Days')}</span>
       </div>
+
+      {/* Harness Quota Overview Card (Codex / Antigravity) */}
+      {(source === 'codex' || source === 'antigravity') && (
+        <QuotaCard harness={source} />
+      )}
 
       {/* Bento: totals */}
       <div className="grid grid-cols-2 gap-3">

@@ -134,3 +134,18 @@ export interface PipelineItem {
   globalOffset: Offset
   rowOffsets: Offset[]
 }
+
+export interface QuotaWindow {
+  label: string
+  percent: number // 0 to 100
+  resets_at?: string | null // ISO string
+}
+
+export interface HarnessQuotaSummary {
+  harness: 'codex' | 'antigravity'
+  connected: boolean
+  plan_label?: string | null
+  primary?: QuotaWindow | null
+  details: QuotaWindow[]
+  updated_at: number
+}
