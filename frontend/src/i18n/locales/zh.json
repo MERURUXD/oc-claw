@@ -54,6 +54,8 @@
     "pin": "置顶",
     "soundOn": "提示音: 开",
     "soundOff": "提示音: 关",
+    "clearCompleted": "清理已完成会话",
+    "clear": "清理",
     "moveMascot": "移动看板娘",
     "pairingDesc": "将 Agent 与角色配对，配对后 Mini 中会显示对应角色的动画。",
     "mascot": "看板娘",

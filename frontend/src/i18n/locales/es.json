@@ -40,6 +40,8 @@
     "pin": "Fijar",
     "soundOn": "Sonido: Activado",
     "soundOff": "Sonido: Desactivado",
+    "clearCompleted": "Limpiar sesiones completadas",
+    "clear": "Limpiar",
     "moveMascot": "Mover mascota",
     "pairingDesc": "Empareja agentes con personajes. Una vez emparejados, Mini mostrará la animación del personaje correspondiente.",
     "mascot": "Mascota",

@@ -40,6 +40,8 @@
     "pin": "Épingler",
     "soundOn": "Son : Activé",
     "soundOff": "Son : Désactivé",
+    "clearCompleted": "Effacer les sessions terminées",
+    "clear": "Effacer",
     "moveMascot": "Déplacer la mascotte",
     "pairingDesc": "Associez des agents à des personnages. Une fois associés, Mini affichera l'animation du personnage correspondant.",
     "mascot": "Mascotte",
