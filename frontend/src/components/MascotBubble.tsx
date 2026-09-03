@@ -2,7 +2,17 @@ import { useEffect, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { emit, listen } from '@tauri-apps/api/event'
 import { useTranslation } from 'react-i18next'
+import type { TFunction } from 'i18next'
 import type { BubbleSessionDetail, MascotBubblePayload } from '../lib/types'
+
+function hashSessionId(id: string): number {
+  let hash = 0
+  for (let i = 0; i < id.length; i++) {
+    hash = (hash << 5) - hash + id.charCodeAt(i)
+    hash |= 0
+  }
+  return Math.abs(hash)
+}
 
 function extractToolParam(toolInput: unknown): string | null {
   if (!toolInput) return null
@@ -64,7 +74,8 @@ function extractToolParam(toolInput: unknown): string | null {
 
 function getSessionLine2(
   session: BubbleSessionDetail,
-  t: any
+  t: TFunction,
+  thinkingText?: string
 ): { actionPrefix: string | null; actionContent: string; isWaiting: boolean; isProcessing: boolean } {
   const isWaiting = session.status === 'waiting'
   const isToolRunning = session.status === 'tool_running' && !!session.tool
@@ -114,7 +125,7 @@ function getSessionLine2(
   if (isProcessing) {
     return {
       actionPrefix: null,
-      actionContent: t('mini.thinking', '思考中...'),
+      actionContent: thinkingText || t('mini.thinking', '思考中...'),
       isWaiting: false,
       isProcessing: true,
     }
@@ -239,11 +250,19 @@ export default function MascotBubble() {
 
   const totalActive = summary.running + summary.waiting
 
+  const getThinkingText = (sessionId: string) => {
+    const rawPool = t('mini.thinkingPool', { returnObjects: true })
+    const pool = Array.isArray(rawPool) && rawPool.length > 0 ? (rawPool as string[]) : [t('mini.thinking', '思考中...')]
+    const idx = hashSessionId(sessionId)
+    return pool[idx % pool.length]
+  }
+
   return (
     <div className="mascot-bubble-root" ref={contentRef}>
       <div className="mascot-bubble-stack">
         {sessionsToRender.map((session, idx) => {
-          const { actionPrefix, actionContent, isWaiting, isProcessing } = getSessionLine2(session, t)
+          const thinkingText = session.status === 'processing' ? getThinkingText(session.sessionId) : undefined
+          const { actionPrefix, actionContent, isWaiting, isProcessing } = getSessionLine2(session, t, thinkingText)
           const isLast = idx === sessionsToRender.length - 1
           const remainingOthers = Math.max(0, totalActive - sessionsToRender.length)
           const showBadge = isLast && remainingOthers > 0

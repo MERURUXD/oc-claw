@@ -57,6 +57,13 @@
     "idle": "inactivo",
     "waiting": "esperando...",
     "thinking": "pensando...",
+    "thinkingPool": [
+      "pensando...",
+      "organizando ideas...",
+      "analizando lógica...",
+      "elaborando respuesta...",
+      "examinando contexto..."
+    ],
     "working": "trabajando...",
     "compacting": "compactando...",
     "local": "Local",

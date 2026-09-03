@@ -57,6 +57,13 @@
     "idle": "inactif",
     "waiting": "en attente...",
     "thinking": "réflexion...",
+    "thinkingPool": [
+      "réflexion...",
+      "brainstorming...",
+      "organisation des idées...",
+      "élaboration de la réponse...",
+      "analyse du contexte..."
+    ],
     "working": "en cours...",
     "compacting": "compactage...",
     "local": "Local",

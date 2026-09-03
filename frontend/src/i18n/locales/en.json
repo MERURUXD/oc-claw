@@ -71,6 +71,15 @@
     "idle": "idle",
     "waiting": "waiting...",
     "thinking": "thinking...",
+    "thinkingPool": [
+      "thinking...",
+      "brainstorming...",
+      "connecting the dots...",
+      "formulating ideas...",
+      "crafting response...",
+      "analyzing context...",
+      "pondering..."
+    ],
     "working": "working...",
     "compacting": "compacting...",
     "local": "Local",
