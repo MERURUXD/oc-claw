@@ -4508,7 +4508,7 @@ export default function Mini() {
 
   // Panel dimensions — CSS uses fixed base sizes; on Windows high-DPI screens
   // the panel root applies `zoom: uiScale` so all content scales uniformly.
-  const panelW = viewMode === 'efficiency' ? 700 : 600
+  const panelW = viewMode === 'efficiency' ? 635 : 535
   const closedNotchWidth = 44
   const closedNotchHeight = 10
   const openClipPath = 'inset(0 0 0 0 round 0 0 24px 24px)'
@@ -4567,7 +4567,7 @@ export default function Mini() {
     const ro = new ResizeObserver((entries) => {
       const h = entries[0]?.contentRect.height
       if (h && h > 0) {
-        const limit = inDetailPage ? detailPageMaxHeight : panelMaxHeight
+        const limit = inDetailPage ? detailPageMaxHeight : Math.max(260, panelMaxHeight)
         const clamped = Math.min(h * uiScale, limit * uiScale)
         const prev = lastResizeHeightRef.current || clamped
         const delta = Math.abs(clamped - prev)
