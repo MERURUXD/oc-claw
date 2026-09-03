@@ -554,3 +554,173 @@ export function QuotaCapsule({
     </div>
   )
 }
+
+/**
+ * Mini Quota Badge on session cards (e.g. `[⚡ 24%]`).
+ * Shows subtle percent badge with color ladder, tooltip with resets countdown.
+ */
+export function QuotaMiniBadge({
+  harness,
+}: {
+  harness: 'codex' | 'antigravity'
+}) {
+  const { data } = useHarnessQuota(harness)
+  const now = useQuotaTicker()
+  if (!data || !data.connected) return null
+  const primary = data.primary || (data.details.length > 0 ? data.details[0] : null)
+  if (!primary) return null
+
+  const pct = Math.round(primary.percent)
+  const ladder = getQuotaColorLadder(pct)
+  const countdown = primary.resets_at
+    ? formatCountdown(primary.resets_at, now, { short: true })
+    : null
+  const harnessLabel = data.harness === 'codex' ? 'Codex' : 'Antigravity'
+
+  return (
+    <span
+      className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono font-medium border shrink-0 transition-colors select-none ${ladder.badge}`}
+      title={`${harnessLabel} ${primary.label || 'Quota'}: ${pct}%${countdown ? ` (Resets in ${countdown})` : ''}`}
+    >
+      <Zap className="w-2.5 h-2.5 shrink-0" />
+      <span>{pct}%</span>
+    </span>
+  )
+}
+
+/**
+ * Floating side rail on the right side of the expanded panel.
+ * Holds compact vertical pills for all detected harnesses (Antigravity & Codex).
+ * Completely decoupled from top session notification area.
+ * Clicking a pill slides out the glassmorphic detail popover inwards to the left.
+ */
+export function QuotaSideRail() {
+  const codex = useHarnessQuota('codex')
+  const antigravity = useHarnessQuota('antigravity')
+  const now = useQuotaTicker()
+
+  const [activePopover, setActivePopover] = useState<'codex' | 'antigravity' | null>(null)
+  const railRef = useRef<HTMLDivElement>(null)
+  const popoverRef = useRef<HTMLDivElement>(null)
+
+  // Click outside to close
+  useEffect(() => {
+    if (!activePopover) return
+    const handlePointerDown = (e: MouseEvent | PointerEvent) => {
+      const target = e.target as Node
+      if (
+        popoverRef.current &&
+        !popoverRef.current.contains(target) &&
+        railRef.current &&
+        !railRef.current.contains(target)
+      ) {
+        setActivePopover(null)
+      }
+    }
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setActivePopover(null)
+    }
+    document.addEventListener('pointerdown', handlePointerDown)
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown)
+      document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [activePopover])
+
+  const items: {
+    harness: 'antigravity' | 'codex'
+    data: HarnessQuotaSummary
+    isRefreshing: boolean
+    refresh: () => Promise<void> | void
+    abbr: string
+    name: string
+  }[] = []
+
+  if (antigravity.data && antigravity.data.connected) {
+    items.push({
+      harness: 'antigravity',
+      data: antigravity.data,
+      isRefreshing: antigravity.isRefreshing,
+      refresh: antigravity.refresh,
+      abbr: 'Ag',
+      name: 'Antigravity',
+    })
+  }
+  if (codex.data && codex.data.connected) {
+    items.push({
+      harness: 'codex',
+      data: codex.data,
+      isRefreshing: codex.isRefreshing,
+      refresh: codex.refresh,
+      abbr: 'Cx',
+      name: 'Codex',
+    })
+  }
+
+  if (items.length === 0) return null
+
+  const activeItem = items.find((i) => i.harness === activePopover)
+
+  return (
+    <div
+      ref={railRef}
+      className="relative shrink-0 flex flex-col items-center gap-1.5 py-3 pr-2 pl-1 border-l border-white/5 select-none z-30"
+    >
+      {items.map((item) => {
+        const primary = item.data.primary || item.data.details[0]
+        const pct = primary ? Math.round(primary.percent) : 0
+        const ladder = getQuotaColorLadder(pct)
+        const countdown = primary?.resets_at
+          ? formatCountdown(primary.resets_at, now, { short: true })
+          : null
+        const isSelected = activePopover === item.harness
+
+        return (
+          <button
+            key={item.harness}
+            data-no-drag
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation()
+              setActivePopover((prev) => (prev === item.harness ? null : item.harness))
+            }}
+            className={`flex flex-col items-center justify-center w-8 py-2 rounded-xl border transition-all duration-200 cursor-pointer shadow-md ${
+              isSelected ? 'ring-2 ring-white/30 scale-105' : 'hover:scale-105 active:scale-95'
+            } ${ladder.capsule}`}
+            title={`${item.name} Quota: ${pct}%${countdown ? ` (Resets in ${countdown})` : ''}. Click for details.`}
+          >
+            <Zap className="w-3.5 h-3.5 mb-0.5 shrink-0" />
+            <span className="text-[9px] font-bold tracking-tight uppercase leading-tight">{item.abbr}</span>
+            <span className="text-[10px] font-mono font-bold leading-tight mt-0.5">{pct}%</span>
+          </button>
+        )
+      })}
+
+      {/* Popover Card sliding out to the left */}
+      <AnimatePresence>
+        {activeItem && (
+          <motion.div
+            ref={popoverRef}
+            initial={{ opacity: 0, scale: 0.95, x: 10 }}
+            animate={{ opacity: 1, scale: 1, x: 0 }}
+            exit={{ opacity: 0, scale: 0.95, x: 10 }}
+            transition={{ duration: 0.15 }}
+            data-no-drag
+            onClick={(e) => e.stopPropagation()}
+            className="absolute right-full mr-2 top-2 z-50 w-76 sm:w-80 max-w-[calc(100vw-48px)] bg-[#18181c]/95 backdrop-blur-xl border border-white/10 shadow-2xl rounded-2xl p-4 select-none cursor-default"
+          >
+            <QuotaCard
+              harness={activeItem.harness}
+              summary={activeItem.data}
+              isRefreshing={activeItem.isRefreshing}
+              onRefresh={activeItem.refresh}
+              variant="popover"
+            />
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  )
+}
+

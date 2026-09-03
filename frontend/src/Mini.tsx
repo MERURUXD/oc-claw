@@ -11,7 +11,7 @@ import { UpdateModal, type UpdateModalInfo, type UpdateModalPhase } from './comp
 import { AgentDetailView } from './components/AgentDetailView'
 import { CreateCharacterModal } from './components/CreateCharacterModal'
 import { ClaudeStatsView } from './components/ClaudeStatsView'
-import { QuotaCapsule } from './components/QuotaCapsule'
+import { QuotaSideRail, QuotaMiniBadge } from './components/QuotaCapsule'
 import { ChatList } from './components/ChatList'
 import { getStore, DEFAULT_CHAR, DEFAULT_CHAR_NAME, loadCharacters, loadOcConnections, saveOcConnections } from './lib/store'
 import type { AgentMetrics, BubbleSessionDetail, BubbleStyle, MascotBubblePayload, OcConnection, SubagentDetail } from './lib/types'
@@ -4498,10 +4498,6 @@ export default function Mini() {
   const detailPageMaxHeight = typeof window !== 'undefined' ? Math.max(240, Math.floor(((window.screen?.availHeight || 800) * 0.75) / Math.max(uiScale, 0.01))) : 600
 
   const activeClaudeSession = selectedClaudeSession ? claudeSessions.find((s) => s.sessionId === selectedClaudeSession) : null
-  const currentHarness: 'codex' | 'antigravity' | null =
-    selectedClaudeSession
-      ? (activeClaudeSession?.source === 'codex' ? 'codex' : activeClaudeSession?.source === 'antigravity' ? 'antigravity' : null)
-      : null
 
   const activeSessionTitle = activeClaudeSession
     ? (sessionNicknames[activeClaudeSession.sessionId] ||
@@ -5156,8 +5152,6 @@ export default function Mini() {
                 </div>
               )}
 
-              {/* Quota Capsule for Codex or Antigravity */}
-              {currentHarness && <QuotaCapsule harness={currentHarness} />}
 
               <button
                 data-no-drag
@@ -5224,11 +5218,12 @@ export default function Mini() {
               flex: 1,
               minHeight: 0,
               display: 'flex',
-              flexDirection: 'column',
+              flexDirection: 'row',
             }}
           >
-            {/* ===== Normal content (always rendered when expanded) ===== */}
-            <AnimatePresence mode="wait">
+            <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+              {/* ===== Normal content (always rendered when expanded) ===== */}
+              <AnimatePresence mode="wait">
               {!inAgentDetail && !selectedClaudeSession && !selectedSessionKey && !showClaudeStats ? (
                 viewMode === 'efficiency' ? (
                   /* ===== Efficiency Mode ===== */
@@ -5695,6 +5690,9 @@ export default function Mini() {
                                         {cs.lastResponse && cs.lastResponse !== '✓' && <span className="min-w-0 max-w-[32%] truncate text-[11px] text-white/40">· {cs.lastResponse}</span>}
                                       </div>
                                       <div className="flex items-center gap-2 shrink-0 ml-auto">
+                                        {(isCodexSource || isAntigravitySource) && (
+                                          <QuotaMiniBadge harness={isCodexSource ? 'codex' : 'antigravity'} />
+                                        )}
                                         <span className={`text-[11px] px-2 py-0.5 rounded-md font-normal whitespace-nowrap ${sourceBadgeClass}`}>{sourceLabel}</span>
                                         <div className="w-8 flex items-center justify-center">
                                           <span className="text-[11px] text-slate-500 font-normal group-hover:hidden">{timeAgo}</span>
@@ -6402,6 +6400,9 @@ export default function Mini() {
                                     </div>
                                     <div className="flex items-baseline gap-2 min-w-0 flex-1">
                                       <span className={`text-sm font-bold tracking-wide truncate ${isActive || isWaiting ? 'text-slate-200' : 'text-slate-400'}`}>{label}</span>
+                                      {(cs.source === 'codex' || cs.source === 'antigravity') && (
+                                        <QuotaMiniBadge harness={cs.source} />
+                                      )}
                                     </div>
                                     <button
                                       data-no-drag
@@ -6519,6 +6520,10 @@ export default function Mini() {
                 </motion.div>
               )}
             </AnimatePresence>
+            </div>
+
+            {/* Persistent Quota Side Rail */}
+            <QuotaSideRail />
           </div>
         </div>
       )}
