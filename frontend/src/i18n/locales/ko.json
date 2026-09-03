@@ -40,6 +40,8 @@
     "pin": "고정",
     "soundOn": "소리: 켬",
     "soundOff": "소리: 끔",
+    "clearCompleted": "완료된 세션 지우기",
+    "clear": "지우기",
     "moveMascot": "마스코트 이동",
     "pairingDesc": "에이전트와 캐릭터를 페어링합니다. 페어링 후 Mini에 해당 캐릭터의 애니메이션이 표시됩니다.",
     "mascot": "마스코트",

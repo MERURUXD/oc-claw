@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { load } from '@tauri-apps/plugin-store'
 import { emit, listen } from '@tauri-apps/api/event'
-import { Loader2, X, Pin, Bell, BellOff, Settings, Asterisk, Trash2, Cloud, Maximize2 } from 'lucide-react'
+import { Loader2, X, Pin, Bell, BellOff, Settings, Asterisk, Trash2, Cloud, Maximize2, Brush } from 'lucide-react'
 import { AnimatePresence, motion } from 'motion/react'
 import ReactMarkdown from 'react-markdown'
 import { useTranslation } from 'react-i18next'
@@ -5179,6 +5179,30 @@ export default function Mini() {
               </button>
             </div>
             <div className="flex items-center gap-4">
+              {(() => {
+                const hasCompletedSessions = claudeSessions.some((s) => s.status === 'stopped' || !s.status) || allSessions.some((s) => !s.active)
+                if (!hasCompletedSessions) return null
+                return (
+                  <button
+                    data-no-drag
+                    onClick={async (e) => {
+                      e.stopPropagation()
+                      for (const cs of claudeSessions) {
+                        if (cs.status === 'stopped' || !cs.status) {
+                          invoke('remove_claude_session', { sessionId: cs.sessionId }).catch(() => {})
+                        }
+                      }
+                      setClaudeSessions((prev) => prev.filter((s) => s.status !== 'stopped' && !!s.status))
+                      setAllSessions((prev) => prev.filter((s) => s.active))
+                    }}
+                    className="flex items-center gap-1 text-slate-500 hover:text-rose-400 transition-colors"
+                    title={t('mini.clearCompleted', 'Clear completed sessions')}
+                  >
+                    <Brush className="w-3.5 h-3.5" strokeWidth={2} />
+                    <span className="text-[11px] font-medium">{t('mini.clear', 'Clear')}</span>
+                  </button>
+                )
+              })()}
               {/* Move-mode toggle has been retired on Windows now that the
                   collapsed mascot supports direct drag-to-move. macOS never
                   showed it (it has its own native drag path), and pet mode
@@ -5237,7 +5261,7 @@ export default function Mini() {
                   >
                     <div className="flex flex-col bg-[#141414]" style={{ flex: 1, minHeight: 0 }}>
                       <div className="overflow-y-auto scrollbar-hidden" style={{ maxHeight: panelMaxHeight - 60 }}>
-                        <AnimatePresence mode="popLayout">
+                        <AnimatePresence>
                           {(() => {
                             const unified: { type: 'oc'; data: MiniSessionInfo; active: boolean; updatedAt: number }[] = allSessions.map((s) => ({
                               type: 'oc' as const,
@@ -5260,12 +5284,24 @@ export default function Mini() {
                               }
                               return 1
                             }
-                            const allItems = [...unified, ...claudeUnified].sort((a, b) => {
-                              const pa = getPriority(a),
-                                pb = getPriority(b)
-                              if (pa !== pb) return pa - pb
-                              return b.updatedAt - a.updatedAt
-                            })
+                            const now = Date.now()
+                            let stoppedCount = 0
+                            const allItems = [...unified, ...claudeUnified]
+                              .sort((a, b) => {
+                                const pa = getPriority(a),
+                                  pb = getPriority(b)
+                                if (pa !== pb) return pa - pb
+                                return b.updatedAt - a.updatedAt
+                              })
+                              .filter((item) => {
+                                const isItemActive = item.active || (item.type === 'claude' && (item.data.status === 'waiting' || item.data.status === 'processing' || item.data.status === 'tool_running' || item.data.status === 'compacting'))
+                                if (isItemActive) return true
+                                if (item.type === 'claude' && completionSessionId === item.data.sessionId) return true
+                                const age = now - (item.updatedAt || 0)
+                                if (age > 15 * 60 * 1000) return false
+                                stoppedCount++
+                                return stoppedCount <= 5
+                              })
 
                             if (allItems.length === 0) {
                               const trackingTargets = [
@@ -5350,11 +5386,10 @@ export default function Mini() {
                                 return (
                                   <motion.div
                                     key={`list-oc-${s.agentId}-${s.key}`}
-                                    layout
-                                    initial={{ opacity: 0, x: -10 }}
-                                    animate={{ opacity: 1, x: 0 }}
-                                    exit={{ opacity: 0, filter: 'blur(4px)' }}
-                                    transition={{ duration: 0.2, delay: index * 0.05 }}
+                                    initial={{ opacity: 0, y: -4 }}
+                                    animate={{ opacity: 1, y: 0 }}
+                                    exit={{ opacity: 0 }}
+                                    transition={{ duration: 0.15 }}
                                     data-no-drag
                                     onClick={() => {
                                       const ch = (s.channel || '').toLowerCase()
@@ -5547,11 +5582,10 @@ export default function Mini() {
                                 return (
                                   <motion.div
                                     key={`list-claude-${cs.sessionId}`}
-                                    layout
-                                    initial={{ opacity: 0, x: -10 }}
-                                    animate={{ opacity: 1, x: 0 }}
-                                    exit={{ opacity: 0, filter: 'blur(4px)' }}
-                                    transition={{ duration: 0.2, delay: index * 0.05 }}
+                                    initial={{ opacity: 0, y: -4 }}
+                                    animate={{ opacity: 1, y: 0 }}
+                                    exit={{ opacity: 0 }}
+                                    transition={{ duration: 0.15 }}
                                     data-no-drag
                                     onClick={() => {
                                       if (isAntigravitySource) {
@@ -6019,7 +6053,7 @@ export default function Mini() {
                             })
                             if (hiddenCount > 0) {
                               elements.push(
-                                <motion.div key="expand-list-btn" layout initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="flex justify-center py-2">
+                                <motion.div key="expand-list-btn" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="flex justify-center py-2">
                                   <button
                                     data-no-drag
                                     onClick={(e) => {
@@ -6034,7 +6068,7 @@ export default function Mini() {
                               )
                             } else if (!effListCollapsed && hasImportant && allItems.length > 1) {
                               elements.push(
-                                <motion.div key="collapse-list-btn" layout initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="flex justify-center py-2">
+                                <motion.div key="collapse-list-btn" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="flex justify-center py-2">
                                   <button
                                     data-no-drag
                                     onClick={(e) => {
@@ -6278,7 +6312,7 @@ export default function Mini() {
                       )}
 
                       <div className="scrollbar-hidden" style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
-                        <AnimatePresence mode="popLayout">
+                        <AnimatePresence>
                           {(() => {
                             const unified: { type: 'oc'; data: MiniSessionInfo; active: boolean; updatedAt: number }[] = allSessions.map((s) => ({
                               type: 'oc' as const,
@@ -6293,10 +6327,22 @@ export default function Mini() {
                               active: cs.status === 'processing' || cs.status === 'tool_running',
                               updatedAt: cs.updatedAt ? new Date(cs.updatedAt).getTime() : 0,
                             }))
-                            const merged = [...unified, ...claudeUnified].sort((a, b) => (b.active ? 1 : 0) - (a.active ? 1 : 0) || b.updatedAt - a.updatedAt)
+                            const now = Date.now()
+                            let islandStoppedCount = 0
+                            const merged = [...unified, ...claudeUnified]
+                              .sort((a, b) => (b.active ? 1 : 0) - (a.active ? 1 : 0) || b.updatedAt - a.updatedAt)
+                              .filter((item) => {
+                                const isItemActive = item.active || (item.type === 'claude' && (item.data.status === 'waiting' || item.data.status === 'processing' || item.data.status === 'tool_running' || item.data.status === 'compacting'))
+                                if (isItemActive) return true
+                                if (item.type === 'claude' && completionSessionId === item.data.sessionId) return true
+                                const age = now - (item.updatedAt || 0)
+                                if (age > 15 * 60 * 1000) return false
+                                islandStoppedCount++
+                                return islandStoppedCount <= 5
+                              })
 
                             const agentSeqCount: Record<string, number> = {}
-                            return merged.map((item, index) => {
+                            return merged.map((item) => {
                               if (item.type === 'oc') {
                                 const s = item.data
                                 const agent = agents.find((a) => a.id === s.agentId)
@@ -6306,11 +6352,10 @@ export default function Mini() {
                                 return (
                                   <motion.div
                                     key={`oc-${s.agentId}-${s.key}`}
-                                    layout
-                                    initial={{ opacity: 0, x: -10 }}
-                                    animate={{ opacity: 1, x: 0 }}
-                                    exit={{ opacity: 0, filter: 'blur(4px)' }}
-                                    transition={{ duration: 0.2, delay: index * 0.05 }}
+                                    initial={{ opacity: 0, y: -4 }}
+                                    animate={{ opacity: 1, y: 0 }}
+                                    exit={{ opacity: 0 }}
+                                    transition={{ duration: 0.15 }}
                                     data-no-drag
                                     onClick={() => {
                                       setSelectedClaudeSession(null)
@@ -6375,11 +6420,10 @@ export default function Mini() {
                                 return (
                                   <motion.div
                                     key={`claude-${cs.sessionId}`}
-                                    layout
-                                    initial={{ opacity: 0, x: -10 }}
-                                    animate={{ opacity: 1, x: 0 }}
-                                    exit={{ opacity: 0, filter: 'blur(4px)' }}
-                                    transition={{ duration: 0.2, delay: index * 0.05 }}
+                                    initial={{ opacity: 0, y: -4 }}
+                                    animate={{ opacity: 1, y: 0 }}
+                                    exit={{ opacity: 0 }}
+                                    transition={{ duration: 0.15 }}
                                     data-no-drag
                                     onClick={() => {
                                       setSelectedAgentId(null)
