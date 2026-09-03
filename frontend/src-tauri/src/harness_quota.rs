@@ -82,8 +82,9 @@ struct DiscoveredProcess {
 async fn discover_antigravity_processes() -> Vec<DiscoveredProcess> {
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-    let ps_exe = if std::path::Path::new(r"C:\Program Files\PowerShell\7\pwsh.exe").is_file() {
-        "pwsh.exe"
+    let ps_candidate = r"C:\Program Files\PowerShell\7\pwsh.exe";
+    let ps_exe = if std::path::Path::new(ps_candidate).is_file() {
+        ps_candidate
     } else {
         "powershell.exe"
     };
@@ -94,7 +95,7 @@ async fn discover_antigravity_processes() -> Vec<DiscoveredProcess> {
     cmd.args(["-NoProfile", "-NonInteractive", "-Command", script]);
     cmd.creation_flags(CREATE_NO_WINDOW);
 
-    let output = match tokio::time::timeout(std::time::Duration::from_secs(5), cmd.output()).await {
+    let output = match tokio::time::timeout(std::time::Duration::from_secs(8), cmd.output()).await {
         Ok(Ok(out)) => out,
         _ => return Vec::new(),
     };
@@ -389,7 +390,117 @@ pub fn decode_antigravity_user_status(
 // Antigravity Fetcher
 // ---------------------------------------------------------------------------
 
+static LAST_KNOWN_AGY_ENDPOINT: OnceLock<Mutex<Option<(u16, String)>>> = OnceLock::new();
+
+fn get_last_known_endpoint() -> &'static Mutex<Option<(u16, String)>> {
+    LAST_KNOWN_AGY_ENDPOINT.get_or_init(|| Mutex::new(None))
+}
+
+async fn try_fetch_antigravity_from_port(
+    client: &reqwest::Client,
+    port: u16,
+    csrf_token: &str,
+    now: u64,
+) -> Result<HarnessQuotaSummary, ()> {
+    // First attempt: RetrieveUserQuotaSummary
+    let quota_url = format!("https://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary");
+    let mut req = client
+        .post(&quota_url)
+        .header("Content-Type", "application/json")
+        .header("Connect-Protocol-Version", "1")
+        .body("{}");
+
+    if !csrf_token.is_empty() {
+        req = req.header("X-Codeium-Csrf-Token", csrf_token);
+    }
+
+    if let Ok(resp) = req.send().await {
+        if resp.status().is_success() {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                // Optionally fetch plan tier from GetUserStatus on the same port
+                let status_url = format!("https://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/GetUserStatus");
+                let mut status_req = client
+                    .post(&status_url)
+                    .header("Content-Type", "application/json")
+                    .header("Connect-Protocol-Version", "1")
+                    .body("{}");
+                if !csrf_token.is_empty() {
+                    status_req = status_req.header("X-Codeium-Csrf-Token", csrf_token);
+                }
+
+                let plan_label = if let Ok(s_resp) = status_req.send().await {
+                    if s_resp.status().is_success() {
+                        if let Ok(s_json) = s_resp.json::<serde_json::Value>().await {
+                            s_json
+                                .get("userStatus")
+                                .and_then(|u| u.get("userTier"))
+                                .and_then(|t| t.get("name"))
+                                .and_then(|v| v.as_str())
+                                .or_else(|| {
+                                    s_json
+                                        .get("userStatus")
+                                        .and_then(|u| u.get("planStatus"))
+                                        .and_then(|p| p.get("planInfo"))
+                                        .and_then(|i| i.get("planName"))
+                                        .and_then(|v| v.as_str())
+                                })
+                                .map(|s| s.to_string())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let summary = decode_antigravity_quota_summary(&json, plan_label, now);
+                return Ok(summary);
+            }
+        }
+    }
+
+    // Fallback attempt: GetUserStatus
+    let status_url = format!("https://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/GetUserStatus");
+    let mut req = client
+        .post(&status_url)
+        .header("Content-Type", "application/json")
+        .header("Connect-Protocol-Version", "1")
+        .body("{}");
+
+    if !csrf_token.is_empty() {
+        req = req.header("X-Codeium-Csrf-Token", csrf_token);
+    }
+
+    if let Ok(resp) = req.send().await {
+        if resp.status().is_success() {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                let summary = decode_antigravity_user_status(&json, now);
+                return Ok(summary);
+            }
+        }
+    }
+
+    Err(())
+}
+
 async fn fetch_antigravity_quota(now: u64) -> Result<(HarnessQuotaSummary, Option<u64>), String> {
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .no_proxy()
+        .timeout(std::time::Duration::from_millis(2500))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client for Antigravity: {e}"))?;
+
+    // Fast-path: try last known working endpoint directly (avoids 4-5s PowerShell WMI query)
+    let cached_endpoint = get_last_known_endpoint().lock().ok().and_then(|g| g.clone());
+    if let Some((port, ref csrf_token)) = cached_endpoint {
+        if let Ok(summary) = try_fetch_antigravity_from_port(&client, port, csrf_token, now).await {
+            return Ok((summary, None));
+        }
+    }
+
     let procs = discover_antigravity_processes().await;
     if procs.is_empty() {
         return Ok((
@@ -404,13 +515,6 @@ async fn fetch_antigravity_quota(now: u64) -> Result<(HarnessQuotaSummary, Optio
             None,
         ));
     }
-
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .no_proxy()
-        .timeout(std::time::Duration::from_millis(2500))
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client for Antigravity: {e}"))?;
 
     for proc in procs {
         let csrf_token = extract_arg_value(&proc.cmdline, "--csrf_token").unwrap_or_default();
@@ -433,84 +537,11 @@ async fn fetch_antigravity_quota(now: u64) -> Result<(HarnessQuotaSummary, Optio
         }
 
         for port in candidate_ports {
-            // First attempt: RetrieveUserQuotaSummary
-            let quota_url = format!("https://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary");
-            let mut req = client
-                .post(&quota_url)
-                .header("Content-Type", "application/json")
-                .header("Connect-Protocol-Version", "1")
-                .body("{}");
-
-            if !csrf_token.is_empty() {
-                req = req.header("X-Codeium-Csrf-Token", &csrf_token);
-            }
-
-            if let Ok(resp) = req.send().await {
-                if resp.status().is_success() {
-                    if let Ok(json) = resp.json::<serde_json::Value>().await {
-                        // Optionally fetch plan tier from GetUserStatus on the same port
-                        let status_url = format!("https://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/GetUserStatus");
-                        let mut status_req = client
-                            .post(&status_url)
-                            .header("Content-Type", "application/json")
-                            .header("Connect-Protocol-Version", "1")
-                            .body("{}");
-                        if !csrf_token.is_empty() {
-                            status_req = status_req.header("X-Codeium-Csrf-Token", &csrf_token);
-                        }
-
-                        let plan_label = if let Ok(s_resp) = status_req.send().await {
-                            if s_resp.status().is_success() {
-                                if let Ok(s_json) = s_resp.json::<serde_json::Value>().await {
-                                    s_json
-                                        .get("userStatus")
-                                        .and_then(|u| u.get("userTier"))
-                                        .and_then(|t| t.get("name"))
-                                        .and_then(|v| v.as_str())
-                                        .or_else(|| {
-                                            s_json
-                                                .get("userStatus")
-                                                .and_then(|u| u.get("planStatus"))
-                                                .and_then(|p| p.get("planInfo"))
-                                                .and_then(|i| i.get("planName"))
-                                                .and_then(|v| v.as_str())
-                                        })
-                                        .map(|s| s.to_string())
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-
-                        let summary = decode_antigravity_quota_summary(&json, plan_label, now);
-                        return Ok((summary, None));
-                    }
+            if let Ok(summary) = try_fetch_antigravity_from_port(&client, port, &csrf_token, now).await {
+                if let Ok(mut lock) = get_last_known_endpoint().lock() {
+                    *lock = Some((port, csrf_token));
                 }
-            }
-
-            // Fallback attempt: GetUserStatus
-            let status_url = format!("https://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/GetUserStatus");
-            let mut req = client
-                .post(&status_url)
-                .header("Content-Type", "application/json")
-                .header("Connect-Protocol-Version", "1")
-                .body("{}");
-
-            if !csrf_token.is_empty() {
-                req = req.header("X-Codeium-Csrf-Token", &csrf_token);
-            }
-
-            if let Ok(resp) = req.send().await {
-                if resp.status().is_success() {
-                    if let Ok(json) = resp.json::<serde_json::Value>().await {
-                        let summary = decode_antigravity_user_status(&json, now);
-                        return Ok((summary, None));
-                    }
-                }
+                return Ok((summary, None));
             }
         }
     }
@@ -1018,6 +1049,14 @@ mod tests {
         if summary.connected {
             assert!(summary.primary.is_some(), "Connected Antigravity should have primary window");
         }
+
+        // Second call should hit the fast-path endpoint cache in <50ms
+        let start = std::time::Instant::now();
+        let res2 = get_harness_quota("antigravity".to_string(), Some(true)).await;
+        let elapsed = start.elapsed();
+        println!("Fast-path Antigravity elapsed: {:?}", elapsed);
+        assert!(res2.is_ok());
+        assert!(elapsed.as_millis() < 500, "Fast-path should complete in <500ms, took {:?}", elapsed);
     }
 
     #[tokio::test]
