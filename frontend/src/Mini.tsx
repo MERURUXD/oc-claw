@@ -526,6 +526,7 @@ export default function Mini() {
   bubbleStyleRef.current = bubbleStyle
   const lastActiveSessionRef = useRef<any>(null)
   const lastBubblePayloadRef = useRef<MascotBubblePayload>({ style: 'compact', running: 0, waiting: 0, activeSession: null, activeSessions: [] })
+  const bubbleActiveSessionOrderRef = useRef<string[]>([])
 
   // Settings mode: native window grows, then a separate settings card animates in.
   const [settingsMode, setSettingsMode] = useState(false)
@@ -2150,9 +2151,6 @@ export default function Mini() {
     // Track previously logged session statuses so we only emit a backend log
     // line when something actually changes — keeps oc-claw.log readable.
     const lastLoggedStatus = new Map<string, string>()
-    // Track first-seen timestamp per session so mascot bubbles sort in a stable,
-    // fixed order rather than jumping around every time updatedAt changes.
-    const sessionFirstSeenMap = new Map<string, number>()
     const isPollingRef = { current: false }
     const isRemotePollingRef = { current: false }
 
@@ -2359,51 +2357,55 @@ export default function Mini() {
         // and at least one session is active.
         let bubbleRunning = 0
         let bubbleWaiting = 0
-        const waitingSessions: any[] = []
-        const runningSessions: any[] = []
+        const activeSessionsMap = new Map<string, any>()
         for (const s of sessions) {
           const st = s.status
           if (st === 'processing' || st === 'tool_running' || st === 'compacting') {
             bubbleRunning++
-            runningSessions.push(s)
+            activeSessionsMap.set(String(s.sessionId), s)
           } else if (st === 'waiting') {
             bubbleWaiting++
-            waitingSessions.push(s)
-          }
-        }
-        const now = Date.now()
-        const getStableSessionTime = (s: Record<string, unknown>) => {
-          if (s.createdAt) {
-            const t = typeof s.createdAt === 'string' ? new Date(s.createdAt).getTime() : Number(s.createdAt)
-            if (!Number.isNaN(t) && t > 0) return t
-          }
-          if (s.startedAt) {
-            const t = typeof s.startedAt === 'string' ? new Date(String(s.startedAt)).getTime() : Number(s.startedAt)
-            if (!Number.isNaN(t) && t > 0) return t
-          }
-          const sid = String(s.sessionId || '')
-          if (!sessionFirstSeenMap.has(sid)) {
-            sessionFirstSeenMap.set(sid, now)
-          }
-          return sessionFirstSeenMap.get(sid) || 0
-        }
-
-        // Clean up stale sessions from sessionFirstSeenMap
-        const activeIds = new Set(sessions.map((s: Record<string, unknown>) => String(s.sessionId || '')))
-        for (const id of sessionFirstSeenMap.keys()) {
-          if (!activeIds.has(id)) {
-            sessionFirstSeenMap.delete(id)
+            activeSessionsMap.set(String(s.sessionId), s)
           }
         }
 
-        const stableSessionSort = (a: Record<string, unknown>, b: Record<string, unknown>) => {
-          const diff = getStableSessionTime(a) - getStableSessionTime(b)
-          if (diff !== 0) return diff
-          return String(a.sessionId || '').localeCompare(String(b.sessionId || ''))
-        }
+        // Retain tracked sessions that still exist in the current sessions list
+        const allKnownSessionIds = new Set(sessions.map((s: any) => String(s.sessionId || '')))
+        bubbleActiveSessionOrderRef.current = bubbleActiveSessionOrderRef.current.filter((id) => allKnownSessionIds.has(id))
 
-        waitingSessions.sort(stableSessionSort)
-        runningSessions.sort(stableSessionSort)
+        // Collect new sessions not yet assigned a slot in bubbleActiveSessionOrderRef
+        const unassignedSessionIds = sessions
+          .map((s: any) => String(s.sessionId || ''))
+          .filter((id: string) => id && !bubbleActiveSessionOrderRef.current.includes(id))
+
+        if (unassignedSessionIds.length > 0) {
+          const getSessionSortTime = (sid: string) => {
+            const s = sessions.find((item: any) => String(item.sessionId) === sid)
+            if (!s) return 0
+            if (s.createdAt) {
+              const t = typeof s.createdAt === 'string' ? new Date(s.createdAt).getTime() : Number(s.createdAt)
+              if (!Number.isNaN(t) && t > 0) return t
+            }
+            if (s.startedAt) {
+              const t = typeof s.startedAt === 'string' ? new Date(String(s.startedAt)).getTime() : Number(s.startedAt)
+              if (!Number.isNaN(t) && t > 0) return t
+            }
+            if (s.updatedAt) {
+              const t = Number(s.updatedAt)
+              if (!Number.isNaN(t) && t > 0) return t
+            }
+            return 0
+          }
+
+          unassignedSessionIds.sort((idA: string, idB: string) => {
+            const tA = getSessionSortTime(idA)
+            const tB = getSessionSortTime(idB)
+            if (tA !== tB && tA > 0 && tB > 0) return tA - tB
+            return idA.localeCompare(idB)
+          })
+
+          bubbleActiveSessionOrderRef.current.push(...unassignedSessionIds)
+        }
 
         const totalActive = bubbleRunning + bubbleWaiting
         const buildBubbleSessionDetail = (s: any): BubbleSessionDetail => {
@@ -2524,7 +2526,10 @@ export default function Mini() {
           }
         }
 
-        const activeRawSessions = [...waitingSessions, ...runningSessions].slice(0, 3)
+        const activeRawSessions = bubbleActiveSessionOrderRef.current
+          .map((id) => activeSessionsMap.get(id))
+          .filter(Boolean)
+          .slice(0, 3)
         const activeSessionDetails: BubbleSessionDetail[] = activeRawSessions.map(buildBubbleSessionDetail)
         const topSession = activeRawSessions[0] || null
         const activeSessionDetail = activeSessionDetails[0] || null
