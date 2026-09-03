@@ -7978,6 +7978,54 @@ pub fn register_antigravity_subagent(subagent_id: &str, parent_id: &str, role: &
     map.insert(subagent_id.to_string(), (parent_id.to_string(), r));
 }
 
+/// Pre-scan all local Antigravity brain transcripts for `invoke_subagent` and tool output
+/// (`Created the following subagents: ... conversationId: ...`), populating the subagent registry.
+pub fn scan_and_register_all_antigravity_subagents() {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return,
+    };
+    let brain_dir = home.join(".gemini").join("antigravity").join("brain");
+    if !brain_dir.is_dir() { return; }
+
+    if let Ok(entries) = std::fs::read_dir(&brain_dir) {
+        for entry in entries.flatten() {
+            if !entry.path().is_dir() { continue; }
+            let sid = entry.file_name().to_string_lossy().to_string();
+            if !is_uuid_str(&sid) { continue; }
+            let tpath = entry.path().join(".system_generated").join("logs").join("transcript.jsonl");
+            if !tpath.is_file() { continue; }
+            let Ok(content) = std::fs::read_to_string(&tpath) else { continue; };
+            if !content.contains("invoke_subagent") { continue; }
+
+            let lines: Vec<&str> = content.lines().collect();
+            for (idx, line) in lines.iter().enumerate() {
+                if !line.contains("invoke_subagent") { continue; }
+                let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
+                if let Some(tools) = parsed.get("tool_calls").and_then(|t| t.as_array()) {
+                    for tc in tools {
+                        if tc.get("name").and_then(|v| v.as_str()) == Some("invoke_subagent") {
+                            let roles = tc.get("args").map(extract_subagent_roles_from_tool_call).unwrap_or_default();
+                            for next_line in lines.iter().skip(idx + 1).take(5) {
+                                let Ok(next_parsed) = serde_json::from_str::<serde_json::Value>(next_line) else { continue; };
+                                let c = next_parsed.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                                if c.contains("Created the following subagents") || c.contains("conversationId") {
+                                    let uuids = extract_uuids_from_text(c);
+                                    for (u_idx, u) in uuids.into_iter().enumerate() {
+                                        let role = roles.get(u_idx).cloned().unwrap_or_else(|| "Subagent".to_string());
+                                        register_antigravity_subagent(&u, &sid, &role);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn get_antigravity_subagent_info(subagent_id: &str) -> Option<(String, String)> {
     if !is_uuid_str(subagent_id) { return None; }
     if let Some(info) = KNOWN_ANTIGRAVITY_SUBAGENTS.lock().unwrap().get(subagent_id).cloned() {
@@ -8073,32 +8121,34 @@ fn extract_subagent_roles_from_tool_call(args: &serde_json::Value) -> Vec<String
 }
 
 fn get_subagent_status(subagent_id: &str) -> (String, u64) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+
     let path = match find_antigravity_session_file(subagent_id) {
         Some(p) => p,
-        None => return ("stopped".to_string(), 0),
+        // File may not yet be flushed to disk on initial spawn: assume processing, not stopped!
+        None => return ("processing".to_string(), now_ms),
     };
     let meta = std::fs::metadata(&path).ok();
     let updated_at = meta
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-    let age_ms = now_ms.saturating_sub(updated_at);
-    // If subagent transcript hasn't been modified in 120s, it has finished or been stopped
-    if age_ms > 120_000 {
-        return ("stopped".to_string(), updated_at);
-    }
+        .unwrap_or(now_ms);
 
     if check_interrupted(&path) {
         return ("stopped".to_string(), updated_at);
     }
 
+    let age_ms = now_ms.saturating_sub(updated_at);
+    // If subagent transcript hasn't been modified in 120s, it has finished or crashed
+    if age_ms > 120_000 {
+        return ("stopped".to_string(), updated_at);
+    }
+
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(_) => return ("stopped".to_string(), updated_at),
+        Err(_) => return ("processing".to_string(), updated_at),
     };
 
     let last_meaningful = content.lines().rev().find(|l| {
@@ -8108,11 +8158,11 @@ fn get_subagent_status(subagent_id: &str) -> (String, u64) {
     });
 
     let Some(line) = last_meaningful else {
-        return ("stopped".to_string(), updated_at);
+        return ("processing".to_string(), updated_at);
     };
 
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) else {
-        return ("stopped".to_string(), updated_at);
+        return ("processing".to_string(), updated_at);
     };
 
     let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -8122,12 +8172,14 @@ fn get_subagent_status(subagent_id: &str) -> (String, u64) {
         if has_tools {
             return ("tool_running".to_string(), updated_at);
         }
-        return ("stopped".to_string(), updated_at);
+        // Subagent turn finished or waiting to deliver report, but not yet interrupted or timed out:
+        // Keep as processing so mascot bubble does not flicker away while subagent reports to parent!
+        return ("processing".to_string(), updated_at);
     } else if msg_type == "GENERIC" || msg_type == "USER_INPUT" {
         return ("processing".to_string(), updated_at);
     }
 
-    ("stopped".to_string(), updated_at)
+    ("processing".to_string(), updated_at)
 }
 
 fn is_subagent_transcript_file(path: &std::path::Path) -> bool {
@@ -8135,7 +8187,15 @@ fn is_subagent_transcript_file(path: &std::path::Path) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
-    for line in content.lines().take(15) {
+    // If transcript calls send_message or has recipient (subagent communicating with parent)
+    if content.contains("\"name\":\"send_message\"")
+        || content.contains("\"name\": \"send_message\"")
+        || content.contains("\"Recipient\":")
+        || content.contains("\"recipient\":")
+    {
+        return true;
+    }
+    for line in content.lines().take(20) {
         let text_opt = if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) {
             parsed.get("content")
                 .or_else(|| parsed.get("text"))
@@ -8148,6 +8208,7 @@ fn is_subagent_transcript_file(path: &std::path::Path) -> bool {
         let text = text_opt.as_deref().unwrap_or(line);
         let cleaned = clean_antigravity_user_text(text);
         if extract_antigravity_subagent_role(&cleaned).is_some()
+            || extract_antigravity_subagent_role(text).is_some()
             || cleaned.contains("You are the ")
             || cleaned.contains("You are a ")
             || text.contains("You are the ")
@@ -8160,6 +8221,12 @@ fn is_subagent_transcript_file(path: &std::path::Path) -> bool {
             || text.contains("Your role is")
             || cleaned.contains("作为子代理")
             || text.contains("作为子代理")
+            || cleaned.contains("专职子代理")
+            || text.contains("专职子代理")
+            || cleaned.contains("subagent")
+            || text.contains("subagent")
+            || cleaned.contains("Subagent")
+            || text.contains("Subagent")
         {
             return true;
         }
@@ -8510,17 +8577,22 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
 }
 
 pub fn load_recent_antigravity_sessions() -> Vec<ClaudeSession> {
+    scan_and_register_all_antigravity_subagents();
     let summaries = parse_agyhub_summaries_pb();
     let home = match dirs::home_dir() {
         Some(h) => h,
         None => return Vec::new(),
     };
     let brain_dir = home.join(".gemini").join("antigravity").join("brain");
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
 
     let mut candidate_ids: HashMap<String, u64> = HashMap::new();
 
     for (sid, meta) in &summaries {
-        candidate_ids.insert(sid.clone(), meta.updated_at_ms);
+        if now_ms.saturating_sub(meta.updated_at_ms) < 24 * 3600 * 1000 {
+            candidate_ids.insert(sid.clone(), meta.updated_at_ms);
+        }
     }
 
     if brain_dir.is_dir() {
@@ -8536,9 +8608,11 @@ pub fn load_recent_antigravity_sessions() -> Vec<ClaudeSession> {
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)))
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
-                    let cur = candidate_ids.entry(sid).or_insert(0);
-                    if mtime > *cur {
-                        *cur = mtime;
+                    if now_ms.saturating_sub(mtime) < 24 * 3600 * 1000 {
+                        let cur = candidate_ids.entry(sid).or_insert(0);
+                        if mtime > *cur {
+                            *cur = mtime;
+                        }
                     }
                 }
             }
@@ -8551,7 +8625,7 @@ pub fn load_recent_antigravity_sessions() -> Vec<ClaudeSession> {
         .collect();
 
     top_candidates.sort_by(|a, b| b.1.cmp(&a.1));
-    top_candidates.truncate(15);
+    top_candidates.truncate(5);
 
     let mut result = Vec::new();
     for (sid, updated_at) in top_candidates {
@@ -9395,6 +9469,39 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
                 // likely using an older hook that doesn't send pid)
             }
         }
+
+        // Auto-cleanup stale stopped sessions:
+        // Completed/stopped sessions older than 15 minutes are pruned from state.sessions
+        // and marked dismissed, keeping memory clean and preventing message box item piling.
+        let mut stale_stopped = Vec::new();
+        for (sid, session) in sessions.iter() {
+            if session.status == "stopped" {
+                let age_ms = now_ms.saturating_sub(session.updated_at);
+                if age_ms > 15 * 60_000 {
+                    stale_stopped.push(sid.clone());
+                }
+            }
+        }
+        for sid in stale_stopped {
+            sessions.remove(&sid);
+            if let Ok(mut dismissed) = state.dismissed.lock() {
+                dismissed.insert(sid);
+            }
+        }
+
+        // Subagent purge: ensure any Antigravity subagents accidentally tracked
+        // as top-level sessions are purged from state.sessions.
+        scan_and_register_all_antigravity_subagents();
+        let subagent_sids: Vec<String> = sessions.keys()
+            .filter(|sid| is_antigravity_subagent_session(sid))
+            .cloned()
+            .collect();
+        for sid in subagent_sids {
+            sessions.remove(&sid);
+            if let Ok(mut dismissed) = state.dismissed.lock() {
+                dismissed.insert(sid);
+            }
+        }
     }
 
     let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
@@ -9584,7 +9691,7 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
         .collect();
     let agy_sessions = load_recent_antigravity_sessions();
     for agys in agy_sessions {
-        if dismissed.contains(&agys.session_id) {
+        if dismissed.contains(&agys.session_id) || is_antigravity_subagent_session(&agys.session_id) {
             continue;
         }
         if live_agy_ids.contains(&agys.session_id) {
@@ -9611,6 +9718,7 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
         }
     }
 
+    list.retain(|s| s.source != "antigravity" || !is_antigravity_subagent_session(&s.session_id));
     list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     Ok(list)
 }
@@ -15407,6 +15515,22 @@ mod codex_adapter_tests {
 
         // Parent session must NOT be detected as subagent
         assert!(!is_antigravity_subagent_session(parent_id));
+
+        // Scan and register subagents across brain directories
+        scan_and_register_all_antigravity_subagents();
+
+        // Subagents from recent sessions must be detected
+        let subagent_sample = "46b74593-2888-42bc-bd2d-4deaf9033a59";
+        if find_antigravity_session_file(subagent_sample).is_some() {
+            assert!(is_antigravity_subagent_session(subagent_sample));
+        }
+
+        // Recent sessions must never include subagents
+        let recent = load_recent_antigravity_sessions();
+        assert!(recent.len() <= 5);
+        for s in &recent {
+            assert!(!is_antigravity_subagent_session(&s.session_id));
+        }
     }
 }
 
@@ -15754,7 +15878,12 @@ fn process_claude_event(
                 if hook_event == "UserPromptSubmit" {
                     // New user prompt = fresh start. Reset counter in case previous
                     // agents were killed or SubagentStop was never delivered.
-                    session.pending_agents = 0;
+                    let has_running_subs = session.active_subagents.as_ref()
+                        .map(|subs| subs.iter().any(|s| s.status != "stopped"))
+                        .unwrap_or(false);
+                    if session.source != "antigravity" || !has_running_subs {
+                        session.pending_agents = 0;
+                    }
                 } else if hook_event == "SubagentStart"
                     || (hook_event == "PreToolUse" && (tool_name == "Agent" || tool_name == "invoke_subagent"))
                     || raw_hook_event == "subagentStart"

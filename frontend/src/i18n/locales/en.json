@@ -54,6 +54,8 @@
     "pin": "Pin",
     "soundOn": "Sound: On",
     "soundOff": "Sound: Off",
+    "clearCompleted": "Clear completed sessions",
+    "clear": "Clear",
     "moveMascot": "Move mascot",
     "pairingDesc": "Pair agents with characters. Once paired, Mini will display the corresponding character animation.",
     "mascot": "Mascot",

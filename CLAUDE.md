@@ -80,6 +80,22 @@ Codex is integrated through the same Rust session pipeline as Claude Code, with 
 7. **Click jump behavior**: Codex session row click should activate the Codex app directly; do not prefer "open working directory" fallback for Codex sessions.
 8. **Session file resolution**: Codex JSONL files are found by scanning `~/.Codex/sessions/**` for filenames containing the session id (not by Claude-style cwd-derived project folder).
 
+## Harness Quota Tracking (Codex & Antigravity)
+
+Real-time 5-hour rolling rate limits, weekly limits, model buckets, and countdown tracking inspired by [Codeburn](https://github.com/getagentseal/codeburn).
+
+- **Rust Backend**: `frontend/src-tauri/src/harness_quota.rs`
+  - Tauri command: `get_harness_quota(harness, force_refresh)`
+  - Codex: reads `~/.codex/auth.json`, requests `https://chatgpt.com/backend-api/wham/usage`, auto-refreshes tokens on 401 via OAuth.
+  - Antigravity: process discovery for `language_server.exe` / `language_server`, extracts `--csrf_token` and `--extension_server_port`, queries Connect-RPC endpoint `POST /exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary`.
+  - Cache: 5-minute memory cache + 429 backoff handling.
+- **Frontend Components**: `frontend/src/components/QuotaCapsule.tsx`
+  - All values display **Remaining Quota (剩余量)**: `100 - used%`.
+  - Health ladder: $\ge 30\%$ emerald green, $15\% \sim 30\%$ amber, $< 15\%$ rose with pulse.
+  - Side Dock (`QuotaSideRail`): 44px `#141414` squircle buttons with white vector icons and inlaid border progress arcs, plus clean remaining percentages below.
+  - Popover Card: Codeburn compact layout (~180px height), pure `#141414` background, hidden native scrollbars, isolated wheel scroll (`stopPropagation`).
+  - Mascot Bubble: Mini badge `[⚡ 76%]` shown next to session title in `MascotBubble.tsx`.
+
 ## Cursor Integration
 
 Cursor is a VS Code-based IDE (not a terminal). Its hook system differs from Claude Code:
