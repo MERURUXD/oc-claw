@@ -5054,7 +5054,7 @@ export default function Mini() {
             overflowX: 'hidden',
             display: 'flex',
             flexDirection: 'column',
-            background: '#010101',
+            background: '#000000',
             // Keep a real closed notch rectangle at the top-center. This mirrors
             // ping-island's "always-present header" model and makes collapse
             // feel like shrinking inward to the notch, not vanishing upward.
@@ -5075,7 +5075,7 @@ export default function Mini() {
                 height: closedNotchHeight,
                 borderBottomLeftRadius: 8,
                 borderBottomRightRadius: 8,
-                background: '#010101',
+                background: '#000000',
                 pointerEvents: 'none',
                 zIndex: 30,
               }}

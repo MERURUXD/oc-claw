@@ -39,7 +39,7 @@ function updateHarnessQuotaCache(
 }
 
 /**
- * Google Gemini / Antigravity 4-point star icon SVG
+ * Google Gemini / Antigravity 4-point star icon SVG (White clean vector)
  */
 export function AntigravityIcon({ className = 'w-4 h-4' }: { className?: string }) {
   return (
@@ -50,7 +50,7 @@ export function AntigravityIcon({ className = 'w-4 h-4' }: { className?: string 
 }
 
 /**
- * OpenAI ChatGPT spiral flower logo SVG
+ * OpenAI ChatGPT spiral flower logo SVG (White clean vector)
  */
 export function CodexIcon({ className = 'w-4 h-4' }: { className?: string }) {
   return (
@@ -232,7 +232,7 @@ export function formatUpdatedAgo(updatedAt: number, now: number): string {
 
 /**
  * Color ladder based on REMAINING percent (剩余量):
- * - >= 30%: Healthy (Emerald / Cyan)
+ * - >= 30%: Healthy (Emerald / Green)
  * - 15% - 30%: Warning (Amber)
  * - < 15%: Critical (Rose with pulse)
  */
@@ -272,6 +272,7 @@ export function getQuotaColorLadder(remainingPercent: number) {
 
 /**
  * Codeburn-style Compact Quota Card component (usable embedded in ClaudeStatsView or in Popover).
+ * Completely pure black background (#000000) with zero ugly scrollbars.
  */
 export function QuotaCard({
   harness,
@@ -296,7 +297,7 @@ export function QuotaCard({
     return null
   }
 
-  const harnessName = data.harness === 'codex' ? 'Codex' : 'Google Antigravity'
+  const harnessName = data.harness === 'codex' ? 'OpenAI Codex' : 'Google Antigravity'
   const allWindows: QuotaWindow[] = []
   if (data.primary) {
     allWindows.push(data.primary)
@@ -316,19 +317,20 @@ export function QuotaCard({
     <div
       onWheel={(e) => e.stopPropagation()}
       onTouchMove={(e) => e.stopPropagation()}
+      style={{ background: '#000000' }}
       className={
         isPopover
-          ? 'flex flex-col gap-2.5 text-white select-none max-h-[250px] overflow-y-auto overscroll-contain pr-0.5'
-          : 'bg-[#0c0c0e] border border-white/10 rounded-2xl p-4 flex flex-col gap-3.5 text-white select-none'
+          ? 'flex flex-col gap-2.5 text-white select-none max-h-[250px] overflow-y-auto overscroll-contain pr-0.5 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden'
+          : 'border border-white/10 rounded-2xl p-4 flex flex-col gap-3.5 text-white select-none'
       }
     >
-      {/* Header: Icon + Title + Plan Label + Refresh */}
+      {/* Header: White Icon + Title + Plan Label + Refresh */}
       <div className="flex items-center justify-between gap-2 pb-2 border-b border-white/10">
         <div className="flex items-center gap-2 min-w-0">
           {data.harness === 'antigravity' ? (
-            <AntigravityIcon className="w-4 h-4 text-indigo-400 shrink-0" />
+            <AntigravityIcon className="w-4 h-4 text-white shrink-0" />
           ) : (
-            <CodexIcon className="w-4 h-4 text-emerald-400 shrink-0" />
+            <CodexIcon className="w-4 h-4 text-white shrink-0" />
           )}
           <span className="font-bold text-xs tracking-tight text-white/95 truncate">
             {harnessName}
@@ -377,7 +379,7 @@ export function QuotaCard({
               </div>
 
               {/* Slim Progress Bar */}
-              <div className="h-1.5 w-full bg-white/10 rounded-full overflow-hidden">
+              <div className="h-1.5 w-full bg-[#222222] rounded-full overflow-hidden">
                 <div
                   className={`h-full rounded-full transition-all duration-500 ${winLadder.bar}`}
                   style={{ width: `${remaining}%` }}
@@ -387,7 +389,7 @@ export function QuotaCard({
               {/* Reset Info */}
               {countdown && (
                 <div className="flex items-center justify-end text-[10px] text-white/40 font-mono">
-                  倒计时 {countdown}{resetTime ? ` (${resetTime})` : ''}
+                  Resets in {countdown}{resetTime ? ` (${resetTime})` : ''}
                 </div>
               )}
             </div>
@@ -436,12 +438,12 @@ export function QuotaMiniBadge({
 }
 
 /**
- * Codeburn-style side rail dock on the right side of the panel:
- * - Solid pure black background (#010101) flush with the main panel
- * - Icon-based squircle buttons with circular progress rings (Antigravity & OpenAI Codex)
- * - Remaining percentage text right below each icon
- * - Compact popover sliding to the left with beak arrow pointing to active icon
- * - Wheel scroll isolation (prevents penetration to underlying conversation list)
+ * Exact Codeburn-styled side rail dock:
+ * - Solid pure black background (#000000) flush with the main panel
+ * - White vector icons (Antigravity 4-star & OpenAI Codex spiral)
+ * - Corner/border SVG progress arc starting at top-center and drawing clockwise along squircle
+ * - Percentage text right below each icon in clean white
+ * - Compact popover with arrow beak, pure black background, and zero ugly scrollbars
  */
 export function QuotaSideRail() {
   const codex = useHarnessQuota('codex')
@@ -512,8 +514,8 @@ export function QuotaSideRail() {
   return (
     <div
       ref={railRef}
-      style={{ background: '#010101' }}
-      className="relative shrink-0 w-[58px] flex flex-col items-center gap-3 py-3 px-1.5 border-l border-white/[0.08] select-none z-30"
+      style={{ background: '#000000' }}
+      className="relative shrink-0 w-[60px] flex flex-col items-center gap-3.5 py-3 px-1.5 border-l border-white/[0.08] select-none z-30"
     >
       {items.map((item) => {
         const primary = item.data.primary || item.data.details[0]
@@ -526,8 +528,9 @@ export function QuotaSideRail() {
           : null
         const isSelected = activePopover === item.harness
 
-        // SVG circle dimensions: radius 17, perimeter = 2 * PI * 17 = 106.81
-        const perimeter = 106.81
+        // Squircle perimeter for rect x=2 y=2 w=40 h=40 rx=12:
+        // perimeter = 4 * (40 - 24) + 2 * PI * 12 = 64 + 75.398 = 139.4
+        const perimeter = 139.4
         const strokeDashoffset = perimeter * (1 - remainingPercent / 100)
 
         return (
@@ -539,47 +542,57 @@ export function QuotaSideRail() {
                 e.stopPropagation()
                 setActivePopover((prev) => (prev === item.harness ? null : item.harness))
               }}
-              className={`relative w-10 h-10 rounded-xl flex items-center justify-center transition-all duration-200 cursor-pointer ${
+              className={`relative w-11 h-11 rounded-[14px] bg-[#141414] hover:bg-[#1f1f1f] flex items-center justify-center transition-all duration-200 cursor-pointer ${
                 isSelected
-                  ? 'bg-white/15 ring-2 ring-emerald-400/50 scale-105'
-                  : 'bg-white/[0.06] hover:bg-white/12 hover:scale-105 active:scale-95'
+                  ? 'ring-2 ring-white/30 scale-105'
+                  : 'hover:scale-105 active:scale-95'
               }`}
               title={`${item.name} · 剩余 ${remainingPercent}%${countdown ? ` (重置倒计时: ${countdown})` : ''}`}
             >
-              {/* Circular SVG Progress Ring hugging the squircle */}
-              <svg className="absolute inset-0 w-full h-full -rotate-90 pointer-events-none" viewBox="0 0 40 40">
-                <circle
-                  cx="20"
-                  cy="20"
-                  r="17"
+              {/* Corner/border SVG progress arc along the squircle */}
+              <svg className="absolute inset-0 w-full h-full pointer-events-none" viewBox="0 0 44 44">
+                {/* Base subtle border */}
+                <rect
+                  x="2"
+                  y="2"
+                  width="40"
+                  height="40"
+                  rx="12"
                   fill="none"
                   stroke="rgba(255,255,255,0.08)"
-                  strokeWidth="2.2"
+                  strokeWidth="2"
                 />
-                <circle
-                  cx="20"
-                  cy="20"
-                  r="17"
+                {/* Progress arc starting from top-center */}
+                <rect
+                  x="2"
+                  y="2"
+                  width="40"
+                  height="40"
+                  rx="12"
                   fill="none"
                   stroke={ladder.stroke}
-                  strokeWidth="2.2"
+                  strokeWidth="2"
                   strokeDasharray={perimeter}
                   strokeDashoffset={strokeDashoffset}
                   strokeLinecap="round"
                   className="transition-all duration-500"
+                  style={{
+                    transformOrigin: '22px 22px',
+                    transform: 'rotate(-90deg)',
+                  }}
                 />
               </svg>
 
-              {/* Provider Icon */}
+              {/* Provider Icon (Both in pure clean white!) */}
               {item.harness === 'antigravity' ? (
-                <AntigravityIcon className="w-5 h-5 text-indigo-400 shrink-0" />
+                <AntigravityIcon className="w-5 h-5 text-white shrink-0" />
               ) : (
-                <CodexIcon className="w-5 h-5 text-emerald-400 shrink-0" />
+                <CodexIcon className="w-5 h-5 text-white shrink-0" />
               )}
             </button>
 
-            {/* Percentage text right below */}
-            <span className={`text-[11px] font-bold font-mono text-center tracking-tight mt-1 leading-none ${ladder.text}`}>
+            {/* Percentage text right below (Clean white Codeburn style) */}
+            <span className="text-xs font-semibold font-mono text-white text-center mt-1.5 leading-none">
               {remainingPercent}%
             </span>
           </div>
@@ -599,12 +612,13 @@ export function QuotaSideRail() {
             onClick={(e) => e.stopPropagation()}
             onWheel={(e) => e.stopPropagation()}
             onTouchMove={(e) => e.stopPropagation()}
-            className="absolute right-full mr-2.5 top-2 z-50 w-72 max-h-[250px] overflow-y-auto overscroll-contain bg-[#0c0c0e] border border-white/15 shadow-[0_12px_40px_rgba(0,0,0,0.9)] rounded-2xl p-3 select-none cursor-default scrollbar-thin scrollbar-thumb-white/20"
+            style={{ background: '#000000' }}
+            className="absolute right-full mr-3 top-2 z-50 w-[310px] max-h-[260px] overflow-y-auto overscroll-contain border border-white/15 shadow-[0_16px_48px_rgba(0,0,0,0.95)] rounded-2xl p-3.5 select-none cursor-default [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden text-white"
           >
             {/* Arrow beak pointing right towards active dock button */}
             <div
-              className="absolute -right-1.5 w-3 h-3 bg-[#0c0c0e] border-t border-r border-white/15 rotate-45 pointer-events-none"
-              style={{ top: activeIdx === 0 ? 18 : 72 }}
+              className="absolute -right-1.5 w-3 h-3 border-t border-r border-white/15 rotate-45 pointer-events-none"
+              style={{ background: '#000000', top: activeIdx === 0 ? 20 : 76 }}
             />
 
             <QuotaCard
