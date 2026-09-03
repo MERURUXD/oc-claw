@@ -5054,7 +5054,7 @@ export default function Mini() {
             overflowX: 'hidden',
             display: 'flex',
             flexDirection: 'column',
-            background: '#000000',
+            background: '#141414',
             // Keep a real closed notch rectangle at the top-center. This mirrors
             // ping-island's "always-present header" model and makes collapse
             // feel like shrinking inward to the notch, not vanishing upward.
@@ -5075,7 +5075,7 @@ export default function Mini() {
                 height: closedNotchHeight,
                 borderBottomLeftRadius: 8,
                 borderBottomRightRadius: 8,
-                background: '#000000',
+                background: '#141414',
                 pointerEvents: 'none',
                 zIndex: 30,
               }}
@@ -5084,7 +5084,7 @@ export default function Mini() {
 
           {/* Top Control Bar — outside the transform wrapper so sticky works correctly */}
           <div
-            className="flex items-center justify-between px-4 py-2.5 shrink-0 sticky top-0 z-20 bg-black text-white"
+            className="flex items-center justify-between px-4 py-2.5 shrink-0 sticky top-0 z-20 bg-[#141414] text-white"
             style={{
               opacity: showPanel ? 1 : 0,
               transition: panelChromeTransition,
@@ -5235,7 +5235,7 @@ export default function Mini() {
                     transition={{ duration: 0.15 }}
                     style={{ position: 'relative', display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}
                   >
-                    <div className="flex flex-col bg-black" style={{ flex: 1, minHeight: 0 }}>
+                    <div className="flex flex-col bg-[#141414]" style={{ flex: 1, minHeight: 0 }}>
                       <div className="overflow-y-auto scrollbar-hidden" style={{ maxHeight: panelMaxHeight - 60 }}>
                         <AnimatePresence mode="popLayout">
                           {(() => {

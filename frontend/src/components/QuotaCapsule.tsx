@@ -317,11 +317,11 @@ export function QuotaCard({
     <div
       onWheel={(e) => e.stopPropagation()}
       onTouchMove={(e) => e.stopPropagation()}
-      style={{ background: '#000000' }}
+      style={{ background: isPopover ? '#141414' : undefined }}
       className={
         isPopover
           ? 'flex flex-col gap-2.5 text-white select-none max-h-[250px] overflow-y-auto overscroll-contain pr-0.5 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden'
-          : 'border border-white/10 rounded-2xl p-4 flex flex-col gap-3.5 text-white select-none'
+          : 'bg-white/[0.03] border border-white/5 rounded-2xl p-4 flex flex-col gap-3.5 text-white select-none'
       }
     >
       {/* Header: White Icon + Title + Plan Label + Refresh */}
@@ -514,7 +514,7 @@ export function QuotaSideRail() {
   return (
     <div
       ref={railRef}
-      style={{ background: '#000000' }}
+      style={{ background: '#141414' }}
       className="relative shrink-0 w-[60px] flex flex-col items-center gap-3.5 py-3 px-1.5 border-l border-white/[0.08] select-none z-30"
     >
       {items.map((item) => {
@@ -612,7 +612,7 @@ export function QuotaSideRail() {
             onClick={(e) => e.stopPropagation()}
             onWheel={(e) => e.stopPropagation()}
             onTouchMove={(e) => e.stopPropagation()}
-            style={{ background: '#000000' }}
+            style={{ background: '#141414' }}
             className="absolute right-full mr-3 top-2 z-50 w-[310px] max-h-[260px] overflow-y-auto overscroll-contain border border-white/15 shadow-[0_16px_48px_rgba(0,0,0,0.95)] rounded-2xl p-3.5 select-none cursor-default [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden text-white"
           >
             {/* Arrow beak pointing right towards active dock button */}
