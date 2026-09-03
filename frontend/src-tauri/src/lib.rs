@@ -73,6 +73,7 @@ static BUBBLE_SIZE: Mutex<(f64, f64)> = Mutex::new((200.0, 40.0));
 /// snaps the window origin to (cursor - anchor). This is the same pattern
 /// macOS uses for native window dragging and avoids the lag introduced by
 /// accumulating deltas across pre-empted frames.
+#[cfg(target_os = "macos")]
 static DRAG_TASK_PENDING: AtomicBool = AtomicBool::new(false);
 static DRAG_ANCHOR: std::sync::OnceLock<Mutex<Option<(f64, f64)>>> = std::sync::OnceLock::new();
 fn drag_anchor() -> &'static Mutex<Option<(f64, f64)>> {
@@ -144,7 +145,6 @@ fn hide_window_cmd(cmd: &mut std::process::Command) {
 /// Apply CREATE_NO_WINDOW on Windows to prevent console popups (tokio version).
 #[cfg(windows)]
 fn hide_window_tokio_cmd(cmd: &mut tokio::process::Command) {
-    use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
     cmd.creation_flags(CREATE_NO_WINDOW);
 }
@@ -1302,6 +1302,7 @@ async fn ssh_is_agent_active(ssh_host: &str, ssh_user: &str, agent_id: &str) -> 
 }
 
 /// Check if a specific session file is active by reading its tail.
+#[allow(dead_code)]
 async fn ssh_is_session_file_active(ssh_host: &str, ssh_user: &str, session_file: &str) -> bool {
     let escaped = session_file.replace('"', r#"\""#);
     let cmd = format!("tail -5 \"{}\" 2>/dev/null", escaped);
@@ -2282,7 +2283,6 @@ async fn get_agent_metrics(agent_id: String, mode: Option<String>, url: Option<S
             let mut last_tool_name: Option<String> = None;
             let mut last_timestamp: Option<String> = None;
             let mut recent_actions: Vec<RecentAction> = vec![];
-            let mut current_msg_timestamp: Option<String> = None;
 
             for line in content.lines() {
                 let val: serde_json::Value = match serde_json::from_str(line) {
@@ -2300,7 +2300,7 @@ async fn get_agent_metrics(agent_id: String, mode: Option<String>, url: Option<S
                     "message" => {
                         let msg = &val["message"];
                         let role = msg["role"].as_str().unwrap_or("");
-                        current_msg_timestamp = val["timestamp"].as_str().map(|s| s.to_string());
+                        let current_msg_timestamp = val["timestamp"].as_str().map(|s| s.to_string());
                         if role == "user" {
                             if let Some(content_arr) = msg["content"].as_array() {
                                 for item in content_arr {
@@ -2548,7 +2548,6 @@ async fn get_agent_metrics(agent_id: String, mode: Option<String>, url: Option<S
     let mut last_tool_name: Option<String> = None;
     let mut last_timestamp: Option<String> = None;
     let mut recent_actions: Vec<RecentAction> = vec![];
-    let mut current_msg_timestamp: Option<String> = None;
 
     for line in content.lines() {
         let val: serde_json::Value = match serde_json::from_str(line) {
@@ -2574,7 +2573,7 @@ async fn get_agent_metrics(agent_id: String, mode: Option<String>, url: Option<S
             "message" => {
                 let msg = &val["message"];
                 let role = msg["role"].as_str().unwrap_or("");
-                current_msg_timestamp = val["timestamp"].as_str().map(|s| s.to_string());
+                let current_msg_timestamp = val["timestamp"].as_str().map(|s| s.to_string());
 
                 if role == "user" {
                     if let Some(content_arr) = msg["content"].as_array() {
@@ -3225,6 +3224,7 @@ async fn close_mini(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 /// Compute collapsed mascot x position based on side preference.
+#[allow(dead_code)]
 fn collapsed_x(sx: f64, sw: f64, win_w: f64, position: &str, notch_offset: f64) -> f64 {
     if position == "left" {
         sx + sw / 2.0 - notch_offset - win_w
@@ -3684,7 +3684,7 @@ async fn set_ime_mode(_app: tauri::AppHandle, _active: bool) -> Result<(), Strin
 /// Resize/reposition the mini window between collapsed (small, right of notch)
 /// and expanded (larger, centered on notch) states.
 #[tauri::command]
-async fn set_mini_expanded(app: tauri::AppHandle, expanded: bool, position: Option<String>, efficiency: Option<bool>, max_height: Option<f64>, mascot_scale: Option<f64>, large_mascot: Option<bool>, keep_position: Option<bool>, large_mascot_scale: Option<f64>) -> Result<(), String> {
+async fn set_mini_expanded(app: tauri::AppHandle, expanded: bool, position: Option<String>, efficiency: Option<bool>, #[allow(unused_variables)] max_height: Option<f64>, mascot_scale: Option<f64>, large_mascot: Option<bool>, keep_position: Option<bool>, large_mascot_scale: Option<f64>) -> Result<(), String> {
     let win = app.get_webview_window("mini").ok_or("mini window not found")?;
     let pos = position.unwrap_or_else(|| "right".to_string());
     let mascot_scale = sanitized_mascot_scale(mascot_scale);
@@ -4278,7 +4278,7 @@ fn request_drag_apply(_app: &tauri::AppHandle) {}
 /// macOS: bottom-left origin, so adjust y to keep the same top anchor.
 /// Windows: top-left origin, so just resize height.
 #[tauri::command]
-async fn resize_mini_height(app: tauri::AppHandle, height: f64, max_height: Option<f64>, animate: Option<bool>) -> Result<(), String> {
+async fn resize_mini_height(app: tauri::AppHandle, height: f64, max_height: Option<f64>, #[allow(unused_variables)] animate: Option<bool>) -> Result<(), String> {
     let win = app.get_webview_window("mini").ok_or("mini window not found")?;
     let limit = max_height.unwrap_or(350.0).max(200.0).min(2000.0);
     // Scale height limits on Windows to match DPI-aware window sizes
@@ -4408,7 +4408,7 @@ fn pet_context_schedule_restore_alpha(ns_win_ptr: *mut std::ffi::c_void) {
 /// 2) Frontmost app fallback (video/music bundle IDs)
 /// 3) Explicit player-state scripts for background music fallback
 #[tauri::command]
-async fn get_system_idle_time(app: tauri::AppHandle) -> Result<f64, String> {
+async fn get_system_idle_time(#[allow(unused_variables)] app: tauri::AppHandle) -> Result<f64, String> {
     #[cfg(target_os = "macos")]
     {
         let (tx, rx) = std::sync::mpsc::channel::<f64>();
@@ -4434,7 +4434,7 @@ async fn get_system_idle_time(app: tauri::AppHandle) -> Result<f64, String> {
 /// Seconds since the last keyboard event (key down).
 /// Used to suppress auto-expand popups when the user is actively typing.
 #[tauri::command]
-async fn get_keyboard_idle_secs(app: tauri::AppHandle) -> Result<f64, String> {
+async fn get_keyboard_idle_secs(#[allow(unused_variables)] app: tauri::AppHandle) -> Result<f64, String> {
     #[cfg(target_os = "macos")]
     {
         let (tx, rx) = std::sync::mpsc::channel::<f64>();
@@ -4459,7 +4459,7 @@ async fn get_keyboard_idle_secs(app: tauri::AppHandle) -> Result<f64, String> {
 }
 
 #[tauri::command]
-async fn get_now_playing(app: tauri::AppHandle) -> Result<String, String> {
+async fn get_now_playing(#[allow(unused_variables)] app: tauri::AppHandle) -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {
         let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -5236,10 +5236,10 @@ async fn set_pet_mode_window(
     }
 
     if active {
-        let was_active = PET_PASSTHROUGH_ACTIVE.load(Ordering::SeqCst);
         // Expand window to menu-ready size (mascot area + padding for buttons).
         #[cfg(target_os = "macos")]
         {
+            let was_active = PET_PASSTHROUGH_ACTIVE.load(Ordering::SeqCst);
             let win_clone = win.clone();
             app.run_on_main_thread(move || {
                 use objc2::runtime::{AnyClass, AnyObject};
@@ -5299,7 +5299,6 @@ async fn set_pet_mode_window(
                     let current_x = pos.x as f64 / scale;
                     let current_y = pos.y as f64 / scale;
                     let current_w = size.width as f64 / scale;
-                    let current_h = size.height as f64 / scale;
                     let sw = monitor.size().width as f64 / scale;
                     let sh = monitor.size().height as f64 / scale;
                     let left_pad = 180.0;
@@ -5798,6 +5797,7 @@ async fn set_mini_size(
     let win = app.get_webview_window("mini").ok_or("mini window not found")?;
     let pos = position.unwrap_or_else(|| "right".to_string());
     let want_top = keep_on_top.unwrap_or(restore);
+    #[allow(unused_variables)]
     let is_pet_context = pet_context.unwrap_or(false);
     let mascot_scale = sanitized_mascot_scale(mascot_scale);
     let large_mascot_scale = large_mascot_scale.unwrap_or(LARGE_MASCOT_SIZE_MULTIPLIER);
@@ -7291,6 +7291,7 @@ fn collect_opencode_stats() -> Result<ClaudeStats, String> {
     let home = dirs::home_dir().ok_or("no home dir")?;
     // opencode uses the XDG data dir on every platform; also check the macOS
     // Application Support location as a fallback.
+    #[allow(unused_mut)]
     let mut candidates = vec![home.join(".local").join("share").join("opencode").join("opencode.db")];
     #[cfg(target_os = "macos")]
     candidates.push(home.join("Library").join("Application Support").join("opencode").join("opencode.db"));
@@ -9798,6 +9799,7 @@ fn load_ooclaw_status(hermes_dir: &std::path::Path) -> HashMap<String, String> {
 
 /// Check if a session is active based on ooclaw plugin status.
 /// Same logic as remote check_active: processing/running_tool/waiting = active.
+#[allow(dead_code)]
 fn is_hermes_active_by_plugin(status_map: &HashMap<String, String>, session_id: &str) -> Option<bool> {
     status_map.get(session_id).map(|st| {
         matches!(st.as_str(), "processing" | "running_tool" | "waiting")
@@ -11093,6 +11095,7 @@ async fn set_extra_mascots_hidden(app: tauri::AppHandle, hidden: bool) -> Result
 /// `sync_mascot_bubble` positions it and `set_mascot_bubble_visible` drives
 /// visibility.
 fn spawn_mascot_bubble(app: tauri::AppHandle) -> Result<(), String> {
+    #[allow(unused_variables)]
     let win = tauri::WebviewWindowBuilder::new(
         &app,
         "mascot-bubble",
@@ -11972,8 +11975,7 @@ fn find_claude_desktop_parent_pid(pid: u32) -> Option<u32> {
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
     };
-    use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION};
-    use windows::Win32::Foundation::{CloseHandle, MAX_PATH};
+    use windows::Win32::Foundation::CloseHandle;
 
     // Take a snapshot of all processes to walk the parent chain
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()? };
@@ -12586,12 +12588,14 @@ async fn focus_cursor_terminal(session_id: String, state: tauri::State<'_, Claud
 async fn jump_to_claude_terminal(session_id: String, state: tauri::State<'_, ClaudeState>) -> Result<String, String> {
     let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
     let session = sessions.get(&session_id).ok_or("Session not found")?;
-    let cwd = session.cwd.clone();
-    let terminal_id = session.terminal_id.clone();
     let pid = session.pid;
     let source = session.source.clone();
     let host_terminal = session.host_terminal.clone();
     let platform = session.platform.clone();
+    #[cfg(target_os = "macos")]
+    let cwd = session.cwd.clone();
+    #[cfg(target_os = "macos")]
+    let terminal_id = session.terminal_id.clone();
     drop(sessions);
 
     #[cfg(target_os = "macos")]
@@ -13905,7 +13909,7 @@ async fn get_hermes_recent_activity(session_id: String) -> Result<Vec<serde_json
     // are housekeeping (skill_view/skills_list/memory_view) and the visible task
     // is already done. Use the Hermes Stop event as the authoritative boundary.
     let mut live_results: Vec<serde_json::Value> = Vec::new();
-    let mut cutoff_ts: Option<f64> = None;  // upper bound (inclusive) when session is done
+    let cutoff_ts: Option<f64> = None;  // upper bound (inclusive) when session is done
     let now_ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
     if !session_id.is_empty() {
@@ -15711,7 +15715,7 @@ fn process_claude_event(
         let claude_status = event.get("claudeStatus").or_else(|| event.get("status"))
             .and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
 
-        let mut is_processing = claude_status != "waiting_for_input";
+        let is_processing = claude_status != "waiting_for_input";
 
         let user_prompt = event.get("userPrompt").or_else(|| event.get("prompt"))
             .and_then(|v| v.as_str()).unwrap_or("");
@@ -16144,7 +16148,6 @@ fn process_claude_event(
                             session.tool_input = None;
                             session.last_response = None;
                             status = "stopped".to_string();
-                            is_processing = false;
                         } else {
                             let is_intermediate = update_antigravity_session_from_transcript(session);
                             let has_active_subagents = session.active_subagents.as_ref().map(|s| !s.is_empty()).unwrap_or(false);
@@ -16154,12 +16157,10 @@ fn process_claude_event(
                                 session.status = if any_tool_running { "tool_running".to_string() } else { "processing".to_string() };
                                 session.is_processing = true;
                                 status = session.status.clone();
-                                is_processing = true;
                             } else {
                                 session.status = "stopped".to_string();
                                 session.is_processing = false;
                                 status = "stopped".to_string();
-                                is_processing = false;
                                 session.tool = None;
                                 session.tool_input = None;
                             }
