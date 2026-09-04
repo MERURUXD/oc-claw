@@ -14,7 +14,7 @@ import { ClaudeStatsView } from './components/ClaudeStatsView'
 import { QuotaSideRail } from './components/QuotaCapsule'
 import { ChatList } from './components/ChatList'
 import { getStore, DEFAULT_CHAR, DEFAULT_CHAR_NAME, loadCharacters, loadOcConnections, saveOcConnections } from './lib/store'
-import type { AgentMetrics, BubbleSessionDetail, BubbleStyle, MascotBubblePayload, OcConnection, SubagentDetail } from './lib/types'
+import type { AgentMetrics, BubbleSessionDetail, BubbleStyle, BubbleTransitionEvent, MascotBubblePayload, OcConnection, SubagentDetail } from './lib/types'
 import { OnboardingModal } from './components/OnboardingModal'
 import { PetContextMenu, PomodoroOverlay } from './components/PetContextMenu'
 import {
@@ -528,8 +528,10 @@ export default function Mini() {
   const lastActiveSessionRef = useRef<any>(null)
   const lastBubblePayloadRef = useRef<MascotBubblePayload>({ style: 'compact', running: 0, waiting: 0, activeSession: null, activeSessions: [] })
   const bubbleActiveSessionOrderRef = useRef<string[]>([])
-  const bubbleVisibleRef = useRef(false)
-  const bubbleCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const bubbleNativeVisibleRef = useRef(false)
+  const bubbleDesiredVisibleRef = useRef(false)
+  const bubbleTransitionIdRef = useRef(0)
+  const bubblePhaseRef = useRef<'hidden' | 'prepared' | 'entering' | 'visible' | 'exiting'>('hidden')
 
   // Settings mode: native window grows, then a separate settings card animates in.
   const [settingsMode, setSettingsMode] = useState(false)
@@ -2142,24 +2144,24 @@ export default function Mini() {
       setClaudeSessions([])
       // The status bubble only exists in coding mode — make sure it is
       // hidden when leaving it (pet mode etc.).
-      bubbleVisibleRef.current = false
-      if (bubbleCloseTimerRef.current) {
-        clearTimeout(bubbleCloseTimerRef.current)
-        bubbleCloseTimerRef.current = null
-      }
+      bubbleDesiredVisibleRef.current = false
+      bubbleTransitionIdRef.current++
+      bubblePhaseRef.current = 'hidden'
+      bubbleNativeVisibleRef.current = false
       invoke('set_mascot_bubble_visible', { visible: false }).catch(() => {})
       return
     }
     if (!(enableClaudeCode || enableClaudeDesktop || enableCodex || enableCursor || enableGemini || enableOpencode || enableHermes || enableAntigravity)) {
       setClaudeSessions([])
-      bubbleVisibleRef.current = false
-      if (bubbleCloseTimerRef.current) {
-        clearTimeout(bubbleCloseTimerRef.current)
-        bubbleCloseTimerRef.current = null
-      }
+      bubbleDesiredVisibleRef.current = false
+      bubbleTransitionIdRef.current++
+      bubblePhaseRef.current = 'hidden'
+      bubbleNativeVisibleRef.current = false
       invoke('set_mascot_bubble_visible', { visible: false }).catch(() => {})
       return
     }
+    // Pre-spawn / warm up bubble window in coding mode so it is ready for handshake
+    invoke('ensure_mascot_bubble').catch(() => {})
     const seenCompletions = new Set<string>(shownCompletionsRef.current)
     // Track previously logged session statuses so we only emit a backend log
     // line when something actually changes — keeps oc-claw.log readable.
@@ -2560,26 +2562,28 @@ export default function Mini() {
         lastBubblePayloadRef.current = bubblePayload
 
         if (bubbleShouldShow) {
-          if (bubbleCloseTimerRef.current) {
-            clearTimeout(bubbleCloseTimerRef.current)
-            bubbleCloseTimerRef.current = null
+          bubbleDesiredVisibleRef.current = true
+          const currentPhase = bubblePhaseRef.current
+          if (currentPhase === 'visible' || currentPhase === 'entering' || currentPhase === 'prepared') {
+            emit('mascot-bubble-summary', bubblePayload).catch(() => {})
+          } else {
+            const transitionId = ++bubbleTransitionIdRef.current
+            bubblePhaseRef.current = 'prepared'
+            invoke('ensure_mascot_bubble')
+              .then(() => {
+                emit('mascot-bubble-prepare', { transitionId, payload: bubblePayload }).catch(() => {})
+              })
+              .catch(() => {
+                emit('mascot-bubble-prepare', { transitionId, payload: bubblePayload }).catch(() => {})
+              })
           }
-          if (!bubbleVisibleRef.current) {
-            bubbleVisibleRef.current = true
-            invoke('set_mascot_bubble_visible', { visible: true }).catch(() => {})
-          }
-          emit('mascot-bubble-summary', bubblePayload).catch(() => {})
         } else {
-          if (bubbleVisibleRef.current) {
-            bubbleVisibleRef.current = false
-            emit('mascot-bubble-close').catch(() => {})
-            if (bubbleCloseTimerRef.current) clearTimeout(bubbleCloseTimerRef.current)
-            bubbleCloseTimerRef.current = setTimeout(() => {
-              invoke('set_mascot_bubble_visible', { visible: false }).catch(() => {})
-              bubbleCloseTimerRef.current = null
-            }, 260)
-          } else if (!bubbleCloseTimerRef.current) {
-            invoke('set_mascot_bubble_visible', { visible: false }).catch(() => {})
+          bubbleDesiredVisibleRef.current = false
+          const currentPhase = bubblePhaseRef.current
+          if (currentPhase !== 'hidden' && currentPhase !== 'exiting') {
+            const transitionId = ++bubbleTransitionIdRef.current
+            bubblePhaseRef.current = 'exiting'
+            emit('mascot-bubble-close', { transitionId }).catch(() => {})
           }
         }
         if (completionCandidate) {
@@ -2970,10 +2974,42 @@ export default function Mini() {
     const unlistenBubbleSession = listen<{ sessionId?: string } | undefined>('mascot-bubble-session-click', (e) => {
       handleBubbleClick(e.payload)
     })
+    const unlistenBubbleReady = listen<BubbleTransitionEvent>('mascot-bubble-ready', async (e) => {
+      const transitionId = e.payload?.transitionId
+      if (
+        transitionId != null &&
+        transitionId === bubbleTransitionIdRef.current &&
+        bubbleDesiredVisibleRef.current
+      ) {
+        await invoke('set_mascot_bubble_visible', { visible: true }).catch(() => {})
+        bubbleNativeVisibleRef.current = true
+        if (
+          transitionId === bubbleTransitionIdRef.current &&
+          bubbleDesiredVisibleRef.current
+        ) {
+          bubblePhaseRef.current = 'entering'
+          emit('mascot-bubble-enter', { transitionId }).catch(() => {})
+        }
+      }
+    })
+    const unlistenBubbleExit = listen<BubbleTransitionEvent>('mascot-bubble-exit-complete', async (e) => {
+      const transitionId = e.payload?.transitionId
+      if (
+        transitionId != null &&
+        transitionId === bubbleTransitionIdRef.current &&
+        !bubbleDesiredVisibleRef.current
+      ) {
+        bubblePhaseRef.current = 'hidden'
+        await invoke('set_mascot_bubble_visible', { visible: false }).catch(() => {})
+        bubbleNativeVisibleRef.current = false
+      }
+    })
     return () => {
       unlistenExtra.then((fn) => fn())
       unlistenBubble.then((fn) => fn())
       unlistenBubbleSession.then((fn) => fn())
+      unlistenBubbleReady.then((fn) => fn())
+      unlistenBubbleExit.then((fn) => fn())
     }
   }, [])
 
@@ -3012,16 +3048,12 @@ export default function Mini() {
     // already shows the full status); the session poll re-shows it on the
     // next tick once collapsed.
     if (expanded) {
-      if (bubbleVisibleRef.current) {
-        bubbleVisibleRef.current = false
-        emit('mascot-bubble-close').catch(() => {})
-        if (bubbleCloseTimerRef.current) clearTimeout(bubbleCloseTimerRef.current)
-        bubbleCloseTimerRef.current = setTimeout(() => {
-          invoke('set_mascot_bubble_visible', { visible: false }).catch(() => {})
-          bubbleCloseTimerRef.current = null
-        }, 220)
-      } else {
-        invoke('set_mascot_bubble_visible', { visible: false }).catch(() => {})
+      bubbleDesiredVisibleRef.current = false
+      const currentPhase = bubblePhaseRef.current
+      if (currentPhase !== 'hidden' && currentPhase !== 'exiting') {
+        const transitionId = ++bubbleTransitionIdRef.current
+        bubblePhaseRef.current = 'exiting'
+        emit('mascot-bubble-close', { transitionId }).catch(() => {})
       }
     }
   }, [expanded, appMode])

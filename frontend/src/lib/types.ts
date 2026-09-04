@@ -38,6 +38,11 @@ export interface MascotBubblePayload {
   activeSessions?: BubbleSessionDetail[]
 }
 
+export interface BubbleTransitionEvent {
+  transitionId: number
+  payload?: MascotBubblePayload
+}
+
 export interface SessionInfo {
   id: string
   label?: string
