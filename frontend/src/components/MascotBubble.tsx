@@ -713,7 +713,7 @@ export default function MascotBubble() {
   const sessionsToRenderRef = useRef<BubbleSessionDetail[]>([])
 
   // Unified geometry synchronization helper
-  const syncBubbleGeometry = useCallback((mode: BubbleGeometryMode) => {
+  const syncBubbleGeometry = useCallback((mode: BubbleGeometryMode, options?: { preserveAnchor?: boolean }) => {
     const el = contentRef.current
     if (!el) return Promise.resolve()
     const width = Math.ceil(el.offsetWidth)
@@ -725,13 +725,15 @@ export default function MascotBubble() {
 
     const entryOffsetX = mode === 'motion' ? BUBBLE_MOTION.reserveX : 0
     const entryOffsetY = mode === 'motion' ? BUBBLE_MOTION.reserveY : 0
+    const preserveAnchor = options?.preserveAnchor ?? (mode === 'stable' || phaseRef.current === 'exiting' || phaseRef.current === 'visible')
 
-    logBubbleDev(`[bubble] syncBubbleGeometry mode=${mode} size=${width}x${height} offset=${entryOffsetX}x${entryOffsetY}`)
+    logBubbleDev(`[bubble] syncBubbleGeometry mode=${mode} size=${width}x${height} offset=${entryOffsetX}x${entryOffsetY} preserve=${preserveAnchor}`)
     return invoke('sync_mascot_bubble', {
       width,
       height,
       entryOffsetX,
       entryOffsetY,
+      preserveAnchor,
     }).catch(() => {})
   }, [])
 
@@ -746,13 +748,14 @@ export default function MascotBubble() {
     currentGeometryModeRef.current = 'motion'
     lastSizeRef.current = { width, height }
 
-    logBubbleDev(`[bubble ${tid}] geometry ${width}x${height} (motion mode)`)
+    logBubbleDev(`[bubble ${tid}] geometry ${width}x${height} (motion mode, fresh anchor)`)
 
     invoke('sync_mascot_bubble', {
       width,
       height,
       entryOffsetX: BUBBLE_MOTION.reserveX,
       entryOffsetY: BUBBLE_MOTION.reserveY,
+      preserveAnchor: false,
     })
       .then(() => {
         if (readySentForTransitionRef.current !== tid && transitionIdRef.current === tid) {
@@ -858,7 +861,7 @@ export default function MascotBubble() {
 
             // Expand to motion geometry before row begins flight to guarantee envelope
             if (currentGeometryModeRef.current !== 'motion') {
-              syncBubbleGeometry('motion').then(() => {
+              syncBubbleGeometry('motion', { preserveAnchor: true }).then(() => {
                 requestAnimationFrame(() => {
                   requestAnimationFrame(() => {
                     startIncrementalEntry()
@@ -884,7 +887,7 @@ export default function MascotBubble() {
           activeMotionTokensRef.current.clear()
           activeMotionTokensRef.current.add('global-entry')
           if (currentGeometryModeRef.current !== 'motion') {
-            syncBubbleGeometry('motion')
+            syncBubbleGeometry('motion', { preserveAnchor: true })
           }
           setPhase('entering')
           phaseRef.current = 'entering'
@@ -901,7 +904,7 @@ export default function MascotBubble() {
           }
 
           if (currentGeometryModeRef.current === 'stable') {
-            syncBubbleGeometry('motion').then(() => {
+            syncBubbleGeometry('motion', { preserveAnchor: true }).then(() => {
               requestAnimationFrame(() => {
                 startExit()
               })
@@ -934,7 +937,7 @@ export default function MascotBubble() {
       }
 
       if (currentGeometryModeRef.current === 'stable') {
-        syncBubbleGeometry('motion').then(() => {
+        syncBubbleGeometry('motion', { preserveAnchor: true }).then(() => {
           requestAnimationFrame(() => {
             startExit()
           })
@@ -988,11 +991,13 @@ export default function MascotBubble() {
         logBubbleDev(`[bubble ro] resize ${width}x${height} mode=${targetMode}`)
         const entryOffsetX = targetMode === 'motion' ? BUBBLE_MOTION.reserveX : 0
         const entryOffsetY = targetMode === 'motion' ? BUBBLE_MOTION.reserveY : 0
+        const preserveAnchor = phaseRef.current !== 'prepared'
         invoke('sync_mascot_bubble', {
           width,
           height,
           entryOffsetX,
           entryOffsetY,
+          preserveAnchor,
         }).catch(() => {})
       }
 
@@ -1034,7 +1039,7 @@ export default function MascotBubble() {
       phaseRef.current = 'visible'
       logBubbleDev(`[bubble ${currentId}] visible`)
       if (activeMotionTokensRef.current.size === 0) {
-        syncBubbleGeometry('stable')
+        syncBubbleGeometry('stable', { preserveAnchor: true })
       }
     } else if (currentPhase === 'exiting') {
       activeMotionTokensRef.current.delete('global-exit')
@@ -1060,7 +1065,7 @@ export default function MascotBubble() {
           return rest
         })
         if (activeMotionTokensRef.current.size === 0 && phaseRef.current === 'visible') {
-          syncBubbleGeometry('stable')
+          syncBubbleGeometry('stable', { preserveAnchor: true })
         }
       }
 
@@ -1078,7 +1083,7 @@ export default function MascotBubble() {
           phaseRef.current = 'visible'
           logBubbleDev(`[bubble ${currentId}] multi-row visible`)
           if (activeMotionTokensRef.current.size === 0) {
-            syncBubbleGeometry('stable')
+            syncBubbleGeometry('stable', { preserveAnchor: true })
           }
         }
       } else if (currentPhase === 'exiting') {

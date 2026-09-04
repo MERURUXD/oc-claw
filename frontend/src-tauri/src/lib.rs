@@ -62,10 +62,36 @@ static PET_POMODORO_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Latest pet-mode mascot scales. The click-through poll thread is long-lived,
 /// so it reads this on each pass instead of capturing the size it started with.
 static PET_MASCOT_SCALES: Mutex<(f64, f64)> = Mutex::new((1.0, LARGE_MASCOT_SIZE_MULTIPLIER));
-/// Last-reported size (logical px) and entry reserves of the mascot status bubble window,
-/// so the bubble can be re-anchored to the mini window whenever the mini moves/resizes.
-/// Stored as (logical_width, logical_height, reserve_x, reserve_y).
-static BUBBLE_SIZE: Mutex<(f64, f64, f64, f64)> = Mutex::new((200.0, 40.0, 170.0, 115.0));
+#[derive(Clone, Copy, Debug)]
+pub struct BubbleAnchor {
+    pub card_right: f64,
+    pub card_bottom: f64,
+    pub mon_x: f64,
+    pub mon_y: f64,
+    pub mon_w: f64,
+    pub mon_h: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BubbleGeometryState {
+    pub width: f64,
+    pub height: f64,
+    pub reserve_x: f64,
+    pub reserve_y: f64,
+    pub anchor: Option<BubbleAnchor>,
+}
+
+/// Last-reported geometry state and resting visual anchor of the mascot status bubble window.
+static BUBBLE_GEOMETRY: Mutex<BubbleGeometryState> = Mutex::new(BubbleGeometryState {
+    width: 200.0,
+    height: 40.0,
+    reserve_x: 170.0,
+    reserve_y: 115.0,
+    anchor: None,
+});
+/// Tracks whether the mini window is currently expanded into the message/settings panel.
+static MINI_IS_EXPANDED: AtomicBool = AtomicBool::new(false);
+
 
 /// Coalesces drag-apply tasks so we never queue more than one
 /// setFrameOrigin: call on the main thread at a time. The poll thread
@@ -3118,12 +3144,14 @@ async fn open_mini(app: tauri::AppHandle) -> Result<(), String> {
     {
         let app_for_events = app.clone();
         win.on_window_event(move |event| {
-            if matches!(event, tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)) {
-                let (w, h, ox, oy) = *BUBBLE_SIZE.lock().unwrap();
-                let app = app_for_events.clone();
-                tauri::async_runtime::spawn(async move {
-                    let _ = sync_mascot_bubble(app, w, h, Some(ox), Some(oy)).await;
-                });
+            if matches!(event, tauri::WindowEvent::Moved(_)) {
+                if !MINI_IS_EXPANDED.load(Ordering::SeqCst) {
+                    let geom = *BUBBLE_GEOMETRY.lock().unwrap();
+                    let app = app_for_events.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let _ = sync_mascot_bubble(app, geom.width, geom.height, Some(geom.reserve_x), Some(geom.reserve_y), Some(false)).await;
+                    });
+                }
             }
         });
     }
@@ -3445,8 +3473,8 @@ async fn move_mini_by(app: tauri::AppHandle, dx: f64, dy: f64) -> Result<(), Str
             let _ = win.set_position(tauri::LogicalPosition::new(logical_x + dx, logical_y + dy));
         }
     }
-    let (bw, bh, ox, oy) = *BUBBLE_SIZE.lock().unwrap();
-    let _ = sync_mascot_bubble(app.clone(), bw, bh, Some(ox), Some(oy)).await;
+    let geom = *BUBBLE_GEOMETRY.lock().unwrap();
+    let _ = sync_mascot_bubble(app.clone(), geom.width, geom.height, Some(geom.reserve_x), Some(geom.reserve_y), Some(false)).await;
     Ok(())
 }
 
@@ -3635,8 +3663,8 @@ async fn set_mini_origin(
                 x, y
             );
             let _ = win.set_position(tauri::LogicalPosition::new(x, y));
-            let (bw, bh, ox, oy) = *BUBBLE_SIZE.lock().unwrap();
-            let _ = sync_mascot_bubble(app.clone(), bw, bh, Some(ox), Some(oy)).await;
+            let geom = *BUBBLE_GEOMETRY.lock().unwrap();
+            let _ = sync_mascot_bubble(app.clone(), geom.width, geom.height, Some(geom.reserve_x), Some(geom.reserve_y), Some(false)).await;
             return Ok(());
         }
         if let Ok(Some(monitor)) = win.current_monitor() {
@@ -3670,8 +3698,8 @@ async fn set_mini_origin(
             let _ = win.set_position(tauri::LogicalPosition::new(x, y + MASCOT_TOP_INSET));
         }
     }
-    let (bw, bh, ox, oy) = *BUBBLE_SIZE.lock().unwrap();
-    let _ = sync_mascot_bubble(app.clone(), bw, bh, Some(ox), Some(oy)).await;
+    let geom = *BUBBLE_GEOMETRY.lock().unwrap();
+    let _ = sync_mascot_bubble(app.clone(), geom.width, geom.height, Some(geom.reserve_x), Some(geom.reserve_y), Some(false)).await;
     Ok(())
 }
 
@@ -3686,6 +3714,10 @@ async fn set_ime_mode(_app: tauri::AppHandle, _active: bool) -> Result<(), Strin
 /// and expanded (larger, centered on notch) states.
 #[tauri::command]
 async fn set_mini_expanded(app: tauri::AppHandle, expanded: bool, position: Option<String>, efficiency: Option<bool>, #[allow(unused_variables)] max_height: Option<f64>, mascot_scale: Option<f64>, large_mascot: Option<bool>, keep_position: Option<bool>, large_mascot_scale: Option<f64>) -> Result<(), String> {
+    MINI_IS_EXPANDED.store(expanded, Ordering::SeqCst);
+    if !expanded {
+        BUBBLE_GEOMETRY.lock().unwrap().anchor = None;
+    }
     let win = app.get_webview_window("mini").ok_or("mini window not found")?;
     let pos = position.unwrap_or_else(|| "right".to_string());
     let mascot_scale = sanitized_mascot_scale(mascot_scale);
@@ -11148,11 +11180,50 @@ const BUBBLE_PAD_BOTTOM: f64 = 16.0;
 /// `entry_offset_x` / `entry_offset_y` specify the motion envelope reserve so the transparent
 /// window encompasses the full flight path without clipping.
 ///
-/// Anchor: The resting bubble content is horizontally right-aligned to the mascot (clamped to
-/// monitor margins), and vertically stacked directly above the mascot's head by default (flipped
-/// below when there is no room above). Because the native window encompasses a motion envelope,
-/// window coordinates are offset such that the resting bubble content position remains strictly
-/// locked relative to the mascot regardless of envelope size or dynamic width changes.
+#[cfg(target_os = "windows")]
+fn set_bubble_frame_atomic(
+    win: &tauri::WebviewWindow,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER,
+    };
+
+    let hwnd_raw = win.hwnd().map_err(|e| e.to_string())?.0;
+    let hwnd = HWND(hwnd_raw as _);
+    let scale = win.scale_factor().unwrap_or(1.0);
+
+    let px_x = (x * scale).round() as i32;
+    let px_y = (y * scale).round() as i32;
+    let px_w = (width * scale).round() as i32;
+    let px_h = (height * scale).round() as i32;
+
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            HWND::default(),
+            px_x,
+            px_y,
+            px_w,
+            px_h,
+            SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
+        );
+    }
+    Ok(())
+}
+
+/// Position the mascot status bubble next to the primary mascot window.
+/// `width`/`height` are the bubble's logical content size in logical pixels, measured
+/// by the frontend via ResizeObserver.
+/// `entry_offset_x` / `entry_offset_y` specify the motion envelope reserve so the transparent
+/// window encompasses the full flight path without clipping.
+/// `preserve_anchor` indicates whether to preserve the existing resting visual anchor
+/// instead of re-anchoring to the mini window (essential during panel expansion/collapse
+/// and motion envelope changes to eliminate drift and 1-frame settle flicker).
 #[tauri::command]
 async fn sync_mascot_bubble(
     app: tauri::AppHandle,
@@ -11160,86 +11231,16 @@ async fn sync_mascot_bubble(
     height: f64,
     entry_offset_x: Option<f64>,
     entry_offset_y: Option<f64>,
+    preserve_anchor: Option<bool>,
 ) -> Result<(), String> {
     let res_x = entry_offset_x.unwrap_or(BUBBLE_RESERVE_X);
     let res_y = entry_offset_y.unwrap_or(BUBBLE_RESERVE_Y);
-    *BUBBLE_SIZE.lock().unwrap() = (width, height, res_x, res_y);
+
     let Some(win) = app.get_webview_window("mascot-bubble") else {
         return Ok(());
     };
     let Some(mini) = app.get_webview_window("mini") else {
         return Ok(());
-    };
-
-    // Mini window frame + its monitor rect, both in logical pixels.
-    let (mini_x, mini_y, mini_w, mini_h, mon_x, mon_y, mon_w, mon_h): (f64, f64, f64, f64, f64, f64, f64, f64) = match () {
-        #[cfg(target_os = "macos")]
-        () => {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let mini_clone = mini.clone();
-            let app_clone = app.clone();
-            app_clone
-                .run_on_main_thread(move || {
-                    use objc2::msg_send;
-                    use objc2::runtime::{AnyClass, AnyObject};
-                    use objc2_foundation::NSRect;
-                    if let Ok(ns_win) = mini_clone.ns_window() {
-                        let obj = unsafe { &*(ns_win as *mut AnyObject) };
-                        let frame: NSRect = unsafe { msg_send![obj, frame] };
-                        let screen: *mut AnyObject = unsafe { msg_send![obj, screen] };
-                        let screen_frame: NSRect = if screen.is_null() {
-                            let cls = match AnyClass::get(c"NSScreen") {
-                                Some(c) => c,
-                                None => return,
-                            };
-                            let main_screen: *mut AnyObject = unsafe { msg_send![cls, mainScreen] };
-                            if main_screen.is_null() {
-                                return;
-                            }
-                            unsafe { msg_send![&*main_screen, frame] }
-                        } else {
-                            unsafe { msg_send![&*screen, frame] }
-                        };
-                        let _ = tx.send((
-                            frame.origin.x,
-                            frame.origin.y,
-                            frame.size.width,
-                            frame.size.height,
-                            screen_frame.origin.x,
-                            screen_frame.origin.y,
-                            screen_frame.size.width,
-                            screen_frame.size.height,
-                        ));
-                    }
-                })
-                .map_err(|e| e.to_string())?;
-            rx.recv_timeout(std::time::Duration::from_secs(1))
-                .map_err(|e| e.to_string())?
-        }
-        #[cfg(target_os = "windows")]
-        () => {
-            let scale = mini.scale_factor().unwrap_or(1.0);
-            let pos = mini.outer_position().map_err(|e| e.to_string())?;
-            let size = mini.outer_size().map_err(|e| e.to_string())?;
-            let monitor = mini
-                .current_monitor()
-                .map_err(|e| e.to_string())?
-                .ok_or("mini has no monitor")?;
-            let mpos = monitor.position();
-            let msize = monitor.size();
-            (
-                pos.x as f64 / scale,
-                pos.y as f64 / scale,
-                size.width as f64 / scale,
-                size.height as f64 / scale,
-                mpos.x as f64 / scale,
-                mpos.y as f64 / scale,
-                msize.width as f64 / scale,
-                msize.height as f64 / scale,
-            )
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        () => return Ok(()),
     };
 
     let margin = 8.0;
@@ -11250,71 +11251,204 @@ async fn sync_mascot_bubble(
     let win_w = (bubble_w + res_x + BUBBLE_PAD_RIGHT).max(8.0);
     let win_h = (bubble_h + res_y + BUBBLE_PAD_BOTTOM).max(8.0);
 
-    // Horizontal Alignment: Resting bubble right edge aligns with the mascot's right edge.
-    // Inside the envelope window, the resting card's right edge is at `win_w - BUBBLE_PAD_RIGHT`.
-    // We want the resting card's right edge on screen to be `mini_x + mini_w - 12.0`.
-    let target_card_right = mini_x + mini_w - 12.0;
-    let mut win_x = target_card_right - (win_w - BUBBLE_PAD_RIGHT);
-
-    // Clamp resting card to monitor bounds [mon_x + margin, mon_x + mon_w - margin]
-    let card_screen_left = win_x + res_x;
-    if card_screen_left < mon_x + margin {
-        win_x += (mon_x + margin) - card_screen_left;
-    }
-    let card_screen_right = win_x + win_w - BUBBLE_PAD_RIGHT;
-    if card_screen_right > mon_x + mon_w - margin {
-        win_x -= card_screen_right - (mon_x + mon_w - margin);
-    }
-
-    // Vertical Alignment
-    #[cfg(target_os = "macos")]
-    let win_y = {
-        // macOS NSWindow frame origin is bottom-left. Above mascot:
-        // Desired card bottom is at mini_y + mini_h + MASCOT_BUBBLE_GAP + 8.0.
-        // Inside window, card bottom is at BUBBLE_PAD_BOTTOM.
-        let card_target_bottom = mini_y + mini_h + MASCOT_BUBBLE_GAP + 8.0;
-        let mut y = card_target_bottom - BUBBLE_PAD_BOTTOM;
-
-        // Check if resting card top exceeds monitor top
-        let card_screen_top = y + win_h - res_y;
-        if card_screen_top > mon_y + mon_h - margin {
-            // Flip below mascot
-            let card_flipped_top = mini_y - MASCOT_BUBBLE_GAP - 8.0;
-            y = card_flipped_top - (win_h - res_y);
-        }
-
-        // Clamp resting card bottom to monitor bottom
-        if y + BUBBLE_PAD_BOTTOM < mon_y + margin {
-            y = (mon_y + margin) - BUBBLE_PAD_BOTTOM;
-        }
-        y
+    let is_expanded = MINI_IS_EXPANDED.load(Ordering::SeqCst);
+    let should_preserve = if is_expanded {
+        true
+    } else {
+        preserve_anchor.unwrap_or(false)
     };
 
-    #[cfg(not(target_os = "macos"))]
-    let win_y = {
-        // Windows top-left origin. Above mascot:
-        // Desired card bottom on screen is mini_y - MASCOT_BUBBLE_GAP - 8.0.
-        // Inside window, card bottom is at win_h - BUBBLE_PAD_BOTTOM.
-        let card_target_bottom = mini_y - MASCOT_BUBBLE_GAP - 8.0;
-        let mut y = card_target_bottom - (win_h - BUBBLE_PAD_BOTTOM);
+    let existing_anchor = BUBBLE_GEOMETRY.lock().unwrap().anchor;
 
-        // Check if resting card top exceeds monitor top
-        let card_screen_top = y + res_y;
-        if card_screen_top < mon_y + margin {
-            // Flip below mascot
-            let card_flipped_top = mini_y + mini_h + MASCOT_BUBBLE_GAP + 8.0;
-            y = card_flipped_top - res_y;
+    let (final_win_x, final_win_y) = if should_preserve && existing_anchor.is_some() {
+        let anchor = existing_anchor.unwrap();
+        let mut preserved_card_right = anchor.card_right;
+        if preserved_card_right - bubble_w < anchor.mon_x + margin {
+            preserved_card_right = anchor.mon_x + margin + bubble_w;
+        }
+        if preserved_card_right > anchor.mon_x + anchor.mon_w - margin {
+            preserved_card_right = anchor.mon_x + anchor.mon_w - margin;
         }
 
-        // Clamp resting card bottom to monitor bottom
-        let card_screen_bottom = y + win_h - BUBBLE_PAD_BOTTOM;
-        if card_screen_bottom > mon_y + mon_h - margin {
-            y -= card_screen_bottom - (mon_y + mon_h - margin);
+        let x = preserved_card_right - (win_w - BUBBLE_PAD_RIGHT);
+
+        #[cfg(target_os = "macos")]
+        let y = {
+            let mut preserved_card_bottom = anchor.card_bottom;
+            if preserved_card_bottom + bubble_h > anchor.mon_y + anchor.mon_h - margin {
+                preserved_card_bottom = (anchor.mon_y + anchor.mon_h - margin - bubble_h).max(anchor.mon_y + margin);
+            }
+            if preserved_card_bottom < anchor.mon_y + margin {
+                preserved_card_bottom = anchor.mon_y + margin;
+            }
+            preserved_card_bottom - BUBBLE_PAD_BOTTOM
+        };
+
+        #[cfg(not(target_os = "macos"))]
+        let y = {
+            let mut preserved_card_bottom = anchor.card_bottom;
+            if preserved_card_bottom - bubble_h < anchor.mon_y + margin {
+                preserved_card_bottom = (anchor.mon_y + margin + bubble_h).min(anchor.mon_y + anchor.mon_h - margin);
+            }
+            if preserved_card_bottom > anchor.mon_y + anchor.mon_h - margin {
+                preserved_card_bottom = anchor.mon_y + anchor.mon_h - margin;
+            }
+            preserved_card_bottom - (win_h - BUBBLE_PAD_BOTTOM)
+        };
+
+        (x, y)
+    } else {
+        // Mini window frame + its monitor rect, both in logical pixels.
+        let (mini_x, mini_y, mini_w, mini_h, mon_x, mon_y, mon_w, mon_h): (f64, f64, f64, f64, f64, f64, f64, f64) = match () {
+            #[cfg(target_os = "macos")]
+            () => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let mini_clone = mini.clone();
+                let app_clone = app.clone();
+                app_clone
+                    .run_on_main_thread(move || {
+                        use objc2::msg_send;
+                        use objc2::runtime::{AnyClass, AnyObject};
+                        use objc2_foundation::NSRect;
+                        if let Ok(ns_win) = mini_clone.ns_window() {
+                            let obj = unsafe { &*(ns_win as *mut AnyObject) };
+                            let frame: NSRect = unsafe { msg_send![obj, frame] };
+                            let screen: *mut AnyObject = unsafe { msg_send![obj, screen] };
+                            let screen_frame: NSRect = if screen.is_null() {
+                                let cls = match AnyClass::get(c"NSScreen") {
+                                    Some(c) => c,
+                                    None => return,
+                                };
+                                let main_screen: *mut AnyObject = unsafe { msg_send![cls, mainScreen] };
+                                if main_screen.is_null() {
+                                    return;
+                                }
+                                unsafe { msg_send![&*main_screen, frame] }
+                            } else {
+                                unsafe { msg_send![&*screen, frame] }
+                            };
+                            let _ = tx.send((
+                                frame.origin.x,
+                                frame.origin.y,
+                                frame.size.width,
+                                frame.size.height,
+                                screen_frame.origin.x,
+                                screen_frame.origin.y,
+                                screen_frame.size.width,
+                                screen_frame.size.height,
+                            ));
+                        }
+                    })
+                    .map_err(|e| e.to_string())?;
+                rx.recv_timeout(std::time::Duration::from_secs(1))
+                    .map_err(|e| e.to_string())?
+            }
+            #[cfg(target_os = "windows")]
+            () => {
+                let scale = mini.scale_factor().unwrap_or(1.0);
+                let pos = mini.outer_position().map_err(|e| e.to_string())?;
+                let size = mini.outer_size().map_err(|e| e.to_string())?;
+                let monitor = mini
+                    .current_monitor()
+                    .map_err(|e| e.to_string())?
+                    .ok_or("mini has no monitor")?;
+                let mpos = monitor.position();
+                let msize = monitor.size();
+                (
+                    pos.x as f64 / scale,
+                    pos.y as f64 / scale,
+                    size.width as f64 / scale,
+                    size.height as f64 / scale,
+                    mpos.x as f64 / scale,
+                    mpos.y as f64 / scale,
+                    msize.width as f64 / scale,
+                    msize.height as f64 / scale,
+                )
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            () => return Ok(()),
+        };
+
+        // Horizontal Alignment: Resting bubble right edge aligns with the mascot's right edge.
+        // Inside the envelope window, the resting card's right edge is at `win_w - BUBBLE_PAD_RIGHT`.
+        // We want the resting card's right edge on screen to be `mini_x + mini_w - 12.0`.
+        let target_card_right = mini_x + mini_w - 12.0;
+        let mut win_x = target_card_right - (win_w - BUBBLE_PAD_RIGHT);
+
+        // Clamp resting card to monitor bounds [mon_x + margin, mon_x + mon_w - margin]
+        let card_screen_left = win_x + res_x;
+        if card_screen_left < mon_x + margin {
+            win_x += (mon_x + margin) - card_screen_left;
         }
-        y
+        let card_screen_right = win_x + win_w - BUBBLE_PAD_RIGHT;
+        if card_screen_right > mon_x + mon_w - margin {
+            win_x -= card_screen_right - (mon_x + mon_w - margin);
+        }
+        let card_right = win_x + win_w - BUBBLE_PAD_RIGHT;
+
+        // Vertical Alignment
+        #[cfg(target_os = "macos")]
+        let (win_y, card_bottom) = {
+            let card_target_bottom = mini_y + mini_h + MASCOT_BUBBLE_GAP + 8.0;
+            let mut y = card_target_bottom - BUBBLE_PAD_BOTTOM;
+
+            let card_screen_top = y + win_h - res_y;
+            if card_screen_top > mon_y + mon_h - margin {
+                let card_flipped_top = mini_y - MASCOT_BUBBLE_GAP - 8.0;
+                y = card_flipped_top - (win_h - res_y);
+            }
+
+            if y + BUBBLE_PAD_BOTTOM < mon_y + margin {
+                y = (mon_y + margin) - BUBBLE_PAD_BOTTOM;
+            }
+            let b = y + BUBBLE_PAD_BOTTOM;
+            (y, b)
+        };
+
+        #[cfg(not(target_os = "macos"))]
+        let (win_y, card_bottom) = {
+            let card_target_bottom = mini_y - MASCOT_BUBBLE_GAP - 8.0;
+            let mut y = card_target_bottom - (win_h - BUBBLE_PAD_BOTTOM);
+
+            let card_screen_top = y + res_y;
+            if card_screen_top < mon_y + margin {
+                let card_flipped_top = mini_y + mini_h + MASCOT_BUBBLE_GAP + 8.0;
+                y = card_flipped_top - res_y;
+            }
+
+            let card_screen_bottom = y + win_h - BUBBLE_PAD_BOTTOM;
+            if card_screen_bottom > mon_y + mon_h - margin {
+                y -= card_screen_bottom - (mon_y + mon_h - margin);
+            }
+            let b = y + win_h - BUBBLE_PAD_BOTTOM;
+            (y, b)
+        };
+
+        let anchor = BubbleAnchor {
+            card_right,
+            card_bottom,
+            mon_x,
+            mon_y,
+            mon_w,
+            mon_h,
+        };
+        BUBBLE_GEOMETRY.lock().unwrap().anchor = Some(anchor);
+
+        (win_x, win_y)
     };
 
-    let _ = win.set_size(tauri::LogicalSize::new(win_w, win_h));
+    {
+        let mut geom = BUBBLE_GEOMETRY.lock().unwrap();
+        geom.width = bubble_w;
+        geom.height = bubble_h;
+        geom.reserve_x = res_x;
+        geom.reserve_y = res_y;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        set_bubble_frame_atomic(&win, final_win_x, final_win_y, win_w, win_h)?;
+    }
 
     #[cfg(target_os = "macos")]
     {
@@ -11327,7 +11461,7 @@ async fn sync_mascot_bubble(
                 use objc2_foundation::{NSPoint, NSRect, NSSize};
                 if let Ok(ns_win) = win_clone.ns_window() {
                     let obj = unsafe { &*(ns_win as *mut AnyObject) };
-                    let new_frame = NSRect::new(NSPoint::new(win_x, win_y), NSSize::new(win_w, win_h));
+                    let new_frame = NSRect::new(NSPoint::new(final_win_x, final_win_y), NSSize::new(win_w, win_h));
                     unsafe {
                         let _: () = msg_send![obj, setFrame: new_frame, display: true, animate: false];
                     }
@@ -11335,9 +11469,11 @@ async fn sync_mascot_bubble(
             })
             .map_err(|e| e.to_string())?;
     }
-    #[cfg(not(target_os = "macos"))]
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        let _ = win.set_position(tauri::LogicalPosition::new(win_x, win_y));
+        let _ = win.set_size(tauri::LogicalSize::new(win_w, win_h));
+        let _ = win.set_position(tauri::LogicalPosition::new(final_win_x, final_win_y));
     }
 
     // Don't re-assert always-on-top while the Windows fullscreen watcher has
@@ -11382,6 +11518,7 @@ async fn set_mascot_bubble_visible(app: tauri::AppHandle, visible: bool) -> Resu
         reassert_mini_floating(&app);
     } else if let Some(win) = app.get_webview_window("mascot-bubble") {
         let _ = win.hide();
+        BUBBLE_GEOMETRY.lock().unwrap().anchor = None;
     }
     Ok(())
 }
