@@ -1,10 +1,31 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { emit, listen } from '@tauri-apps/api/event'
 import { useTranslation } from 'react-i18next'
 import type { TFunction } from 'i18next'
-import type { BubbleSessionDetail, MascotBubblePayload } from '../lib/types'
+import { motion, useReducedMotion } from 'motion/react'
+import type {
+  BubbleSessionDetail,
+  BubbleTransitionEvent,
+  MascotBubblePayload,
+} from '../lib/types'
 import { QuotaMiniBadge } from './QuotaCapsule'
+
+const BUBBLE_HIDDEN_SCALE = 0.97
+const BUBBLE_HIDDEN_Y = 8
+const BUBBLE_SPRING_TRANSITION = {
+  type: 'spring' as const,
+  stiffness: 360,
+  damping: 26,
+  mass: 0.8,
+}
+
+type BubblePhase =
+  | 'hidden'
+  | 'prepared'
+  | 'entering'
+  | 'visible'
+  | 'exiting'
 
 function hashSessionId(id: string): number {
   let hash = 0
@@ -144,93 +165,128 @@ function getSessionLine2(
  * Mascot status bubble — an interactive status capsule/card stack for the `mascot-bubble` window
  * (`index.html#/mascot-bubble`).
  *
- *   1. Listens for `mascot-bubble-summary` events emitted by Mini.tsx and
- *      renders either a compact glassmorphism capsule or a rich detailed status card stack.
- *   2. Measures its own content size with a ResizeObserver and reports it to
- *      Rust via `sync_mascot_bubble` so the window can be positioned next to
- *      the primary mascot.
- *   3. Allows clicking on individual bubble cards to interact
- *      (jump to terminal or expand panel).
- *   4. Renders nothing when no summary has arrived yet or no active sessions exist.
+ * Synchronizes with Mini.tsx via an explicit handshake protocol:
+ *   1. Mini emits `mascot-bubble-prepare` with a monotonic transitionId.
+ *   2. MascotBubble renders content in hidden spring state (opacity: 0, scale: 0.97, y: 8),
+ *      measures untransformed geometry (offsetWidth / offsetHeight), reports to Rust via `sync_mascot_bubble`,
+ *      and emits `mascot-bubble-ready`.
+ *   3. Mini shows the native window and emits `mascot-bubble-enter`.
+ *   4. MascotBubble awaits double requestAnimationFrame and springs to visible state.
+ *   5. When closing, Mini emits `mascot-bubble-close`. MascotBubble springs back to hidden state,
+ *      and on animation completion emits `mascot-bubble-exit-complete`, prompting Mini to hide the native window.
  */
 export default function MascotBubble() {
   const { t } = useTranslation()
+  const prefersReducedMotion = useReducedMotion()
+
   const [summary, setSummary] = useState<MascotBubblePayload | null>(null)
-  const [isEntering, setIsEntering] = useState(false)
-  const [isExiting, setIsExiting] = useState(false)
+  const [phase, setPhase] = useState<BubblePhase>('hidden')
+  const phaseRef = useRef<BubblePhase>('hidden')
+  phaseRef.current = phase
+
   const lastValidSummaryRef = useRef<MascotBubblePayload | null>(null)
   const contentRef = useRef<HTMLDivElement>(null)
   const lastSizeRef = useRef<{ width: number; height: number } | null>(null)
-  const enteringTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const exitingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const wasActiveRef = useRef(false)
+  const transitionIdRef = useRef<number>(0)
+  const readySentForTransitionRef = useRef<number>(-1)
+  const rafIdRef = useRef<number | null>(null)
 
-  // Listen for summary updates and close requests
+  // Measure geometry and notify Mini that the bubble is ready to be natively shown
+  const syncGeometryAndNotifyReady = useCallback((tid: number) => {
+    const el = contentRef.current
+    if (!el) return
+    const width = Math.ceil(el.offsetWidth)
+    const height = Math.ceil(el.offsetHeight)
+    if (width <= 0 || height <= 0) return
+
+    lastSizeRef.current = { width, height }
+    invoke('sync_mascot_bubble', { width, height })
+      .then(() => {
+        if (readySentForTransitionRef.current !== tid && transitionIdRef.current === tid) {
+          readySentForTransitionRef.current = tid
+          emit('mascot-bubble-ready', { transitionId: tid }).catch(() => {})
+        }
+      })
+      .catch(() => {})
+  }, [])
+
+  // Listen for handshake events from Mini
   useEffect(() => {
+    let unlistenPrepare: (() => void) | undefined
+    let unlistenEnter: (() => void) | undefined
     let unlistenSummary: (() => void) | undefined
     let unlistenClose: (() => void) | undefined
     let disposed = false
 
-    const handleSummary = (payload: MascotBubblePayload) => {
+    listen<BubbleTransitionEvent>('mascot-bubble-prepare', (e) => {
       if (disposed) return
-      const hasActive = payload.running > 0 || payload.waiting > 0
+      const tid = e.payload?.transitionId ?? 0
+      const newPayload = e.payload?.payload
+      transitionIdRef.current = tid
+      readySentForTransitionRef.current = -1
 
-      if (hasActive) {
-        lastValidSummaryRef.current = payload
-        if (exitingTimerRef.current) {
-          clearTimeout(exitingTimerRef.current)
-          exitingTimerRef.current = null
-        }
-        setIsExiting(false)
-
-        if (!wasActiveRef.current) {
-          wasActiveRef.current = true
-          setIsEntering(true)
-          if (enteringTimerRef.current) clearTimeout(enteringTimerRef.current)
-          enteringTimerRef.current = setTimeout(() => {
-            setIsEntering(false)
-            enteringTimerRef.current = null
-          }, 450)
-        }
-        setSummary(payload)
-      } else {
-        // No active sessions
-        if (wasActiveRef.current) {
-          wasActiveRef.current = false
-          setIsExiting(true)
-          setIsEntering(false)
-          if (exitingTimerRef.current) clearTimeout(exitingTimerRef.current)
-          exitingTimerRef.current = setTimeout(() => {
-            setSummary(null)
-            setIsExiting(false)
-            exitingTimerRef.current = null
-          }, 260)
-        } else {
-          setSummary(null)
-        }
+      if (newPayload) {
+        lastValidSummaryRef.current = newPayload
+        setSummary(newPayload)
       }
-    }
+      setPhase('prepared')
+      phaseRef.current = 'prepared'
+    }).then((fn) => {
+      if (disposed) fn()
+      else unlistenPrepare = fn
+    })
+
+    listen<BubbleTransitionEvent>('mascot-bubble-enter', (e) => {
+      if (disposed) return
+      const tid = e.payload?.transitionId ?? 0
+      if (tid !== transitionIdRef.current) return
+
+      if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current)
+      rafIdRef.current = requestAnimationFrame(() => {
+        rafIdRef.current = requestAnimationFrame(() => {
+          if (disposed || transitionIdRef.current !== tid) return
+          setPhase('entering')
+          phaseRef.current = 'entering'
+        })
+      })
+    }).then((fn) => {
+      if (disposed) fn()
+      else unlistenEnter = fn
+    })
 
     listen<MascotBubblePayload>('mascot-bubble-summary', (e) => {
-      handleSummary(e.payload)
+      if (disposed) return
+      const p = e.payload
+      const hasActive = p.running > 0 || p.waiting > 0
+
+      if (hasActive) {
+        lastValidSummaryRef.current = p
+        setSummary(p)
+        // If an update arrives while exiting, reverse back to entering
+        if (phaseRef.current === 'exiting') {
+          setPhase('entering')
+          phaseRef.current = 'entering'
+        }
+      } else {
+        if (phaseRef.current !== 'hidden' && phaseRef.current !== 'exiting') {
+          setPhase('exiting')
+          phaseRef.current = 'exiting'
+        }
+      }
     }).then((fn) => {
       if (disposed) fn()
       else unlistenSummary = fn
     })
 
-    listen('mascot-bubble-close', () => {
+    listen<BubbleTransitionEvent | undefined>('mascot-bubble-close', (e) => {
       if (disposed) return
-      if (wasActiveRef.current) {
-        wasActiveRef.current = false
-        setIsExiting(true)
-        setIsEntering(false)
-        if (exitingTimerRef.current) clearTimeout(exitingTimerRef.current)
-        exitingTimerRef.current = setTimeout(() => {
-          setSummary(null)
-          setIsExiting(false)
-          exitingTimerRef.current = null
-        }, 260)
+      const tid = e?.payload?.transitionId
+      if (tid != null) {
+        transitionIdRef.current = tid
       }
+      if (phaseRef.current === 'hidden') return
+      setPhase('exiting')
+      phaseRef.current = 'exiting'
     }).then((fn) => {
       if (disposed) fn()
       else unlistenClose = fn
@@ -238,19 +294,25 @@ export default function MascotBubble() {
 
     return () => {
       disposed = true
+      unlistenPrepare?.()
+      unlistenEnter?.()
       unlistenSummary?.()
       unlistenClose?.()
-      if (enteringTimerRef.current) clearTimeout(enteringTimerRef.current)
-      if (exitingTimerRef.current) clearTimeout(exitingTimerRef.current)
+      if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current)
     }
   }, [])
 
-  // The active payload to render (fallback to lastValidSummary during exiting animation)
-  const displaySummary = summary || (isExiting ? lastValidSummaryRef.current : null)
+  // The active payload to render (retain last valid summary during exiting so DOM does not collapse early)
+  const displaySummary = summary || (phase === 'exiting' ? lastValidSummaryRef.current : null)
 
-  // Report content size changes to Rust so it can reposition the bubble next
-  // to the mascot. Use untransformed offsetWidth / offsetHeight so spring
-  // transforms don't cause window resize jitter.
+  // Measure geometry on commit whenever prepared
+  useLayoutEffect(() => {
+    if (phase === 'prepared') {
+      syncGeometryAndNotifyReady(transitionIdRef.current)
+    }
+  }, [phase, displaySummary, syncGeometryAndNotifyReady])
+
+  // Continuous ResizeObserver to synchronize size changes with Rust untransformed
   useEffect(() => {
     const el = contentRef.current
     if (!el || !displaySummary) return
@@ -260,70 +322,78 @@ export default function MascotBubble() {
       const width = Math.ceil(target.offsetWidth)
       const height = Math.ceil(target.offsetHeight)
       if (width <= 0 || height <= 0) return
+
       const last = lastSizeRef.current
-      if (last && last.width === width && last.height === height) return
-      lastSizeRef.current = { width, height }
-      invoke('sync_mascot_bubble', { width, height }).catch(() => {})
+      if (!last || last.width !== width || last.height !== height) {
+        lastSizeRef.current = { width, height }
+        invoke('sync_mascot_bubble', { width, height }).catch(() => {})
+      }
+
+      if (phaseRef.current === 'prepared') {
+        const tid = transitionIdRef.current
+        if (readySentForTransitionRef.current !== tid) {
+          readySentForTransitionRef.current = tid
+          emit('mascot-bubble-ready', { transitionId: tid }).catch(() => {})
+        }
+      }
     })
     ro.observe(el)
     return () => ro.disconnect()
   }, [displaySummary])
 
-  if (!displaySummary) return <div className="mascot-bubble-root" />
+  // Safety fallback for prefersReducedMotion: ensure exit completion is emitted without hanging
+  useEffect(() => {
+    if (prefersReducedMotion && phase === 'exiting') {
+      const currentId = transitionIdRef.current
+      setPhase('hidden')
+      phaseRef.current = 'hidden'
+      setSummary(null)
+      emit('mascot-bubble-exit-complete', { transitionId: currentId }).catch(() => {})
+    }
+  }, [prefersReducedMotion, phase])
+
+  const handleAnimationComplete = useCallback(() => {
+    const currentPhase = phaseRef.current
+    const currentId = transitionIdRef.current
+
+    if (currentPhase === 'entering') {
+      setPhase('visible')
+      phaseRef.current = 'visible'
+    } else if (currentPhase === 'exiting') {
+      setPhase('hidden')
+      phaseRef.current = 'hidden'
+      setSummary(null)
+      emit('mascot-bubble-exit-complete', { transitionId: currentId }).catch(() => {})
+    }
+  }, [])
+
+  if (!displaySummary || phase === 'hidden') {
+    return <div className="mascot-bubble-root" />
+  }
 
   const hasRunning = displaySummary.running > 0
   const hasWaiting = displaySummary.waiting > 0
-  if (!hasRunning && !hasWaiting && !isExiting) return <div className="mascot-bubble-root" />
+  if (!hasRunning && !hasWaiting && phase !== 'exiting') {
+    return <div className="mascot-bubble-root" />
+  }
+
+  const isBubbleShown = phase === 'entering' || phase === 'visible'
+  const isInteractive = isBubbleShown
 
   const handleClick = (sessionId?: string) => {
+    if (!isInteractive) return
     emit('mascot-bubble-click', { sessionId }).catch(() => {})
     emit('mascot-bubble-session-click', { sessionId }).catch(() => {})
   }
 
-  const sessionsToRender = (displaySummary.activeSessions && displaySummary.activeSessions.length > 0)
-    ? displaySummary.activeSessions
-    : (displaySummary.activeSession ? [displaySummary.activeSession] : [])
+  const sessionsToRender =
+    displaySummary.activeSessions && displaySummary.activeSessions.length > 0
+      ? displaySummary.activeSessions
+      : displaySummary.activeSession
+        ? [displaySummary.activeSession]
+        : []
 
   const isDetailed = displaySummary.style === 'detailed' && sessionsToRender.length > 0
-
-  if (!isDetailed) {
-    return (
-      <div className="mascot-bubble-root" ref={contentRef}>
-        <div
-          className={`mascot-bubble-card ${isEntering ? 'is-entering' : ''} ${isExiting ? 'is-exiting' : ''}`}
-          onClick={() => !isExiting && handleClick()}
-          role="button"
-          tabIndex={0}
-        >
-          {hasRunning && (
-            <div className="mascot-bubble-item">
-              <span className="mascot-bubble-beacon">
-                <span className="mascot-bubble-beacon-ring is-running" />
-                <span className="mascot-bubble-beacon-dot is-running" />
-              </span>
-              <span className="mascot-bubble-count is-running">{displaySummary.running}</span>
-              <span className="mascot-bubble-label">running</span>
-            </div>
-          )}
-
-          {hasRunning && hasWaiting && <span className="mascot-bubble-divider" />}
-
-          {hasWaiting && (
-            <div className="mascot-bubble-item">
-              <span className="mascot-bubble-beacon">
-                <span className="mascot-bubble-beacon-ring is-waiting" />
-                <span className="mascot-bubble-beacon-dot is-waiting" />
-              </span>
-              <span className="mascot-bubble-count is-waiting">{displaySummary.waiting}</span>
-              <span className="mascot-bubble-label">waiting</span>
-            </div>
-          )}
-        </div>
-      </div>
-    )
-  }
-
-  const totalActive = displaySummary.running + displaySummary.waiting
 
   const getThinkingText = (sessionId: string) => {
     const rawPool = t('mini.thinkingPool', { returnObjects: true })
@@ -332,79 +402,162 @@ export default function MascotBubble() {
     return pool[idx % pool.length]
   }
 
+  const totalActive = displaySummary.running + displaySummary.waiting
+
   return (
     <div className="mascot-bubble-root" ref={contentRef}>
-      <div className="mascot-bubble-stack">
-        {sessionsToRender.map((session, idx) => {
-          const thinkingText = session.status === 'processing' ? getThinkingText(session.sessionId) : undefined
-          const { actionPrefix, actionContent, isWaiting, isProcessing } = getSessionLine2(session, t, thinkingText)
-          const isLast = idx === sessionsToRender.length - 1
-          const remainingOthers = Math.max(0, totalActive - sessionsToRender.length)
-          const showBadge = isLast && remainingOthers > 0
-
-          return (
-            <div
-              key={session.sessionId || idx}
-              className={`mascot-bubble-detailed ${isWaiting ? 'is-waiting-card' : ''} ${isEntering ? 'is-entering' : ''} ${isExiting ? 'is-exiting' : ''}`}
-              onClick={() => !isExiting && handleClick(session.sessionId)}
-              role="button"
-              tabIndex={0}
-              title={session.title}
-            >
-              <div className="mascot-bubble-content">
-                {/* Line 1: Session Title / Topic */}
-                <div className="mascot-bubble-title-line gap-1.5">
-                  <span className="mascot-bubble-main-title truncate">{session.title}</span>
-                  {(session.source === 'codex' || session.source === 'antigravity') && (
-                    <QuotaMiniBadge harness={session.source} />
-                  )}
-                </div>
-
-                {/* Line 2: Current Action / Status */}
-                {session.activeSubagents && session.activeSubagents.length > 0 ? (
-                  <div className="mascot-bubble-subagents-row">
-                    <span className="mascot-bubble-subagent-robot">🤖</span>
-                    {session.activeSubagents.map((sub, sIdx) => {
-                      const isSubWorking = sub.status === 'tool_running' || sub.status === 'processing'
-                      return (
-                        <span key={sub.id || sIdx} className="mascot-bubble-subagent-chip">
-                          <span className="mascot-bubble-subagent-role">[{sub.role}]</span>
-                          {isSubWorking && <span className="mascot-bubble-subagent-dot" />}
-                        </span>
-                      )
-                    })}
-                  </div>
-                ) : (
-                  <div className={`mascot-bubble-action-line ${isWaiting ? 'is-waiting' : ''} ${isProcessing ? 'is-processing' : ''}`}>
-                    {actionPrefix && <span className="mascot-bubble-tool-prefix">{actionPrefix}: </span>}
-                    <span className="mascot-bubble-action-text">{actionContent || (actionPrefix ? '' : t('mini.working', 'working...'))}</span>
-                  </div>
-                )}
+      <motion.div
+        className="mascot-bubble-motion"
+        initial={false}
+        animate={
+          isBubbleShown
+            ? {
+                opacity: 1,
+                scale: 1,
+                y: 0,
+              }
+            : {
+                opacity: 0,
+                scale: prefersReducedMotion ? 1 : BUBBLE_HIDDEN_SCALE,
+                y: prefersReducedMotion ? 0 : BUBBLE_HIDDEN_Y,
+              }
+        }
+        transition={
+          prefersReducedMotion
+            ? { duration: 0 }
+            : BUBBLE_SPRING_TRANSITION
+        }
+        onAnimationComplete={handleAnimationComplete}
+        style={{
+          pointerEvents: isInteractive ? 'auto' : 'none',
+        }}
+      >
+        {!isDetailed ? (
+          <div
+            className="mascot-bubble-card"
+            onClick={() => handleClick()}
+            role="button"
+            tabIndex={0}
+          >
+            {hasRunning && (
+              <div className="mascot-bubble-item">
+                <span className="mascot-bubble-beacon">
+                  <span className="mascot-bubble-beacon-ring is-running" />
+                  <span className="mascot-bubble-beacon-dot is-running" />
+                </span>
+                <span className="mascot-bubble-count is-running">{displaySummary.running}</span>
+                <span className="mascot-bubble-label">running</span>
               </div>
+            )}
 
-              {/* Right side indicator: Spinner or Pulsing Dot + Badge */}
-              <div className="mascot-bubble-status-area">
-                {showBadge && (
-                  <span
-                    className="mascot-bubble-badge"
-                    title={t('settings.bubbleActiveOthers', { count: remainingOthers })}
+            {hasRunning && hasWaiting && <span className="mascot-bubble-divider" />}
+
+            {hasWaiting && (
+              <div className="mascot-bubble-item">
+                <span className="mascot-bubble-beacon">
+                  <span className="mascot-bubble-beacon-ring is-waiting" />
+                  <span className="mascot-bubble-beacon-dot is-waiting" />
+                </span>
+                <span className="mascot-bubble-count is-waiting">{displaySummary.waiting}</span>
+                <span className="mascot-bubble-label">waiting</span>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="mascot-bubble-stack">
+            {sessionsToRender.map((session, idx) => {
+              const thinkingText = session.status === 'processing' ? getThinkingText(session.sessionId) : undefined
+              const { actionPrefix, actionContent, isWaiting, isProcessing } = getSessionLine2(session, t, thinkingText)
+              const isLast = idx === sessionsToRender.length - 1
+              const remainingOthers = Math.max(0, totalActive - sessionsToRender.length)
+              const showBadge = isLast && remainingOthers > 0
+
+              return (
+                <motion.div
+                  key={session.sessionId || idx}
+                  className="mascot-bubble-row-motion"
+                  initial={{
+                    opacity: 0,
+                    y: prefersReducedMotion ? 0 : 4,
+                  }}
+                  animate={{
+                    opacity: 1,
+                    y: 0,
+                  }}
+                  transition={
+                    prefersReducedMotion
+                      ? { duration: 0 }
+                      : {
+                          delay: Math.min(idx, 3) * 0.035,
+                          duration: 0.18,
+                          ease: 'easeOut',
+                        }
+                  }
+                >
+                  <div
+                    className={`mascot-bubble-detailed ${isWaiting ? 'is-waiting-card' : ''}`}
+                    onClick={() => handleClick(session.sessionId)}
+                    role="button"
+                    tabIndex={0}
+                    title={session.title}
                   >
-                    +{remainingOthers}
-                  </span>
-                )}
-                {isWaiting ? (
-                  <span className="mascot-bubble-beacon">
-                    <span className="mascot-bubble-beacon-ring is-waiting" />
-                    <span className="mascot-bubble-beacon-dot is-waiting" />
-                  </span>
-                ) : (
-                  <span className="mascot-bubble-spinner" />
-                )}
-              </div>
-            </div>
-          )
-        })}
-      </div>
+                    <div className="mascot-bubble-content">
+                      {/* Line 1: Session Title / Topic */}
+                      <div className="mascot-bubble-title-line gap-1.5">
+                        <span className="mascot-bubble-main-title truncate">{session.title}</span>
+                        {(session.source === 'codex' || session.source === 'antigravity') && (
+                          <QuotaMiniBadge harness={session.source} />
+                        )}
+                      </div>
+
+                      {/* Line 2: Current Action / Status */}
+                      {session.activeSubagents && session.activeSubagents.length > 0 ? (
+                        <div className="mascot-bubble-subagents-row">
+                          <span className="mascot-bubble-subagent-robot">🤖</span>
+                          {session.activeSubagents.map((sub, sIdx) => {
+                            const isSubWorking = sub.status === 'tool_running' || sub.status === 'processing'
+                            return (
+                              <span key={sub.id || sIdx} className="mascot-bubble-subagent-chip">
+                                <span className="mascot-bubble-subagent-role">[{sub.role}]</span>
+                                {isSubWorking && <span className="mascot-bubble-subagent-dot" />}
+                              </span>
+                            )
+                          })}
+                        </div>
+                      ) : (
+                        <div className={`mascot-bubble-action-line ${isWaiting ? 'is-waiting' : ''} ${isProcessing ? 'is-processing' : ''}`}>
+                          {actionPrefix && <span className="mascot-bubble-tool-prefix">{actionPrefix}: </span>}
+                          <span className="mascot-bubble-action-text">{actionContent || (actionPrefix ? '' : t('mini.working', 'working...'))}</span>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Right side indicator: Spinner or Pulsing Dot + Badge */}
+                    <div className="mascot-bubble-status-area">
+                      {showBadge && (
+                        <span
+                          className="mascot-bubble-badge"
+                          title={t('settings.bubbleActiveOthers', { count: remainingOthers })}
+                        >
+                          +{remainingOthers}
+                        </span>
+                      )}
+                      {isWaiting ? (
+                        <span className="mascot-bubble-beacon">
+                          <span className="mascot-bubble-beacon-ring is-waiting" />
+                          <span className="mascot-bubble-beacon-dot is-waiting" />
+                        </span>
+                      ) : (
+                        <span className="mascot-bubble-spinner" />
+                      )}
+                    </div>
+                  </div>
+                </motion.div>
+              )
+            })}
+          </div>
+        )}
+      </motion.div>
     </div>
   )
 }
