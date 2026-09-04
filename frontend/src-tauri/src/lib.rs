@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub mod harness_quota;
 use harness_quota::get_harness_quota;
 pub mod session_activity;
+pub mod hermes;
 
 /// Whether the efficiency-mode notch hover tracking thread should be running.
 static EFFICIENCY_HOVER_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -6986,6 +6987,9 @@ pub struct ClaudeSession {
     /// Normalized activity subtitle state for the mascot bubble.
     #[serde(rename = "activity", skip_serializing_if = "Option::is_none")]
     pub activity: Option<session_activity::SessionActivity>,
+    /// Active turn ID for Hermes or other harnesses supporting per-turn lifecycles.
+    #[serde(rename = "turnId", skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
 }
 
 type PendingPermissions = Arc<Mutex<HashMap<String, std::sync::mpsc::Sender<String>>>>;
@@ -9109,6 +9113,7 @@ pub fn load_recent_antigravity_sessions() -> Vec<ClaudeSession> {
             cursor_native_handle: None,
             active_subagents: None,
             activity: None,
+            turn_id: None,
         };
 
         let is_active = update_antigravity_session_from_transcript(&mut session);
@@ -10233,52 +10238,40 @@ fn is_interactive_tool(tool: &str) -> bool {
 ///   2. No event has arrived within 180s (staleness timeout), OR
 ///   3. The last non-internal event reports a non-active status
 ///
-/// Internal-tool events (skill_view, skill_manage, skills_list, memory_*, etc.)
-/// are skipped when picking the last status, so framework housekeeping during a
-/// turn doesn't keep the UI stuck in "working".
-fn load_ooclaw_status(hermes_dir: &std::path::Path) -> HashMap<String, String> {
+/// Helper to load raw events per session from ooclaw-status.json
+fn load_ooclaw_raw_events(hermes_dir: &std::path::Path) -> HashMap<String, Vec<serde_json::Value>> {
     let mut result = HashMap::new();
     let status_path = hermes_dir.join("ooclaw-status.json");
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
     if let Ok(data) = std::fs::read_to_string(&status_path) {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
             if let Some(obj) = parsed.as_object() {
                 for (sid, events) in obj {
                     if let Some(arr) = events.as_array() {
-                        if arr.is_empty() { continue; }
-                        // Pick the latest non-internal event (skip skill_*/memor_* housekeeping).
-                        let last_non_internal = arr.iter().rev().find(|e| {
-                            let tool = e.get("tool").and_then(|v| v.as_str()).unwrap_or("");
-                            !is_internal_tool(tool)
-                        }).or_else(|| arr.last());
-
-                        let status = last_non_internal
-                            .map(|e| {
-                                let ts = e.get("timestamp").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                // Staleness timeout: if no event within 60s, session is stopped
-                                if ts > 0.0 && (now_secs - ts) > 60.0 {
-                                    return "waiting_for_input".to_string();
-                                }
-                                let tool = e.get("tool").and_then(|v| v.as_str()).unwrap_or("");
-                                let event_type = e.get("event").and_then(|v| v.as_str()).unwrap_or("");
-                                if event_type == "SessionEnd" || event_type == "Stop" {
-                                    return "waiting_for_input".to_string();
-                                }
-                                if event_type == "PermissionRequest"
-                                    || (event_type == "PreToolUse" && is_interactive_tool(tool))
-                                {
-                                    return "blocked_on_user".to_string();
-                                }
-                                e.get("claudeStatus").and_then(|v| v.as_str()).unwrap_or("").to_string()
-                            })
-                            .unwrap_or_default();
-
-                        result.insert(sid.clone(), status);
+                        result.insert(sid.clone(), arr.clone());
                     }
                 }
             }
         }
+    }
+    result
+}
+
+/// Read ooclaw-status.json from a Hermes profile directory.
+/// Returns a map of session_id -> effective claudeStatus using the canonical hermes reducer.
+/// Silence is NOT completion; no wall-clock timeouts.
+fn load_ooclaw_status(hermes_dir: &std::path::Path) -> HashMap<String, String> {
+    let mut result = HashMap::new();
+    let raw = load_ooclaw_raw_events(hermes_dir);
+    for (sid, events) in raw {
+        if events.is_empty() { continue; }
+        let reduced = hermes::reduce_hermes_events(&events, None);
+        let status_str = match reduced.status {
+            hermes::HermesStatus::Processing => "processing".to_string(),
+            hermes::HermesStatus::ToolRunning => "running_tool".to_string(),
+            hermes::HermesStatus::Waiting => "blocked_on_user".to_string(),
+            hermes::HermesStatus::Stopped | hermes::HermesStatus::Failed => "waiting_for_input".to_string(),
+        };
+        result.insert(sid, status_str);
     }
     result
 }
@@ -10292,116 +10285,61 @@ fn is_hermes_active_by_plugin(status_map: &HashMap<String, String>, session_id: 
     })
 }
 
-/// Return the freshest event timestamp (ms) for `session_id` across all
-/// ooclaw-status.json files (default profile + named profiles). Returns 0 if
-/// the session is unknown or has no events.
-fn ooclaw_session_latest_event_ms(hermes_dir: &std::path::Path, session_id: &str) -> u64 {
-    let mut dirs_to_check = vec![hermes_dir.to_path_buf()];
-    let profiles_dir = hermes_dir.join("profiles");
-    if profiles_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&profiles_dir) {
-            for entry in entries.flatten() {
-                if entry.path().is_dir() {
-                    dirs_to_check.push(entry.path());
-                }
-            }
-        }
-    }
-    let mut max_ts: f64 = 0.0;
-    for dir in dirs_to_check {
-        let status_path = dir.join("ooclaw-status.json");
-        if let Ok(data) = std::fs::read_to_string(&status_path) {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
-                if let Some(events) = parsed.get(session_id).and_then(|v| v.as_array()) {
-                    for e in events {
-                        if let Some(ts) = e.get("timestamp").and_then(|v| v.as_f64()) {
-                            if ts > max_ts { max_ts = ts; }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    (max_ts * 1000.0) as u64
-}
-
-/// Read userPrompt and lastResponse for a specific session from ooclaw-status.json.
-/// Searches default profile and named profiles.
-/// Returns (Option<userPrompt>, Option<lastResponse>).
-fn load_ooclaw_session_detail(hermes_dir: &std::path::Path, session_id: &str) -> Option<(Option<String>, Option<String>)> {
-    let mut dirs_to_check = vec![hermes_dir.to_path_buf()];
-    let profiles_dir = hermes_dir.join("profiles");
-    if profiles_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&profiles_dir) {
-            for entry in entries.flatten() {
-                if entry.path().is_dir() {
-                    dirs_to_check.push(entry.path());
-                }
-            }
-        }
-    }
-
-    for dir in &dirs_to_check {
-        let status_path = dir.join("ooclaw-status.json");
-        if let Ok(data) = std::fs::read_to_string(&status_path) {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
-                if let Some(events) = parsed.get(session_id).and_then(|v| v.as_array()) {
-                    // userPrompt only on UserPromptSubmit events; lastResponse only on
-                    // Stop events. Scan ALL events and take the most recent non-empty
-                    // value of each — last event alone is rarely the right pick.
-                    let mut up: Option<String> = None;
-                    let mut lr: Option<String> = None;
-                    for evt in events.iter().rev() {
-                        if up.is_none() {
-                            if let Some(s) = evt.get("userPrompt").and_then(|v| v.as_str()) {
-                                if !s.is_empty() { up = Some(s.to_string()); }
-                            }
-                        }
-                        if lr.is_none() {
-                            if let Some(s) = evt.get("lastResponse").and_then(|v| v.as_str()) {
-                                if !s.is_empty() { lr = Some(s.to_string()); }
-                            }
-                        }
-                        if up.is_some() && lr.is_some() { break; }
-                    }
-                    return Some((up, lr));
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Load recent Hermes sessions from ooclaw-status.json (plugin required).
-/// Only sessions present in ooclaw-status.json are shown. If the plugin
-/// is not installed (no JSON file), no Hermes sessions are displayed.
-/// Session metadata (userPrompt, lastResponse) is enriched from state.db.
+/// Load recent Hermes sessions from ooclaw-status.json using the canonical metadata authority (`state.db`)
+/// and lifecycle authority (lifecycle events via `hermes::reduce_hermes_events`).
+///
+/// Rules:
+/// - `state.db is metadata/history, not the Hermes turn lifecycle authority.`
+/// - Assistant row timestamps (`a_ts >= u_ts`) do not terminate a turn.
+/// - Inactivity / silence does not terminate a turn.
+/// - Lineage resolution resolves the tip session and canonical title.
 fn load_recent_hermes_sessions_from_db() -> Result<Vec<ClaudeSession>, String> {
     let home = dirs::home_dir().ok_or("no home dir")?;
     let hermes_dir = home.join(".hermes");
 
-    // Load ooclaw plugin status — this is the single source of truth.
-    // No JSON → no sessions shown.
-    let mut plugin_status: HashMap<String, String> = HashMap::new();
-    plugin_status.extend(load_ooclaw_status(&hermes_dir));
+    if !hermes_dir.exists() {
+        return Ok(vec![]);
+    }
+
+    // Collect all profile directories: ~/.hermes + ~/.hermes/profiles/*
+    let mut dirs_to_check = vec![hermes_dir.clone()];
     let profiles_dir = hermes_dir.join("profiles");
     if profiles_dir.is_dir() {
         if let Ok(entries) = std::fs::read_dir(&profiles_dir) {
             for entry in entries.flatten() {
                 if entry.path().is_dir() {
-                    plugin_status.extend(load_ooclaw_status(&entry.path()));
+                    dirs_to_check.push(entry.path());
                 }
             }
         }
     }
-    if plugin_status.is_empty() {
+
+    // Read all ooclaw-status.json events
+    let mut all_events: std::collections::HashMap<String, Vec<serde_json::Value>> = std::collections::HashMap::new();
+    for dir in &dirs_to_check {
+        let status_path = dir.join("ooclaw-status.json");
+        if let Ok(data) = std::fs::read_to_string(&status_path) {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
+                if let Some(obj) = parsed.as_object() {
+                    for (sid, evts_val) in obj {
+                        if let Some(arr) = evts_val.as_array() {
+                            let entry = all_events.entry(sid.clone()).or_default();
+                            entry.extend(arr.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if all_events.is_empty() {
         return Ok(vec![]);
     }
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
 
-    // Open state.db for enrichment (userPrompt, lastResponse, timestamps)
+    // Open state.db for metadata authority
     let db_path = hermes_dir.join("state.db");
     let conn = if db_path.exists() {
         rusqlite::Connection::open_with_flags(
@@ -10413,102 +10351,98 @@ fn load_recent_hermes_sessions_from_db() -> Result<Vec<ClaudeSession>, String> {
     };
 
     let mut sessions = Vec::new();
+    let mut seen_roots = std::collections::HashSet::new();
 
-    for (sid, claude_status) in &plugin_status {
-        // load_ooclaw_status uses "blocked_on_user" as a sentinel when the
-        // agent is paused waiting for user reply (PermissionRequest or an
-        // interactive tool like clarify). UI maps that to the waiting pet,
-        // while plain "waiting_for_input" means the turn cleanly ended.
-        let mut status = match claude_status.as_str() {
-            "processing" | "running_tool" | "waiting" => "processing".to_string(),
-            "blocked_on_user" => "waiting".to_string(),
-            _ => "stopped".to_string(),
-        };
-
-        let mut user_prompt: Option<String> = None;
-        let mut asst_response: Option<String> = None;
-        let mut custom_title: Option<String> = None;
-        let mut updated_at_ms = 0u64;
-        let mut platform = String::new();
-        let mut db_ended_at: Option<f64> = None;
-        let mut db_u_ts: Option<f64> = None;
-        let mut db_a_ts: Option<f64> = None;
-
-        // Read userPrompt/lastResponse from plugin status
-        if let Some((up, lr)) = load_ooclaw_session_detail(&hermes_dir, sid) {
-            user_prompt = up;
-            asst_response = lr;
+    for (sid, events) in all_events {
+        if events.is_empty() {
+            continue;
         }
 
-        // Enrich from state.db
+        // Skip subagent-only sessions
+        if events.iter().all(|e| e.get("event").and_then(|v| v.as_str()) == Some("SubagentStop")) {
+            continue;
+        }
+
+        let reduced = hermes::reduce_hermes_events(&events, None);
+        let status = match reduced.status {
+            hermes::HermesStatus::Processing => "processing".to_string(),
+            hermes::HermesStatus::ToolRunning => "tool_running".to_string(),
+            hermes::HermesStatus::Waiting => "waiting".to_string(),
+            hermes::HermesStatus::Failed => "failed".to_string(),
+            hermes::HermesStatus::Stopped => "stopped".to_string(),
+        };
+        let is_active = reduced.active;
+        let turn_id = reduced.turn_id;
+
+        let mut user_prompt = reduced.user_prompt;
+        let mut asst_response = reduced.last_response;
+        let mut custom_title = None;
+        let mut platform = String::new();
+        let mut updated_at_ms = (reduced.latest_timestamp * 1000.0) as u64;
+
+        // Lineage and title resolution via state.db
         if let Some(ref db) = conn {
+            let lineage = hermes::resolve_hermes_lineage(db, &sid).unwrap_or_else(|_| hermes::LineageInfo {
+                root_session_id: sid.clone(),
+                tip_session_id: sid.clone(),
+                lineage_ids: vec![sid.clone()],
+            });
+            let db_root = lineage.root_session_id.clone();
+            let tip_id = lineage.tip_session_id.clone();
+
+            if seen_roots.contains(&db_root) {
+                continue;
+            }
+            seen_roots.insert(db_root);
+
             if let Ok(src) = db.query_row(
-                "SELECT source FROM sessions WHERE id = ?1", rusqlite::params![sid], |r| r.get::<_, String>(0)
+                "SELECT source FROM sessions WHERE id = ?1", rusqlite::params![&tip_id], |r| r.get::<_, String>(0)
+            ) {
+                platform = src;
+            } else if let Ok(src) = db.query_row(
+                "SELECT source FROM sessions WHERE id = ?1", rusqlite::params![&sid], |r| r.get::<_, String>(0)
             ) {
                 platform = src;
             }
-            if let Ok(t) = db.query_row(
-                "SELECT title FROM sessions WHERE id = ?1", rusqlite::params![sid], |r| r.get::<_, Option<String>>(0)
-            ) {
-                if let Some(t_val) = t {
-                    let trimmed = t_val.trim();
-                    if !trimmed.is_empty() {
-                        custom_title = Some(trimmed.to_string());
-                    }
+
+            let title_res = hermes::resolve_canonical_title(db, &lineage, None, Some(&platform), sessions.len() + 1);
+            custom_title = Some(title_res.canonical_title);
+
+            if user_prompt.is_none() {
+                if let Ok(u_content) = db.query_row(
+                    "SELECT substr(content, 1, 200) FROM messages WHERE session_id = ?1 AND role = 'user' ORDER BY timestamp DESC LIMIT 1",
+                    rusqlite::params![&tip_id], |r| r.get::<_, String>(0)
+                ) {
+                    user_prompt = Some(u_content);
                 }
             }
-            if let Ok(ended) = db.query_row(
-                "SELECT ended_at FROM sessions WHERE id = ?1", rusqlite::params![sid], |r| r.get::<_, Option<f64>>(0)
-            ) {
-                db_ended_at = ended;
+            if asst_response.is_none() {
+                if let Ok(a_content) = db.query_row(
+                    "SELECT substr(content, 1, 200) FROM messages WHERE session_id = ?1 AND role = 'assistant' AND content IS NOT NULL AND content <> '' ORDER BY timestamp DESC LIMIT 1",
+                    rusqlite::params![&tip_id], |r| r.get::<_, String>(0)
+                ) {
+                    asst_response = Some(a_content);
+                }
             }
             if let Ok(Some(ts)) = db.query_row(
                 "SELECT MAX(timestamp) FROM messages WHERE session_id = ?1 AND role NOT IN ('session_meta','system','metadata')",
-                rusqlite::params![sid], |r| r.get::<_, Option<f64>>(0)
+                rusqlite::params![&tip_id], |r| r.get::<_, Option<f64>>(0)
             ) {
-                updated_at_ms = (ts * 1000.0) as u64;
+                let msg_ts_ms = (ts * 1000.0) as u64;
+                if msg_ts_ms > updated_at_ms {
+                    updated_at_ms = msg_ts_ms;
+                }
             }
-            if let Ok((u_content, u_ts)) = db.query_row(
-                "SELECT substr(content, 1, 200), timestamp FROM messages WHERE session_id = ?1 AND role = 'user' ORDER BY timestamp DESC LIMIT 1",
-                rusqlite::params![sid], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
-            ) {
-                if user_prompt.is_none() { user_prompt = Some(u_content); }
-                db_u_ts = Some(u_ts);
+        } else {
+            if seen_roots.contains(&sid) {
+                continue;
             }
-            if let Ok((a_content, a_ts)) = db.query_row(
-                "SELECT substr(content, 1, 200), timestamp FROM messages WHERE session_id = ?1 AND role = 'assistant' AND content IS NOT NULL AND content <> '' ORDER BY timestamp DESC LIMIT 1",
-                rusqlite::params![sid], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
-            ) {
-                if asst_response.is_none() { asst_response = Some(a_content); }
-                db_a_ts = Some(a_ts);
-            }
+            seen_roots.insert(sid.clone());
         }
-        // Plugin event timestamps lead state.db by several seconds (especially
-        // on UserPromptSubmit when feishu is still flushing). Prefer the
-        // freshest ooclaw event timestamp so the "Xm ago" badge reflects
-        // actual activity instead of the last persisted message.
-        let evt_max_ms = ooclaw_session_latest_event_ms(&hermes_dir, sid);
-        if evt_max_ms > updated_at_ms {
-            updated_at_ms = evt_max_ms;
-        }
+
         if updated_at_ms == 0 {
             updated_at_ms = now_ms;
         }
-
-        // Cross-check state.db completion:
-        // If ended_at is set in sessions table, session is explicitly stopped.
-        // If assistant has already replied to user in state.db (a_ts >= u_ts) and no newer UserPromptSubmit event, session is stopped.
-        if db_ended_at.is_some() {
-            status = "stopped".to_string();
-        } else if let (Some(u_ts), Some(a_ts)) = (db_u_ts, db_a_ts) {
-            if a_ts >= u_ts {
-                let a_ts_ms = (a_ts * 1000.0) as u64;
-                if evt_max_ms <= a_ts_ms + 2000 {
-                    status = "stopped".to_string();
-                }
-            }
-        }
-        let is_active = status == "processing";
 
         // Skip CLI sessions
         if platform == "cli" || platform == "terminal" {
@@ -10542,6 +10476,7 @@ fn load_recent_hermes_sessions_from_db() -> Result<Vec<ClaudeSession>, String> {
             cursor_native_handle: None,
             active_subagents: None,
             activity: None,
+            turn_id,
         });
     }
 
@@ -16069,6 +16004,7 @@ mod codex_adapter_tests {
             cursor_native_handle: None,
             active_subagents: None,
             activity: None,
+            turn_id: None,
         };
         assert!(is_codex_internal_utility_session(&session));
     }
@@ -16358,6 +16294,7 @@ mod codex_adapter_tests {
             cursor_native_handle: None,
             active_subagents: None,
             activity: None,
+            turn_id: None,
         });
 
         // Nested subagent C emits PreToolUse
@@ -16448,6 +16385,7 @@ mod codex_adapter_tests {
             cursor_native_handle: None,
             active_subagents: None,
             activity: None,
+            turn_id: None,
         });
         // Subagents accidentally in sessions map
         sessions.insert(b.to_string(), sessions.get(a).unwrap().clone());
@@ -16562,6 +16500,7 @@ mod codex_adapter_tests {
             cursor_native_handle: None,
             active_subagents: None,
             activity: None,
+            turn_id: None,
         });
 
         // Even though B is stopped, C event maintains Root A in tool_running
@@ -16671,6 +16610,7 @@ pub fn handle_antigravity_subagent_event(
             cursor_native_handle: None,
             active_subagents: None,
             activity: None,
+            turn_id: None,
         };
         update_antigravity_session_from_transcript(&mut new_session);
         sessions.insert(root_id.clone(), new_session);
@@ -16782,6 +16722,11 @@ fn process_claude_event(
             "afterShellExecution" | "afterMCPExecution" | "afterFileEdit" => "PostToolUse".to_string(),
             "afterAgentThought" | "afterAgentResponse" => "PostToolUse".to_string(),
             "stop" => "Stop".to_string(),
+            // Hermes gateway and plugin normalized events
+            "GatewayAgentStart" => "GatewayAgentStart".to_string(),
+            "GatewayAgentStep" => "GatewayAgentStep".to_string(),
+            "GatewayAgentEnd" => "GatewayAgentEnd".to_string(),
+            "HermesPostLlm" => "HermesPostLlm".to_string(),
             // Gemini CLI events → map to CC equivalents
             "BeforeAgent" => "UserPromptSubmit".to_string(),
             "AfterAgent" => "Stop".to_string(),
@@ -16844,9 +16789,12 @@ fn process_claude_event(
 
         let pretool_needs_waiting = hook_event == "PreToolUse" && codex_requires_escalation(&event);
         let mut status = match hook_event.as_str() {
-            "UserPromptSubmit" => {
+            "UserPromptSubmit" | "GatewayAgentStart" => {
                 if is_local_slash { "stopped".to_string() } else { "processing".to_string() }
             }
+            "GatewayAgentStep" => "processing".to_string(),
+            "GatewayAgentEnd" => "stopped".to_string(),
+            "HermesPostLlm" => "processing".to_string(),
             "PreCompact" => "compacting".to_string(),
             "PreToolUse" => {
                 let tool = event.get("tool")
@@ -16896,12 +16844,12 @@ fn process_claude_event(
 
         // Guard: if CC's own status is "waiting_for_input" but our event-derived
         // status says "processing"/"tool_running", something is out of sync.
-        // Override to "stopped" — EXCEPT for UserPromptSubmit, where CC's status
-        // field may still say "waiting_for_input" because the hook fires before
-        // CC's internal state transitions. A new prompt always means processing.
+        // Override to "stopped" — EXCEPT for UserPromptSubmit/GatewayAgentStart/HermesPostLlm.
         if !is_processing
             && matches!(status.as_str(), "processing" | "tool_running")
             && hook_event != "UserPromptSubmit"
+            && hook_event != "GatewayAgentStart"
+            && hook_event != "HermesPostLlm"
         {
             log::info!("[claude_event] guard override: {} → stopped (is_processing=false)", status);
             status = "stopped".to_string();
@@ -16919,6 +16867,7 @@ fn process_claude_event(
         // the moment a waiting/permission event arrives — used to suppress the
         // waiting popup, same focus rule as the completion popup.
         let mut wait_tab_active = false;
+        let mut is_stale_turn_stop = false;
 
         {
             let mut sessions = state.lock().unwrap();
@@ -16968,6 +16917,7 @@ fn process_claude_event(
                     cursor_native_handle: None,
                     active_subagents: None,
                     activity: None,
+                    turn_id: None,
                 });
                 // Only upgrade source, never downgrade:
                 // cc < codex < gemini < cursor.
@@ -16990,6 +16940,27 @@ fn process_claude_event(
                     session.source = source.clone();
                 }
 
+                let incoming_turn_id = event.get("turnId")
+                    .or_else(|| event.get("turn_id"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                if hook_event == "UserPromptSubmit" || hook_event == "GatewayAgentStart" {
+                    session.turn_id = incoming_turn_id.clone();
+                } else if session.turn_id.is_none() && incoming_turn_id.is_some() {
+                    session.turn_id = incoming_turn_id.clone();
+                }
+
+                if (hook_event == "Stop" || hook_event == "GatewayAgentEnd")
+                    && incoming_turn_id.is_some()
+                    && session.turn_id.is_some()
+                    && incoming_turn_id != session.turn_id
+                {
+                    is_stale_turn_stop = true;
+                    log::info!("[claude_event] session={} ignoring stale stop event: current_turn={:?}, incoming_turn={:?}",
+                        &session_id[..session_id.len().min(8)], session.turn_id, incoming_turn_id);
+                    status = session.status.clone();
+                }
+
                 // Track pending sub-agents:
                 // - PreToolUse with tool=Agent / invoke_subagent → a sub-agent is being launched
                 // - SubagentStop / PostToolUse(invoke_subagent) → a sub-agent has completed
@@ -16999,7 +16970,7 @@ fn process_claude_event(
                     .or_else(|| event.get("toolCall").and_then(|tc| tc.get("name")))
                     .or_else(|| event.get("tool_call").and_then(|tc| tc.get("name")))
                     .and_then(|v| v.as_str()).unwrap_or("");
-                if hook_event == "UserPromptSubmit" {
+                if hook_event == "UserPromptSubmit" || hook_event == "GatewayAgentStart" {
                     // New user prompt = fresh start. Reset counter in case previous
                     // agents were killed or SubagentStop was never delivered.
                     let has_running_subs = session.active_subagents.as_ref()
@@ -17024,8 +16995,10 @@ fn process_claude_event(
                         &session_id[..session_id.len().min(8)], session.pending_agents);
                 }
 
-                session.status = status.clone();
-                session.is_processing = is_processing;
+                if !is_stale_turn_stop {
+                    session.status = status.clone();
+                    session.is_processing = is_processing;
+                }
                 let mut incoming_cwd = event
                     .get("cwd")
                     .or_else(|| event.get("workdir"))
@@ -17237,7 +17210,7 @@ fn process_claude_event(
                     }
                 }
 
-                if hook_event == "PostToolUse" || hook_event == "Stop" || hook_event == "SubagentStop" {
+                if hook_event == "PostToolUse" || hook_event == "Stop" || hook_event == "SubagentStop" || hook_event == "GatewayAgentEnd" {
                     session.tool = None;
                     session.tool_input = None;
                     session.activity = None;
@@ -17249,8 +17222,11 @@ fn process_claude_event(
                 // For Cursor: afterAgentResponse fires before stop and carries
                 // the actual response text. We stash it here so the Stop handler
                 // can use it instead of a placeholder.
-                if raw_hook_event == "afterAgentResponse" {
-                    if let Some(resp) = event.get("lastResponse").and_then(|v| v.as_str()) {
+                if raw_hook_event == "afterAgentResponse" || hook_event == "HermesPostLlm" {
+                    if let Some(resp) = event.get("lastResponse")
+                        .or_else(|| event.get("last_response"))
+                        .or_else(|| event.get("response"))
+                        .and_then(|v| v.as_str()) {
                         if !resp.is_empty() {
                             session.last_response = Some(resp.to_string());
                         }
@@ -17260,7 +17236,7 @@ fn process_claude_event(
                 // Check at Stop time (real-time, not polling) whether the user
                 // is already looking at this terminal tab. If so, skip setting
                 // last_response so the completion popup never triggers.
-                if hook_event == "Stop" {
+                if (hook_event == "Stop" || hook_event == "GatewayAgentEnd") && !is_stale_turn_stop {
                     let interrupted = stop_event_was_interrupted(&event, &session.source, &claude_status);
                     // CC: check if the user is looking at this session's Ghostty tab
                     // Cursor: check if Cursor (or oc-claw) is the frontmost app.
@@ -17305,12 +17281,14 @@ fn process_claude_event(
                         // on the frontend side (s.source !== 'hermes' guard).
                         if !is_tab_active && !interrupted {
                             let resp_from_event = event.get("lastResponse")
+                                .or_else(|| event.get("last_response"))
+                                .or_else(|| event.get("response"))
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string());
                             if resp_from_event.is_some() {
                                 session.last_response = resp_from_event;
                             }
-                            // else: keep existing last_response from post_llm_call
+                            // else: keep existing last_response from post_llm_call / HermesPostLlm
                         }
                     } else {
                         // Prefer lastResponse from the event itself (CC's Stop has it),
@@ -17344,7 +17322,7 @@ fn process_claude_event(
                         status = "failed".to_string();
                     }
                     stop_was_interrupted = interrupted;
-                } else if hook_event == "UserPromptSubmit" {
+                } else if hook_event == "UserPromptSubmit" || hook_event == "GatewayAgentStart" {
                     session.last_response = None;
                     stop_was_interrupted = false;
                 } else {
@@ -17391,8 +17369,8 @@ fn process_claude_event(
             // Suppress the waiting popup when the user is already looking at the
             // session's terminal tab (same focus rule as the completion popup).
             && !wait_tab_active;
-        let is_completion_stop = hook_event == "Stop" && status == "stopped" && pending_agents == 0 && !stop_was_interrupted;
-        let is_failed_stop = hook_event == "Stop" && pending_agents == 0 && stop_was_interrupted;
+        let is_completion_stop = (hook_event == "Stop" || hook_event == "GatewayAgentEnd") && status == "stopped" && pending_agents == 0 && !stop_was_interrupted && !is_stale_turn_stop;
+        let is_failed_stop = (hook_event == "Stop" || hook_event == "GatewayAgentEnd") && pending_agents == 0 && stop_was_interrupted && !is_stale_turn_stop;
 
         if was_processing && !was_compacting && is_failed_stop {
             if cfg!(debug_assertions) {
@@ -18391,21 +18369,8 @@ async fn install_hermes_hooks() -> Result<(), String> {
         return Ok(());
     }
 
-    let plugin_yaml = r#"name: ooclaw
-version: 0.2.3
-description: "Forward Hermes Agent lifecycle events to oc-claw (local socket + status file)."
-hooks:
-  - on_session_start
-  - pre_llm_call
-  - post_llm_call
-  - pre_tool_call
-  - post_tool_call
-  - on_session_end
-  - on_session_finalize
-  - on_session_reset
-  - pre_approval_request
-  - post_approval_response
-"#;
+    let plugin_yaml = hermes::build_hermes_plugin_yaml();
+    let hook_yaml = hermes::build_hermes_gateway_hook_yaml();
 
     // Install plugin to all profiles (same as remote)
     let mut install_dirs = vec![hermes_dir.clone()];
@@ -18421,8 +18386,6 @@ hooks:
         }
     }
 
-    // The Python plugin is written as a static string with a placeholder for
-    // the connection target (Unix socket path or TCP port).
     #[cfg(unix)]
     let connect_code = r#"SOCKET_PATH = "/tmp/ooclaw-hermes.sock"
 
@@ -18454,181 +18417,42 @@ def _send(payload):
     except Exception:
         pass"#;
 
-    let init_py = format!(
-        r##"# ooclaw plugin for Hermes Agent - forwards events to oc-claw.
-from __future__ import annotations
-import json, os, socket, time, threading
-from typing import Any, Dict, Tuple
-from pathlib import Path
+    #[cfg(unix)]
+    let gw_connect_code = r#"SOCKET_PATH = "/tmp/ooclaw-hermes.sock"
 
-{connect_code}
-
-# Track the last session_id per thread so we can detect context-compaction
-# rollovers and emit a synthetic SessionEnd for the old session.
-# Using thread-local storage because delegate_task subagents run in separate
-# threads within the same process.
-_thread_local = threading.local()
-
-HOOK_TO_EVENT: Dict[str, Tuple[str, str]] = {{
-    "on_session_start": ("waiting_for_input", "SessionStart"),
-    "pre_llm_call": ("processing", "UserPromptSubmit"),
-    "post_llm_call": ("waiting_for_input", "Stop"),
-    "pre_tool_call": ("running_tool", "PreToolUse"),
-    "post_tool_call": ("processing", "PostToolUse"),
-    "on_session_end": ("waiting_for_input", "Stop"),
-    "on_session_finalize": ("ended", "SessionEnd"),
-    "on_session_reset": ("waiting_for_input", "SessionStart"),
-    "pre_approval_request": ("waiting", "PermissionRequest"),
-    "post_approval_response": ("processing", "PostToolUse"),
-}}
-
-def _status_file_path():
-    """Find the ooclaw status file path under the active profile or hermes home."""
-    hermes_home = os.environ.get("HERMES_HOME", "") or os.path.expanduser("~/.hermes")
-    profile = os.environ.get("HERMES_PROFILE", "")
-    if profile:
-        return os.path.join(hermes_home, "profiles", profile, "ooclaw-status.json")
-    return os.path.join(hermes_home, "ooclaw-status.json")
-
-_MAX_EVENTS_PER_SESSION = 100
-_MAX_SESSIONS = 20
-
-def _write_status(payload):
-    """Append event to status file, keeping last N events per session."""
-    try:
-        status_path = _status_file_path()
-        session_id = payload.get("sessionId", "unknown")
-        data = {{}}
-        if os.path.exists(status_path):
-            try:
-                with open(status_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if not isinstance(data, dict):
-                    data = {{}}
-            except Exception:
-                data = {{}}
-        if session_id not in data:
-            data[session_id] = []
-        data[session_id].append(payload)
-        if len(data[session_id]) > _MAX_EVENTS_PER_SESSION:
-            data[session_id] = data[session_id][-_MAX_EVENTS_PER_SESSION:]
-        if len(data) > _MAX_SESSIONS:
-            by_ts = sorted(data.items(), key=lambda kv: (kv[1][-1].get("timestamp", 0) if kv[1] else 0), reverse=True)
-            data = dict(by_ts[:_MAX_SESSIONS])
-        tmp_path = status_path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-        os.replace(tmp_path, status_path)
-    except Exception:
-        pass
-
-def _handle(event_name, **kwargs):
-    mapping = HOOK_TO_EVENT.get(event_name)
-    if not mapping:
+def _send_to_ooclaw(payload):
+    raw = json.dumps(payload) + "\n"
+    if not os.path.exists(SOCKET_PATH):
+        _log("socket not found: " + SOCKET_PATH)
         return
-    status, cc_event = mapping
-    if event_name == "post_tool_call":
-        result = kwargs.get("result")
-        if isinstance(result, dict) and (result.get("error") or
-            (isinstance(result.get("exit_code"), int) and result["exit_code"] != 0)):
-            status, cc_event = "processing", "PostToolUse"
-    session_id = kwargs.get("session_id", "") or kwargs.get("conversation_id", "")
-    # Some Hermes hook callsites don't propagate session_id:
-    #   - pre_tool_call (run_agent.py calls get_pre_tool_call_block_message
-    #     without session_id, so invoke_hook fires with session_id="")
-    #   - pre_approval_request / post_approval_response (only pass session_key)
-    # Fall back to the last session_id seen on this thread (set during
-    # pre_llm_call earlier in the same agent turn).
-    if not session_id:
-        session_id = getattr(_thread_local, "last_session_id", "") or ""
-    if not session_id:
-        return
-    tool_name = ""
-    if event_name in ("pre_tool_call", "post_tool_call", "pre_approval_request"):
-        tool_name = kwargs.get("tool_name", "") or kwargs.get("tool", "") or ""
-    platform = kwargs.get("platform", "") or ""
     try:
-        cwd = os.getcwd()
-    except Exception:
-        cwd = os.path.expanduser("~/.hermes")
-    if not cwd:
-        cwd = os.path.expanduser("~/.hermes")
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2)
+        s.connect(SOCKET_PATH)
+        s.sendall(raw.encode("utf-8"))
+        s.close()
+        _log(f"sent OK: {payload.get('event')} status={payload.get('claudeStatus')}")
+    except Exception as e:
+        _log(f"send FAILED: {e}")"#;
 
-    # Detect context-compaction session rollover: if session_id changed from
-    # a previous value (same thread), emit a synthetic SessionEnd for the old
-    # session so oc-claw stops showing it as active.
-    last_sid = getattr(_thread_local, "last_session_id", "")
-    if last_sid and last_sid != session_id:
-        end_payload = {{
-            "sessionId": last_sid,
-            "cwd": cwd,
-            "event": "SessionEnd",
-            "claudeStatus": "ended",
-            "source": "hermes",
-            "pid": os.getpid(),
-            "platform": platform,
-            "timestamp": time.time(),
-        }}
-        _send(end_payload)
-        _write_status(end_payload)
-    _thread_local.last_session_id = session_id
+    #[cfg(windows)]
+    let gw_connect_code = r#"TCP_PORT = 19286
 
-    payload = {{
-        "sessionId": session_id,
-        "cwd": cwd,
-        "event": cc_event,
-        "claudeStatus": status,
-        "source": "hermes",
-        "pid": os.getpid(),
-        "platform": platform,
-        "timestamp": time.time(),
-    }}
-    if tool_name:
-        payload["tool"] = tool_name
-    if event_name == "pre_llm_call":
-        prompt = kwargs.get("user_message", "") or kwargs.get("prompt", "") or kwargs.get("message", "")
-        if prompt and isinstance(prompt, str):
-            if "[CONTEXT COMPACTION" in prompt[:30]:
-                marker = "--- END OF CONTEXT SUMMARY"
-                idx = prompt.find(marker)
-                if idx != -1:
-                    prompt = prompt[idx + len(marker):].strip().lstrip("-").strip()
-            if prompt:
-                payload["userPrompt"] = prompt[:500]
-    elif event_name == "post_llm_call":
-        resp = kwargs.get("assistant_response", "") or kwargs.get("response", "") or kwargs.get("result", "")
-        has_tools = False
-        if isinstance(resp, dict):
-            if resp.get("tool_calls") or resp.get("function_call"):
-                has_tools = True
-            resp = resp.get("content", "") or resp.get("text", "")
-        elif hasattr(resp, "tool_calls") and getattr(resp, "tool_calls", None):
-            has_tools = True
-        if kwargs.get("tool_calls") or kwargs.get("tools"):
-            has_tools = True
-        if has_tools:
-            status, cc_event = "processing", "PostToolUse"
-            payload["event"] = cc_event
-            payload["claudeStatus"] = status
-        if resp and isinstance(resp, str):
-            payload["lastResponse"] = resp[:2000]
-    _send(payload)
-    _write_status(payload)
+def _send_to_ooclaw(payload):
+    raw = json.dumps(payload) + "\n"
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(2)
+        s.connect(("127.0.0.1", TCP_PORT))
+        s.sendall(raw.encode("utf-8"))
+        s.shutdown(socket.SHUT_WR)
+        s.close()
+        _log(f"sent OK: {payload.get('event')} status={payload.get('claudeStatus')}")
+    except Exception as e:
+        _log(f"send FAILED: {e}")"#;
 
-def _make_cb(event_name):
-    def cb(**kwargs):
-        try:
-            _handle(event_name, **kwargs)
-        except Exception:
-            pass
-        return None
-    cb.__name__ = "ooclaw_" + event_name
-    return cb
-
-def register(ctx):
-    for hook_name in HOOK_TO_EVENT:
-        ctx.register_hook(hook_name, _make_cb(hook_name))
-"##, connect_code = connect_code);
+    let init_py = hermes::build_hermes_plugin_source(connect_code);
+    let handler_py = hermes::build_hermes_gateway_hook_source(gw_connect_code);
 
     let hermes_bin = which_hermes();
 
@@ -18638,16 +18462,17 @@ def register(ctx):
         let _ = std::fs::create_dir_all(&pd);
         let _ = std::fs::write(pd.join("plugin.yaml"), plugin_yaml);
         let _ = std::fs::write(pd.join("__init__.py"), &init_py);
-        // Clear pycache
         let pc = pd.join("__pycache__");
         if pc.exists() { let _ = std::fs::remove_dir_all(&pc); }
         log::info!("[hermes_hooks] installed plugin to {:?}", pd);
 
-        // Gateway hook
         let hd = target_dir.join("hooks").join("ooclaw");
         let _ = std::fs::create_dir_all(&hd);
+        let _ = std::fs::write(hd.join("HOOK.yaml"), hook_yaml);
+        let _ = std::fs::write(hd.join("handler.py"), &handler_py);
         let hpc = hd.join("__pycache__");
         if hpc.exists() { let _ = std::fs::remove_dir_all(&hpc); }
+        log::info!("[hermes_hooks] installed gateway hook to {:?}", hd);
     }
 
     // Enable plugin via CLI for each profile
@@ -18691,161 +18516,6 @@ def register(ctx):
                 }
             }
         }
-    }
-
-    // ── Gateway hook (for Feishu / Telegram / Slack / etc.) ──
-    let hook_yaml = r#"name: ooclaw
-description: Forward Hermes gateway events to oc-claw desktop pet
-events:
-  - session:start
-  - agent:start
-  - agent:end
-  - session:end
-  - session:reset
-"#;
-
-    #[cfg(unix)]
-    let gw_connect_code = r#"SOCKET_PATH = "/tmp/ooclaw-hermes.sock"
-
-def _send_to_ooclaw(payload):
-    raw = json.dumps(payload) + "\n"
-    if not os.path.exists(SOCKET_PATH):
-        _log("socket not found: " + SOCKET_PATH)
-        return
-    try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(2)
-        s.connect(SOCKET_PATH)
-        s.sendall(raw.encode("utf-8"))
-        s.close()
-        _log(f"sent OK: {payload.get('event')} status={payload.get('claudeStatus')}")
-    except Exception as e:
-        _log(f"send FAILED: {e}")"#;
-
-    #[cfg(windows)]
-    let gw_connect_code = r#"TCP_PORT = 19286
-
-def _send_to_ooclaw(payload):
-    raw = json.dumps(payload) + "\n"
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(2)
-        s.connect(("127.0.0.1", TCP_PORT))
-        s.sendall(raw.encode("utf-8"))
-        s.shutdown(socket.SHUT_WR)
-        s.close()
-        _log(f"sent OK: {payload.get('event')} status={payload.get('claudeStatus')}")
-    except Exception as e:
-        _log(f"send FAILED: {e}")"#;
-
-    let handler_py = format!(
-        r##""""
-Gateway hook handler for oc-claw integration.
-Forwards Hermes gateway lifecycle events to oc-claw via socket + status file.
-"""
-import json, os, socket, sys, datetime, time
-
-LOG_DIR = os.path.expanduser("~/.hermes/logs")
-LOG_FILE = os.path.join(LOG_DIR, "ooclaw-hook.log")
-
-def _log(msg):
-    os.makedirs(LOG_DIR, exist_ok=True)
-    ts = datetime.datetime.now().isoformat()
-    with open(LOG_FILE, "a") as f:
-        f.write(f"[{{ts}}] {{msg}}\n")
-
-{gw_connect_code}
-
-def _status_file_path():
-    hermes_home = os.environ.get("HERMES_HOME", "") or os.path.expanduser("~/.hermes")
-    profile = os.environ.get("HERMES_PROFILE", "")
-    if profile:
-        return os.path.join(hermes_home, "profiles", profile, "ooclaw-status.json")
-    return os.path.join(hermes_home, "ooclaw-status.json")
-
-_MAX_EVENTS_PER_SESSION = 30
-_MAX_SESSIONS = 20
-
-def _write_status(payload):
-    try:
-        status_path = _status_file_path()
-        session_id = payload.get("sessionId", "unknown")
-        data = {{}}
-        if os.path.exists(status_path):
-            try:
-                with open(status_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if not isinstance(data, dict):
-                    data = {{}}
-            except Exception:
-                data = {{}}
-        if session_id not in data:
-            data[session_id] = []
-        data[session_id].append(payload)
-        if len(data[session_id]) > _MAX_EVENTS_PER_SESSION:
-            data[session_id] = data[session_id][-_MAX_EVENTS_PER_SESSION:]
-        if len(data) > _MAX_SESSIONS:
-            by_ts = sorted(data.items(), key=lambda kv: (kv[1][-1].get("timestamp", 0) if kv[1] else 0), reverse=True)
-            data = dict(by_ts[:_MAX_SESSIONS])
-        tmp_path = status_path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-        os.replace(tmp_path, status_path)
-    except Exception:
-        pass
-
-EVENT_MAP = {{
-    "session:start": ("SessionStart", "waiting_for_input"),
-    "agent:start":   ("UserPromptSubmit", "processing"),
-    "agent:end":     ("Stop", "waiting_for_input"),
-    "session:end":   ("Stop", "waiting_for_input"),
-    "session:reset": ("SessionStart", "waiting_for_input"),
-}}
-
-def handle(event_type, context):
-    _log(f"hook called: {{event_type}} context_keys={{list(context.keys())}}")
-    mapping = EVENT_MAP.get(event_type)
-    if not mapping:
-        _log(f"unmapped event: {{event_type}}")
-        return
-    oc_event, claude_status = mapping
-    platform = context.get("platform", "")
-    user_id = context.get("user_id", "")
-    session_id = context.get("session_id", "")
-    if not session_id:
-        session_id = f"gw_{{platform}}_{{user_id}}" if user_id else f"gw_{{platform}}"
-    payload = {{
-        "sessionId": session_id,
-        "cwd": os.path.expanduser("~/.hermes"),
-        "event": oc_event,
-        "claudeStatus": claude_status,
-        "source": "hermes",
-        "pid": os.getpid(),
-        "platform": platform or "gateway",
-        "timestamp": time.time(),
-    }}
-    if event_type == "agent:start":
-        msg = context.get("message", "")
-        if msg:
-            payload["userPrompt"] = msg[:500]
-    elif event_type == "agent:end":
-        resp = context.get("response", "")
-        if resp:
-            payload["lastResponse"] = resp[:2000]
-    _log(f"payload: {{json.dumps(payload)}}")
-    _send_to_ooclaw(payload)
-    _write_status(payload)
-"##, gw_connect_code = gw_connect_code);
-
-    // Write gateway hook to default + all profiles
-    for target_dir in &install_dirs {
-        let hd = target_dir.join("hooks").join("ooclaw");
-        let _ = std::fs::create_dir_all(&hd);
-        let _ = std::fs::write(hd.join("HOOK.yaml"), &hook_yaml);
-        let _ = std::fs::write(hd.join("handler.py"), &handler_py);
-        let hpc = hd.join("__pycache__");
-        if hpc.exists() { let _ = std::fs::remove_dir_all(&hpc); }
-        log::info!("[hermes_hooks] installed gateway hook to {:?}", hd);
     }
 
     // Restart local gateway (all profiles, same as remote)
@@ -19152,288 +18822,12 @@ print(json.dumps(rows))
 /// and checks gateway.log for recent activity.
 #[tauri::command]
 async fn get_hermes_remote_sessions(ssh_host: String, ssh_user: String) -> Result<Vec<serde_json::Value>, String> {
-    let py_script = r#"
-import json, os, time, glob, datetime
-hermes_home = os.path.expanduser('~/.hermes')
-# Collect all profile paths: default + named profiles
-profile_dirs = [hermes_home]
-profiles_root = os.path.join(hermes_home, 'profiles')
-if os.path.isdir(profiles_root):
-    for name in os.listdir(profiles_root):
-        p = os.path.join(profiles_root, name)
-        if os.path.isdir(p):
-            profile_dirs.append(p)
-seen = set()
-results = []
-now = time.time()
-# Read ooclaw plugin status files — single source of truth.
-# No ooclaw-status.json → no sessions shown (plugin not installed).
-_ooclaw_status = {}  # profile_name -> {session_id: [events]}
-_all_known_sids = set()  # all session ids known to ooclaw plugin
-for _pdir in profile_dirs:
-    _pname = os.path.basename(_pdir) if _pdir != hermes_home else 'default'
-    _sf = os.path.join(_pdir, 'ooclaw-status.json')
-    if not os.path.exists(_sf):
-        _sf = os.path.join(hermes_home, 'ooclaw-status.json') if _pname == 'default' else _sf
-    try:
-        if os.path.exists(_sf):
-            with open(_sf) as _f:
-                _st = json.load(_f)
-            if isinstance(_st, dict):
-                _filtered = {}
-                for _sid, _evts in _st.items():
-                    if isinstance(_evts, list) and _evts:
-                        # Skip pure sub-agents (only emit SubagentStop).
-                        _is_subagent_only = all(_e.get('event') == 'SubagentStop' for _e in _evts)
-                        if _is_subagent_only: continue
-                        _filtered[_sid] = _evts
-                        _all_known_sids.add(_sid)
-                if _filtered:
-                    _ooclaw_status[_pname] = _filtered
-    except: pass
-
-def _turn_boundary(evts):
-    """Return (last Stop/SessionEnd ts, last UserPromptSubmit ts)."""
-    _stop_ts = 0.0
-    _user_ts = 0.0
-    for _e in evts:
-        _ts = _e.get('timestamp', 0) or 0
-        _ev = _e.get('event', '')
-        if _ev in ('Stop', 'SessionEnd') and _ts > _stop_ts: _stop_ts = _ts
-        if _ev == 'UserPromptSubmit' and _ts > _user_ts: _user_ts = _ts
-    return _stop_ts, _user_ts
-
-def _is_internal_tool(t):
-    """Hermes framework housekeeping tools (skill/memory management)."""
-    return t.startswith('skill') or t.startswith('memor')
-
-_INTERACTIVE_TOOLS = ('clarify', 'ask_user', 'confirm')
-def _is_interactive_tool(t):
-    """Tools that block the agent waiting for user reply (clarify, etc)."""
-    return t in _INTERACTIVE_TOOLS
-
-# No plugin data at all → return empty
-if not _all_known_sids:
-    print(json.dumps([]))
-    import sys; sys.exit(0)
-
-for _pdir in profile_dirs:
-    sj = os.path.join(_pdir, 'sessions', 'sessions.json')
-    db = os.path.join(_pdir, 'state.db')
-    _profile_name = os.path.basename(_pdir) if _pdir != hermes_home else 'default'
-    db_conn = None
-    if os.path.exists(db):
-        try:
-            import sqlite3
-            db_conn = sqlite3.connect(db)
-        except: pass
-
-    def _find_latest_session(sid):
-        """Resolve newest session id for this logical thread."""
-        current = sid
-        for _ in range(20):
-            child = db_conn.execute(
-                'SELECT id FROM sessions WHERE parent_session_id=? ORDER BY started_at DESC LIMIT 1',
-                (current,)).fetchone()
-            if not child: break
-            current = child[0]
-        row = db_conn.execute(
-            'SELECT id FROM sessions WHERE (id = ? OR id LIKE ? OR id = ? OR id LIKE ?) '
-            'ORDER BY started_at DESC LIMIT 1',
-            (sid, sid + ':%', current, current + ':%')
-        ).fetchone()
-        if row: current = row[0]
-        return current
-
-    def check_status(sid, db_ended_at=None, db_u_ts=0.0, db_a_ts=0.0):
-        """Returns ('stopped' | 'waiting' | 'processing', is_active_bool).
-        'waiting' means the agent is blocked on user input (PermissionRequest
-        or an interactive tool like clarify) — distinct from 'processing' so
-        the frontend can render a separate pet/state.
-        """
-        _prof_status = _ooclaw_status.get(_profile_name, {})
-        _sid_events = _prof_status.get(sid, [])
-        if not _sid_events:
-            return ('stopped', False)
-        # Check if session ended in state.db
-        if db_ended_at is not None:
-            return ('stopped', False)
-
-        # Pick last non-internal event (skip skill_*/memor_* housekeeping).
-        _last_evt = None
-        for _e in reversed(_sid_events):
-            if not _is_internal_tool(_e.get('tool', '')):
-                _last_evt = _e
-                break
-        if _last_evt is None:
-            _last_evt = _sid_events[-1]
-
-        _last_ts = _last_evt.get('timestamp', 0) or 0
-        # Staleness timeout: 60s without any event = stopped
-        if _last_ts > 0 and (now - _last_ts) > 60:
-            return ('stopped', False)
-
-        _ev = _last_evt.get('event', '')
-        if _ev in ('SessionEnd', 'Stop'):
-            return ('stopped', False)
-        if _ev == 'PermissionRequest':
-            return ('waiting', False)
-        if _ev == 'PreToolUse' and _is_interactive_tool(_last_evt.get('tool', '')):
-            return ('waiting', False)
-
-        # If assistant has already replied to user prompt in state.db and no new prompt was submitted after, turn is finished.
-        if db_a_ts > 0 and db_a_ts >= db_u_ts:
-            _last_user_submit = 0.0
-            for _e in reversed(_sid_events):
-                if _e.get('event') == 'UserPromptSubmit':
-                    _last_user_submit = _e.get('timestamp', 0) or 0
-                    break
-            if _last_user_submit <= (db_a_ts + 2.0):
-                return ('stopped', False)
-
-        st = _last_evt.get('claudeStatus', '')
-        if st in ('processing', 'running_tool', 'waiting'):
-            return ('processing', True)
-        return ('stopped', False)
-
-    _pfx = '' if _profile_name == 'default' else _profile_name + ':'
-    def _fetch_db_info(_real_sid):
-        """Fetch latest user prompt + assistant response + timestamps from state.db."""
-        if not (db_conn and _real_sid): return ('', '', None, 0.0, 0.0)
-        _up, _lr = '', ''
-        _ended_at = None
-        _u_ts, _a_ts = 0.0, 0.0
-        try:
-            row = db_conn.execute("SELECT ended_at FROM sessions WHERE id=?", (_real_sid,)).fetchone()
-            if row: _ended_at = row[0]
-        except: pass
-        try:
-            row = db_conn.execute(
-                "SELECT substr(content,1,200), timestamp FROM messages WHERE session_id=? AND role='user' "
-                "ORDER BY timestamp DESC LIMIT 1", (_real_sid,)).fetchone()
-            if row:
-                if row[0]: _up = row[0]
-                if row[1]: _u_ts = float(row[1])
-        except: pass
-        try:
-            row = db_conn.execute(
-                "SELECT substr(content,1,200), timestamp FROM messages WHERE session_id=? AND role='assistant' "
-                "AND content IS NOT NULL AND content <> '' ORDER BY timestamp DESC LIMIT 1", (_real_sid,)).fetchone()
-            if row:
-                if row[0]: _lr = row[0]
-                if row[1]: _a_ts = float(row[1])
-        except: pass
-        return (_up, _lr, _ended_at, _u_ts, _a_ts)
-
-    def _scan_ooclaw_text(sid):
-        """Scan ooclaw events backward for latest non-empty userPrompt/lastResponse."""
-        _up, _lr = '', ''
-        for _e in reversed(_ooclaw_status.get(_profile_name, {}).get(sid, [])):
-            if not _up:
-                _v = _e.get('userPrompt') or ''
-                if _v: _up = _v
-            if not _lr:
-                _v = _e.get('lastResponse') or ''
-                if _v: _lr = _v
-            if _up and _lr: break
-        return (_up, _lr)
-
-    if os.path.exists(sj):
-        try:
-            data = json.load(open(sj))
-            for key, v in data.items():
-                sid = v.get('session_id','')
-                if sid: seen.add(_pfx + sid)
-                if sid not in _all_known_sids: continue
-                plat = v.get('platform','')
-                if plat in ('cron',): continue
-                updated = v.get('updated_at','')
-                label = plat
-                if _profile_name != 'default': label = _profile_name + ('/' + plat if plat else '')
-                last_ts = now
-                _real_sid = sid
-                _db_up, _db_lr, _db_ended, _db_u_ts, _db_a_ts = ('', '', None, 0.0, 0.0)
-                if db_conn and sid:
-                    try:
-                        _real_sid = _find_latest_session(sid)
-                        _db_up, _db_lr, _db_ended, _db_u_ts, _db_a_ts = _fetch_db_info(_real_sid)
-                        lts = db_conn.execute("SELECT MAX(timestamp) FROM messages WHERE session_id=? AND role NOT IN ('session_meta','system','metadata')", (_real_sid,)).fetchone()[0]
-                        if lts: last_ts = lts
-                    except: pass
-                sess_status, active = check_status(sid, _db_ended, _db_u_ts, _db_a_ts)
-                _evts = _ooclaw_status.get(_profile_name, {}).get(sid, [])
-                if _evts:
-                    _evt_max = max((_e.get('timestamp', 0) or 0) for _e in _evts)
-                    if _evt_max and _evt_max > last_ts:
-                        last_ts = _evt_max
-                _up, _lr = _scan_ooclaw_text(sid)
-                if not _up: _up = _db_up
-                if not _lr: _lr = _db_lr
-                _custom_title = v.get('title') or ''
-                _disp_name = v.get('display_name') or ''
-                results.append({'sessionId': _pfx + sid, 'platform': label, 'updatedAt': updated,
-                                'displayName': _disp_name, 'customTitle': _custom_title,
-                                'active': active,
-                                'status': sess_status, 'source': 'hermes',
-                                'startedAt': last_ts,
-                                'userPrompt': _up, 'lastResponse': _lr,
-                                'ooclaw': _ooclaw_status.get(_profile_name, {}).get(sid)})
-        except: pass
-
-    if db_conn:
-        try:
-            if _all_known_sids:
-                _ph = ','.join('?' * len(_all_known_sids))
-                cur = db_conn.execute(
-                    'SELECT id, source, model, started_at, ended_at, message_count, input_tokens, output_tokens '
-                    f'FROM sessions WHERE id IN ({_ph}) AND parent_session_id IS NULL ORDER BY started_at DESC',
-                    list(_all_known_sids))
-                _rows = cur.fetchall()
-            else:
-                _rows = []
-            for r in _rows:
-                sid = r[0]
-                if (_pfx + sid) in seen: continue
-                if sid not in _all_known_sids: continue
-                plat_db = r[1] or ''
-                if plat_db in ('cron',): continue
-                seen.add(_pfx + sid)
-                latest_sid = _find_latest_session(sid)
-                _db_up, _db_lr, _db_ended, _db_u_ts, _db_a_ts = _fetch_db_info(latest_sid)
-                if _db_ended is None and r[4] is not None: _db_ended = r[4]
-                sess_status, active = check_status(sid, _db_ended, _db_u_ts, _db_a_ts)
-                label = plat_db
-                if _profile_name != 'default': label = _profile_name + ('/' + plat_db if plat_db else '')
-                db_last_ts = r[3]
-                try:
-                    lts = db_conn.execute("SELECT MAX(timestamp) FROM messages WHERE session_id=? AND role NOT IN ('session_meta','system','metadata')", (latest_sid,)).fetchone()[0]
-                    if lts: db_last_ts = lts
-                except: pass
-                _evts2 = _ooclaw_status.get(_profile_name, {}).get(sid, [])
-                if _evts2:
-                    _evt_max2 = max((_e.get('timestamp', 0) or 0) for _e in _evts2)
-                    if _evt_max2 and (not db_last_ts or _evt_max2 > db_last_ts):
-                        db_last_ts = _evt_max2
-                _up, _lr = _scan_ooclaw_text(sid)
-                if not _up: _up = _db_up
-                if not _lr: _lr = _db_lr
-                results.append({'sessionId': _pfx + sid, 'platform': label, 'model': r[2] or '',
-                                'customTitle': '',
-                                'userPrompt': _up, 'lastResponse': _lr,
-                                'startedAt': db_last_ts, 'messageCount': r[5] or 0,
-                                'inputTokens': r[6] or 0, 'outputTokens': r[7] or 0,
-                                'active': active, 'status': sess_status, 'source': 'hermes'})
-        except: pass
-    if db_conn:
-        try: db_conn.close()
-        except: pass
-print(json.dumps(results))
-"#;
+    let py_script = hermes::build_hermes_remote_collector_script();
     let cmd = format!("python3 -c {}", shell_escape_single(py_script));
     let output = ssh_exec(&ssh_host, &ssh_user, &cmd).await?;
     let trimmed = output.trim();
     let sessions: Vec<serde_json::Value> = serde_json::from_str(trimmed)
-        .map_err(|e| format!("parse hermes remote sessions: {}", e))?;
+        .map_err(|e| format!("parse hermes remote sessions: {} (output: {})", e, truncate_chars(trimmed, 300)))?;
     Ok(sessions)
 }
 
@@ -19458,11 +18852,25 @@ except: checks['gateway_running'] = False
 # Check ooclaw plugin status — check all profile dirs
 checks['plugin_installed'] = False
 checks['plugin_enabled'] = False
+checks['plugin_version'] = ''
+checks['plugin_outdated'] = False
+checks['gateway_hook_installed'] = os.path.exists(os.path.join(hermes_dir, 'hooks', 'ooclaw', 'handler.py'))
 _check_dirs = [hermes_dir] + glob.glob(os.path.join(hermes_dir, 'profiles', '*'))
 for _cd in _check_dirs:
     _pd = os.path.join(_cd, 'plugins', 'ooclaw')
     if os.path.exists(os.path.join(_pd, '__init__.py')):
         checks['plugin_installed'] = True
+        _yaml_file = os.path.join(_pd, 'plugin.yaml')
+        if os.path.exists(_yaml_file):
+            try:
+                with open(_yaml_file) as f:
+                    for line in f:
+                        if line.startswith('version:'):
+                            checks['plugin_version'] = line.split(':', 1)[1].strip()
+                            break
+            except: pass
+        if checks['plugin_version'] and checks['plugin_version'] != '0.3.0':
+            checks['plugin_outdated'] = True
         # Check if enabled via hermes CLI (look for enabled marker or config reference)
         _cfg = os.path.join(_cd, 'config.yaml')
         if os.path.exists(_cfg):
@@ -19524,22 +18932,8 @@ print(json.dumps(checks))
 /// Pushes the plugin files and enables it in config.
 #[tauri::command]
 async fn install_hermes_remote_plugin(ssh_host: String, ssh_user: String) -> Result<serde_json::Value, String> {
-    // Generate the same plugin code as install_hermes_hooks but for remote
-    let plugin_yaml = r#"name: ooclaw
-version: 0.2.3
-description: "Forward Hermes Agent lifecycle events to oc-claw (local socket + status file)."
-hooks:
-  - on_session_start
-  - pre_llm_call
-  - post_llm_call
-  - pre_tool_call
-  - post_tool_call
-  - on_session_end
-  - on_session_finalize
-  - on_session_reset
-  - pre_approval_request
-  - post_approval_response
-"#;
+    let plugin_yaml = hermes::build_hermes_plugin_yaml();
+    let hook_yaml = hermes::build_hermes_gateway_hook_yaml();
 
     // Unix socket connect code for remote (Linux servers)
     let connect_code = r#"SOCKET_PATH = "/tmp/ooclaw-hermes.sock"
@@ -19558,170 +18952,32 @@ def _send(payload):
     except Exception:
         pass"#;
 
-    let init_py = format!(r##"# ooclaw plugin for Hermes Agent - forwards events to oc-claw.
-from __future__ import annotations
-import json, os, socket, time, threading
-from typing import Any, Dict, Tuple
-from pathlib import Path
+    let gw_connect_code = r#"SOCKET_PATH = "/tmp/ooclaw-hermes.sock"
 
-{connect_code}
-
-# Track the last session_id per thread so we can detect context-compaction
-# rollovers and emit a synthetic SessionEnd for the old session.
-_thread_local = threading.local()
-
-HOOK_TO_EVENT: Dict[str, Tuple[str, str]] = {{
-    "on_session_start": ("waiting_for_input", "SessionStart"),
-    "pre_llm_call": ("processing", "UserPromptSubmit"),
-    "post_llm_call": ("waiting_for_input", "Stop"),
-    "pre_tool_call": ("running_tool", "PreToolUse"),
-    "post_tool_call": ("processing", "PostToolUse"),
-    "on_session_end": ("waiting_for_input", "Stop"),
-    "on_session_finalize": ("ended", "SessionEnd"),
-    "on_session_reset": ("waiting_for_input", "SessionStart"),
-    "pre_approval_request": ("waiting", "PermissionRequest"),
-    "post_approval_response": ("processing", "PostToolUse"),
-}}
-
-def _status_file_path():
-    """Find the ooclaw status file path under the active profile or hermes home."""
-    hermes_home = os.environ.get("HERMES_HOME", "") or os.path.expanduser("~/.hermes")
-    profile = os.environ.get("HERMES_PROFILE", "")
-    if profile:
-        return os.path.join(hermes_home, "profiles", profile, "ooclaw-status.json")
-    return os.path.join(hermes_home, "ooclaw-status.json")
-
-_MAX_EVENTS_PER_SESSION = 100
-_MAX_SESSIONS = 20
-
-def _write_status(payload):
-    """Append event to status file, keeping last N events per session."""
-    try:
-        status_path = _status_file_path()
-        session_id = payload.get("sessionId", "unknown")
-        data = {{}}
-        if os.path.exists(status_path):
-            try:
-                with open(status_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if not isinstance(data, dict):
-                    data = {{}}
-            except Exception:
-                data = {{}}
-        if session_id not in data:
-            data[session_id] = []
-        data[session_id].append(payload)
-        if len(data[session_id]) > _MAX_EVENTS_PER_SESSION:
-            data[session_id] = data[session_id][-_MAX_EVENTS_PER_SESSION:]
-        if len(data) > _MAX_SESSIONS:
-            by_ts = sorted(data.items(), key=lambda kv: (kv[1][-1].get("timestamp", 0) if kv[1] else 0), reverse=True)
-            data = dict(by_ts[:_MAX_SESSIONS])
-        tmp_path = status_path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-        os.replace(tmp_path, status_path)
-    except Exception:
-        pass
-
-def _handle(event_name, **kwargs):
-    mapping = HOOK_TO_EVENT.get(event_name)
-    if not mapping:
+def _send_to_ooclaw(payload):
+    raw = json.dumps(payload) + "\n"
+    if not os.path.exists(SOCKET_PATH):
         return
-    status, cc_event = mapping
-    if event_name == "post_tool_call":
-        result = kwargs.get("result")
-        if isinstance(result, dict) and (result.get("error") or
-            (isinstance(result.get("exit_code"), int) and result["exit_code"] != 0)):
-            status, cc_event = "processing", "PostToolUse"
-    session_id = kwargs.get("session_id", "") or kwargs.get("conversation_id", "")
-    if not session_id:
-        session_id = getattr(_thread_local, "last_session_id", "") or ""
-    if not session_id:
-        return
-    tool_name = ""
-    if event_name in ("pre_tool_call", "post_tool_call", "pre_approval_request"):
-        tool_name = kwargs.get("tool_name", "") or kwargs.get("tool", "") or ""
-        if tool_name and (tool_name.startswith("skill") or tool_name.startswith("memor")):
-            return
-    platform = kwargs.get("platform", "") or ""
     try:
-        cwd = os.getcwd()
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2)
+        s.connect(SOCKET_PATH)
+        s.sendall(raw.encode("utf-8"))
+        s.close()
     except Exception:
-        cwd = os.path.expanduser("~/.hermes")
-    if not cwd:
-        cwd = os.path.expanduser("~/.hermes")
+        pass"#;
 
-    # Detect context-compaction session rollover
-    last_sid = getattr(_thread_local, "last_session_id", "")
-    if last_sid and last_sid != session_id:
-        end_payload = {{
-            "sessionId": last_sid,
-            "cwd": cwd,
-            "event": "SessionEnd",
-            "claudeStatus": "ended",
-            "source": "hermes",
-            "pid": os.getpid(),
-            "platform": platform,
-            "timestamp": time.time(),
-        }}
-        _send(end_payload)
-        _write_status(end_payload)
-    _thread_local.last_session_id = session_id
+    let init_py = hermes::build_hermes_plugin_source(connect_code);
+    let handler_py = hermes::build_hermes_gateway_hook_source(gw_connect_code);
 
-    payload = {{
-        "sessionId": session_id,
-        "cwd": cwd,
-        "event": cc_event,
-        "claudeStatus": status,
-        "source": "hermes",
-        "pid": os.getpid(),
-        "platform": platform,
-        "timestamp": time.time(),
-    }}
-    if tool_name:
-        payload["tool"] = tool_name
-    if event_name == "pre_llm_call":
-        prompt = kwargs.get("user_message", "") or kwargs.get("prompt", "") or kwargs.get("message", "")
-        if prompt and isinstance(prompt, str):
-            if "[CONTEXT COMPACTION" in prompt[:30]:
-                marker = "--- END OF CONTEXT SUMMARY"
-                idx = prompt.find(marker)
-                if idx != -1:
-                    prompt = prompt[idx + len(marker):].strip().lstrip("-").strip()
-            if prompt:
-                payload["userPrompt"] = prompt[:500]
-    elif event_name == "post_llm_call":
-        resp = kwargs.get("assistant_response", "") or kwargs.get("response", "") or kwargs.get("result", "")
-        if isinstance(resp, dict):
-            resp = resp.get("content", "") or resp.get("text", "")
-        if resp and isinstance(resp, str):
-            payload["lastResponse"] = resp[:2000]
-    _send(payload)
-    _write_status(payload)
-
-def _make_cb(event_name):
-    def cb(**kwargs):
-        try:
-            _handle(event_name, **kwargs)
-        except Exception:
-            pass
-        return None
-    cb.__name__ = "ooclaw_" + event_name
-    return cb
-
-def register(ctx):
-    for hook_name in HOOK_TO_EVENT:
-        ctx.register_hook(hook_name, _make_cb(hook_name))
-"##, connect_code = connect_code);
-
-    // Build a Python script that writes the plugin files and enables it
+    // Build a Python script that writes the plugin and gateway hook files and enables it
     let install_script = format!(r#"
-import json, os, subprocess, glob
+import json, os, subprocess, glob, shutil
 
 hermes_dir = os.path.expanduser('~/.hermes')
 
 # Install to ALL profiles + hermes root (for default profile)
-# This ensures every gateway instance gets the plugin.
+# This ensures every gateway instance gets the plugin and hook.
 install_targets = [hermes_dir]  # hermes root = default profile
 profiles_root = os.path.join(hermes_dir, 'profiles')
 if os.path.isdir(profiles_root):
@@ -19730,7 +18986,6 @@ if os.path.isdir(profiles_root):
             install_targets.append(pd)
 
 result = {{"installed": True, "enabled": False, "method": "none", "targets": []}}
-import shutil
 hermes_bin = shutil.which('hermes')
 if not hermes_bin:
     for p in [os.path.expanduser('~/.local/bin/hermes'),
@@ -19747,11 +19002,24 @@ for target_dir in install_targets:
         f.write('''{plugin_yaml}''')
     with open(os.path.join(plugin_dir, '__init__.py'), 'w') as f:
         f.write('''{init_py}''')
+    pycache = os.path.join(plugin_dir, '__pycache__')
+    if os.path.exists(pycache):
+        shutil.rmtree(pycache, ignore_errors=True)
+
+    hook_dir = os.path.join(target_dir, 'hooks', 'ooclaw')
+    os.makedirs(hook_dir, exist_ok=True)
+    with open(os.path.join(hook_dir, 'HOOK.yaml'), 'w') as f:
+        f.write('''{hook_yaml}''')
+    with open(os.path.join(hook_dir, 'handler.py'), 'w') as f:
+        f.write('''{handler_py}''')
+    h_pycache = os.path.join(hook_dir, '__pycache__')
+    if os.path.exists(h_pycache):
+        shutil.rmtree(h_pycache, ignore_errors=True)
+
     result["targets"].append(target_dir)
 
 # Enable via hermes CLI for each profile
 if hermes_bin:
-    # Enable for default
     try:
         out = subprocess.run([hermes_bin, 'plugins', 'enable', 'ooclaw'],
                             capture_output=True, text=True, timeout=5)
@@ -19759,7 +19027,6 @@ if hermes_bin:
             result["enabled"] = True
             result["method"] = "cli"
     except: pass
-    # Enable for each named profile
     for pd in install_targets:
         if pd == hermes_dir: continue
         profile_name = os.path.basename(pd)
@@ -19768,7 +19035,6 @@ if hermes_bin:
                           capture_output=True, text=True, timeout=5)
         except: pass
 if not result["enabled"]:
-    # Fallback: patch config.yaml
     config_path = os.path.join(hermes_dir, 'config.yaml')
     if os.path.exists(config_path):
         try:
@@ -19794,9 +19060,6 @@ if not result["enabled"]:
 # Restart all gateway processes so they load the new plugin
 result["restarted"] = []
 if hermes_bin:
-    # Just kill existing gateways — they will be auto-restarted by systemd/supervisor
-    # or the user can restart manually. We use a separate nohup command so it
-    # doesn't interfere with this SSH session.
     try:
         restart_script = '''
 import subprocess, glob, os, sys, time
@@ -19814,7 +19077,6 @@ if os.path.isdir(profiles_root):
             pname = os.path.basename(pd)
             subprocess.Popen([hermes_bin, "--profile", pname, "gateway", "run"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 '''
-        # Write restart script and run it detached (won't block or kill our session)
         restart_path = '/tmp/_ooclaw_restart_gw.py'
         with open(restart_path, 'w') as f:
             f.write(restart_script)
@@ -19825,7 +19087,12 @@ if os.path.isdir(profiles_root):
     except: pass
 
 print(json.dumps(result))
-"#, plugin_yaml = plugin_yaml.replace("'''", "\\'''"), init_py = init_py.replace("'''", "\\'''"));
+"#,
+        plugin_yaml = plugin_yaml.replace("'''", "\\'''"),
+        init_py = init_py.replace("'''", "\\'''"),
+        hook_yaml = hook_yaml.replace("'''", "\\'''"),
+        handler_py = handler_py.replace("'''", "\\'''")
+    );
 
     let cmd = format!("python3 -c {}", shell_escape_single(&install_script));
     let output = ssh_exec(&ssh_host, &ssh_user, &cmd).await?;
