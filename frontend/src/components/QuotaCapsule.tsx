@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/core'
-import { RotateCw, Zap } from 'lucide-react'
+import { RotateCw } from 'lucide-react'
 import { motion, AnimatePresence } from 'motion/react'
 import type { HarnessQuotaSummary, QuotaWindow } from '../lib/types'
 
@@ -406,7 +406,45 @@ export function QuotaCard({
 }
 
 /**
+ * Get color tone for MascotBubble's QuotaMiniBadge (Codex-style metadata lozenge).
+ * Does NOT modify global getQuotaColorLadder() which serves QuotaCard and SideRail.
+ *
+ * - >30%: Neutral metadata (secondary foreground, subtle transparent bg & border)
+ * - 15% - 30%: Warning (amber foreground, subtle amber bg & border)
+ * - <15%: Critical (rose foreground, subtle rose bg & border, tiny 4px dot, NO pulse)
+ */
+export function getQuotaMiniBadgeTone(remainingPercent: number) {
+  if (remainingPercent < 15) {
+    return {
+      tone: 'danger' as const,
+      className: 'text-rose-400 bg-rose-500/10 border-rose-500/25',
+      hasDot: true,
+      dotClass: 'bg-rose-400',
+    }
+  }
+  if (remainingPercent <= 30) {
+    return {
+      tone: 'warning' as const,
+      className: 'text-amber-400 bg-amber-500/10 border-amber-500/20',
+      hasDot: false,
+      dotClass: '',
+    }
+  }
+  return {
+    tone: 'neutral' as const,
+    className: 'text-white/60 bg-white/[0.06] border-white/[0.08]',
+    hasDot: false,
+    dotClass: '',
+  }
+}
+
+/**
  * Mini Quota Badge specifically tailored for MascotBubble.
+ * Designed as a subtle, non-intrusive Codex metadata lozenge:
+ * - 18px height, rounded-full pill
+ * - Tabular numbers, 10px font size
+ * - No Zap icon
+ * - Neutral color when healthy (>30%)
  */
 export function QuotaMiniBadge({
   harness,
@@ -420,7 +458,7 @@ export function QuotaMiniBadge({
   if (!primary) return null
 
   const remainingPercent = Math.max(0, Math.min(100, Math.round(100 - primary.percent)))
-  const ladder = getQuotaColorLadder(remainingPercent)
+  const toneInfo = getQuotaMiniBadgeTone(remainingPercent)
   const countdown = primary.resets_at
     ? formatCountdown(primary.resets_at, now, { short: true })
     : null
@@ -428,10 +466,10 @@ export function QuotaMiniBadge({
 
   return (
     <span
-      className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono font-medium border shrink-0 transition-colors select-none ${ladder.badge}`}
+      className={`mascot-bubble-quota-badge inline-flex items-center gap-1 h-[18px] px-1.5 rounded-full text-[10px] font-medium font-mono tabular-nums border shrink-0 transition-colors select-none ${toneInfo.className}`}
       title={`${harnessLabel} ${primary.label || '配额'}: 剩余 ${remainingPercent}%${countdown ? ` (重置倒计时: ${countdown})` : ''}`}
     >
-      <Zap className="w-2.5 h-2.5 shrink-0" />
+      {toneInfo.hasDot && <span className={`w-1 h-1 rounded-full shrink-0 ${toneInfo.dotClass}`} />}
       <span>{remainingPercent}%</span>
     </span>
   )

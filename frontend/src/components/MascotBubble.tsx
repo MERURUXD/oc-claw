@@ -161,6 +161,78 @@ function getSessionLine2(
   }
 }
 
+const SHIMMER_INITIAL_DELAY_MS = 600
+const SHIMMER_ACTIVE_MS = 1000
+const SHIMMER_INTERVAL_MS = 4000
+
+/**
+ * Codex-style Cadenced Shimmer for session title:
+ * - 600ms initial delay after active
+ * - 1000ms active sweep (mask/sweep translated opposite to highlight layer)
+ * - 4000ms cadence interval (1s sweep, ~3s quiet)
+ * - steps(48, end) timing
+ * - Stops immediately when inactive (e.g. waiting / stopped)
+ * - Completely disabled under prefers-reduced-motion
+ * - Isolated against QuotaMiniBadge 1-second ticker rerenders
+ */
+export function CadencedShimmerText({
+  children,
+  active,
+  reducedMotion = false,
+  className = '',
+}: {
+  children: React.ReactNode
+  active: boolean
+  reducedMotion?: boolean
+  className?: string
+}) {
+  const [isShimmering, setIsShimmering] = useState(false)
+
+  useEffect(() => {
+    if (!active || reducedMotion) {
+      setIsShimmering(false)
+      return
+    }
+
+    let activeTimer: ReturnType<typeof setTimeout> | null = null
+    let intervalTimer: ReturnType<typeof setInterval> | null = null
+    let initialTimer: ReturnType<typeof setTimeout> | null = null
+
+    const triggerSweep = () => {
+      setIsShimmering(true)
+      if (activeTimer) clearTimeout(activeTimer)
+      activeTimer = setTimeout(() => {
+        setIsShimmering(false)
+      }, SHIMMER_ACTIVE_MS)
+    }
+
+    initialTimer = setTimeout(() => {
+      triggerSweep()
+      intervalTimer = setInterval(() => {
+        triggerSweep()
+      }, SHIMMER_INTERVAL_MS)
+    }, SHIMMER_INITIAL_DELAY_MS)
+
+    return () => {
+      if (initialTimer) clearTimeout(initialTimer)
+      if (intervalTimer) clearInterval(intervalTimer)
+      if (activeTimer) clearTimeout(activeTimer)
+      setIsShimmering(false)
+    }
+  }, [active, reducedMotion])
+
+  return (
+    <div className={`mascot-bubble-title-wrapper ${className}`}>
+      <span className="mascot-bubble-main-title truncate">{children}</span>
+      {isShimmering && !reducedMotion && (
+        <span className="mascot-bubble-shimmer-sweep" aria-hidden="true">
+          <span className="mascot-bubble-shimmer-highlight truncate">{children}</span>
+        </span>
+      )}
+    </div>
+  )
+}
+
 /**
  * Mascot status bubble — an interactive status capsule/card stack for the `mascot-bubble` window
  * (`index.html#/mascot-bubble`).
@@ -495,30 +567,55 @@ export default function MascotBubble() {
                   }
                 >
                   <div
-                    className={`mascot-bubble-detailed ${isWaiting ? 'is-waiting-card' : ''}`}
+                    className="mascot-bubble-detailed"
                     onClick={() => handleClick(session.sessionId)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault()
+                        handleClick(session.sessionId)
+                      }
+                    }}
                     role="button"
                     tabIndex={0}
                     title={session.title}
                   >
                     <div className="mascot-bubble-content">
-                      {/* Line 1: Session Title / Topic */}
-                      <div className="mascot-bubble-title-line gap-1.5">
-                        <span className="mascot-bubble-main-title truncate">{session.title}</span>
-                        {(session.source === 'codex' || session.source === 'antigravity') && (
-                          <QuotaMiniBadge harness={session.source} />
-                        )}
+                      {/* Line 1: Session Title / Topic + Metadata */}
+                      <div className="mascot-bubble-title-line">
+                        <CadencedShimmerText
+                          active={(session.status === 'processing' || session.status === 'tool_running') && !isWaiting}
+                          reducedMotion={Boolean(prefersReducedMotion)}
+                        >
+                          {session.title}
+                        </CadencedShimmerText>
+
+                        <div className="mascot-bubble-metadata-group">
+                          {showBadge && (
+                            <span
+                              className="mascot-bubble-badge"
+                              title={t('settings.bubbleActiveOthers', { count: remainingOthers })}
+                            >
+                              +{remainingOthers}
+                            </span>
+                          )}
+                          {(session.source === 'codex' || session.source === 'antigravity') && (
+                            <QuotaMiniBadge harness={session.source} />
+                          )}
+                        </div>
                       </div>
 
-                      {/* Line 2: Current Action / Status */}
+                      {/* Line 2: Current Action / Subagents */}
                       {session.activeSubagents && session.activeSubagents.length > 0 ? (
                         <div className="mascot-bubble-subagents-row">
-                          <span className="mascot-bubble-subagent-robot">🤖</span>
                           {session.activeSubagents.map((sub, sIdx) => {
                             const isSubWorking = sub.status === 'tool_running' || sub.status === 'processing'
                             return (
-                              <span key={sub.id || sIdx} className="mascot-bubble-subagent-chip">
-                                <span className="mascot-bubble-subagent-role">[{sub.role}]</span>
+                              <span
+                                key={sub.id || sIdx}
+                                className="mascot-bubble-subagent-chip"
+                                title={`${sub.role} (${sub.status})`}
+                              >
+                                <span className="mascot-bubble-subagent-role">{sub.role}</span>
                                 {isSubWorking && <span className="mascot-bubble-subagent-dot" />}
                               </span>
                             )
@@ -526,29 +623,11 @@ export default function MascotBubble() {
                         </div>
                       ) : (
                         <div className={`mascot-bubble-action-line ${isWaiting ? 'is-waiting' : ''} ${isProcessing ? 'is-processing' : ''}`}>
-                          {actionPrefix && <span className="mascot-bubble-tool-prefix">{actionPrefix}: </span>}
-                          <span className="mascot-bubble-action-text">{actionContent || (actionPrefix ? '' : t('mini.working', 'working...'))}</span>
+                          {actionPrefix && <span className="mascot-bubble-tool-prefix">{actionPrefix}:</span>}
+                          <span className="mascot-bubble-action-text truncate">
+                            {actionContent || (actionPrefix ? '' : t('mini.working', 'working...'))}
+                          </span>
                         </div>
-                      )}
-                    </div>
-
-                    {/* Right side indicator: Spinner or Pulsing Dot + Badge */}
-                    <div className="mascot-bubble-status-area">
-                      {showBadge && (
-                        <span
-                          className="mascot-bubble-badge"
-                          title={t('settings.bubbleActiveOthers', { count: remainingOthers })}
-                        >
-                          +{remainingOthers}
-                        </span>
-                      )}
-                      {isWaiting ? (
-                        <span className="mascot-bubble-beacon">
-                          <span className="mascot-bubble-beacon-ring is-waiting" />
-                          <span className="mascot-bubble-beacon-dot is-waiting" />
-                        </span>
-                      ) : (
-                        <span className="mascot-bubble-spinner" />
                       )}
                     </div>
                   </div>
