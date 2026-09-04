@@ -15,6 +15,7 @@ import { QuotaSideRail } from './components/QuotaCapsule'
 import { ChatList } from './components/ChatList'
 import { getStore, DEFAULT_CHAR, DEFAULT_CHAR_NAME, loadCharacters, loadOcConnections, saveOcConnections } from './lib/store'
 import type { AgentMetrics, BubbleSessionDetail, BubbleStyle, BubbleTransitionEvent, MascotBubblePayload, OcConnection, SubagentDetail } from './lib/types'
+import { deriveSessionActivity, isSameBubblePayload } from './lib/sessionActivity'
 import { OnboardingModal } from './components/OnboardingModal'
 import { PetContextMenu, PomodoroOverlay } from './components/PetContextMenu'
 import {
@@ -2524,6 +2525,15 @@ export default function Mini() {
             }
           }
 
+          const activity =
+            s.status !== 'stopped' && s.status !== 'waiting'
+              ? (s.activity || deriveSessionActivity(s))
+              : undefined
+
+          if (import.meta.env.DEV && activity) {
+            console.debug(`[bubble activity] ${s.source || 'session'} ${activity.source}/${activity.kind} ->`, activity.summary || activity.target || activity.toolName || activity.query || activity.kind)
+          }
+
           return {
             sessionId: s.sessionId,
             title: displayTitle,
@@ -2539,6 +2549,7 @@ export default function Mini() {
             customTitle: s.customTitle || undefined,
             activeSubagents: s.activeSubagents || undefined,
             otherCount: Math.max(0, totalActive - 1),
+            activity,
           }
         }
 
@@ -2560,13 +2571,16 @@ export default function Mini() {
           activeSession: activeSessionDetail,
           activeSessions: activeSessionDetails,
         }
+        const isDuplicatePayload = isSameBubblePayload(lastBubblePayloadRef.current, bubblePayload)
         lastBubblePayloadRef.current = bubblePayload
 
         if (bubbleShouldShow) {
           bubbleDesiredVisibleRef.current = true
           const currentPhase = bubblePhaseRef.current
           if (currentPhase === 'visible' || currentPhase === 'entering' || currentPhase === 'prepared') {
-            emit('mascot-bubble-summary', bubblePayload).catch(() => {})
+            if (!isDuplicatePayload) {
+              emit('mascot-bubble-summary', bubblePayload).catch(() => {})
+            }
           } else {
             const transitionId = ++bubbleTransitionIdRef.current
             bubblePhaseRef.current = 'prepared'

@@ -10,6 +10,8 @@ import type {
   MascotBubblePayload,
   SubagentDetail,
 } from '../lib/types'
+import { formatActivity } from '../lib/activityFormat'
+import { isSameBubblePayload } from '../lib/sessionActivity'
 import { QuotaMiniBadge } from './QuotaCapsule'
 
 /**
@@ -199,13 +201,13 @@ function extractToolParam(toolInput: unknown): string | null {
 function getSessionLine2(
   session: BubbleSessionDetail,
   t: TFunction,
-  thinkingText?: string
+  fallbackThinkingText?: string
 ): { actionPrefix: string | null; actionContent: string; isWaiting: boolean; isProcessing: boolean } {
   const isWaiting = session.status === 'waiting'
-  const isToolRunning = session.status === 'tool_running' && !!session.tool
-  const isCompacting = session.status === 'compacting'
+  const isRunning = session.status === 'processing' || session.status === 'tool_running'
   const isProcessing = session.status === 'processing'
 
+  // 1. Waiting for user interaction / question
   if (isWaiting) {
     return {
       actionPrefix: null,
@@ -215,6 +217,7 @@ function getSessionLine2(
     }
   }
 
+  // 2. Active subagents
   if (session.activeSubagents && session.activeSubagents.length > 0) {
     const roles = session.activeSubagents.map((s) => s.role).filter(Boolean)
     if (roles.length > 0) {
@@ -222,12 +225,45 @@ function getSessionLine2(
         actionPrefix: null,
         actionContent: `[${roles.join(', ')}]`,
         isWaiting: false,
+        isProcessing,
+      }
+    }
+  }
+
+  // 3. Normalized Session Activity (reasoning summary, tool call, command, search, read, edit, etc.)
+  if (isRunning && session.activity) {
+    const formatted = formatActivity(session.activity, t)
+    if (formatted) {
+      return {
+        actionPrefix: null,
+        actionContent: formatted,
+        isWaiting: false,
         isProcessing: session.status === 'processing',
       }
     }
   }
 
-  if (isToolRunning && session.tool) {
+  // 4. Compacting
+  if (session.status === 'compacting') {
+    return {
+      actionPrefix: null,
+      actionContent: t('mini.compacting', 'compacting...'),
+      isWaiting: false,
+      isProcessing: false,
+    }
+  }
+
+  // 5. Legacy tool running fallback (if activity not present)
+  if (session.status === 'tool_running' && session.tool) {
+    const toolLower = session.tool.toLowerCase()
+    if (toolLower.includes('command') || toolLower.includes('bash') || toolLower.includes('shell')) {
+      return {
+        actionPrefix: null,
+        actionContent: t('mini.activityRunningCommand', 'Running command'),
+        isWaiting: false,
+        isProcessing: false,
+      }
+    }
     const param = extractToolParam(session.toolInput)
     return {
       actionPrefix: session.tool,
@@ -237,24 +273,17 @@ function getSessionLine2(
     }
   }
 
-  if (isCompacting) {
-    return {
-      actionPrefix: null,
-      actionContent: t('mini.compacting', 'compacting...'),
-      isWaiting: false,
-      isProcessing: false,
-    }
-  }
-
+  // 6. Processing thinking pool fallback
   if (isProcessing) {
     return {
       actionPrefix: null,
-      actionContent: thinkingText || t('mini.thinking', '思考中...'),
+      actionContent: fallbackThinkingText || t('mini.thinking', '思考中...'),
       isWaiting: false,
       isProcessing: true,
     }
   }
 
+  // 7. General fallback
   return {
     actionPrefix: null,
     actionContent: session.actionText || session.subtitle || session.userPrompt || t('mini.working', 'working...'),
@@ -482,6 +511,7 @@ interface SessionBubbleRowProps {
   onAnimationComplete: (sessionId: string) => void
   t: TFunction
   thinkingText?: string
+  fallbackThinkingText?: string
   showBadge: boolean
   remainingOthers: number
 }
@@ -498,10 +528,12 @@ function SessionBubbleRow({
   onAnimationComplete,
   t,
   thinkingText,
+  fallbackThinkingText,
   showBadge,
   remainingOthers,
 }: SessionBubbleRowProps) {
-  const { actionPrefix, actionContent, isWaiting, isProcessing } = getSessionLine2(session, t, thinkingText)
+  const fallback = fallbackThinkingText || thinkingText
+  const { actionPrefix, actionContent, isWaiting, isProcessing } = getSessionLine2(session, t, fallback)
 
   const mode = getRowMotionMode({
     phase,
@@ -832,6 +864,9 @@ export default function MascotBubble() {
       const hasActive = p.running > 0 || p.waiting > 0
 
       if (hasActive) {
+        if (phaseRef.current === 'visible' && isSameBubblePayload(lastValidSummaryRef.current, p)) {
+          return
+        }
         lastValidSummaryRef.current = p
         const currentSessionIds = getSessionIdsFromPayload(p)
         const currentPhase = phaseRef.current
@@ -1137,7 +1172,7 @@ export default function MascotBubble() {
   isMultiSessionRef.current = isMultiSession
   sessionsToRenderRef.current = sessionsToRender
 
-  const getThinkingText = (sessionId: string) => {
+  const getFallbackThinkingText = (sessionId: string) => {
     const rawPool = t('mini.thinkingPool', { returnObjects: true })
     const pool = Array.isArray(rawPool) && rawPool.length > 0 ? (rawPool as string[]) : [t('mini.thinking', '思考中...')]
     const idx = hashSessionId(sessionId)
@@ -1231,7 +1266,7 @@ export default function MascotBubble() {
           ) : (
             <div className="mascot-bubble-stack">
               {sessionsToRender.map((session, idx) => {
-                const thinkingText = session.status === 'processing' ? getThinkingText(session.sessionId) : undefined
+                const fallbackThinkingText = session.status === 'processing' ? getFallbackThinkingText(session.sessionId) : undefined
                 const isLast = idx === sessionsToRender.length - 1
                 const remainingOthers = Math.max(0, totalActive - sessionsToRender.length)
                 const showBadge = isLast && remainingOthers > 0
@@ -1249,7 +1284,8 @@ export default function MascotBubble() {
                     onClick={handleClick}
                     onAnimationComplete={handleRowAnimationComplete}
                     t={t}
-                    thinkingText={thinkingText}
+                    fallbackThinkingText={fallbackThinkingText}
+                    thinkingText={fallbackThinkingText}
                     showBadge={showBadge}
                     remainingOthers={remainingOthers}
                   />
