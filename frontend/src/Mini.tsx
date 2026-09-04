@@ -268,19 +268,20 @@ function formatHermesPlatform(platform?: string): string {
 }
 
 function getHermesTitle(
-  s: { sessionId: string; customTitle?: string; displayName?: string; platform?: string; cwd?: string; userPrompt?: string; user_prompt?: string },
+  s: { sessionId: string; customTitle?: string; title?: string; displayName?: string; platform?: string; cwd?: string; userPrompt?: string; user_prompt?: string },
   getSeq: (sid: string) => number
 ): string {
-  const prompt = s.userPrompt || s.user_prompt || ''
-  if (s.customTitle && (!prompt || !isSubtitleDuplicate(s.customTitle, prompt))) {
-    return s.customTitle
+  const canonical = (s.customTitle || s.title || '').trim()
+  if (canonical) {
+    return canonical
   }
   const plat = formatHermesPlatform(s.platform)
-  if (s.displayName) {
-    if (plat && !s.displayName.toLowerCase().includes(plat.toLowerCase())) {
-      return `${plat}: ${s.displayName}`
+  const disp = (s.displayName || '').trim()
+  if (disp) {
+    if (plat && !disp.toLowerCase().includes(plat.toLowerCase())) {
+      return `${plat}: ${disp}`
     }
-    return s.displayName
+    return disp
   }
   if (plat) return plat
   return `Hermes #${getSeq(s.sessionId)}`
@@ -2276,7 +2277,13 @@ export default function Mini() {
               user_prompt: userPrompt,
               lastResponse: rs.lastResponse || '',
               customTitle,
+              title: customTitle,
               displayName,
+              titleSource: rs.titleSource,
+              lifecycleSource: rs.lifecycleSource,
+              turnId: rs.turnId,
+              rootSessionId: rs.rootSessionId,
+              resolvedSessionId: rs.resolvedSessionId,
               isActiveTab: false,
             })
           }
