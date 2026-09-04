@@ -111,6 +111,15 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
  * A sleek transparent always-on-top capsule anchored next to the primary mascot.
  * ------------------------------------------------------------------------- */
 .mascot-bubble-root {
+  --bubble-surface: rgba(32, 32, 32, 0.90);
+  --bubble-border: rgba(255, 255, 255, 0.12);
+  --bubble-text-primary: rgba(255, 255, 255, 0.96);
+  --bubble-text-secondary: rgba(255, 255, 255, 0.65);
+  --bubble-warning: #fbbf24;
+  --bubble-error: #f87171;
+  --bubble-metadata-bg: rgba(255, 255, 255, 0.06);
+  --bubble-metadata-border: rgba(255, 255, 255, 0.08);
+
   display: flex;
   align-items: center;
   justify-content: flex-end;
@@ -118,14 +127,15 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
   height: fit-content;
   padding: 8px 12px;
   box-sizing: border-box;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro", "Segoe UI", sans-serif;
 }
 
 .mascot-bubble-stack {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
   align-items: stretch;
-  width: 280px;
+  width: 345px;
   box-sizing: border-box;
 }
 
@@ -282,26 +292,23 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
   flex: none;
 }
 
-/* ── Mascot Detailed Bubble Card ── */
+/* ── Mascot Detailed Bubble Card (Codex Native-Frame visual parity) ── */
 .mascot-bubble-detailed {
   position: relative;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 10px;
   width: 100%;
-  padding: 6px 11px;
-  border-radius: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  background: linear-gradient(135deg, rgba(23, 27, 39, 0.94) 0%, rgba(13, 16, 25, 0.98) 100%);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
+  padding: 10px 22px;
+  border-radius: 27px;
+  border: 1px solid var(--bubble-border);
+  background: var(--bubble-surface);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.2),
-    inset 0 -1px 0 rgba(0, 0, 0, 0.4),
-    0 8px 24px -4px rgba(0, 0, 0, 0.6),
-    0 2px 8px rgba(0, 0, 0, 0.35);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    inset 0 1px 1px rgba(255, 255, 255, 0.20),
+    inset 0 -1px 2px rgba(255, 255, 255, 0.078),
+    0 3px 16px rgba(0, 0, 0, 0.35);
+  font-family: inherit;
   user-select: none;
   cursor: pointer;
   box-sizing: border-box;
@@ -309,99 +316,155 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
 }
 
 .mascot-bubble-detailed:hover {
-  border-color: rgba(255, 255, 255, 0.26);
-  background: linear-gradient(135deg, rgba(28, 33, 48, 0.96) 0%, rgba(16, 20, 32, 0.99) 100%);
+  border-color: rgba(255, 255, 255, 0.18);
+  background: rgba(38, 38, 38, 0.92);
   transform: translateY(-0.5px);
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.26),
-    0 10px 28px -4px rgba(0, 0, 0, 0.7),
-    0 3px 10px rgba(0, 0, 0, 0.4);
+    inset 0 1px 1px rgba(255, 255, 255, 0.24),
+    inset 0 -1px 2px rgba(255, 255, 255, 0.08),
+    0 4px 18px rgba(0, 0, 0, 0.40);
 }
 
 .mascot-bubble-detailed:active {
-  transform: translateY(0) scale(0.98);
-}
-
-.mascot-bubble-detailed.is-waiting-card {
-  border-color: rgba(251, 191, 36, 0.35);
-}
-
-.mascot-bubble-detailed.is-waiting-card:hover {
-  border-color: rgba(251, 191, 36, 0.5);
+  transform: translateY(0) scale(0.985);
 }
 
 .mascot-bubble-content {
   display: flex;
   flex-direction: column;
-  gap: 1.5px;
+  gap: 2px;
   flex: 1;
   min-width: 0;
+  width: 100%;
 }
 
 .mascot-bubble-title-line {
   display: flex;
   align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   min-width: 0;
+  width: 100%;
 }
 
-@keyframes titleShimmer {
-  0% {
-    background-position: -200% 0;
-  }
-  100% {
-    background-position: 200% 0;
-  }
+.mascot-bubble-title-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
 }
 
 .mascot-bubble-main-title {
-  font-size: 13.5px;
-  font-weight: 700;
-  line-height: 1.3;
-  letter-spacing: -0.01em;
-  background: linear-gradient(
-    110deg,
-    #94a3b8 0%,
-    #cbd5e1 30%,
-    #ffffff 50%,
-    #cbd5e1 70%,
-    #94a3b8 100%
-  );
-  background-size: 200% 100%;
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
-  animation: titleShimmer 3.5s ease-in-out infinite;
+  font-size: 13px;
+  line-height: 17px;
+  font-weight: 500;
+  letter-spacing: normal;
+  color: var(--bubble-text-primary);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  width: 100%;
+}
+
+/* Codex ThinkingShimmer mask/sweep */
+.mascot-bubble-shimmer-sweep {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    black 20% 30%,
+    transparent 50% 100%
+  );
+  mask-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    black 20% 30%,
+    transparent 50% 100%
+  );
+  animation: codex-shimmer-sweep 1s steps(48, end) 1 forwards;
+  will-change: transform;
+}
+
+.mascot-bubble-shimmer-highlight {
+  display: block;
+  font-size: 13px;
+  line-height: 17px;
+  font-weight: 500;
+  letter-spacing: normal;
+  color: #ffffff;
+  text-shadow: 0 0 6px rgba(255, 255, 255, 0.7);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  width: 100%;
+  animation: codex-shimmer-highlight 1s steps(48, end) 1 forwards;
+  will-change: transform;
+}
+
+@keyframes codex-shimmer-sweep {
+  0% {
+    transform: translateX(-50%);
+  }
+  100% {
+    transform: translateX(125%);
+  }
+}
+
+@keyframes codex-shimmer-highlight {
+  0% {
+    transform: translateX(50%);
+  }
+  100% {
+    transform: translateX(-125%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mascot-bubble-shimmer-sweep {
+    display: none !important;
+    animation: none !important;
+  }
+}
+
+.mascot-bubble-metadata-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
 }
 
 .mascot-bubble-action-line {
-  font-size: 11.5px;
+  font-size: 13px;
+  line-height: 17px;
   font-weight: 400;
-  color: #94a3b8;
-  line-height: 1.3;
+  margin-top: 2px;
+  color: var(--bubble-text-secondary);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   display: flex;
   align-items: center;
   min-width: 0;
-}
-
-.mascot-bubble-action-line.is-waiting {
-  color: #fde68a;
+  width: 100%;
 }
 
 .mascot-bubble-tool-prefix {
-  font-weight: 600;
-  color: #38bdf8;
-  margin-right: 3px;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.78);
+  margin-right: 4px;
   flex: none;
 }
 
 .mascot-bubble-action-text {
-  color: #e2e8f0;
+  color: inherit;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -409,80 +472,63 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
   min-width: 0;
 }
 
-.mascot-bubble-action-line.is-waiting .mascot-bubble-action-text {
-  color: #fde68a;
+.mascot-bubble-action-line.is-waiting {
+  color: var(--bubble-warning);
 }
 
-.mascot-bubble-action-line.is-processing .mascot-bubble-action-text {
-  color: #94a3b8;
+.mascot-bubble-action-line.is-waiting .mascot-bubble-tool-prefix {
+  color: var(--bubble-warning);
 }
 
-.mascot-bubble-status-area {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex: none;
-  flex-shrink: 0;
-  margin-left: 8px;
-}
-
-.mascot-bubble-spinner {
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-  border: 2px solid rgba(56, 189, 248, 0.2);
-  border-top-color: #38bdf8;
-  border-right-color: #38bdf8;
-  animation: mascot-bubble-spin 0.85s linear infinite;
-  flex: none;
-}
-
-@keyframes mascot-bubble-spin {
-  0% { transform: rotate(0deg); }
-  100% { transform: rotate(360deg); }
+.mascot-bubble-action-line.is-error {
+  color: var(--bubble-error);
 }
 
 .mascot-bubble-badge {
-  font-size: 9.5px;
-  font-weight: 700;
-  padding: 1px 5px;
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 6px;
   border-radius: 9999px;
-  background: rgba(255, 255, 255, 0.12);
-  color: rgba(255, 255, 255, 0.9);
+  background: var(--bubble-metadata-bg);
+  border: 1px solid var(--bubble-metadata-border);
+  color: var(--bubble-text-secondary);
+  font-size: 10px;
+  font-weight: 500;
+  font-family: inherit;
+  font-variant-numeric: tabular-nums;
   flex: none;
-  font-family: ui-monospace, SFMono-Regular, monospace;
 }
 
 .mascot-bubble-subagents-row {
   display: flex;
   align-items: center;
-  gap: 5px;
+  gap: 6px;
   min-width: 0;
+  width: 100%;
   overflow: hidden;
-  margin-top: 1px;
-}
-
-.mascot-bubble-subagent-robot {
-  font-size: 11px;
-  flex: none;
+  margin-top: 2px;
 }
 
 .mascot-bubble-subagent-chip {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  font-size: 10.5px;
-  font-weight: 600;
-  padding: 1px 6px;
+  height: 17px;
+  font-size: 11px;
+  line-height: 15px;
+  font-weight: 500;
+  padding: 0 7px;
   border-radius: 9999px;
-  background: rgba(168, 85, 247, 0.18);
-  color: #e9d5ff;
-  border: 1px solid rgba(192, 132, 252, 0.35);
-  box-shadow: 0 0 10px rgba(168, 85, 247, 0.2);
+  background: var(--bubble-metadata-bg);
+  color: var(--bubble-text-secondary);
+  border: 1px solid var(--bubble-metadata-border);
+  box-shadow: none;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 140px;
+  max-width: 130px;
+  flex-shrink: 0;
 }
 
 .mascot-bubble-subagent-role {
@@ -492,13 +538,11 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
 }
 
 .mascot-bubble-subagent-dot {
-  width: 5px;
-  height: 5px;
+  width: 4px;
+  height: 4px;
   border-radius: 50%;
   background: #10b981;
-  box-shadow: 0 0 6px #10b981;
   flex: none;
-  animation: mascot-beacon-pulse 1.6s ease-in-out infinite;
 }
 
 /* ── Mascot Bubble Motion Wrapper & Layout ── */
