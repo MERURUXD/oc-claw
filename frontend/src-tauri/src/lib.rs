@@ -8001,60 +8001,583 @@ fn extract_uuids_from_text(text: &str) -> Vec<String> {
     uuids
 }
 
-/// Global registry of known Antigravity subagents: subagent_id -> (parent_id, role)
-static KNOWN_ANTIGRAVITY_SUBAGENTS: std::sync::LazyLock<Mutex<HashMap<String, (String, String)>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
-
-pub fn register_antigravity_subagent(subagent_id: &str, parent_id: &str, role: &str) {
-    if !is_uuid_str(subagent_id) { return; }
-    let mut map = KNOWN_ANTIGRAVITY_SUBAGENTS.lock().unwrap();
-    let r = if role.is_empty() || role == "Subagent" {
-        map.get(subagent_id).map(|(_, existing_role)| existing_role.clone()).unwrap_or_else(|| "Subagent".to_string())
-    } else {
-        role.to_string()
-    };
-    map.insert(subagent_id.to_string(), (parent_id.to_string(), r));
+/// Role quality source ranking for Antigravity subagents.
+/// Higher numeric value means higher authority. Role upgrade is permitted; downgrade is strictly forbidden.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AntigravityRoleSource {
+    GenericFallback = 0,
+    HeuristicTranscript = 1,
+    TranscriptExplicit = 2,
+    InvokeArgs = 3,
+    Protobuf = 4,
 }
 
-/// Pre-scan all local Antigravity brain transcripts for `invoke_subagent` and tool output
-/// (`Created the following subagents: ... conversationId: ...`), populating the subagent registry.
-pub fn scan_and_register_all_antigravity_subagents() {
+#[derive(Clone, Debug)]
+pub struct AntigravitySubagentMeta {
+    pub parent_id: String,
+    pub role: String,
+    pub role_source: AntigravityRoleSource,
+    pub status: Option<String>,
+    pub updated_at: u64,
+}
+
+/// Authoritative in-memory graph of Antigravity subagent relationships and metadata.
+/// Decouples subagent tracking from top-level UI visibility in `state.sessions`.
+pub static ANTIGRAVITY_SUBAGENT_GRAPH: std::sync::LazyLock<Mutex<HashMap<String, AntigravitySubagentMeta>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+pub fn clear_antigravity_subagent_graph_for_tests() {
+    let mut graph = ANTIGRAVITY_SUBAGENT_GRAPH.lock().unwrap();
+    graph.clear();
+}
+
+pub fn upsert_antigravity_subagent(
+    subagent_id: &str,
+    parent_id: &str,
+    role: &str,
+    source: AntigravityRoleSource,
+    status: Option<&str>,
+    updated_at: Option<u64>,
+) -> bool {
+    if !is_uuid_str(subagent_id) {
+        return false;
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let ts = updated_at.unwrap_or(now_ms);
+
+    let trimmed_role = role.trim();
+    let (final_role, effective_source) = if trimmed_role.is_empty() || trimmed_role == "Subagent" {
+        ("Subagent".to_string(), AntigravityRoleSource::GenericFallback)
+    } else {
+        (trimmed_role.to_string(), source)
+    };
+
+    let mut graph = ANTIGRAVITY_SUBAGENT_GRAPH.lock().unwrap();
+    if let Some(existing) = graph.get_mut(subagent_id) {
+        let mut changed = false;
+
+        // Role upgrade allowed, downgrade strictly forbidden
+        if effective_source > existing.role_source {
+            log::info!(
+                "[agy-subgraph] role upgrade {} \"{}\" ({:?}) -> \"{}\" ({:?})",
+                subagent_id, existing.role, existing.role_source, final_role, effective_source
+            );
+            existing.role = final_role;
+            existing.role_source = effective_source;
+            changed = true;
+        } else if effective_source == existing.role_source {
+            if existing.role == "Subagent" && final_role != "Subagent" {
+                log::info!(
+                    "[agy-subgraph] role upgrade {} \"{}\" -> \"{}\"",
+                    subagent_id, existing.role, final_role
+                );
+                existing.role = final_role;
+                changed = true;
+            }
+        }
+
+        // Parent relationship update:
+        // Only update if incoming parent_id is a valid UUID
+        if is_uuid_str(parent_id) {
+            if existing.parent_id.is_empty() {
+                log::info!(
+                    "[agy-subgraph] set parent child={} parent={}",
+                    subagent_id, parent_id
+                );
+                existing.parent_id = parent_id.to_string();
+                changed = true;
+            } else if (effective_source >= existing.role_source || effective_source == AntigravityRoleSource::Protobuf)
+                && existing.parent_id != parent_id
+            {
+                log::info!(
+                    "[agy-subgraph] parent update child={} parent: {} -> {}",
+                    subagent_id, existing.parent_id, parent_id
+                );
+                existing.parent_id = parent_id.to_string();
+                changed = true;
+            }
+        }
+
+        // Status update
+        if let Some(st) = status {
+            if existing.status.as_deref() != Some(st) {
+                existing.status = Some(st.to_string());
+                changed = true;
+            }
+        }
+
+        if ts >= existing.updated_at {
+            existing.updated_at = ts;
+        }
+
+        changed
+    } else {
+        log::info!(
+            "[agy-subgraph] register child={} parent={} role=\"{}\" source={:?}",
+            subagent_id, parent_id, final_role, effective_source
+        );
+        graph.insert(
+            subagent_id.to_string(),
+            AntigravitySubagentMeta {
+                parent_id: parent_id.to_string(),
+                role: final_role,
+                role_source: effective_source,
+                status: status.map(|s| s.to_string()),
+                updated_at: ts,
+            },
+        );
+        true
+    }
+}
+
+pub fn register_antigravity_subagent(subagent_id: &str, parent_id: &str, role: &str) {
+    let source = if role.is_empty() || role == "Subagent" {
+        AntigravityRoleSource::GenericFallback
+    } else {
+        AntigravityRoleSource::InvokeArgs
+    };
+    upsert_antigravity_subagent(subagent_id, parent_id, role, source, None, None);
+}
+
+pub fn resolve_antigravity_ancestor_chain(session_id: &str) -> Vec<String> {
+    if !is_uuid_str(session_id) {
+        return Vec::new();
+    }
+    let mut chain = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(session_id.to_string());
+
+    let mut current = session_id.to_string();
+    const MAX_DEPTH: usize = 64;
+
+    while chain.len() < MAX_DEPTH {
+        let parent_opt = {
+            let graph = ANTIGRAVITY_SUBAGENT_GRAPH.lock().unwrap();
+            graph.get(&current).and_then(|m| {
+                if is_uuid_str(&m.parent_id) {
+                    Some(m.parent_id.clone())
+                } else {
+                    None
+                }
+            })
+        }.or_else(|| {
+            let summaries = parse_agyhub_summaries_pb();
+            if let Some(m) = summaries.get(&current) {
+                if let Some(ref p) = m.parent_session_id {
+                    if is_uuid_str(p) {
+                        let role = m.subagent_role.as_deref().unwrap_or("Subagent");
+                        let source = if m.subagent_role.is_some() && role != "Subagent" {
+                            AntigravityRoleSource::Protobuf
+                        } else {
+                            AntigravityRoleSource::GenericFallback
+                        };
+                        upsert_antigravity_subagent(&current, p, role, source, None, Some(m.updated_at_ms));
+                        return Some(p.clone());
+                    }
+                }
+            }
+            None
+        });
+
+        let Some(parent) = parent_opt else {
+            break;
+        };
+
+        if visited.contains(&parent) {
+            log::warn!(
+                "[agy-subgraph] Cycle detected in ancestor chain for session={}: parent={} already visited",
+                session_id, parent
+            );
+            break;
+        }
+
+        visited.insert(parent.clone());
+        chain.push(parent.clone());
+        current = parent;
+    }
+
+    if !chain.is_empty() {
+        let full_chain_repr = std::iter::once(session_id)
+            .chain(chain.iter().map(|s| s.as_str()))
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        log::info!("[agy-subgraph] resolve {}", full_chain_repr);
+    }
+
+    chain
+}
+
+pub fn resolve_antigravity_root_session(subagent_id: &str) -> Option<String> {
+    let chain = resolve_antigravity_ancestor_chain(subagent_id);
+    chain.last().cloned()
+}
+
+pub fn get_antigravity_descendant_ids(root_id: &str) -> Vec<String> {
+    if !is_uuid_str(root_id) {
+        return Vec::new();
+    }
+    // Hydrate from protobuf first if any entries with parent_session_id are missing from in-memory graph
+    let summaries = parse_agyhub_summaries_pb();
+    for (sid, meta) in &summaries {
+        if let Some(ref pid) = meta.parent_session_id {
+            if is_uuid_str(pid) {
+                let role = meta.subagent_role.as_deref().unwrap_or("Subagent");
+                let source = if meta.subagent_role.is_some() && role != "Subagent" {
+                    AntigravityRoleSource::Protobuf
+                } else {
+                    AntigravityRoleSource::GenericFallback
+                };
+                upsert_antigravity_subagent(sid, pid, role, source, None, Some(meta.updated_at_ms));
+            }
+        }
+    }
+
+    let graph = ANTIGRAVITY_SUBAGENT_GRAPH.lock().unwrap();
+    let mut children_map: HashMap<String, Vec<String>> = HashMap::new();
+    for (child_id, meta) in graph.iter() {
+        if is_uuid_str(&meta.parent_id) {
+            children_map.entry(meta.parent_id.clone()).or_default().push(child_id.clone());
+        }
+    }
+    drop(graph);
+
+    let mut descendants = Vec::new();
+    let mut queue = std::collections::VecDeque::new();
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(root_id.to_string());
+    queue.push_back(root_id.to_string());
+
+    const MAX_DESCENDANTS: usize = 256;
+    while let Some(parent) = queue.pop_front() {
+        if let Some(children) = children_map.get(&parent) {
+            for child in children {
+                if visited.insert(child.clone()) {
+                    descendants.push(child.clone());
+                    if descendants.len() < MAX_DESCENDANTS {
+                        queue.push_back(child.clone());
+                    }
+                }
+            }
+        }
+    }
+    descendants
+}
+
+pub fn check_subagent_completed_in_parent(sub_id: &str, parent_id: &str) -> bool {
+    if !is_uuid_str(parent_id) || !is_uuid_str(sub_id) {
+        return false;
+    }
+    let parent_path = match find_antigravity_session_file(parent_id) {
+        Some(p) => p,
+        None => return false,
+    };
+    let content = match std::fs::read_to_string(&parent_path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    content.contains(&format!("sender={}", sub_id))
+        || content.contains(&format!("sender=\"{}\"", sub_id))
+        || content.contains(&format!("\"sender\":\"{}\"", sub_id))
+        || content.contains(&format!("\"sender\": \"{}\"", sub_id))
+}
+
+pub fn aggregate_antigravity_root_subagents(root_id: &str) -> (Vec<SubagentDetail>, String) {
+    let descendant_ids = get_antigravity_descendant_ids(root_id);
+    if descendant_ids.is_empty() {
+        return (Vec::new(), "stopped".to_string());
+    }
+
+    let mut active_subs = Vec::new();
+    let mut any_tool_running = false;
+
+    for id in &descendant_ids {
+        let (parent_id, mut role, role_source, in_mem_status, in_mem_ts) = {
+            let graph = ANTIGRAVITY_SUBAGENT_GRAPH.lock().unwrap();
+            match graph.get(id) {
+                Some(m) => (m.parent_id.clone(), m.role.clone(), m.role_source, m.status.clone(), m.updated_at),
+                None => continue,
+            }
+        };
+
+        // Determine current status
+        let is_completed_in_parent = check_subagent_completed_in_parent(id, &parent_id);
+
+        let (final_status, updated_at) = if is_completed_in_parent {
+            ("stopped".to_string(), in_mem_ts)
+        } else if let Some(_path) = find_antigravity_session_file(id) {
+            let (raw_disk_status, disk_updated_at) = get_subagent_status(id);
+            let ts = in_mem_ts.max(disk_updated_at);
+            if raw_disk_status == "stopped" {
+                ("stopped".to_string(), ts)
+            } else if let Some(ref st) = in_mem_status {
+                if in_mem_ts >= disk_updated_at {
+                    (st.clone(), ts)
+                } else {
+                    (raw_disk_status, ts)
+                }
+            } else {
+                (raw_disk_status, ts)
+            }
+        } else {
+            // File not yet on disk (e.g. freshly launched or in-memory stub)
+            (in_mem_status.clone().unwrap_or_else(|| "processing".to_string()), in_mem_ts)
+        };
+
+        // Try upgrading role if generic or heuristic
+        if role_source < AntigravityRoleSource::Protobuf {
+            if let Some(info) = get_antigravity_subagent_info(id) {
+                if !info.1.is_empty() && info.1 != "Subagent" {
+                    role = info.1;
+                }
+            }
+        }
+
+        // Update back in graph
+        {
+            let mut graph = ANTIGRAVITY_SUBAGENT_GRAPH.lock().unwrap();
+            if let Some(m) = graph.get_mut(id) {
+                m.status = Some(final_status.clone());
+                m.updated_at = updated_at;
+                if role != "Subagent" && m.role == "Subagent" {
+                    m.role = role.clone();
+                }
+            }
+        }
+
+        if final_status != "stopped" {
+            if final_status == "tool_running" {
+                any_tool_running = true;
+            }
+            active_subs.push(SubagentDetail {
+                id: id.clone(),
+                role,
+                status: final_status,
+                updated_at,
+            });
+        }
+    }
+
+    let agg_status = if active_subs.is_empty() {
+        "stopped".to_string()
+    } else if any_tool_running {
+        "tool_running".to_string()
+    } else {
+        "processing".to_string()
+    };
+
+    (active_subs, agg_status)
+}
+
+pub fn get_antigravity_subagent_info(subagent_id: &str) -> Option<(String, String)> {
+    if !is_uuid_str(subagent_id) {
+        return None;
+    }
+
+    let current_meta = {
+        let graph = ANTIGRAVITY_SUBAGENT_GRAPH.lock().unwrap();
+        graph.get(subagent_id).cloned()
+    };
+
+    let current_source = current_meta.as_ref().map(|m| m.role_source).unwrap_or(AntigravityRoleSource::GenericFallback);
+
+    // If source is less than Protobuf, try protobuf metadata
+    if current_source < AntigravityRoleSource::Protobuf {
+        let summaries = parse_agyhub_summaries_pb();
+        if let Some(meta) = summaries.get(subagent_id) {
+            let pid = meta.parent_session_id.as_deref()
+                .or_else(|| current_meta.as_ref().map(|m| m.parent_id.as_str()))
+                .unwrap_or("");
+            let role = meta.subagent_role.clone().unwrap_or_else(|| "Subagent".to_string());
+            let source = if meta.subagent_role.is_some() && role != "Subagent" && !role.is_empty() {
+                AntigravityRoleSource::Protobuf
+            } else {
+                AntigravityRoleSource::GenericFallback
+            };
+            upsert_antigravity_subagent(subagent_id, pid, &role, source, None, Some(meta.updated_at_ms));
+        }
+    }
+
+    // If still less than TranscriptExplicit, try inspecting subagent's transcript
+    let current_source_after_pb = {
+        let graph = ANTIGRAVITY_SUBAGENT_GRAPH.lock().unwrap();
+        graph.get(subagent_id).map(|m| m.role_source).unwrap_or(AntigravityRoleSource::GenericFallback)
+    };
+    if current_source_after_pb < AntigravityRoleSource::TranscriptExplicit {
+        if let Some(path) = find_antigravity_session_file(subagent_id) {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                for line in content.lines().take(20) {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) {
+                        let text = parsed.get("content")
+                            .or_else(|| parsed.get("text"))
+                            .or_else(|| parsed.get("message"))
+                            .and_then(|v| v.as_str());
+                        if let Some(t) = text {
+                            if let Some(role) = extract_antigravity_subagent_role(t) {
+                                let pid = {
+                                    let graph = ANTIGRAVITY_SUBAGENT_GRAPH.lock().unwrap();
+                                    graph.get(subagent_id).map(|m| m.parent_id.clone()).unwrap_or_default()
+                                };
+                                upsert_antigravity_subagent(subagent_id, &pid, &role, AntigravityRoleSource::TranscriptExplicit, None, None);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let graph = ANTIGRAVITY_SUBAGENT_GRAPH.lock().unwrap();
+    graph.get(subagent_id).map(|meta| (meta.parent_id.clone(), meta.role.clone()))
+}
+
+pub fn is_known_antigravity_subagent(subagent_id: &str) -> bool {
+    if !is_uuid_str(subagent_id) {
+        return false;
+    }
+    {
+        let graph = ANTIGRAVITY_SUBAGENT_GRAPH.lock().unwrap();
+        if let Some(meta) = graph.get(subagent_id) {
+            if !meta.parent_id.is_empty() {
+                return true;
+            }
+        }
+    }
+    let summaries = parse_agyhub_summaries_pb();
+    if let Some(meta) = summaries.get(subagent_id) {
+        if let Some(ref pid) = meta.parent_session_id {
+            if is_uuid_str(pid) {
+                let role = meta.subagent_role.clone().unwrap_or_else(|| "Subagent".to_string());
+                let source = if meta.subagent_role.is_some() && role != "Subagent" && !role.is_empty() {
+                    AntigravityRoleSource::Protobuf
+                } else {
+                    AntigravityRoleSource::GenericFallback
+                };
+                upsert_antigravity_subagent(subagent_id, pid, &role, source, None, Some(meta.updated_at_ms));
+                return true;
+            }
+        }
+    }
+    // Fallback: refresh from transcripts
+    refresh_antigravity_subagent_graph();
+    let graph = ANTIGRAVITY_SUBAGENT_GRAPH.lock().unwrap();
+    if let Some(meta) = graph.get(subagent_id) {
+        if !meta.parent_id.is_empty() {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn refresh_antigravity_subagent_graph() {
+    // 1. Ingest all protobuf metadata
+    let summaries = parse_agyhub_summaries_pb();
+    for (sid, meta) in &summaries {
+        if let Some(ref pid) = meta.parent_session_id {
+            if is_uuid_str(pid) {
+                let role = meta.subagent_role.clone().unwrap_or_else(|| "Subagent".to_string());
+                let source = if meta.subagent_role.is_some() && role != "Subagent" && !role.is_empty() {
+                    AntigravityRoleSource::Protobuf
+                } else {
+                    AntigravityRoleSource::GenericFallback
+                };
+                upsert_antigravity_subagent(sid, pid, &role, source, None, Some(meta.updated_at_ms));
+            }
+        }
+    }
+
+    // 2. Scan brain transcripts for invoke_subagent calls
     let home = match dirs::home_dir() {
         Some(h) => h,
         None => return,
     };
     let brain_dir = home.join(".gemini").join("antigravity").join("brain");
-    if !brain_dir.is_dir() { return; }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
 
-    if let Ok(entries) = std::fs::read_dir(&brain_dir) {
-        for entry in entries.flatten() {
-            if !entry.path().is_dir() { continue; }
-            let sid = entry.file_name().to_string_lossy().to_string();
-            if !is_uuid_str(&sid) { continue; }
-            let tpath = entry.path().join(".system_generated").join("logs").join("transcript.jsonl");
-            if !tpath.is_file() { continue; }
-            let Ok(content) = std::fs::read_to_string(&tpath) else { continue; };
-            if !content.contains("invoke_subagent") { continue; }
+    if brain_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&brain_dir) {
+            for entry in entries.flatten() {
+                if !entry.path().is_dir() { continue; }
+                let sid = entry.file_name().to_string_lossy().to_string();
+                if !is_uuid_str(&sid) { continue; }
+                let tpath = entry.path().join(".system_generated").join("logs").join("transcript.jsonl");
+                if !tpath.is_file() { continue; }
 
-            let lines: Vec<&str> = content.lines().collect();
-            for (idx, line) in lines.iter().enumerate() {
-                if !line.contains("invoke_subagent") { continue; }
-                let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
-                if let Some(tools) = parsed.get("tool_calls").and_then(|t| t.as_array()) {
-                    for tc in tools {
-                        if tc.get("name").and_then(|v| v.as_str()) == Some("invoke_subagent") {
-                            let roles = tc.get("args").map(extract_subagent_roles_from_tool_call).unwrap_or_default();
-                            for next_line in lines.iter().skip(idx + 1).take(5) {
-                                let Ok(next_parsed) = serde_json::from_str::<serde_json::Value>(next_line) else { continue; };
-                                let c = next_parsed.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                                if c.contains("Created the following subagents") || c.contains("conversationId") {
-                                    let uuids = extract_uuids_from_text(c);
-                                    for (u_idx, u) in uuids.into_iter().enumerate() {
-                                        let role = roles.get(u_idx).cloned().unwrap_or_else(|| "Subagent".to_string());
-                                        register_antigravity_subagent(&u, &sid, &role);
+                // Only scan transcripts modified within the last 24 hours for efficiency
+                if let Ok(meta) = std::fs::metadata(&tpath) {
+                    if let Ok(mtime) = meta.modified() {
+                        if let Ok(d) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                            let mtime_ms = d.as_millis() as u64;
+                            if now_ms.saturating_sub(mtime_ms) > 24 * 3600 * 1000 {
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                let Ok(content) = std::fs::read_to_string(&tpath) else { continue; };
+                if !content.contains("invoke_subagent") { continue; }
+
+                let lines: Vec<&str> = content.lines().collect();
+                for (idx, line) in lines.iter().enumerate() {
+                    if !line.contains("invoke_subagent") { continue; }
+                    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
+                    if let Some(tools) = parsed.get("tool_calls").and_then(|t| t.as_array()) {
+                        for tc in tools {
+                            if tc.get("name").and_then(|v| v.as_str()) == Some("invoke_subagent") {
+                                let roles = tc.get("args").map(extract_subagent_roles_from_tool_call).unwrap_or_default();
+                                for next_line in lines.iter().skip(idx + 1).take(5) {
+                                    let Ok(next_parsed) = serde_json::from_str::<serde_json::Value>(next_line) else { continue; };
+                                    let c = next_parsed.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                                    if c.contains("Created the following subagents") || c.contains("conversationId") {
+                                        let uuids = extract_uuids_from_text(c);
+                                        for (u_idx, u) in uuids.into_iter().enumerate() {
+                                            let role_cand = roles.get(u_idx).cloned().unwrap_or_default();
+                                            let (role, source) = if role_cand.is_empty() || role_cand == "Subagent" {
+                                                ("Subagent".to_string(), AntigravityRoleSource::GenericFallback)
+                                            } else {
+                                                (role_cand, AntigravityRoleSource::InvokeArgs)
+                                            };
+                                            upsert_antigravity_subagent(&u, &sid, &role, source, None, None);
+                                        }
+                                        break;
                                     }
-                                    break;
                                 }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Inspect transcripts for subagents whose role is still generic/heuristic
+    let subagent_ids: Vec<(String, String)> = {
+        let graph = ANTIGRAVITY_SUBAGENT_GRAPH.lock().unwrap();
+        graph.iter()
+            .filter(|(_, meta)| meta.role_source < AntigravityRoleSource::TranscriptExplicit || meta.role == "Subagent")
+            .map(|(id, meta)| (id.clone(), meta.parent_id.clone()))
+            .collect()
+    };
+
+    for (sub_id, parent_id) in subagent_ids {
+        if let Some(path) = find_antigravity_session_file(&sub_id) {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                for line in content.lines().take(20) {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) {
+                        let text = parsed.get("content")
+                            .or_else(|| parsed.get("text"))
+                            .or_else(|| parsed.get("message"))
+                            .and_then(|v| v.as_str());
+                        if let Some(t) = text {
+                            if let Some(role) = extract_antigravity_subagent_role(t) {
+                                upsert_antigravity_subagent(&sub_id, &parent_id, &role, AntigravityRoleSource::TranscriptExplicit, None, None);
+                                break;
                             }
                         }
                     }
@@ -8064,37 +8587,8 @@ pub fn scan_and_register_all_antigravity_subagents() {
     }
 }
 
-pub fn get_antigravity_subagent_info(subagent_id: &str) -> Option<(String, String)> {
-    if !is_uuid_str(subagent_id) { return None; }
-    if let Some(info) = KNOWN_ANTIGRAVITY_SUBAGENTS.lock().unwrap().get(subagent_id).cloned() {
-        return Some(info);
-    }
-    // Fall back to protobuf summaries
-    let summaries = parse_agyhub_summaries_pb();
-    if let Some(meta) = summaries.get(subagent_id) {
-        if let Some(ref pid) = meta.parent_session_id {
-            let role = meta.subagent_role.clone().unwrap_or_else(|| "Subagent".to_string());
-            register_antigravity_subagent(subagent_id, pid, &role);
-            return Some((pid.clone(), role));
-        }
-    }
-    None
-}
-
-pub fn is_known_antigravity_subagent(subagent_id: &str) -> bool {
-    if !is_uuid_str(subagent_id) { return false; }
-    if KNOWN_ANTIGRAVITY_SUBAGENTS.lock().unwrap().contains_key(subagent_id) {
-        return true;
-    }
-    let summaries = parse_agyhub_summaries_pb();
-    if let Some(meta) = summaries.get(subagent_id) {
-        if let Some(ref pid) = meta.parent_session_id {
-            let role = meta.subagent_role.clone().unwrap_or_else(|| "Subagent".to_string());
-            register_antigravity_subagent(subagent_id, pid, &role);
-            return true;
-        }
-    }
-    false
+pub fn scan_and_register_all_antigravity_subagents() {
+    refresh_antigravity_subagent_graph();
 }
 
 fn extract_subagent_roles_from_tool_call(args: &serde_json::Value) -> Vec<String> {
@@ -8179,8 +8673,7 @@ fn get_subagent_status(subagent_id: &str) -> (String, u64) {
     }
 
     let age_ms = now_ms.saturating_sub(updated_at);
-    // If subagent transcript hasn't been modified in 120s, it has finished or crashed
-    if age_ms > 120_000 {
+    if age_ms > 30_000 {
         return ("stopped".to_string(), updated_at);
     }
 
@@ -8210,8 +8703,10 @@ fn get_subagent_status(subagent_id: &str) -> (String, u64) {
         if has_tools {
             return ("tool_running".to_string(), updated_at);
         }
-        // Subagent turn finished or waiting to deliver report, but not yet interrupted or timed out:
-        // Keep as processing so mascot bubble does not flicker away while subagent reports to parent!
+        let has_send_message = content.contains("send_message") || content.contains("Message sent to");
+        if has_send_message || age_ms > 5000 {
+            return ("stopped".to_string(), updated_at);
+        }
         return ("processing".to_string(), updated_at);
     } else if msg_type == "GENERIC" || msg_type == "USER_INPUT" {
         return ("processing".to_string(), updated_at);
@@ -8220,7 +8715,7 @@ fn get_subagent_status(subagent_id: &str) -> (String, u64) {
     ("processing".to_string(), updated_at)
 }
 
-fn is_antigravity_subagent_session(session_id: &str) -> bool {
+pub fn is_antigravity_subagent_session(session_id: &str) -> bool {
     if !is_uuid_str(session_id) {
         return false;
     }
@@ -8450,8 +8945,7 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
         }
     }
 
-    // 4. Scan transcript for subagent invocations
-    let mut invoked_subagents: Vec<(String, String, usize)> = Vec::new(); // (subagent_id, role, step_idx)
+    // 4. Scan transcript for subagent invocations and upsert them into graph
     for (idx, line) in lines.iter().enumerate() {
         let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
         if let Some(tools) = parsed.get("tool_calls").and_then(|t| t.as_array()) {
@@ -8464,38 +8958,13 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
                         if c.contains("Created the following subagents") || c.contains("conversationId") {
                             let uuids = extract_uuids_from_text(c);
                             for (u_idx, u) in uuids.into_iter().enumerate() {
-                                let mut role = roles.get(u_idx).cloned().unwrap_or_else(|| "Subagent".to_string());
-                                if role == "Subagent" {
-                                    if let Some(info) = get_antigravity_subagent_info(&u) {
-                                        if !info.1.is_empty() && info.1 != "Subagent" {
-                                            role = info.1;
-                                        }
-                                    }
-                                }
-                                if role == "Subagent" {
-                                    if let Some(sub_path) = find_antigravity_session_file(&u) {
-                                        if let Ok(sub_content) = std::fs::read_to_string(&sub_path) {
-                                            for sub_line in sub_content.lines().take(15) {
-                                                if let Ok(sub_parsed) = serde_json::from_str::<serde_json::Value>(sub_line) {
-                                                    let sub_text = sub_parsed.get("content")
-                                                        .or_else(|| sub_parsed.get("text"))
-                                                        .or_else(|| sub_parsed.get("message"))
-                                                        .and_then(|v| v.as_str());
-                                                    if let Some(st) = sub_text {
-                                                        if let Some(r) = extract_antigravity_subagent_role(st) {
-                                                            role = r;
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                register_antigravity_subagent(&u, &session.session_id, &role);
-                                if !invoked_subagents.iter().any(|(id, _, _)| id == &u) {
-                                    invoked_subagents.push((u, role, idx));
-                                }
+                                let role_cand = roles.get(u_idx).cloned().unwrap_or_default();
+                                let (role, source) = if role_cand.is_empty() || role_cand == "Subagent" {
+                                    ("Subagent".to_string(), AntigravityRoleSource::GenericFallback)
+                                } else {
+                                    (role_cand, AntigravityRoleSource::InvokeArgs)
+                                };
+                                upsert_antigravity_subagent(&u, &session.session_id, &role, source, None, None);
                             }
                             break;
                         }
@@ -8505,64 +8974,14 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
         }
     }
 
-    let mut active_subs = Vec::new();
-    for (sub_id, mut role, sub_created_idx) in invoked_subagents {
-        let finished_in_main = lines.iter().skip(sub_created_idx + 1).any(|l| {
-            l.contains(&format!("sender={}", sub_id)) || l.contains(&format!("sender=\"{}\"", sub_id))
-        });
-        if finished_in_main {
-            continue;
-        }
-
-        let (sub_status, sub_updated_at) = get_subagent_status(&sub_id);
-        if sub_status != "stopped" {
-            if role == "Subagent" {
-                if let Some(info) = get_antigravity_subagent_info(&sub_id) {
-                    if !info.1.is_empty() && info.1 != "Subagent" {
-                        role = info.1;
-                    }
-                }
-            }
-            if role == "Subagent" {
-                if let Some(sub_path) = find_antigravity_session_file(&sub_id) {
-                    if let Ok(sub_content) = std::fs::read_to_string(&sub_path) {
-                        for sub_line in sub_content.lines().take(15) {
-                            if let Ok(sub_parsed) = serde_json::from_str::<serde_json::Value>(sub_line) {
-                                let sub_text = sub_parsed.get("content")
-                                    .or_else(|| sub_parsed.get("text"))
-                                    .or_else(|| sub_parsed.get("message"))
-                                    .and_then(|v| v.as_str());
-                                if let Some(st) = sub_text {
-                                    if let Some(r) = extract_antigravity_subagent_role(st) {
-                                        role = r;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            register_antigravity_subagent(&sub_id, &session.session_id, &role);
-            active_subs.push(SubagentDetail {
-                id: sub_id,
-                role,
-                status: sub_status,
-                updated_at: sub_updated_at,
-            });
-        }
-    }
-
+    // 5. Aggregate active subagents across all descendants (supporting arbitrary nesting depth)
+    let (active_subs, agg_status) = aggregate_antigravity_root_subagents(&session.session_id);
     let has_active_subs = !active_subs.is_empty();
+
     if has_active_subs {
-        let any_tool_running = active_subs.iter().any(|s| s.status == "tool_running");
-        session.status = if any_tool_running {
-            "tool_running".to_string()
-        } else {
-            "processing".to_string()
-        };
+        session.status = agg_status;
         session.is_processing = true;
-        session.pending_agents = active_subs.iter().filter(|s| s.status != "stopped").count() as u32;
+        session.pending_agents = active_subs.len() as u32;
         session.active_subagents = Some(active_subs);
         session.last_response = None;
         return true;
@@ -9545,9 +9964,6 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
             .collect();
         for sid in subagent_sids {
             sessions.remove(&sid);
-            if let Ok(mut dismissed) = state.dismissed.lock() {
-                dismissed.insert(sid);
-            }
         }
     }
 
@@ -15772,6 +16188,502 @@ mod codex_adapter_tests {
             assert!(!is_antigravity_subagent_session(&s.session_id));
         }
     }
+
+    // --- Antigravity Subagent Graph & Regression Tests ---
+
+    #[test]
+    fn test_agy_subagent_test1_generic_role_can_be_upgraded() {
+        let sub_id = "11111111-1111-1111-1111-111111111111";
+        let parent_id = "11111111-1111-1111-1111-111111111112";
+
+        // First: GenericFallback
+        upsert_antigravity_subagent(
+            sub_id,
+            parent_id,
+            "Subagent",
+            AntigravityRoleSource::GenericFallback,
+            None,
+            None,
+        );
+        let info1 = get_antigravity_subagent_info(sub_id).unwrap();
+        assert_eq!(info1.1, "Subagent");
+
+        // Later: upgraded to Frontend Engineer with Protobuf
+        upsert_antigravity_subagent(
+            sub_id,
+            parent_id,
+            "Frontend Engineer",
+            AntigravityRoleSource::Protobuf,
+            None,
+            None,
+        );
+        let info2 = get_antigravity_subagent_info(sub_id).unwrap();
+        assert_eq!(info2.1, "Frontend Engineer");
+    }
+
+    #[test]
+    fn test_agy_subagent_test2_high_quality_role_cannot_downgrade() {
+        let sub_id = "22222222-2222-2222-2222-222222222221";
+        let parent_id = "22222222-2222-2222-2222-222222222222";
+
+        // First: registered with high-quality Protobuf source
+        upsert_antigravity_subagent(
+            sub_id,
+            parent_id,
+            "Backend Engineer",
+            AntigravityRoleSource::Protobuf,
+            None,
+            None,
+        );
+
+        // Later: scan attempts to write generic fallback "Subagent"
+        upsert_antigravity_subagent(
+            sub_id,
+            parent_id,
+            "Subagent",
+            AntigravityRoleSource::GenericFallback,
+            None,
+            None,
+        );
+        let info1 = get_antigravity_subagent_info(sub_id).unwrap();
+        assert_eq!(info1.1, "Backend Engineer");
+
+        // Later: heuristic scan also cannot downgrade Protobuf
+        upsert_antigravity_subagent(
+            sub_id,
+            parent_id,
+            "Heuristic Guess",
+            AntigravityRoleSource::HeuristicTranscript,
+            None,
+            None,
+        );
+        let info2 = get_antigravity_subagent_info(sub_id).unwrap();
+        assert_eq!(info2.1, "Backend Engineer");
+    }
+
+    #[test]
+    fn test_agy_subagent_test3_two_level_nesting() {
+        let a = "33333333-3333-3333-3333-333333333331";
+        let b = "33333333-3333-3333-3333-333333333332";
+        let c = "33333333-3333-3333-3333-333333333333";
+
+        // A -> B -> C
+        upsert_antigravity_subagent(b, a, "Coordinator", AntigravityRoleSource::InvokeArgs, None, None);
+        upsert_antigravity_subagent(c, b, "Worker", AntigravityRoleSource::InvokeArgs, None, None);
+
+        assert_eq!(resolve_antigravity_root_session(b).as_deref(), Some(a));
+        assert_eq!(resolve_antigravity_root_session(c).as_deref(), Some(a));
+        assert_eq!(resolve_antigravity_ancestor_chain(c), vec![b.to_string(), a.to_string()]);
+    }
+
+    #[test]
+    fn test_agy_subagent_test4_three_level_nesting() {
+        let a = "44444444-4444-4444-4444-444444444441";
+        let b = "44444444-4444-4444-4444-444444444442";
+        let c = "44444444-4444-4444-4444-444444444443";
+        let d = "44444444-4444-4444-4444-444444444444";
+
+        // A -> B -> C -> D
+        upsert_antigravity_subagent(b, a, "Manager", AntigravityRoleSource::InvokeArgs, None, None);
+        upsert_antigravity_subagent(c, b, "Lead", AntigravityRoleSource::InvokeArgs, None, None);
+        upsert_antigravity_subagent(d, c, "Specialist", AntigravityRoleSource::InvokeArgs, None, None);
+
+        assert_eq!(resolve_antigravity_root_session(d).as_deref(), Some(a));
+        assert_eq!(
+            resolve_antigravity_ancestor_chain(d),
+            vec![c.to_string(), b.to_string(), a.to_string()]
+        );
+    }
+
+    #[test]
+    fn test_agy_subagent_test5_cycle_safety() {
+        let b = "55555555-5555-5555-5555-555555555551";
+        let c = "55555555-5555-5555-5555-555555555552";
+
+        // Construct cyclic dependency: B -> C -> B
+        upsert_antigravity_subagent(b, c, "AgentB", AntigravityRoleSource::InvokeArgs, None, None);
+        upsert_antigravity_subagent(c, b, "AgentC", AntigravityRoleSource::InvokeArgs, None, None);
+
+        // Must terminate safely and not stack overflow / hang indefinitely
+        let chain = resolve_antigravity_ancestor_chain(b);
+        assert!(!chain.is_empty());
+        assert!(chain.len() <= 2);
+    }
+
+    #[test]
+    fn test_agy_subagent_test6_nested_event_attribution() {
+        let a = "66666666-6666-6666-6666-666666666661";
+        let b = "66666666-6666-6666-6666-666666666662";
+        let c = "66666666-6666-6666-6666-666666666663";
+
+        upsert_antigravity_subagent(b, a, "Coordinator", AntigravityRoleSource::InvokeArgs, Some("processing"), None);
+        upsert_antigravity_subagent(c, b, "NestedWorker", AntigravityRoleSource::InvokeArgs, Some("processing"), None);
+
+        let mut sessions: HashMap<String, ClaudeSession> = HashMap::new();
+        sessions.insert(a.to_string(), ClaudeSession {
+            session_id: a.to_string(),
+            cwd: "C:/test".to_string(),
+            status: "stopped".to_string(),
+            tool: None,
+            tool_input: None,
+            user_prompt: None,
+            custom_title: None,
+            interactive: true,
+            updated_at: 100,
+            is_processing: false,
+            pid: None,
+            pending_agents: 0,
+            last_response: None,
+            is_active_tab: false,
+            source: "antigravity".to_string(),
+            permission_suggestions: None,
+            terminal_id: None,
+            host_terminal: None,
+            platform: None,
+            cursor_port: None,
+            cursor_workspace_root: None,
+            cursor_workspace_name: None,
+            cursor_native_handle: None,
+            active_subagents: None,
+            activity: None,
+        });
+
+        // Nested subagent C emits PreToolUse
+        let res = handle_antigravity_subagent_event(c, "PreToolUse", &mut sessions);
+        assert_eq!(res.as_deref(), Some(a));
+
+        // Root A must be tool_running, active, and have C in active_subagents
+        let root = sessions.get(a).unwrap();
+        assert_eq!(root.status, "tool_running");
+        assert!(root.is_processing);
+        let subs = root.active_subagents.as_ref().unwrap();
+        assert!(subs.iter().any(|s| s.id == c && s.status == "tool_running"));
+        // Subagents B and C must not be in top-level sessions
+        assert!(!sessions.contains_key(b));
+        assert!(!sessions.contains_key(c));
+    }
+
+    #[test]
+    fn test_agy_subagent_test7_direct_parent_stopped_descendant_active() {
+        let a = "77777777-7777-7777-7777-777777777771";
+        let b = "77777777-7777-7777-7777-777777777772";
+        let c = "77777777-7777-7777-7777-777777777773";
+
+        // B stopped, C processing
+        upsert_antigravity_subagent(b, a, "Coordinator", AntigravityRoleSource::InvokeArgs, Some("stopped"), None);
+        upsert_antigravity_subagent(c, b, "Researcher", AntigravityRoleSource::InvokeArgs, Some("processing"), None);
+
+        let (active_subs, status) = aggregate_antigravity_root_subagents(a);
+        assert_eq!(status, "processing");
+        assert_eq!(active_subs.len(), 1);
+        assert_eq!(active_subs[0].id, c);
+        assert_eq!(active_subs[0].role, "Researcher");
+    }
+
+    #[test]
+    fn test_agy_subagent_test8_all_descendants_stopped() {
+        let a = "88888888-8888-8888-8888-888888888881";
+        let b = "88888888-8888-8888-8888-888888888882";
+        let c = "88888888-8888-8888-8888-888888888883";
+
+        // Both B and C stopped
+        upsert_antigravity_subagent(b, a, "Coordinator", AntigravityRoleSource::InvokeArgs, Some("stopped"), None);
+        upsert_antigravity_subagent(c, b, "Researcher", AntigravityRoleSource::InvokeArgs, Some("stopped"), None);
+
+        let (active_subs, status) = aggregate_antigravity_root_subagents(a);
+        assert_eq!(status, "stopped");
+        assert!(active_subs.is_empty());
+    }
+
+    #[test]
+    fn test_agy_subagent_test9_subagents_not_in_top_level_list() {
+        let a = "99999999-9999-9999-9999-999999999991";
+        let b = "99999999-9999-9999-9999-999999999992";
+        let c = "99999999-9999-9999-9999-999999999993";
+
+        upsert_antigravity_subagent(b, a, "B_Sub", AntigravityRoleSource::InvokeArgs, Some("processing"), None);
+        upsert_antigravity_subagent(c, b, "C_Sub", AntigravityRoleSource::InvokeArgs, Some("processing"), None);
+
+        assert!(is_antigravity_subagent_session(b));
+        assert!(is_antigravity_subagent_session(c));
+        assert!(!is_antigravity_subagent_session(a));
+
+        let mut sessions: HashMap<String, ClaudeSession> = HashMap::new();
+        sessions.insert(a.to_string(), ClaudeSession {
+            session_id: a.to_string(),
+            cwd: "C:/test".to_string(),
+            status: "processing".to_string(),
+            tool: None,
+            tool_input: None,
+            user_prompt: None,
+            custom_title: None,
+            interactive: true,
+            updated_at: 100,
+            is_processing: true,
+            pid: None,
+            pending_agents: 2,
+            last_response: None,
+            is_active_tab: false,
+            source: "antigravity".to_string(),
+            permission_suggestions: None,
+            terminal_id: None,
+            host_terminal: None,
+            platform: None,
+            cursor_port: None,
+            cursor_workspace_root: None,
+            cursor_workspace_name: None,
+            cursor_native_handle: None,
+            active_subagents: None,
+            activity: None,
+        });
+        // Subagents accidentally in sessions map
+        sessions.insert(b.to_string(), sessions.get(a).unwrap().clone());
+        sessions.insert(c.to_string(), sessions.get(a).unwrap().clone());
+
+        let subagent_sids: Vec<String> = sessions.keys()
+            .filter(|sid| is_antigravity_subagent_session(sid))
+            .cloned()
+            .collect();
+        for sid in subagent_sids {
+            sessions.remove(&sid);
+        }
+
+        assert!(sessions.contains_key(a));
+        assert!(!sessions.contains_key(b));
+        assert!(!sessions.contains_key(c));
+
+        let (active_subs, _) = aggregate_antigravity_root_subagents(a);
+        assert_eq!(active_subs.len(), 2);
+    }
+
+    #[test]
+    fn test_agy_subagent_test10_multiple_sibling_and_nested_agents() {
+        let a = "aaaaaaaa-1010-1010-1010-aaaaaaaaaa01";
+        let b = "aaaaaaaa-1010-1010-1010-aaaaaaaaaa02";
+        let c = "aaaaaaaa-1010-1010-1010-aaaaaaaaaa03";
+        let d = "aaaaaaaa-1010-1010-1010-aaaaaaaaaa04";
+        let e = "aaaaaaaa-1010-1010-1010-aaaaaaaaaa05";
+
+        // A -> B (processing), A -> E (processing)
+        // B -> C (tool_running), B -> D (processing)
+        upsert_antigravity_subagent(b, a, "SubB", AntigravityRoleSource::InvokeArgs, Some("processing"), None);
+        upsert_antigravity_subagent(e, a, "SubE", AntigravityRoleSource::InvokeArgs, Some("processing"), None);
+        upsert_antigravity_subagent(c, b, "SubC", AntigravityRoleSource::InvokeArgs, Some("tool_running"), None);
+        upsert_antigravity_subagent(d, b, "SubD", AntigravityRoleSource::InvokeArgs, Some("processing"), None);
+
+        let (active_subs, status) = aggregate_antigravity_root_subagents(a);
+        assert_eq!(status, "tool_running");
+        assert_eq!(active_subs.len(), 4);
+        let ids: Vec<&str> = active_subs.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&b));
+        assert!(ids.contains(&c));
+        assert!(ids.contains(&d));
+        assert!(ids.contains(&e));
+    }
+
+    #[test]
+    fn test_agy_subagent_test11_heuristic_can_upgrade_to_protobuf() {
+        let sub_id = "bbbbbbbb-1111-1111-1111-bbbbbbbbbb01";
+        let parent_id = "bbbbbbbb-1111-1111-1111-bbbbbbbbbb02";
+
+        // First: registered with HeuristicTranscript
+        upsert_antigravity_subagent(
+            sub_id,
+            parent_id,
+            "Heuristic Role Guess",
+            AntigravityRoleSource::HeuristicTranscript,
+            None,
+            None,
+        );
+        let info1 = get_antigravity_subagent_info(sub_id).unwrap();
+        assert_eq!(info1.1, "Heuristic Role Guess");
+
+        // Later: upgraded to high-quality Protobuf source
+        upsert_antigravity_subagent(
+            sub_id,
+            parent_id,
+            "Principal Rust Engineer",
+            AntigravityRoleSource::Protobuf,
+            None,
+            None,
+        );
+        let info2 = get_antigravity_subagent_info(sub_id).unwrap();
+        assert_eq!(info2.1, "Principal Rust Engineer");
+    }
+
+    #[test]
+    fn test_agy_subagent_test12_parent_send_message_descendant_still_running() {
+        let a = "cccccccc-1212-1212-1212-cccccccccc01";
+        let b = "cccccccc-1212-1212-1212-cccccccccc02";
+        let c = "cccccccc-1212-1212-1212-cccccccccc03";
+
+        // B reports to A and is stopped; C is still executing tool_running
+        upsert_antigravity_subagent(b, a, "Coordinator", AntigravityRoleSource::InvokeArgs, Some("stopped"), None);
+        upsert_antigravity_subagent(c, b, "Worker", AntigravityRoleSource::InvokeArgs, Some("tool_running"), None);
+
+        let mut sessions: HashMap<String, ClaudeSession> = HashMap::new();
+        sessions.insert(a.to_string(), ClaudeSession {
+            session_id: a.to_string(),
+            cwd: "C:/test".to_string(),
+            status: "stopped".to_string(),
+            tool: None,
+            tool_input: None,
+            user_prompt: None,
+            custom_title: None,
+            interactive: true,
+            updated_at: 100,
+            is_processing: false,
+            pid: None,
+            pending_agents: 0,
+            last_response: None,
+            is_active_tab: false,
+            source: "antigravity".to_string(),
+            permission_suggestions: None,
+            terminal_id: None,
+            host_terminal: None,
+            platform: None,
+            cursor_port: None,
+            cursor_workspace_root: None,
+            cursor_workspace_name: None,
+            cursor_native_handle: None,
+            active_subagents: None,
+            activity: None,
+        });
+
+        // Even though B is stopped, C event maintains Root A in tool_running
+        let root = handle_antigravity_subagent_event(c, "PreToolUse", &mut sessions);
+        assert_eq!(root.as_deref(), Some(a));
+        let root_sess = sessions.get(a).unwrap();
+        assert_eq!(root_sess.status, "tool_running");
+        assert!(root_sess.is_processing);
+        assert_eq!(root_sess.pending_agents, 1);
+        assert_eq!(root_sess.active_subagents.as_ref().unwrap()[0].id, c);
+
+        // When C also stops
+        upsert_antigravity_subagent(c, b, "Worker", AntigravityRoleSource::InvokeArgs, Some("stopped"), None);
+        let (active_subs, status) = aggregate_antigravity_root_subagents(a);
+        assert_eq!(status, "stopped");
+        assert!(active_subs.is_empty());
+    }
+}
+
+/// Handle an Antigravity subagent event: purge subagent from top-level sessions,
+/// update subagent in the global subagent graph, resolve its root session across arbitrary
+/// nesting levels, and re-aggregate active descendants onto the root session.
+/// Returns Some(root_session_id) if successfully attributed to a root session.
+pub fn handle_antigravity_subagent_event(
+    session_id: &str,
+    hook_event: &str,
+    sessions: &mut HashMap<String, ClaudeSession>,
+) -> Option<String> {
+    if !is_uuid_str(session_id) {
+        return None;
+    }
+
+    // 1. Purge subagent from top-level session map so it never appears in message box
+    sessions.remove(session_id);
+
+    // 2. Map hook event to subagent status
+    let sub_status = match hook_event {
+        "PreToolUse" => "tool_running",
+        "UserPromptSubmit" | "PostToolUse" | "PreInvocation" => "processing",
+        "Stop" => {
+            let (st, _) = get_subagent_status(session_id);
+            if st == "stopped" { "stopped" } else { "processing" }
+        }
+        _ => "processing",
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // 3. Update subagent in the global graph
+    let (direct_parent_id, role) = get_antigravity_subagent_info(session_id)
+        .unwrap_or_else(|| (String::new(), "Subagent".to_string()));
+
+    upsert_antigravity_subagent(
+        session_id,
+        &direct_parent_id,
+        &role,
+        AntigravityRoleSource::GenericFallback, // Keeps existing higher source if present
+        Some(sub_status),
+        Some(now_ms),
+    );
+
+    // 4. Resolve root session across arbitrary nesting
+    let root_id = match resolve_antigravity_root_session(session_id) {
+        Some(r) => {
+            log::info!("[agy-subgraph] resolve child={} -> root={}", session_id, r);
+            r
+        }
+        None => {
+            log::warn!("[agy-subgraph] failed to resolve root for subagent={}", session_id);
+            return None;
+        }
+    };
+
+    // 5. Update the root session with aggregated descendants
+    let root_session = if let Some(s) = sessions.get_mut(&root_id) {
+        s
+    } else {
+        let summaries = parse_agyhub_summaries_pb();
+        let meta = summaries.get(&root_id);
+        let mut new_session = ClaudeSession {
+            session_id: root_id.clone(),
+            cwd: meta.and_then(|m| m.cwd.clone()).unwrap_or_default(),
+            status: "processing".to_string(),
+            tool: None,
+            tool_input: None,
+            user_prompt: None,
+            custom_title: meta.and_then(|m| if m.title.is_empty() { None } else { Some(m.title.clone()) }),
+            interactive: true,
+            updated_at: now_ms,
+            is_processing: true,
+            pid: None,
+            pending_agents: 0,
+            last_response: None,
+            is_active_tab: false,
+            source: "antigravity".to_string(),
+            permission_suggestions: None,
+            terminal_id: None,
+            host_terminal: None,
+            platform: None,
+            cursor_port: None,
+            cursor_workspace_root: None,
+            cursor_workspace_name: None,
+            cursor_native_handle: None,
+            active_subagents: None,
+            activity: None,
+        };
+        update_antigravity_session_from_transcript(&mut new_session);
+        sessions.insert(root_id.clone(), new_session);
+        sessions.get_mut(&root_id).unwrap()
+    };
+
+    let (active_subs, agg_status) = aggregate_antigravity_root_subagents(&root_id);
+    log::info!(
+        "[agy-subgraph] root={} active_descendants={:?} status={} pending={}",
+        root_id,
+        active_subs.iter().map(|s| &s.role).collect::<Vec<_>>(),
+        agg_status,
+        active_subs.len()
+    );
+
+    if !active_subs.is_empty() {
+        root_session.status = agg_status;
+        root_session.is_processing = true;
+        root_session.pending_agents = active_subs.len() as u32;
+        root_session.last_response = None;
+        root_session.active_subagents = Some(active_subs);
+    } else {
+        root_session.active_subagents = None;
+        let _ = update_antigravity_session_from_transcript(root_session);
+    }
+    root_session.updated_at = now_ms;
+
+    Some(root_id)
 }
 
 /// Process a Claude hook event (shared logic between Unix socket and TCP server).
@@ -15885,65 +16797,20 @@ fn process_claude_event(
         let is_agy_source = source_override == Some("antigravity")
             || event.get("source").and_then(|v| v.as_str()) == Some("antigravity");
         if is_agy_source && is_antigravity_subagent_session(&session_id) {
-            if let Ok(mut sessions) = state.lock() {
-                sessions.remove(&session_id);
-            }
             stop_session_file_watcher(&session_id);
-
-            // Attribute event to parent session and update active_subagents
-            if let Some((parent_id, role)) = get_antigravity_subagent_info(&session_id) {
-                let sub_status = match hook_event.as_str() {
-                    "PreToolUse" => "tool_running",
-                    "UserPromptSubmit" | "PostToolUse" | "PreInvocation" => "processing",
-                    "Stop" => {
-                        let (st, _) = get_subagent_status(&session_id);
-                        if st == "stopped" { "stopped" } else { "processing" }
-                    }
-                    _ => "processing",
-                };
-
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-
-                if let Ok(mut sessions_guard) = state.lock() {
-                    if let Some(parent_session) = sessions_guard.get_mut(&parent_id) {
-                        let mut subs = parent_session.active_subagents.take().unwrap_or_default();
-                        if let Some(existing) = subs.iter_mut().find(|s| s.id == session_id) {
-                            existing.status = sub_status.to_string();
-                            existing.updated_at = now_ms;
-                            if (existing.role == "Subagent" || existing.role.is_empty()) && role != "Subagent" {
-                                existing.role = role.clone();
-                            }
-                        } else {
-                            subs.push(SubagentDetail {
-                                id: session_id.clone(),
-                                role: role.clone(),
-                                status: sub_status.to_string(),
-                                updated_at: now_ms,
-                            });
-                        }
-
-                        let any_active = subs.iter().any(|s| s.status != "stopped");
-                        if any_active {
-                            let any_running = subs.iter().any(|s| s.status == "tool_running");
-                            parent_session.status = if any_running { "tool_running".to_string() } else { "processing".to_string() };
-                            parent_session.is_processing = true;
-                            parent_session.pending_agents = subs.iter().filter(|s| s.status != "stopped").count() as u32;
-                            parent_session.last_response = None;
-                            parent_session.active_subagents = Some(subs);
-                        } else {
-                            let _ = update_antigravity_session_from_transcript(parent_session);
-                        }
-                        parent_session.updated_at = now_ms;
-                        let _ = app.emit("claude-session-update", &parent_id);
-                    }
-                }
+            let root_opt = if let Ok(mut sessions_guard) = state.lock() {
+                handle_antigravity_subagent_event(&session_id, &hook_event, &mut sessions_guard)
+            } else {
+                None
+            };
+            if let Some(ref root_id) = root_opt {
+                let _ = app.emit("claude-session-update", root_id);
             }
-
             log::info!(
-                "[claude_event] ignore antigravity subagent session={} event={}",
+                "[claude_event] handled antigravity subagent session={} event={} root={:?}",
                 session_id,
-                hook_event
+                hook_event,
+                root_opt
             );
             return None;
         }
