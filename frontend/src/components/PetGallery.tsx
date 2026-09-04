@@ -60,7 +60,9 @@ const KIND_LABEL_KEYS: Record<'creature' | 'character' | 'object', string> = {
 
 const PREVIEW_ANIMATION_STATES: { state: CodexPetState; labelKey: string }[] = [
   { state: 'idle', labelKey: 'petGallery.stateIdle' },
+  { state: 'running', labelKey: 'petGallery.stateRunning' },
   { state: 'run-right', labelKey: 'petGallery.stateRun' },
+  { state: 'run-left', labelKey: 'petGallery.stateRunLeft' },
   { state: 'jumping', labelKey: 'petGallery.stateJump' },
   { state: 'waving', labelKey: 'petGallery.stateWave' },
   { state: 'waiting', labelKey: 'petGallery.stateWait' },

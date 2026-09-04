@@ -3,13 +3,22 @@ import { SpritePet } from './SpritePet'
 import { ANIMATION_ROWS, fpsFor } from '../lib/codexPet'
 import type { CodexPet, CodexPetState } from '../lib/codexPet'
 
+export interface MascotReaction {
+  state: 'waving' | 'failed'
+  id: number
+}
+
 interface MiniPetMascotProps {
   pet: CodexPet
   // Resting state computed by the parent: idle / running (working+compacting) /
-  // waiting / run-right / run-left. `jumping` is owned by this wrapper via
+  // waiting / review / run-right / run-left. `jumping` is owned by this wrapper via
   // hover and should not be passed in.
   baseState: CodexPetState
   size: number
+  // Transient reaction: waving (success one-shot) or failed (error one-shot).
+  reaction?: MascotReaction | null
+  // Fired when the one-shot reaction reaches its last frame so the parent can clear it.
+  onReactionEnd?: (reactionId: number) => void
   // When true, the wrapper plays a one-shot jump while hovered, then waits
   // before triggering the next jump.
   enableHoverJump?: boolean
@@ -40,6 +49,8 @@ export function MiniPetMascot({
   pet,
   baseState,
   size,
+  reaction = null,
+  onReactionEnd,
   enableHoverJump = false,
   externalHover = false,
   useExternalHover = false,
@@ -56,19 +67,35 @@ export function MiniPetMascot({
   const [jumpKey, setJumpKey] = useState(0)
   const hoveringRef = useRef(false)
   const restTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const onReactionEndRef = useRef(onReactionEnd)
+  onReactionEndRef.current = onReactionEnd
+
+  const isMovement = baseState === 'run-left' || baseState === 'run-right'
+  const isReactionActive = !!reaction && (reaction.state === 'failed' || reaction.state === 'waving')
+  const isReview = baseState === 'review'
+
+  // Hover jumping is only allowed when:
+  // 1. enableHoverJump is active and not suppressed by drag
+  // 2. Not in active movement (run-left / run-right)
+  // 3. Not currently playing a transient reaction (failed / waving)
+  // 4. Not in persistent review state
+  const allowHoverJump =
+    enableHoverJump &&
+    !suppressHover &&
+    !isMovement &&
+    !isReactionActive &&
+    !isReview
 
   const onEnter = useCallback(() => {
-    if (enableHoverJump && !useExternalHover) setInternalHover(true)
-  }, [enableHoverJump, useExternalHover])
+    if (allowHoverJump && !useExternalHover) setInternalHover(true)
+  }, [allowHoverJump, useExternalHover])
 
   const onLeave = useCallback(() => {
-    if (enableHoverJump && !useExternalHover) setInternalHover(false)
-  }, [enableHoverJump, useExternalHover])
+    if (!useExternalHover) setInternalHover(false)
+  }, [useExternalHover])
 
   const hovering =
-    enableHoverJump
-    && !suppressHover
-    && (useExternalHover ? externalHover : internalHover)
+    allowHoverJump && (useExternalHover ? externalHover : internalHover)
   hoveringRef.current = hovering
 
   useEffect(() => {
@@ -100,7 +127,7 @@ export function MiniPetMascot({
     }, JUMP_REST_MS)
   }, [])
 
-  // Safety net: if SpritePet's onOneShotEnd somehow doesn't fire (e.g.
+  // Safety net for jumping: if SpritePet's onOneShotEnd somehow doesn't fire (e.g.
   // tab throttling), schedule the rest cycle by the animation's nominal
   // duration plus a small buffer.
   useEffect(() => {
@@ -114,21 +141,67 @@ export function MiniPetMascot({
     return () => clearTimeout(fallback)
   }, [showJump, jumpKey, handleJumpEnd])
 
-  const renderState: CodexPetState = showJump ? 'jumping' : baseState
+  // Reaction handling: when reaction is active, handle its completion
+  const handleReactionEnd = useCallback(() => {
+    if (reaction) {
+      onReactionEndRef.current?.(reaction.id)
+    }
+  }, [reaction])
+
+  // Safety net for reaction one-shot: if SpritePet's onOneShotEnd somehow doesn't fire,
+  // ensure we clear the reaction after nominal duration + buffer.
+  useEffect(() => {
+    if (!isReactionActive || !reaction) return
+    const row = ANIMATION_ROWS[reaction.state]
+    const fps = fpsFor(reaction.state)
+    const expected = (row.frames / Math.max(fps, 1)) * 1000
+    const fallback = setTimeout(() => {
+      handleReactionEnd()
+    }, expected + 250)
+    return () => clearTimeout(fallback)
+  }, [isReactionActive, reaction, handleReactionEnd])
+
+  // Unified priority:
+  // movement > failed > waving > review > jumping > baseState
+  const renderState: CodexPetState = isMovement
+    ? baseState
+    : reaction?.state === 'failed'
+      ? 'failed'
+      : reaction?.state === 'waving'
+        ? 'waving'
+        : isReview
+          ? 'review'
+          : showJump
+            ? 'jumping'
+            : baseState
+
+  const spriteKey = isMovement
+    ? `move-${renderState}`
+    : isReactionActive && reaction
+      ? `reaction-${reaction.state}-${reaction.id}`
+      : showJump
+        ? `jump-${jumpKey}`
+        : `base-${renderState}`
+
+  const onOneShotEnd = showJump
+    ? handleJumpEnd
+    : isReactionActive
+      ? handleReactionEnd
+      : undefined
 
   return (
     <div
       className={className}
-      onMouseEnter={enableHoverJump && !useExternalHover ? onEnter : undefined}
-      onMouseLeave={enableHoverJump && !useExternalHover ? onLeave : undefined}
+      onMouseEnter={allowHoverJump && !useExternalHover ? onEnter : undefined}
+      onMouseLeave={!useExternalHover ? onLeave : undefined}
       style={{ display: 'inline-block', lineHeight: 0, ...style }}
     >
       <SpritePet
-        key={showJump ? `jump-${jumpKey}` : `base-${renderState}`}
+        key={spriteKey}
         pet={pet}
         state={renderState}
         size={size}
-        onOneShotEnd={handleJumpEnd}
+        onOneShotEnd={onOneShotEnd}
       />
     </div>
   )

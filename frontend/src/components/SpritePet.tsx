@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import {
   ATLAS,
   ANIMATION_ROWS,
+  ONE_SHOT_STATES,
   fpsFor,
   loopRestMsFor,
   type CodexPet,
@@ -13,7 +14,7 @@ interface SpritePetProps {
   state: CodexPetState
   // Visual width in CSS pixels. Height is derived from the 192:208 cell ratio.
   size: number
-  // Fired once jumping reaches its last frame so the parent can flip back
+  // Fired once jumping/waving/failed reaches its last frame so the parent can flip back
   // to its previous resting state. No-op for looping states.
   onOneShotEnd?: () => void
   // When true, treat one-shot states (jumping) as looping. Used by hover
@@ -23,12 +24,6 @@ interface SpritePetProps {
   className?: string
   style?: React.CSSProperties
 }
-
-// Render a single 192x208 cell from a hatch-pet style 8x9 / 8x11 atlas, advancing
-// frames at SPRITE_FPS via requestAnimationFrame. Looping states cycle
-// indefinitely; one-shot states (currently `jumping`) hold the last frame
-// and notify the parent via onOneShotEnd.
-const ONE_SHOT_STATES: ReadonlySet<CodexPetState> = new Set(['jumping'])
 
 export function SpritePet({ pet, state, size, onOneShotEnd, loop, className, style }: SpritePetProps) {
   const [prevState, setPrevState] = useState(state)

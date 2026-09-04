@@ -37,7 +37,7 @@ import {
   petStateToCodexState,
   type CodexPet, type CodexPetState,
 } from './lib/codexPet'
-import { MiniPetMascot } from './components/MiniPetMascot'
+import { MiniPetMascot, type MascotReaction } from './components/MiniPetMascot'
 import { SpritePet } from './components/SpritePet'
 import { PetPicker } from './components/PetPicker'
 import { PetGallery } from './components/PetGallery'
@@ -116,7 +116,24 @@ const MASCOT_BASE_SIZE = 43
 // large-mode video sizing keeps working.
 const SESSION_SPRITE_DISPLAY_MULTIPLIER = 0.88
 
-type PetState = 'idle' | 'working' | 'compacting' | 'waiting'
+type PetState = 'idle' | 'working' | 'compacting' | 'waiting' | 'review'
+
+function isSessionReview(cs: any): boolean {
+  if (cs.status !== 'waiting') return false
+  if (cs.needsReview === true) return true
+  if (cs.permissionSuggestions != null) return true
+  if (cs.source === 'codex' && typeof cs.toolInput === 'string') {
+    return (
+      cs.toolInput.includes('require_escalated') ||
+      cs.toolInput.includes('with_escalated_permissions') ||
+      cs.toolInput.includes('justification') ||
+      cs.toolInput.includes('requires_approval') ||
+      cs.toolInput.includes('approval_required')
+    )
+  }
+  return false
+}
+
 type ClaudeStatsSource = 'cc' | 'codex' | 'cursor' | 'gemini' | 'hermes' | 'opencode' | 'antigravity'
 const TRANSIENT_PET_ACTIONS: PetAction[] = ['eat', 'headpat', 'dance', 'farewell', 'angry', 'spin', 'milktea', 'walkout']
 
@@ -197,7 +214,7 @@ function getLargeVideo(char: CharacterMeta | undefined, petState: PetState, over
     : fallbackLargeActions
   if (!la || Object.keys(la).length === 0) return undefined
   if (overrideAction && la[overrideAction]) return la[overrideAction]
-  if (petState === 'waiting' && la['question']) return la['question']
+  if ((petState === 'waiting' || petState === 'review') && la['question']) return la['question']
   if (petState === 'working' || petState === 'compacting') return la['work'] || la['rest']
   return la['rest'] || la['work']
 }
@@ -362,6 +379,30 @@ export default function Mini() {
   const [claudeSessions, setClaudeSessions] = useState<any[]>([])
   const claudeSessionsRef = useRef<any[]>([])
   claudeSessionsRef.current = claudeSessions
+
+  // Transient mascot reactions (waving / failed)
+  const [mascotReaction, setMascotReaction] = useState<MascotReaction | null>(null)
+  const mascotReactionRef = useRef<MascotReaction | null>(null)
+  mascotReactionRef.current = mascotReaction
+  const reactionSeqRef = useRef(0)
+
+  const triggerReaction = useCallback((state: 'waving' | 'failed') => {
+    reactionSeqRef.current += 1
+    const r: MascotReaction = { state, id: reactionSeqRef.current }
+    setMascotReaction(r)
+  }, [])
+
+  const clearReaction = useCallback((reactionId?: number) => {
+    setMascotReaction((cur) => {
+      if (!cur) return null
+      if (reactionId !== undefined && cur.id !== reactionId) return cur
+      return null
+    })
+  }, [])
+
+  // Session lifecycle tracking to prevent failed -> stopped from triggering waving
+  const sessionLifecycleRef = useRef<Map<string, { wasWorking: boolean; terminalFired?: 'waving' | 'failed' }>>(new Map())
+
   const [charQueue, setCharQueue] = useState<string[]>([DEFAULT_CHAR_NAME])
   // ─── Codex pet rotation queue (mini mode) ───
   // Each session slot maps to petQueue[i % petQueue.length] so multiple
@@ -1802,6 +1843,7 @@ export default function Mini() {
         if (anyBecameInactive) {
           console.log('[pollHealth] session became inactive, prev:', prev, 'curr:', sMap)
           playOcCompletionSound('pollHealth')
+          triggerReaction('waving')
         }
       }
       prevSessionHealthRef.current = sMap
@@ -1815,7 +1857,7 @@ export default function Mini() {
       /* ignore */
     }
     pollHealthBusyRef.current = false
-  }, [playOcCompletionSound])
+  }, [playOcCompletionSound, triggerReaction])
 
   const previewCacheRef = useRef<Map<string, { active: boolean; lastUserMsg?: string; lastAssistantMsg?: string; fetchedAt: number }>>(new Map())
   const previewQueueRef = useRef<string[]>([])
@@ -2300,6 +2342,42 @@ export default function Mini() {
             newCompletions.push(s)
           }
         }
+
+        // Mascot lifecycle tracking for transient reactions (waving / failed)
+        for (const s of sessions) {
+          const sid = String(s.sessionId)
+          let lc = sessionLifecycleRef.current.get(sid)
+          if (!lc) {
+            lc = { wasWorking: false }
+            sessionLifecycleRef.current.set(sid, lc)
+          }
+          const isWorking = s.status === 'processing' || s.status === 'tool_running' || s.status === 'compacting'
+          const isFailed = s.status === 'failed' || s.status === 'error' || s.status === 'aborted' || s.status === 'cancelled' || s.status === 'canceled' || s.status === 'interrupted'
+          const isNormalStopped = s.status === 'stopped' || s.status === 'completed'
+
+          if (isWorking) {
+            lc.wasWorking = true
+            lc.terminalFired = undefined
+          } else if (isFailed) {
+            if (lc.wasWorking && !lc.terminalFired) {
+              lc.terminalFired = 'failed'
+              lc.wasWorking = false
+              triggerReaction('failed')
+            }
+          } else if (isNormalStopped) {
+            if (lc.wasWorking && !lc.terminalFired) {
+              lc.terminalFired = 'waving'
+              lc.wasWorking = false
+              triggerReaction('waving')
+            }
+          }
+        }
+        const currentSidSet = new Set(sessions.map((s: any) => String(s.sessionId)))
+        for (const id of Array.from(sessionLifecycleRef.current.keys())) {
+          if (!currentSidSet.has(id)) {
+            sessionLifecycleRef.current.delete(id)
+          }
+        }
         // Decide whether to pop the completion popup, but DO NOT commit
         // setCompletionSessionId yet. We need to batch it with
         // setClaudeSessions(sessions) below so the panel's first frame
@@ -2672,13 +2750,33 @@ export default function Mini() {
         // session list before the async session refetch lands.
         const sid = ev.payload?.sessionId
         if (sid) {
-          setClaudeSessions((prev) => prev.map((s) => s.sessionId === sid ? { ...s, status: 'waiting' } : s))
+          const isRev = ev.payload?.needsReview === true
+          setClaudeSessions((prev) => prev.map((s) => s.sessionId === sid ? { ...s, status: 'waiting', needsReview: isRev } : s))
         }
         setEffListCollapsed(true)
         if (!expandedRef.current && expandFnRef.current) {
           expandFnRef.current()
         }
       }
+
+      if (!ev.payload?.waiting) {
+        const sid = ev.payload?.sessionId
+        if (sid) {
+          let lc = sessionLifecycleRef.current.get(String(sid))
+          if (!lc) {
+            lc = { wasWorking: true }
+            sessionLifecycleRef.current.set(String(sid), lc)
+          }
+          if (!lc.terminalFired) {
+            lc.terminalFired = 'waving'
+            lc.wasWorking = false
+            triggerReaction('waving')
+          }
+        } else {
+          triggerReaction('waving')
+        }
+      }
+
       const shouldSound = isCursor ? cursorSoundEnabledRef.current : isCodex ? codexSoundEnabledRef.current : isGemini ? geminiSoundEnabledRef.current : isOpencode ? opencodeSoundEnabledRef.current : isHermes ? hermesSoundEnabledRef.current : isAntigravity ? antigravitySoundEnabledRef.current : soundEnabledRef.current
       if (!shouldSound) return
       if (ev.payload?.waiting && !waitingSoundRef.current) return
@@ -2688,10 +2786,30 @@ export default function Mini() {
         playDefaultSound()
       }
     })
+
+    const unlistenFailed = listen('claude-task-failed', (ev: any) => {
+      const sid = ev.payload?.sessionId
+      if (sid) {
+        let lc = sessionLifecycleRef.current.get(String(sid))
+        if (!lc) {
+          lc = { wasWorking: true }
+          sessionLifecycleRef.current.set(String(sid), lc)
+        }
+        if (!lc.terminalFired) {
+          lc.terminalFired = 'failed'
+          lc.wasWorking = false
+          triggerReaction('failed')
+        }
+      } else {
+        triggerReaction('failed')
+      }
+    })
+
     return () => {
       unlisten.then((fn) => fn())
+      unlistenFailed.then((fn) => fn())
     }
-  }, [enableClaudeCode, enableClaudeDesktop, enableCodex, enableCursor, enableGemini, enableOpencode, enableHermes, enableAntigravity, appMode])
+  }, [enableClaudeCode, enableClaudeDesktop, enableCodex, enableCursor, enableGemini, enableOpencode, enableHermes, enableAntigravity, appMode, triggerReaction])
 
   // Fetch OpenClaw session messages when selected
   useEffect(() => {
@@ -2801,18 +2919,19 @@ export default function Mini() {
     return isDesktop ? enableClaudeDesktop : enableClaudeCode
   })
   const claudeSlots: SessionSlot[] = visibleClaudeSessions.map((cs, i) => {
-    const isWaiting = cs.status === 'waiting'
+    const isReview = isSessionReview(cs)
+    const isWaiting = cs.status === 'waiting' && !isReview
     const isCompacting = cs.status === 'compacting'
     const isActive = cs.status === 'processing' || cs.status === 'tool_running'
     const qName = charQueue[i % charQueue.length]
     const char = characters.find((c) => c.name === qName) || DEFAULT_CHAR
-    const petState: PetState = isWaiting ? 'waiting' : isCompacting ? 'compacting' : isActive ? 'working' : 'idle'
+    const petState: PetState = isReview ? 'review' : isWaiting ? 'waiting' : isCompacting ? 'compacting' : isActive ? 'working' : 'idle'
     return {
       agentId: `claude:${cs.sessionId}`,
       sessionIdx: ocSlots.length + i,
       agent: { id: `claude:${cs.sessionId}`, identityName: 'Claude', identityEmoji: '🤖' },
       char,
-      isWorking: isActive || isCompacting || isWaiting,
+      isWorking: isActive || isCompacting || isWaiting || isReview,
       petState,
     }
   })
@@ -4384,12 +4503,13 @@ export default function Mini() {
     }
   }, [moveMode])
 
-  const claudeWaiting = visibleClaudeSessions.some((cs) => cs.status === 'waiting')
+  const claudeReview = visibleClaudeSessions.some((cs) => isSessionReview(cs))
+  const claudeWaiting = visibleClaudeSessions.some((cs) => cs.status === 'waiting' && !isSessionReview(cs))
   const claudeCompacting = visibleClaudeSessions.some((cs) => cs.status === 'compacting')
   const claudeWorking = visibleClaudeSessions.some((cs) => cs.status === 'processing' || cs.status === 'tool_running')
-  const hasWorking = anySessionActive || Object.values(healthMap).some(Boolean) || claudeWorking || claudeCompacting || claudeWaiting
-  // Priority: waiting > compacting > working > idle
-  const mainPetState: PetState = claudeWaiting ? 'waiting' : claudeCompacting ? 'compacting' : hasWorking ? 'working' : 'idle'
+  const hasWorking = anySessionActive || Object.values(healthMap).some(Boolean) || claudeWorking || claudeCompacting || claudeWaiting || claudeReview
+  // Priority: review > waiting > compacting > working > idle
+  const mainPetState: PetState = claudeReview ? 'review' : claudeWaiting ? 'waiting' : claudeCompacting ? 'compacting' : hasWorking ? 'working' : 'idle'
   // Sprite resting state for the main mascot. Walking direction (set by
   // the walk timer) overrides the working/waiting/idle mapping so the pet
   // visibly runs left/right while the native window is moving.
@@ -4416,24 +4536,34 @@ export default function Mini() {
   useEffect(() => {
     if (!import.meta.env.DEV) return
     const culprits = visibleClaudeSessions
-      .filter((cs) => ['waiting', 'compacting', 'processing', 'tool_running'].includes(cs.status))
-      .map((cs) => `${String(cs.sessionId).slice(0, 8)}:${cs.source}:${cs.hostTerminal || 'noHost'}:${cs.status}`)
-    const summary = `state=${mainPetState} hasWorking=${hasWorking} ocActive=${anySessionActive} healthOn=${Object.values(healthMap).some(Boolean)} claude(P=${claudeWorking},W=${claudeWaiting},C=${claudeCompacting}) culprits=${JSON.stringify(culprits)}`
+      .filter((cs) => ['waiting', 'compacting', 'processing', 'tool_running', 'failed'].includes(cs.status) || isSessionReview(cs))
+      .map((cs) => `${String(cs.sessionId).slice(0, 8)}:${cs.source}:${cs.hostTerminal || 'noHost'}:${cs.status}${isSessionReview(cs) ? ':review' : ''}`)
+    const summary = `state=${mainPetState} sprite=${mainSpriteState} review=${claudeReview} reaction=${mascotReaction?.state || 'none'} hasWorking=${hasWorking} ocActive=${anySessionActive} healthOn=${Object.values(healthMap).some(Boolean)} claude(P=${claudeWorking},W=${claudeWaiting},C=${claudeCompacting},R=${claudeReview}) culprits=${JSON.stringify(culprits)}`
     if (summary === lastMascotLogRef.current) return
     lastMascotLogRef.current = summary
     invoke('debug_log', { scope: 'mascot', msg: summary }).catch(() => {})
-  }, [mainPetState, hasWorking, anySessionActive, healthMap, claudeWorking, claudeWaiting, claudeCompacting, visibleClaudeSessions])
+  }, [mainPetState, mainSpriteState, claudeReview, mascotReaction, hasWorking, anySessionActive, healthMap, claudeWorking, claudeWaiting, claudeCompacting, visibleClaudeSessions])
   useEffect(() => {
     if (appMode !== 'coding') return
-    emit('mini-pet-state', { state: mainPetState }).catch(() => {})
-  }, [mainPetState, appMode])
+    emit('mini-pet-state', {
+      state: mainPetState,
+      baseState: mainSpriteState,
+      reaction: mascotReaction?.state ?? null,
+      reactionId: mascotReaction?.id ?? null,
+    }).catch(() => {})
+  }, [mainPetState, mainSpriteState, mascotReaction, appMode])
   useEffect(() => {
     if (appMode !== 'coding') return
     const t = setInterval(() => {
-      emit('mini-pet-state', { state: mainPetStateRef.current }).catch(() => {})
+      emit('mini-pet-state', {
+        state: mainPetStateRef.current,
+        baseState: mainSpriteState,
+        reaction: mascotReactionRef.current?.state ?? null,
+        reactionId: mascotReactionRef.current?.id ?? null,
+      }).catch(() => {})
     }, 2000)
     return () => clearInterval(t)
-  }, [appMode])
+  }, [appMode, mainSpriteState])
 
   const fallbackLargeActions = useMemo(() => {
     const c = characters.find((ch) => ch.largeActions && Object.keys(ch.largeActions).length > 0)
@@ -4936,6 +5066,8 @@ export default function Mini() {
                 <MiniPetMascot
                   pet={miniPet}
                   baseState={mainSpriteState}
+                  reaction={mascotReaction}
+                  onReactionEnd={clearReaction}
                   size={largeMascotVisualSize}
                   enableHoverJump
                   externalHover={mascotHover}
@@ -5215,20 +5347,28 @@ export default function Mini() {
                   {activeClaudeSession.status && (
                     <span
                       className={`text-[10px] px-1.5 py-0.5 rounded font-normal shrink-0 ${
-                        activeClaudeSession.status === 'waiting'
-                          ? 'bg-amber-500/20 text-amber-400'
-                          : activeClaudeSession.status === 'processing' || activeClaudeSession.status === 'tool_running'
-                            ? 'bg-emerald-500/20 text-emerald-400'
-                            : 'bg-white/10 text-slate-400'
+                        isSessionReview(activeClaudeSession)
+                          ? 'bg-purple-500/20 text-purple-300'
+                          : activeClaudeSession.status === 'waiting'
+                            ? 'bg-amber-500/20 text-amber-400'
+                            : activeClaudeSession.status === 'processing' || activeClaudeSession.status === 'tool_running'
+                              ? 'bg-emerald-500/20 text-emerald-400'
+                              : activeClaudeSession.status === 'failed'
+                                ? 'bg-rose-500/20 text-rose-300'
+                                : 'bg-white/10 text-slate-400'
                       }`}
                     >
-                      {activeClaudeSession.status === 'waiting'
-                        ? t('mini.waiting')
-                        : activeClaudeSession.status === 'processing'
-                          ? t('mini.thinking')
-                          : activeClaudeSession.status === 'tool_running'
-                            ? t('mini.working')
-                            : activeClaudeSession.status}
+                      {isSessionReview(activeClaudeSession)
+                        ? t('mini.review', 'Review')
+                        : activeClaudeSession.status === 'waiting'
+                          ? t('mini.waiting')
+                          : activeClaudeSession.status === 'processing'
+                            ? t('mini.thinking')
+                            : activeClaudeSession.status === 'tool_running'
+                              ? t('mini.working')
+                              : activeClaudeSession.status === 'failed'
+                                ? t('mini.failed', 'Failed')
+                                : activeClaudeSession.status}
                     </span>
                   )}
                 </div>
@@ -6483,20 +6623,25 @@ export default function Mini() {
                                   ? `[${cs.cursorWorkspaceName}] ${projectName}`
                                   : projectName
                                 const isActive = item.active
-                                const isWaiting = cs.status === 'waiting'
+                                const isReview = isSessionReview(cs)
+                                const isWaiting = cs.status === 'waiting' && !isReview
                                 const statusText = cs.tool
                                   ? `🔧 ${cs.tool}`
                                   : cs.status === 'stopped'
                                     ? t('mini.idle')
-                                    : cs.status === 'waiting'
-                                      ? '⏳ ' + t('mini.waiting')
-                                      : cs.status === 'processing'
-                                        ? t('mini.thinking')
-                                        : cs.status === 'tool_running'
-                                          ? t('mini.working')
-                                          : cs.status === 'compacting'
-                                            ? t('mini.compacting')
-                                            : cs.status
+                                    : isReview
+                                      ? '👀 ' + t('mini.review', 'Review')
+                                      : cs.status === 'waiting'
+                                        ? '⏳ ' + t('mini.waiting')
+                                        : cs.status === 'processing'
+                                          ? t('mini.thinking')
+                                          : cs.status === 'tool_running'
+                                            ? t('mini.working')
+                                            : cs.status === 'compacting'
+                                              ? t('mini.compacting')
+                                              : cs.status === 'failed'
+                                                ? '❌ ' + t('mini.failed', 'Failed')
+                                                : cs.status
                                 const showPromptInLabel = cs.userPrompt && !isSubtitleDuplicate(displayTitle, cs.userPrompt)
                                 const label = `${displayTitle}${showPromptInLabel ? ` - ${cs.userPrompt}` : ` - ${statusText}`}`
                                 return (
@@ -6515,14 +6660,16 @@ export default function Mini() {
                                     className="group flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-white/[0.04] transition-colors cursor-pointer"
                                   >
                                     <div className="shrink-0 flex items-center justify-center w-4 h-4">
-                                      {isActive || isWaiting ? (
-                                        <Asterisk className={`w-4 h-4 animate-[spin_4s_linear_infinite] ${isWaiting ? 'text-amber-400' : 'text-emerald-400'}`} strokeWidth={2.5} />
+                                      {isActive || isWaiting || isReview ? (
+                                        <Asterisk className={`w-4 h-4 animate-[spin_4s_linear_infinite] ${isReview ? 'text-purple-400' : isWaiting ? 'text-amber-400' : 'text-emerald-400'}`} strokeWidth={2.5} />
+                                      ) : cs.status === 'failed' ? (
+                                        <span className="w-2 h-2 rounded-full bg-rose-500" />
                                       ) : (
                                         <span className="w-1 h-1 rounded-full bg-slate-600" />
                                       )}
                                     </div>
                                     <div className="flex items-baseline gap-2 min-w-0 flex-1">
-                                      <span className={`text-sm font-bold tracking-wide truncate ${isActive || isWaiting ? 'text-slate-200' : 'text-slate-400'}`}>{label}</span>
+                                      <span className={`text-sm font-bold tracking-wide truncate ${isActive || isWaiting || isReview ? 'text-slate-200' : cs.status === 'failed' ? 'text-rose-300' : 'text-slate-400'}`}>{label}</span>
                                     </div>
                                     <button
                                       data-no-drag
