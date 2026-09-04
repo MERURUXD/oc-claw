@@ -320,7 +320,7 @@ export function QuotaCard({
       style={{ background: isPopover ? '#141414' : undefined }}
       className={
         isPopover
-          ? 'flex flex-col gap-2.5 text-white select-none max-h-[250px] overflow-y-auto overscroll-contain pr-0.5 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden'
+          ? 'flex flex-col gap-2.5 text-white select-none pr-0.5'
           : 'bg-white/[0.03] border border-white/5 rounded-2xl p-4 flex flex-col gap-3.5 text-white select-none'
       }
     >
@@ -593,11 +593,11 @@ export function QuotaSideRail({
       // Method 1 (offset layout): immune to framer-motion scale(0.96) animation
       const railTopInPanelCss = Math.max(0, (railRect.top - panelRect.top) / zoom)
       const popoverTopInRailCss = currentPopover.offsetTop
-      const popoverHeightCss = currentPopover.offsetHeight
-      const offsetRequiredCss = Math.ceil(railTopInPanelCss + popoverTopInRailCss + popoverHeightCss + 8)
+      const popoverHeightCss = Math.max(currentPopover.offsetHeight, currentPopover.scrollHeight)
+      const offsetRequiredCss = Math.ceil(railTopInPanelCss + popoverTopInRailCss + popoverHeightCss + 16)
 
       // Method 2 (bounding rect): measured from actual rendered bottom relative to panel top
-      const rectRequiredCss = Math.ceil(Math.max(0, (popoverRect.bottom - panelRect.top) / zoom) + 8)
+      const rectRequiredCss = Math.ceil(Math.max(0, (popoverRect.bottom - panelRect.top) / zoom) + 16)
 
       // Use max to guarantee no clipping regardless of layout variations
       const required = Math.max(offsetRequiredCss, rectRequiredCss)
@@ -743,7 +743,7 @@ export function QuotaSideRail({
             onWheel={(e) => e.stopPropagation()}
             onTouchMove={(e) => e.stopPropagation()}
             style={{ background: '#141414' }}
-            className="absolute right-full mr-3 top-2 z-50 w-[310px] max-h-[260px] overflow-y-auto overscroll-contain border border-white/15 shadow-[0_16px_48px_rgba(0,0,0,0.95)] rounded-2xl p-3.5 select-none cursor-default [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden text-white"
+            className="absolute right-full mr-3 top-2 z-50 w-[310px] max-h-[320px] overflow-y-auto overscroll-contain border border-white/15 shadow-[0_16px_48px_rgba(0,0,0,0.95)] rounded-2xl p-3.5 select-none cursor-default [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden text-white"
           >
 
             <QuotaCard
