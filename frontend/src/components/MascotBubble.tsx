@@ -8,16 +8,63 @@ import type {
   BubbleSessionDetail,
   BubbleTransitionEvent,
   MascotBubblePayload,
+  SubagentDetail,
 } from '../lib/types'
 import { QuotaMiniBadge } from './QuotaCapsule'
 
-const BUBBLE_HIDDEN_SCALE = 0.97
-const BUBBLE_HIDDEN_Y = 8
-const BUBBLE_SPRING_TRANSITION = {
-  type: 'spring' as const,
-  stiffness: 360,
-  damping: 26,
-  mass: 0.8,
+/**
+ * Centralized motion and geometry constants for the mascot status bubble.
+ * 2D Spring Flight entry/exit parameters matched to current Codex Desktop live observations:
+ * - Entry vector: (-150, -95) -> (0, 0)
+ * - Spring: stiffness 140, damping 17, mass 1 (~300ms main travel, ~4-5px overshoot, settle by ~500ms)
+ * - Motion envelope reserves: 170x115 to guarantee zero clipping in native transparent window
+ */
+export const BUBBLE_MOTION = {
+  offsetX: 150,
+  offsetY: 95,
+  spring: {
+    type: 'spring' as const,
+    stiffness: 140,
+    damping: 17,
+    mass: 1,
+  },
+  exitSpring: {
+    type: 'spring' as const,
+    stiffness: 140,
+    damping: 17,
+    mass: 1,
+  },
+  reserveX: 170, // 150 flight + 20 margin for overshoot and shadow
+  reserveY: 115, // 95 flight + 20 margin for overshoot and shadow
+  padRight: 16,  // right margin inside envelope
+  padBottom: 16, // bottom margin inside envelope
+}
+
+export const BUBBLE_WIDTH = {
+  min: 190,
+  max: 345,
+}
+
+export const SHIMMER_TIMING = {
+  initialDelayMs: 500,
+  activeMs: 1400,
+  intervalMs: 4600,
+}
+
+export type BubblePlacement = 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right'
+
+export function getBubbleEntryOffset(placement: BubblePlacement = 'top-left') {
+  switch (placement) {
+    case 'top-right':
+      return { x: BUBBLE_MOTION.offsetX, y: -BUBBLE_MOTION.offsetY }
+    case 'bottom-left':
+      return { x: -BUBBLE_MOTION.offsetX, y: BUBBLE_MOTION.offsetY }
+    case 'bottom-right':
+      return { x: BUBBLE_MOTION.offsetX, y: BUBBLE_MOTION.offsetY }
+    case 'top-left':
+    default:
+      return { x: -BUBBLE_MOTION.offsetX, y: -BUBBLE_MOTION.offsetY }
+  }
 }
 
 type BubblePhase =
@@ -26,6 +73,12 @@ type BubblePhase =
   | 'entering'
   | 'visible'
   | 'exiting'
+
+function logBubbleDev(...args: unknown[]) {
+  if (import.meta.env.DEV) {
+    console.debug(...args)
+  }
+}
 
 function hashSessionId(id: string): number {
   let hash = 0
@@ -161,16 +214,12 @@ function getSessionLine2(
   }
 }
 
-const SHIMMER_INITIAL_DELAY_MS = 600
-const SHIMMER_ACTIVE_MS = 1000
-const SHIMMER_INTERVAL_MS = 4000
-
 /**
  * Codex-style Cadenced Shimmer for session title:
- * - 600ms initial delay after active
- * - 1000ms active sweep (mask/sweep translated opposite to highlight layer)
- * - 4000ms cadence interval (1s sweep, ~3s quiet)
- * - steps(48, end) timing
+ * - 500ms initial delay after active
+ * - 1400ms active sweep (mask/sweep translated opposite to highlight layer)
+ * - 4600ms cadence interval (1.4s sweep, ~3.2s quiet)
+ * - steps(60, end) timing
  * - Stops immediately when inactive (e.g. waiting / stopped)
  * - Completely disabled under prefers-reduced-motion
  * - Isolated against QuotaMiniBadge 1-second ticker rerenders
@@ -203,15 +252,15 @@ export function CadencedShimmerText({
       if (activeTimer) clearTimeout(activeTimer)
       activeTimer = setTimeout(() => {
         setIsShimmering(false)
-      }, SHIMMER_ACTIVE_MS)
+      }, SHIMMER_TIMING.activeMs)
     }
 
     initialTimer = setTimeout(() => {
       triggerSweep()
       intervalTimer = setInterval(() => {
         triggerSweep()
-      }, SHIMMER_INTERVAL_MS)
-    }, SHIMMER_INITIAL_DELAY_MS)
+      }, SHIMMER_TIMING.intervalMs)
+    }, SHIMMER_TIMING.initialDelayMs)
 
     return () => {
       if (initialTimer) clearTimeout(initialTimer)
@@ -234,17 +283,156 @@ export function CadencedShimmerText({
 }
 
 /**
+ * Subagent row with deterministic overflow management:
+ * - Displays active subagents as quiet pills with dot in front: ● researcher
+ * - Dot is emerald (#10b981) during processing / tool_running; no dot for idle/other
+ * - Deterministically calculates how many chips fit in available container width
+ * - When space is insufficient, displays visible chips + +N badge with hover tooltip
+ * - Never silently truncates active subagents
+ */
+function SubagentsRow({ subagents }: { subagents: SubagentDetail[] }) {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const measureRef = useRef<HTMLDivElement>(null)
+  const [visibleCount, setVisibleCount] = useState<number>(subagents.length)
+
+  const recomputeVisible = useCallback(() => {
+    const container = containerRef.current
+    const measure = measureRef.current
+    if (!container || !measure || subagents.length <= 1) {
+      setVisibleCount(subagents.length)
+      return
+    }
+
+    const availableWidth = container.clientWidth
+    if (availableWidth <= 0) return
+
+    const chips = Array.from(measure.querySelectorAll<HTMLElement>('.mascot-bubble-subagent-chip'))
+    const plusBadge = measure.querySelector<HTMLElement>('.mascot-bubble-badge')
+    const plusWidth = plusBadge ? plusBadge.offsetWidth : 26
+    const gap = 6
+
+    let totalWidth = 0
+    let allFit = true
+    const chipWidths: number[] = []
+
+    for (let i = 0; i < subagents.length; i++) {
+      const chipEl = chips[i]
+      const w = chipEl ? chipEl.offsetWidth : 80
+      chipWidths.push(w)
+      totalWidth += (i > 0 ? gap : 0) + w
+      if (totalWidth > availableWidth) {
+        allFit = false
+      }
+    }
+
+    if (allFit) {
+      setVisibleCount(subagents.length)
+      return
+    }
+
+    // Not all fit, determine how many fit alongside +N badge
+    let runningWidth = 0
+    let count = 0
+    for (let i = 0; i < subagents.length; i++) {
+      const needed = (i > 0 ? gap : 0) + chipWidths[i] + gap + plusWidth
+      if (runningWidth + needed <= availableWidth) {
+        runningWidth += (i > 0 ? gap : 0) + chipWidths[i]
+        count++
+      } else {
+        break
+      }
+    }
+
+    setVisibleCount(Math.max(1, count))
+  }, [subagents])
+
+  useLayoutEffect(() => {
+    recomputeVisible()
+  }, [recomputeVisible, subagents])
+
+  useEffect(() => {
+    const container = containerRef.current
+    if (!container) return
+    const ro = new ResizeObserver(() => {
+      recomputeVisible()
+    })
+    ro.observe(container)
+    return () => ro.disconnect()
+  }, [recomputeVisible])
+
+  const visibleSubagents = subagents.slice(0, visibleCount)
+  const hiddenSubagents = subagents.slice(visibleCount)
+  const hiddenRolesTitle = hiddenSubagents.map((s) => s.role).join(', ')
+
+  return (
+    <>
+      {/* Hidden off-screen measurement row */}
+      <div
+        ref={measureRef}
+        className="mascot-bubble-subagents-row"
+        style={{
+          position: 'absolute',
+          visibility: 'hidden',
+          pointerEvents: 'none',
+          top: -9999,
+          left: -9999,
+          width: 'max-content',
+          whiteSpace: 'nowrap',
+        }}
+        aria-hidden="true"
+      >
+        {subagents.map((sub, idx) => {
+          const isWorking = sub.status === 'tool_running' || sub.status === 'processing'
+          return (
+            <span key={sub.id || idx} className="mascot-bubble-subagent-chip">
+              {isWorking && <span className="mascot-bubble-subagent-dot" />}
+              <span className="mascot-bubble-subagent-role">{sub.role}</span>
+            </span>
+          )
+        })}
+        <span className="mascot-bubble-badge">+99</span>
+      </div>
+
+      {/* Actual rendered subagents row */}
+      <div ref={containerRef} className="mascot-bubble-subagents-row">
+        {visibleSubagents.map((sub, sIdx) => {
+          const isSubWorking = sub.status === 'tool_running' || sub.status === 'processing'
+          return (
+            <span
+              key={sub.id || sIdx}
+              className="mascot-bubble-subagent-chip"
+              title={`${sub.role} (${sub.status})`}
+            >
+              {isSubWorking && <span className="mascot-bubble-subagent-dot" />}
+              <span className="mascot-bubble-subagent-role">{sub.role}</span>
+            </span>
+          )
+        })}
+        {hiddenSubagents.length > 0 && (
+          <span
+            className="mascot-bubble-badge"
+            title={hiddenRolesTitle}
+          >
+            +{hiddenSubagents.length}
+          </span>
+        )}
+      </div>
+    </>
+  )
+}
+
+/**
  * Mascot status bubble — an interactive status capsule/card stack for the `mascot-bubble` window
  * (`index.html#/mascot-bubble`).
  *
  * Synchronizes with Mini.tsx via an explicit handshake protocol:
  *   1. Mini emits `mascot-bubble-prepare` with a monotonic transitionId.
- *   2. MascotBubble renders content in hidden spring state (opacity: 0, scale: 0.97, y: 8),
+ *   2. MascotBubble renders content in hidden 2D offset state (x: -150, y: -95, scale: 1, opacity: 1),
  *      measures untransformed geometry (offsetWidth / offsetHeight), reports to Rust via `sync_mascot_bubble`,
  *      and emits `mascot-bubble-ready`.
  *   3. Mini shows the native window and emits `mascot-bubble-enter`.
- *   4. MascotBubble awaits double requestAnimationFrame and springs to visible state.
- *   5. When closing, Mini emits `mascot-bubble-close`. MascotBubble springs back to hidden state,
+ *   4. MascotBubble awaits double requestAnimationFrame and springs to visible state (0, 0).
+ *   5. When closing, Mini emits `mascot-bubble-close`. MascotBubble springs back to hidden state (-150, -95),
  *      and on animation completion emits `mascot-bubble-exit-complete`, prompting Mini to hide the native window.
  */
 export default function MascotBubble() {
@@ -271,11 +459,23 @@ export default function MascotBubble() {
     const height = Math.ceil(el.offsetHeight)
     if (width <= 0 || height <= 0) return
 
+    const nativeWidth = width + BUBBLE_MOTION.reserveX + BUBBLE_MOTION.padRight
+    const nativeHeight = height + BUBBLE_MOTION.reserveY + BUBBLE_MOTION.padBottom
+
+    logBubbleDev(`[bubble ${tid}] geometry ${width}x${height}`)
+    logBubbleDev(`[bubble ${tid}] native envelope ${nativeWidth}x${nativeHeight} (reserves ${BUBBLE_MOTION.reserveX}x${BUBBLE_MOTION.reserveY})`)
+
     lastSizeRef.current = { width, height }
-    invoke('sync_mascot_bubble', { width, height })
+    invoke('sync_mascot_bubble', {
+      width,
+      height,
+      entryOffsetX: BUBBLE_MOTION.reserveX,
+      entryOffsetY: BUBBLE_MOTION.reserveY,
+    })
       .then(() => {
         if (readySentForTransitionRef.current !== tid && transitionIdRef.current === tid) {
           readySentForTransitionRef.current = tid
+          logBubbleDev(`[bubble ${tid}] ready`)
           emit('mascot-bubble-ready', { transitionId: tid }).catch(() => {})
         }
       })
@@ -296,6 +496,7 @@ export default function MascotBubble() {
       const newPayload = e.payload?.payload
       transitionIdRef.current = tid
       readySentForTransitionRef.current = -1
+      logBubbleDev(`[bubble ${tid}] prepare`)
 
       if (newPayload) {
         lastValidSummaryRef.current = newPayload
@@ -312,6 +513,7 @@ export default function MascotBubble() {
       if (disposed) return
       const tid = e.payload?.transitionId ?? 0
       if (tid !== transitionIdRef.current) return
+      logBubbleDev(`[bubble ${tid}] enter`)
 
       if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current)
       rafIdRef.current = requestAnimationFrame(() => {
@@ -356,6 +558,7 @@ export default function MascotBubble() {
       if (tid != null) {
         transitionIdRef.current = tid
       }
+      logBubbleDev(`[bubble ${transitionIdRef.current}] close`)
       if (phaseRef.current === 'hidden') return
       setPhase('exiting')
       phaseRef.current = 'exiting'
@@ -398,13 +601,20 @@ export default function MascotBubble() {
       const last = lastSizeRef.current
       if (!last || last.width !== width || last.height !== height) {
         lastSizeRef.current = { width, height }
-        invoke('sync_mascot_bubble', { width, height }).catch(() => {})
+        logBubbleDev(`[bubble ro] resize ${width}x${height}`)
+        invoke('sync_mascot_bubble', {
+          width,
+          height,
+          entryOffsetX: BUBBLE_MOTION.reserveX,
+          entryOffsetY: BUBBLE_MOTION.reserveY,
+        }).catch(() => {})
       }
 
       if (phaseRef.current === 'prepared') {
         const tid = transitionIdRef.current
         if (readySentForTransitionRef.current !== tid) {
           readySentForTransitionRef.current = tid
+          logBubbleDev(`[bubble ${tid}] ready (ro)`)
           emit('mascot-bubble-ready', { transitionId: tid }).catch(() => {})
         }
       }
@@ -420,6 +630,7 @@ export default function MascotBubble() {
       setPhase('hidden')
       phaseRef.current = 'hidden'
       setSummary(null)
+      logBubbleDev(`[bubble ${currentId}] exit complete (reduced-motion)`)
       emit('mascot-bubble-exit-complete', { transitionId: currentId }).catch(() => {})
     }
   }, [prefersReducedMotion, phase])
@@ -431,10 +642,12 @@ export default function MascotBubble() {
     if (currentPhase === 'entering') {
       setPhase('visible')
       phaseRef.current = 'visible'
+      logBubbleDev(`[bubble ${currentId}] visible`)
     } else if (currentPhase === 'exiting') {
       setPhase('hidden')
       phaseRef.current = 'hidden'
       setSummary(null)
+      logBubbleDev(`[bubble ${currentId}] exit complete`)
       emit('mascot-bubble-exit-complete', { transitionId: currentId }).catch(() => {})
     }
   }, [])
@@ -475,9 +688,10 @@ export default function MascotBubble() {
   }
 
   const totalActive = displaySummary.running + displaySummary.waiting
+  const entryOffset = getBubbleEntryOffset('top-left')
 
   return (
-    <div className="mascot-bubble-root" ref={contentRef}>
+    <div className="mascot-bubble-root">
       <motion.div
         className="mascot-bubble-motion"
         initial={false}
@@ -486,158 +700,149 @@ export default function MascotBubble() {
             ? {
                 opacity: 1,
                 scale: 1,
+                x: 0,
                 y: 0,
               }
             : {
-                opacity: 0,
-                scale: prefersReducedMotion ? 1 : BUBBLE_HIDDEN_SCALE,
-                y: prefersReducedMotion ? 0 : BUBBLE_HIDDEN_Y,
+                opacity: 1,
+                scale: 1,
+                x: prefersReducedMotion ? 0 : entryOffset.x,
+                y: prefersReducedMotion ? 0 : entryOffset.y,
               }
         }
         transition={
           prefersReducedMotion
             ? { duration: 0 }
-            : BUBBLE_SPRING_TRANSITION
+            : phase === 'exiting'
+              ? BUBBLE_MOTION.exitSpring
+              : BUBBLE_MOTION.spring
         }
         onAnimationComplete={handleAnimationComplete}
         style={{
           pointerEvents: isInteractive ? 'auto' : 'none',
         }}
       >
-        {!isDetailed ? (
-          <div
-            className="mascot-bubble-card"
-            onClick={() => handleClick()}
-            role="button"
-            tabIndex={0}
-          >
-            {hasRunning && (
-              <div className="mascot-bubble-item">
-                <span className="mascot-bubble-beacon">
-                  <span className="mascot-bubble-beacon-ring is-running" />
-                  <span className="mascot-bubble-beacon-dot is-running" />
-                </span>
-                <span className="mascot-bubble-count is-running">{displaySummary.running}</span>
-                <span className="mascot-bubble-label">running</span>
-              </div>
-            )}
+        <div className="mascot-bubble-logical-box" ref={contentRef}>
+          {!isDetailed ? (
+            <div
+              className="mascot-bubble-card"
+              onClick={() => handleClick()}
+              role="button"
+              tabIndex={0}
+            >
+              {hasRunning && (
+                <div className="mascot-bubble-item">
+                  <span className="mascot-bubble-beacon">
+                    <span className="mascot-bubble-beacon-ring is-running" />
+                    <span className="mascot-bubble-beacon-dot is-running" />
+                  </span>
+                  <span className="mascot-bubble-count is-running">{displaySummary.running}</span>
+                  <span className="mascot-bubble-label">running</span>
+                </div>
+              )}
 
-            {hasRunning && hasWaiting && <span className="mascot-bubble-divider" />}
+              {hasRunning && hasWaiting && <span className="mascot-bubble-divider" />}
 
-            {hasWaiting && (
-              <div className="mascot-bubble-item">
-                <span className="mascot-bubble-beacon">
-                  <span className="mascot-bubble-beacon-ring is-waiting" />
-                  <span className="mascot-bubble-beacon-dot is-waiting" />
-                </span>
-                <span className="mascot-bubble-count is-waiting">{displaySummary.waiting}</span>
-                <span className="mascot-bubble-label">waiting</span>
-              </div>
-            )}
-          </div>
-        ) : (
-          <div className="mascot-bubble-stack">
-            {sessionsToRender.map((session, idx) => {
-              const thinkingText = session.status === 'processing' ? getThinkingText(session.sessionId) : undefined
-              const { actionPrefix, actionContent, isWaiting, isProcessing } = getSessionLine2(session, t, thinkingText)
-              const isLast = idx === sessionsToRender.length - 1
-              const remainingOthers = Math.max(0, totalActive - sessionsToRender.length)
-              const showBadge = isLast && remainingOthers > 0
+              {hasWaiting && (
+                <div className="mascot-bubble-item">
+                  <span className="mascot-bubble-beacon">
+                    <span className="mascot-bubble-beacon-ring is-waiting" />
+                    <span className="mascot-bubble-beacon-dot is-waiting" />
+                  </span>
+                  <span className="mascot-bubble-count is-waiting">{displaySummary.waiting}</span>
+                  <span className="mascot-bubble-label">waiting</span>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="mascot-bubble-stack">
+              {sessionsToRender.map((session, idx) => {
+                const thinkingText = session.status === 'processing' ? getThinkingText(session.sessionId) : undefined
+                const { actionPrefix, actionContent, isWaiting, isProcessing } = getSessionLine2(session, t, thinkingText)
+                const isLast = idx === sessionsToRender.length - 1
+                const remainingOthers = Math.max(0, totalActive - sessionsToRender.length)
+                const showBadge = isLast && remainingOthers > 0
 
-              return (
-                <motion.div
-                  key={session.sessionId || idx}
-                  className="mascot-bubble-row-motion"
-                  initial={{
-                    opacity: 0,
-                    y: prefersReducedMotion ? 0 : 4,
-                  }}
-                  animate={{
-                    opacity: 1,
-                    y: 0,
-                  }}
-                  transition={
-                    prefersReducedMotion
-                      ? { duration: 0 }
-                      : {
-                          delay: Math.min(idx, 3) * 0.035,
-                          duration: 0.18,
-                          ease: 'easeOut',
-                        }
-                  }
-                >
-                  <div
-                    className="mascot-bubble-detailed"
-                    onClick={() => handleClick(session.sessionId)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' || e.key === ' ') {
-                        e.preventDefault()
-                        handleClick(session.sessionId)
-                      }
+                return (
+                  <motion.div
+                    key={session.sessionId || idx}
+                    className="mascot-bubble-row-motion"
+                    initial={{
+                      opacity: 0,
+                      y: prefersReducedMotion ? 0 : 4,
                     }}
-                    role="button"
-                    tabIndex={0}
-                    title={session.title}
+                    animate={{
+                      opacity: 1,
+                      y: 0,
+                    }}
+                    transition={
+                      prefersReducedMotion
+                        ? { duration: 0 }
+                        : {
+                            delay: Math.min(idx, 3) * 0.035,
+                            duration: 0.18,
+                            ease: 'easeOut',
+                          }
+                    }
                   >
-                    <div className="mascot-bubble-content">
-                      {/* Line 1: Session Title / Topic + Metadata */}
-                      <div className="mascot-bubble-title-line">
-                        <CadencedShimmerText
-                          active={(session.status === 'processing' || session.status === 'tool_running') && !isWaiting}
-                          reducedMotion={Boolean(prefersReducedMotion)}
-                        >
-                          {session.title}
-                        </CadencedShimmerText>
+                    <div
+                      className="mascot-bubble-detailed"
+                      onClick={() => handleClick(session.sessionId)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault()
+                          handleClick(session.sessionId)
+                        }
+                      }}
+                      role="button"
+                      tabIndex={0}
+                      title={session.title}
+                    >
+                      <div className="mascot-bubble-content">
+                        {/* Line 1: Session Title / Topic + Metadata */}
+                        <div className="mascot-bubble-title-line">
+                          <CadencedShimmerText
+                            active={(session.status === 'processing' || session.status === 'tool_running') && !isWaiting}
+                            reducedMotion={Boolean(prefersReducedMotion)}
+                          >
+                            {session.title}
+                          </CadencedShimmerText>
 
-                        <div className="mascot-bubble-metadata-group">
-                          {showBadge && (
-                            <span
-                              className="mascot-bubble-badge"
-                              title={t('settings.bubbleActiveOthers', { count: remainingOthers })}
-                            >
-                              +{remainingOthers}
-                            </span>
-                          )}
-                          {(session.source === 'codex' || session.source === 'antigravity') && (
-                            <QuotaMiniBadge harness={session.source} />
-                          )}
-                        </div>
-                      </div>
-
-                      {/* Line 2: Current Action / Subagents */}
-                      {session.activeSubagents && session.activeSubagents.length > 0 ? (
-                        <div className="mascot-bubble-subagents-row">
-                          {session.activeSubagents.map((sub, sIdx) => {
-                            const isSubWorking = sub.status === 'tool_running' || sub.status === 'processing'
-                            return (
+                          <div className="mascot-bubble-metadata-group">
+                            {showBadge && (
                               <span
-                                key={sub.id || sIdx}
-                                className="mascot-bubble-subagent-chip"
-                                title={`${sub.role} (${sub.status})`}
+                                className="mascot-bubble-badge"
+                                title={t('settings.bubbleActiveOthers', { count: remainingOthers })}
                               >
-                                <span className="mascot-bubble-subagent-role">{sub.role}</span>
-                                {isSubWorking && <span className="mascot-bubble-subagent-dot" />}
+                                +{remainingOthers}
                               </span>
-                            )
-                          })}
+                            )}
+                            {(session.source === 'codex' || session.source === 'antigravity') && (
+                              <QuotaMiniBadge harness={session.source} />
+                            )}
+                          </div>
                         </div>
-                      ) : (
-                        <div className={`mascot-bubble-action-line ${isWaiting ? 'is-waiting' : ''} ${isProcessing ? 'is-processing' : ''}`}>
-                          {actionPrefix && <span className="mascot-bubble-tool-prefix">{actionPrefix}:</span>}
-                          <span className="mascot-bubble-action-text truncate">
-                            {actionContent || (actionPrefix ? '' : t('mini.working', 'working...'))}
-                          </span>
-                        </div>
-                      )}
+
+                        {/* Line 2: Current Action / Subagents */}
+                        {session.activeSubagents && session.activeSubagents.length > 0 ? (
+                          <SubagentsRow subagents={session.activeSubagents} />
+                        ) : (
+                          <div className={`mascot-bubble-action-line ${isWaiting ? 'is-waiting' : ''} ${isProcessing ? 'is-processing' : ''}`}>
+                            {actionPrefix && <span className="mascot-bubble-tool-prefix">{actionPrefix}:</span>}
+                            <span className="mascot-bubble-action-text truncate">
+                              {actionContent || (actionPrefix ? '' : t('mini.working', 'working...'))}
+                            </span>
+                          </div>
+                        )}
+                      </div>
                     </div>
-                  </div>
-                </motion.div>
-              )
-            })}
-          </div>
-        )}
+                  </motion.div>
+                )
+              })}
+            </div>
+          )}
+        </div>
       </motion.div>
     </div>
   )
 }
-
