@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { RotateCw } from 'lucide-react'
 import { motion, AnimatePresence } from 'motion/react'
@@ -483,7 +483,13 @@ export function QuotaMiniBadge({
  * - Percentage text right below each icon in clean white
  * - Compact popover with arrow beak, pure black background, and zero ugly scrollbars
  */
-export function QuotaSideRail() {
+export function QuotaSideRail({
+  onOverlayHeightChange,
+  uiScale = 1.0,
+}: {
+  onOverlayHeightChange?: (height: number) => void
+  uiScale?: number
+}) {
   const codex = useHarnessQuota('codex')
   const antigravity = useHarnessQuota('antigravity')
   const now = useQuotaTicker()
@@ -491,6 +497,12 @@ export function QuotaSideRail() {
   const [activePopover, setActivePopover] = useState<'codex' | 'antigravity' | null>(null)
   const railRef = useRef<HTMLDivElement>(null)
   const popoverRef = useRef<HTMLDivElement>(null)
+  const lastReportedOverlayHeightRef = useRef(0)
+  const onOverlayHeightChangeRef = useRef(onOverlayHeightChange)
+
+  useEffect(() => {
+    onOverlayHeightChangeRef.current = onOverlayHeightChange
+  }, [onOverlayHeightChange])
 
   // Click outside or Escape to close popover
   useEffect(() => {
@@ -544,10 +556,90 @@ export function QuotaSideRail() {
     })
   }
 
-  if (items.length === 0) return null
-
   const activeIdx = items.findIndex((i) => i.harness === activePopover)
   const activeItem = activeIdx >= 0 ? items[activeIdx] : null
+
+  // Measure popover overlay height dynamically and report required panel height
+  useLayoutEffect(() => {
+    if (!activeItem) {
+      if (lastReportedOverlayHeightRef.current !== 0) {
+        lastReportedOverlayHeightRef.current = 0
+        onOverlayHeightChangeRef.current?.(0)
+      }
+      return
+    }
+
+    const update = () => {
+      if (!popoverRef.current || !railRef.current) return
+      const currentPopover = popoverRef.current
+      const currentRail = railRef.current
+      const currentPanel = (currentRail.closest('#mini-panel') as HTMLElement | null) ?? currentRail
+
+      const popoverRect = currentPopover.getBoundingClientRect()
+      const panelRect = currentPanel.getBoundingClientRect()
+      const railRect = currentRail.getBoundingClientRect()
+
+      // Resolve CSS zoom on #mini-panel (Windows high-DPI scaling)
+      let zoom = uiScale && uiScale > 0 ? uiScale : 1.0
+      if (zoom === 1.0 && currentPanel.style.zoom) {
+        const parsed = Number.parseFloat(currentPanel.style.zoom)
+        if (Number.isFinite(parsed) && parsed > 0) zoom = parsed
+      }
+      if (zoom === 1.0) {
+        const computed = Number.parseFloat(getComputedStyle(currentPanel).zoom)
+        if (Number.isFinite(computed) && computed > 0) zoom = computed
+      }
+
+      // Method 1 (offset layout): immune to framer-motion scale(0.96) animation
+      const railTopInPanelCss = Math.max(0, (railRect.top - panelRect.top) / zoom)
+      const popoverTopInRailCss = currentPopover.offsetTop
+      const popoverHeightCss = currentPopover.offsetHeight
+      const offsetRequiredCss = Math.ceil(railTopInPanelCss + popoverTopInRailCss + popoverHeightCss + 8)
+
+      // Method 2 (bounding rect): measured from actual rendered bottom relative to panel top
+      const rectRequiredCss = Math.ceil(Math.max(0, (popoverRect.bottom - panelRect.top) / zoom) + 8)
+
+      // Use max to guarantee no clipping regardless of layout variations
+      const required = Math.max(offsetRequiredCss, rectRequiredCss)
+
+      if (Math.abs(required - lastReportedOverlayHeightRef.current) >= 1) {
+        lastReportedOverlayHeightRef.current = required
+        onOverlayHeightChangeRef.current?.(required)
+      }
+    }
+
+    // Initial synchronous measurement before paint
+    update()
+
+    // Settle measurements across animation frames
+    const raf1 = requestAnimationFrame(update)
+    const raf2 = requestAnimationFrame(() => requestAnimationFrame(update))
+
+    // Re-measure on popover content/size changes
+    let ro: ResizeObserver | null = null
+    if (popoverRef.current) {
+      ro = new ResizeObserver(update)
+      ro.observe(popoverRef.current)
+    }
+
+    return () => {
+      cancelAnimationFrame(raf1)
+      cancelAnimationFrame(raf2)
+      ro?.disconnect()
+    }
+  }, [activeItem, uiScale])
+
+  // Ensure height is cleared to 0 when QuotaSideRail unmounts
+  useEffect(() => {
+    return () => {
+      if (lastReportedOverlayHeightRef.current !== 0) {
+        lastReportedOverlayHeightRef.current = 0
+        onOverlayHeightChangeRef.current?.(0)
+      }
+    }
+  }, [])
+
+  if (items.length === 0) return null
 
   return (
     <div

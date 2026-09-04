@@ -521,6 +521,7 @@ export default function Mini() {
   const mascotPositionRef = useRef<'left' | 'right'>('right')
   const [islandBg, setIslandBg] = useState('__anime__')
   const [uiScale, setUiScale] = useState(1.0)
+  const [quotaOverlayRequiredHeight, setQuotaOverlayRequiredHeight] = useState(0)
   const [bgPos, setBgPos] = useState({ x: 50, y: 50 })
   const [bubbleStyle, setBubbleStyle] = useState<BubbleStyle>('compact')
   const bubbleStyleRef = useRef<BubbleStyle>('compact')
@@ -3822,6 +3823,7 @@ export default function Mini() {
     setSelectedClaudeSession(null)
     setSelectedSessionKey(null)
     setShowClaudeStats(false)
+    setQuotaOverlayRequiredHeight(0)
     const wasSettings = settingsModeRef.current
     if (wasSettings) {
       setShowSettingsOverlay(false)
@@ -4572,6 +4574,9 @@ export default function Mini() {
   const selectedAgent = agents.find((a) => a.id === selectedAgentId)
   const inDetailPage = inAgentDetail || selectedClaudeSession !== null || selectedSessionKey !== null || showClaudeStats
   const detailPageMaxHeight = typeof window !== 'undefined' ? Math.max(240, Math.floor(((window.screen?.availHeight || 800) * 0.75) / Math.max(uiScale, 0.01))) : 600
+  const effectivePanelMaxHeight = inDetailPage
+    ? detailPageMaxHeight
+    : Math.max(panelMaxHeight, quotaOverlayRequiredHeight > 0 ? Math.min(quotaOverlayRequiredHeight, detailPageMaxHeight) : 0)
 
   const activeClaudeSession = selectedClaudeSession ? claudeSessions.find((s) => s.sessionId === selectedClaudeSession) : null
 
@@ -4643,7 +4648,7 @@ export default function Mini() {
     const ro = new ResizeObserver((entries) => {
       const h = entries[0]?.contentRect.height
       if (h && h > 0) {
-        const limit = inDetailPage ? detailPageMaxHeight : Math.max(260, panelMaxHeight)
+        const limit = inDetailPage ? detailPageMaxHeight : Math.max(260, effectivePanelMaxHeight)
         const clamped = Math.min(h * uiScale, limit * uiScale)
         const prev = lastResizeHeightRef.current || clamped
         const delta = Math.abs(clamped - prev)
@@ -4663,7 +4668,7 @@ export default function Mini() {
       ro.disconnect()
       stopResizeTween()
     }
-  }, [expanded, settingsMode, settingsTransitioning, showPanel, uiScale, panelMaxHeight, inDetailPage, detailPageMaxHeight, pushMiniHeight, stopResizeTween, tweenMiniHeight])
+  }, [expanded, settingsMode, settingsTransitioning, showPanel, uiScale, panelMaxHeight, inDetailPage, detailPageMaxHeight, effectivePanelMaxHeight, quotaOverlayRequiredHeight, pushMiniHeight, stopResizeTween, tweenMiniHeight])
 
   useEffect(() => {
     if (!expanded || !showPanel || settingsMode || settingsTransitioning || updateModalOpen) return
@@ -5125,7 +5130,8 @@ export default function Mini() {
               ? (uiScale !== 1 ? `calc(100vw / ${uiScale})` : '100vw')
               : panelW,
             height: 'auto',
-            maxHeight: inDetailPage ? detailPageMaxHeight : panelMaxHeight,
+            maxHeight: effectivePanelMaxHeight,
+            minHeight: quotaOverlayRequiredHeight > 0 ? quotaOverlayRequiredHeight : undefined,
             overflowY: 'hidden',
             overflowX: 'hidden',
             display: 'flex',
@@ -6637,7 +6643,10 @@ export default function Mini() {
             </div>
 
             {/* Persistent Quota Side Rail */}
-            <QuotaSideRail />
+            <QuotaSideRail
+              onOverlayHeightChange={setQuotaOverlayRequiredHeight}
+              uiScale={uiScale}
+            />
           </div>
         </div>
       )}
