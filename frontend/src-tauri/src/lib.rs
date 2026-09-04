@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub mod harness_quota;
 use harness_quota::get_harness_quota;
+pub mod session_activity;
 
 /// Whether the efficiency-mode notch hover tracking thread should be running.
 static EFFICIENCY_HOVER_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -6979,6 +6980,9 @@ pub struct ClaudeSession {
     /// Active subagents spawned by this session (e.g. Antigravity invoke_subagent).
     #[serde(rename = "activeSubagents", skip_serializing_if = "Option::is_none")]
     pub active_subagents: Option<Vec<SubagentDetail>>,
+    /// Normalized activity subtitle state for the mascot bubble.
+    #[serde(rename = "activity", skip_serializing_if = "Option::is_none")]
+    pub activity: Option<session_activity::SessionActivity>,
 }
 
 type PendingPermissions = Arc<Mutex<HashMap<String, std::sync::mpsc::Sender<String>>>>;
@@ -8347,7 +8351,7 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
         }
 
         if source_field == "MODEL" && msg_type == "PLANNER_RESPONSE" {
-            if latest_model_content.is_none() {
+            if !last_turn_was_user && latest_model_content.is_none() {
                 if let Some(content_str) = parsed.get("content").and_then(|c| c.as_str()) {
                     let trimmed = content_str.trim();
                     if !trimmed.is_empty() {
@@ -8358,14 +8362,19 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
                     || parsed.get("truncated_fields").and_then(|t| t.as_array()).map(|arr| arr.iter().any(|v| v == "tool_calls")).unwrap_or(false);
                 if has_tools {
                     is_intermediate_tool_turn = true;
-                    if session.tool.is_none() {
-                        if let Some(first_tool) = parsed.get("tool_calls")
-                            .and_then(|t| t.as_array())
-                            .and_then(|arr| arr.first())
-                            .and_then(|tc| tc.get("name"))
-                            .and_then(|n| n.as_str())
-                        {
-                            session.tool = Some(first_tool.to_string());
+                    if let Some(first_tool) = parsed.get("tool_calls")
+                        .and_then(|t| t.as_array())
+                        .and_then(|arr| arr.first())
+                    {
+                        if let Some(n) = first_tool.get("name").and_then(|n| n.as_str()) {
+                            if session.tool.is_none() {
+                                session.tool = Some(n.to_string());
+                            }
+                            let args_val = first_tool.get("args").cloned().unwrap_or(serde_json::json!({}));
+                            if session.tool_input.is_none() {
+                                session.tool_input = Some(args_val.to_string());
+                            }
+                            session.activity = session_activity::normalize_antigravity_tool_activity(n, &args_val);
                         }
                     }
                 }
@@ -8380,6 +8389,13 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
                 }
             }
         }
+    }
+
+    if last_turn_was_user {
+        session.tool = None;
+        session.tool_input = None;
+        session.activity = None;
+        is_intermediate_tool_turn = false;
     }
 
     if let Some(t) = custom_title {
@@ -8561,6 +8577,7 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
             session.pending_agents = 0;
             session.tool = None;
             session.tool_input = None;
+            session.activity = None;
         }
         return false;
     }
@@ -8583,6 +8600,7 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
             session.is_processing = false;
             session.tool = None;
             session.tool_input = None;
+            session.activity = None;
         }
         false
     }
@@ -8667,6 +8685,7 @@ pub fn load_recent_antigravity_sessions() -> Vec<ClaudeSession> {
             cursor_workspace_name: None,
             cursor_native_handle: None,
             active_subagents: None,
+            activity: None,
         };
 
         let is_active = update_antigravity_session_from_transcript(&mut session);
@@ -9094,10 +9113,19 @@ fn start_session_file_watcher(
                         if !tool_input.is_empty() {
                             session.tool_input = Some(tool_input);
                         }
+                        session.activity = None;
                     } else if session.status == "waiting" {
                         session.status = "processing".to_string();
                         session.is_processing = true;
                         changed = true;
+                    }
+                    if session.status != "waiting" && session.status != "stopped" {
+                        let prev_act = session.activity.clone();
+                        let new_act = session_activity::parse_codex_activity_from_transcript(&path2);
+                        if prev_act != new_act {
+                            session.activity = new_act;
+                            changed = true;
+                        }
                     }
                 } else if session.source == "antigravity" {
                     let _ = update_antigravity_session_from_transcript(session);
@@ -9127,6 +9155,7 @@ fn start_session_file_watcher(
                         session.is_processing = false;
                         session.tool = None;
                         session.tool_input = None;
+                        session.activity = None;
                         session.permission_suggestions = None;
                         changed = true;
                     }
@@ -9406,8 +9435,11 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
                             if !tool_input.is_empty() {
                                 session.tool_input = Some(tool_input);
                             }
+                            session.activity = None;
                             session.updated_at = now_ms;
                             continue;
+                        } else if session.status == "processing" || session.status == "tool_running" {
+                            session.activity = session_activity::parse_codex_activity_from_transcript(&path);
                         }
                     }
                 }
@@ -9431,6 +9463,7 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
                                     session.active_subagents = None;
                                     session.tool = None;
                                     session.tool_input = None;
+                                    session.activity = None;
                                     continue;
                                 }
                             }
@@ -9467,6 +9500,7 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
                     session.active_subagents = None;
                     session.tool = None;
                     session.tool_input = None;
+                    session.activity = None;
                 }
             } else {
                 // CC: PID-alive check
@@ -9475,6 +9509,7 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
                         log::info!("[get_claude_sessions] CC pid {} dead, clearing {} for {}", pid, session.status, session.session_id);
                         session.status = "stopped".to_string();
                         session.pending_agents = 0;
+                        session.activity = None;
                     }
                 }
                 // No pid recorded → can't verify, keep current status (CC is
@@ -10080,6 +10115,7 @@ fn load_recent_hermes_sessions_from_db() -> Result<Vec<ClaudeSession>, String> {
             cursor_workspace_name: None,
             cursor_native_handle: None,
             active_subagents: None,
+            activity: None,
         });
     }
 
@@ -15605,6 +15641,7 @@ mod codex_adapter_tests {
             cursor_workspace_name: None,
             cursor_native_handle: None,
             active_subagents: None,
+            activity: None,
         };
         assert!(is_codex_internal_utility_session(&session));
     }
@@ -16047,6 +16084,7 @@ fn process_claude_event(
                     cursor_workspace_name: None,
                     cursor_native_handle: None,
                     active_subagents: None,
+                    activity: None,
                 });
                 // Only upgrade source, never downgrade:
                 // cc < codex < gemini < cursor.
@@ -16087,6 +16125,9 @@ fn process_claude_event(
                     if session.source != "antigravity" || !has_running_subs {
                         session.pending_agents = 0;
                     }
+                    session.tool = None;
+                    session.tool_input = None;
+                    session.activity = None;
                 } else if hook_event == "SubagentStart"
                     || (hook_event == "PreToolUse" && (tool_name == "Agent" || tool_name == "invoke_subagent"))
                     || raw_hook_event == "subagentStart"
@@ -16226,6 +16267,14 @@ fn process_claude_event(
                         }
                     }
                 }
+                if hook_event == "PreToolUse" || (session.status == "tool_running" && session.tool.is_some()) {
+                    if let Some(ref t) = session.tool {
+                        let parsed_input = session.tool_input.as_deref()
+                            .and_then(|inp| serde_json::from_str::<serde_json::Value>(inp).ok())
+                            .unwrap_or(serde_json::json!({}));
+                        session.activity = session_activity::generic_tool_activity(t, &parsed_input);
+                    }
+                }
                 if let Some(t) = event.get("userPrompt")
                     .or_else(|| event.get("prompt"))
                     .or_else(|| event.get("user_prompt"))
@@ -16305,9 +16354,10 @@ fn process_claude_event(
                     }
                 }
 
-                if hook_event == "Stop" || hook_event == "SubagentStop" {
+                if hook_event == "PostToolUse" || hook_event == "Stop" || hook_event == "SubagentStop" {
                     session.tool = None;
                     session.tool_input = None;
+                    session.activity = None;
                 }
 
                 // Store AI's last response for the completion reminder popup.
@@ -16345,6 +16395,7 @@ fn process_claude_event(
                             session.active_subagents = None;
                             session.tool = None;
                             session.tool_input = None;
+                            session.activity = None;
                             session.last_response = None;
                             status = "stopped".to_string();
                         } else {
@@ -16362,6 +16413,7 @@ fn process_claude_event(
                                 status = "stopped".to_string();
                                 session.tool = None;
                                 session.tool_input = None;
+                                session.activity = None;
                             }
                         }
                     } else if session.source == "hermes" {

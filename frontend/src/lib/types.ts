@@ -13,6 +13,36 @@ export interface SubagentDetail {
   updatedAt?: number
 }
 
+export type SessionActivityKind =
+  | 'reasoning'
+  | 'read'
+  | 'list'
+  | 'search'
+  | 'edit'
+  | 'command'
+  | 'tool'
+  | 'web'
+  | 'subagent'
+  | 'generic'
+
+export type SessionActivitySource =
+  | 'reasoning-summary'
+  | 'tool-call'
+  | 'agent-message'
+  | 'derived'
+  | 'fallback'
+
+export interface SessionActivity {
+  kind: SessionActivityKind
+  target?: string
+  query?: string
+  count?: number
+  summary?: string
+  toolName?: string
+  status: 'running' | 'completed'
+  source: SessionActivitySource
+}
+
 export interface BubbleSessionDetail {
   sessionId: string
   title: string
@@ -28,6 +58,7 @@ export interface BubbleSessionDetail {
   customTitle?: string
   activeSubagents?: SubagentDetail[]
   otherCount?: number
+  activity?: SessionActivity
 }
 
 export interface MascotBubblePayload {
