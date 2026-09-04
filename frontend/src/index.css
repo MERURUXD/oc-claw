@@ -125,7 +125,7 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
   justify-content: flex-end;
   width: 100vw;
   height: 100vh;
-  padding: 115px 16px 16px 170px;
+  padding: 0 16px 16px 0;
   box-sizing: border-box;
   overflow: visible;
   pointer-events: none;

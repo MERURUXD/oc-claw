@@ -38,6 +38,9 @@ export const BUBBLE_MOTION = {
   reserveY: 115, // 95 flight + 20 margin for overshoot and shadow
   padRight: 16,  // right margin inside envelope
   padBottom: 16, // bottom margin inside envelope
+  staggerDelay: 0.035,
+  exitFadeDuration: 0.18,
+  exitFadeDelay: 0.08,
 }
 
 export const BUBBLE_WIDTH = {
@@ -67,12 +70,58 @@ export function getBubbleEntryOffset(placement: BubblePlacement = 'top-left') {
   }
 }
 
-type BubblePhase =
+export type BubblePhase =
   | 'hidden'
   | 'prepared'
   | 'entering'
   | 'visible'
   | 'exiting'
+
+export type BubbleGeometryMode = 'stable' | 'motion'
+
+export type RowMotionMode =
+  | 'none'
+  | 'incremental-entry'
+  | 'global-entry'
+  | 'global-exit'
+
+export function getSessionsFromPayload(payload?: MascotBubblePayload | null): BubbleSessionDetail[] {
+  if (!payload) return []
+  if (payload.activeSessions && payload.activeSessions.length > 0) {
+    return payload.activeSessions
+  }
+  if (payload.activeSession) {
+    return [payload.activeSession]
+  }
+  return []
+}
+
+export function getSessionIdsFromPayload(payload?: MascotBubblePayload | null): string[] {
+  return getSessionsFromPayload(payload)
+    .map((s) => s.sessionId)
+    .filter(Boolean)
+}
+
+export function getRowMotionMode({
+  phase,
+  isMultiSession,
+  isIncremental,
+}: {
+  phase: BubblePhase
+  isMultiSession: boolean
+  isIncremental: boolean
+}): RowMotionMode {
+  if (phase === 'exiting') {
+    return isMultiSession ? 'global-exit' : 'none'
+  }
+  if (phase === 'prepared' || phase === 'entering') {
+    return isMultiSession ? 'global-entry' : 'none'
+  }
+  if (phase === 'visible') {
+    return isIncremental ? 'incremental-entry' : 'none'
+  }
+  return 'none'
+}
 
 function logBubbleDev(...args: unknown[]) {
   if (import.meta.env.DEV) {
@@ -421,6 +470,200 @@ function SubagentsRow({ subagents }: { subagents: SubagentDetail[] }) {
   )
 }
 
+interface SessionBubbleRowProps {
+  session: BubbleSessionDetail
+  idx: number
+  phase: BubblePhase
+  isMultiSession: boolean
+  incrementalEntry?: { delay: number }
+  prefersReducedMotion: boolean | null
+  entryOffset: { x: number; y: number }
+  onClick: (sessionId: string) => void
+  onAnimationComplete: (sessionId: string) => void
+  t: TFunction
+  thinkingText?: string
+  showBadge: boolean
+  remainingOthers: number
+}
+
+function SessionBubbleRow({
+  session,
+  idx,
+  phase,
+  isMultiSession,
+  incrementalEntry,
+  prefersReducedMotion,
+  entryOffset,
+  onClick,
+  onAnimationComplete,
+  t,
+  thinkingText,
+  showBadge,
+  remainingOthers,
+}: SessionBubbleRowProps) {
+  const { actionPrefix, actionContent, isWaiting, isProcessing } = getSessionLine2(session, t, thinkingText)
+
+  const mode = getRowMotionMode({
+    phase,
+    isMultiSession,
+    isIncremental: incrementalEntry != null,
+  })
+
+  const rowDelay = Math.min(idx, 3) * BUBBLE_MOTION.staggerDelay
+
+  let initial: false | { opacity: number; x: number; y: number; scale: number } = false
+  let animate: { opacity: number; x: number; y: number; scale: number }
+  let transition: any
+
+  if (prefersReducedMotion) {
+    initial = false
+    animate = {
+      opacity: mode === 'global-exit' ? 0 : 1,
+      x: 0,
+      y: 0,
+      scale: 1,
+    }
+    transition = { duration: 0 }
+  } else {
+    switch (mode) {
+      case 'incremental-entry':
+        initial = {
+          opacity: 1,
+          x: entryOffset.x,
+          y: entryOffset.y,
+          scale: 1,
+        }
+        animate = {
+          opacity: 1,
+          x: 0,
+          y: 0,
+          scale: 1,
+        }
+        transition = {
+          ...BUBBLE_MOTION.spring,
+          delay: incrementalEntry?.delay ?? 0,
+        }
+        break
+
+      case 'global-entry':
+        initial = {
+          opacity: 1,
+          x: entryOffset.x,
+          y: entryOffset.y,
+          scale: 1,
+        }
+        animate = {
+          opacity: 1,
+          x: phase === 'prepared' ? entryOffset.x : 0,
+          y: phase === 'prepared' ? entryOffset.y : 0,
+          scale: 1,
+        }
+        transition =
+          phase === 'prepared'
+            ? { duration: 0 }
+            : {
+                ...BUBBLE_MOTION.spring,
+                delay: rowDelay,
+              }
+        break
+
+      case 'global-exit':
+        initial = false
+        animate = {
+          opacity: 0,
+          x: entryOffset.x,
+          y: entryOffset.y,
+          scale: 1,
+        }
+        transition = {
+          x: { ...BUBBLE_MOTION.exitSpring, delay: rowDelay },
+          y: { ...BUBBLE_MOTION.exitSpring, delay: rowDelay },
+          opacity: {
+            duration: BUBBLE_MOTION.exitFadeDuration,
+            ease: 'easeOut',
+            delay: BUBBLE_MOTION.exitFadeDelay + rowDelay,
+          },
+        }
+        break
+
+      case 'none':
+      default:
+        initial = false
+        animate = {
+          opacity: 1,
+          x: 0,
+          y: 0,
+          scale: 1,
+        }
+        transition = { duration: 0 }
+        break
+    }
+  }
+
+  return (
+    <motion.div
+      key={session.sessionId}
+      className="mascot-bubble-row-motion"
+      initial={initial}
+      animate={animate}
+      transition={transition}
+      onAnimationComplete={() => onAnimationComplete(session.sessionId)}
+    >
+      <div
+        className="mascot-bubble-detailed"
+        onClick={() => onClick(session.sessionId)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault()
+            onClick(session.sessionId)
+          }
+        }}
+        role="button"
+        tabIndex={0}
+        title={session.title}
+      >
+        <div className="mascot-bubble-content">
+          {/* Line 1: Session Title / Topic + Metadata */}
+          <div className="mascot-bubble-title-line">
+            <CadencedShimmerText
+              active={(session.status === 'processing' || session.status === 'tool_running') && !isWaiting}
+              reducedMotion={Boolean(prefersReducedMotion)}
+            >
+              {session.title}
+            </CadencedShimmerText>
+
+            <div className="mascot-bubble-metadata-group">
+              {showBadge && (
+                <span
+                  className="mascot-bubble-badge"
+                  title={t('settings.bubbleActiveOthers', { count: remainingOthers })}
+                >
+                  +{remainingOthers}
+                </span>
+              )}
+              {(session.source === 'codex' || session.source === 'antigravity') && (
+                <QuotaMiniBadge harness={session.source} />
+              )}
+            </div>
+          </div>
+
+          {/* Line 2: Current Action / Subagents */}
+          {session.activeSubagents && session.activeSubagents.length > 0 ? (
+            <SubagentsRow subagents={session.activeSubagents} />
+          ) : (
+            <div className={`mascot-bubble-action-line ${isWaiting ? 'is-waiting' : ''} ${isProcessing ? 'is-processing' : ''}`}>
+              {actionPrefix && <span className="mascot-bubble-tool-prefix">{actionPrefix}:</span>}
+              <span className="mascot-bubble-action-text truncate">
+                {actionContent || (actionPrefix ? '' : t('mini.working', 'working...'))}
+              </span>
+            </div>
+          )}
+        </div>
+      </div>
+    </motion.div>
+  )
+}
+
 /**
  * Mascot status bubble — an interactive status capsule/card stack for the `mascot-bubble` window
  * (`index.html#/mascot-bubble`).
@@ -428,12 +671,13 @@ function SubagentsRow({ subagents }: { subagents: SubagentDetail[] }) {
  * Synchronizes with Mini.tsx via an explicit handshake protocol:
  *   1. Mini emits `mascot-bubble-prepare` with a monotonic transitionId.
  *   2. MascotBubble renders content in hidden 2D offset state (x: -150, y: -95, scale: 1, opacity: 1),
- *      measures untransformed geometry (offsetWidth / offsetHeight), reports to Rust via `sync_mascot_bubble`,
- *      and emits `mascot-bubble-ready`.
+ *      measures untransformed geometry (offsetWidth / offsetHeight), reports to Rust via `sync_mascot_bubble`
+ *      with motion reserve, and emits `mascot-bubble-ready`.
  *   3. Mini shows the native window and emits `mascot-bubble-enter`.
  *   4. MascotBubble awaits double requestAnimationFrame and springs to visible state (0, 0).
- *   5. When closing, Mini emits `mascot-bubble-close`. MascotBubble springs back to hidden state (-150, -95),
- *      and on animation completion emits `mascot-bubble-exit-complete`, prompting Mini to hide the native window.
+ *   5. When animation settles in visible state, native geometry shrinks from motion mode to stable mode (0 reserve).
+ *   6. When closing, Mini emits `mascot-bubble-close`. MascotBubble expands back to motion mode, springs to (-150, -95)
+ *      with concurrent opacity fade-out, and on animation completion emits `mascot-bubble-exit-complete`.
  */
 export default function MascotBubble() {
   const { t } = useTranslation()
@@ -451,6 +695,46 @@ export default function MascotBubble() {
   const readySentForTransitionRef = useRef<number>(-1)
   const rafIdRef = useRef<number | null>(null)
 
+  // Session tracking and incremental entry state
+  const knownSessionIdsRef = useRef<Set<string>>(new Set())
+  const [incrementalEntries, setIncrementalEntries] = useState<Record<string, { delay: number }>>({})
+  const incrementalEntriesRef = useRef<Record<string, { delay: number }>>({})
+  incrementalEntriesRef.current = incrementalEntries
+
+  // Active motion tracking and transient envelope mode
+  const activeMotionTokensRef = useRef<Set<string>>(new Set())
+  const currentGeometryModeRef = useRef<BubbleGeometryMode>('motion')
+
+  // Multi-row completion tracking
+  const enteringCompletedSessionIdsRef = useRef<Set<string>>(new Set())
+  const exitingCompletedSessionIdsRef = useRef<Set<string>>(new Set())
+
+  const isMultiSessionRef = useRef<boolean>(false)
+  const sessionsToRenderRef = useRef<BubbleSessionDetail[]>([])
+
+  // Unified geometry synchronization helper
+  const syncBubbleGeometry = useCallback((mode: BubbleGeometryMode) => {
+    const el = contentRef.current
+    if (!el) return Promise.resolve()
+    const width = Math.ceil(el.offsetWidth)
+    const height = Math.ceil(el.offsetHeight)
+    if (width <= 0 || height <= 0) return Promise.resolve()
+
+    currentGeometryModeRef.current = mode
+    lastSizeRef.current = { width, height }
+
+    const entryOffsetX = mode === 'motion' ? BUBBLE_MOTION.reserveX : 0
+    const entryOffsetY = mode === 'motion' ? BUBBLE_MOTION.reserveY : 0
+
+    logBubbleDev(`[bubble] syncBubbleGeometry mode=${mode} size=${width}x${height} offset=${entryOffsetX}x${entryOffsetY}`)
+    return invoke('sync_mascot_bubble', {
+      width,
+      height,
+      entryOffsetX,
+      entryOffsetY,
+    }).catch(() => {})
+  }, [])
+
   // Measure geometry and notify Mini that the bubble is ready to be natively shown
   const syncGeometryAndNotifyReady = useCallback((tid: number) => {
     const el = contentRef.current
@@ -459,13 +743,11 @@ export default function MascotBubble() {
     const height = Math.ceil(el.offsetHeight)
     if (width <= 0 || height <= 0) return
 
-    const nativeWidth = width + BUBBLE_MOTION.reserveX + BUBBLE_MOTION.padRight
-    const nativeHeight = height + BUBBLE_MOTION.reserveY + BUBBLE_MOTION.padBottom
-
-    logBubbleDev(`[bubble ${tid}] geometry ${width}x${height}`)
-    logBubbleDev(`[bubble ${tid}] native envelope ${nativeWidth}x${nativeHeight} (reserves ${BUBBLE_MOTION.reserveX}x${BUBBLE_MOTION.reserveY})`)
-
+    currentGeometryModeRef.current = 'motion'
     lastSizeRef.current = { width, height }
+
+    logBubbleDev(`[bubble ${tid}] geometry ${width}x${height} (motion mode)`)
+
     invoke('sync_mascot_bubble', {
       width,
       height,
@@ -498,9 +780,21 @@ export default function MascotBubble() {
       readySentForTransitionRef.current = -1
       logBubbleDev(`[bubble ${tid}] prepare`)
 
+      enteringCompletedSessionIdsRef.current.clear()
+      exitingCompletedSessionIdsRef.current.clear()
+      activeMotionTokensRef.current.clear()
+      activeMotionTokensRef.current.add('global-entry')
+      currentGeometryModeRef.current = 'motion'
+      setIncrementalEntries({})
+      incrementalEntriesRef.current = {}
+
       if (newPayload) {
         lastValidSummaryRef.current = newPayload
         setSummary(newPayload)
+        const initialSessionIds = getSessionIdsFromPayload(newPayload)
+        knownSessionIdsRef.current = new Set(initialSessionIds)
+      } else {
+        knownSessionIdsRef.current.clear()
       }
       setPhase('prepared')
       phaseRef.current = 'prepared'
@@ -519,6 +813,7 @@ export default function MascotBubble() {
       rafIdRef.current = requestAnimationFrame(() => {
         rafIdRef.current = requestAnimationFrame(() => {
           if (disposed || transitionIdRef.current !== tid) return
+          enteringCompletedSessionIdsRef.current.clear()
           setPhase('entering')
           phaseRef.current = 'entering'
         })
@@ -535,16 +830,85 @@ export default function MascotBubble() {
 
       if (hasActive) {
         lastValidSummaryRef.current = p
+        const currentSessionIds = getSessionIdsFromPayload(p)
+        const currentPhase = phaseRef.current
+
+        if (currentPhase === 'visible') {
+          // Detect incremental sessions only when bubble is fully visible
+          const newIds = currentSessionIds.filter((id) => !knownSessionIdsRef.current.has(id))
+          if (newIds.length > 0) {
+            logBubbleDev(`[bubble] incremental sessions added:`, newIds)
+            newIds.forEach((id) => {
+              activeMotionTokensRef.current.add(`incremental:${id}`)
+            })
+
+            const startIncrementalEntry = () => {
+              if (disposed) return
+              setIncrementalEntries((prev) => {
+                const next = { ...prev }
+                newIds.forEach((id, newIdx) => {
+                  next[id] = {
+                    delay: Math.min(newIdx, 3) * BUBBLE_MOTION.staggerDelay,
+                  }
+                })
+                return next
+              })
+              setSummary(p)
+            }
+
+            // Expand to motion geometry before row begins flight to guarantee envelope
+            if (currentGeometryModeRef.current !== 'motion') {
+              syncBubbleGeometry('motion').then(() => {
+                requestAnimationFrame(() => {
+                  requestAnimationFrame(() => {
+                    startIncrementalEntry()
+                  })
+                })
+              })
+            } else {
+              startIncrementalEntry()
+            }
+            knownSessionIdsRef.current = new Set(currentSessionIds)
+            return
+          }
+        }
+
+        // Normal payload update or non-visible phase
+        knownSessionIdsRef.current = new Set(currentSessionIds)
         setSummary(p)
+
         // If an update arrives while exiting, reverse back to entering
         if (phaseRef.current === 'exiting') {
+          exitingCompletedSessionIdsRef.current.clear()
+          enteringCompletedSessionIdsRef.current.clear()
+          activeMotionTokensRef.current.clear()
+          activeMotionTokensRef.current.add('global-entry')
+          if (currentGeometryModeRef.current !== 'motion') {
+            syncBubbleGeometry('motion')
+          }
           setPhase('entering')
           phaseRef.current = 'entering'
         }
       } else {
         if (phaseRef.current !== 'hidden' && phaseRef.current !== 'exiting') {
-          setPhase('exiting')
-          phaseRef.current = 'exiting'
+          exitingCompletedSessionIdsRef.current.clear()
+          activeMotionTokensRef.current.add('global-exit')
+
+          const startExit = () => {
+            if (disposed) return
+            setPhase('exiting')
+            phaseRef.current = 'exiting'
+          }
+
+          if (currentGeometryModeRef.current === 'stable') {
+            syncBubbleGeometry('motion').then(() => {
+              requestAnimationFrame(() => {
+                startExit()
+              })
+            })
+          } else {
+            startExit()
+          }
         }
       }
     }).then((fn) => {
@@ -560,8 +924,24 @@ export default function MascotBubble() {
       }
       logBubbleDev(`[bubble ${transitionIdRef.current}] close`)
       if (phaseRef.current === 'hidden') return
-      setPhase('exiting')
-      phaseRef.current = 'exiting'
+      exitingCompletedSessionIdsRef.current.clear()
+      activeMotionTokensRef.current.add('global-exit')
+
+      const startExit = () => {
+        if (disposed) return
+        setPhase('exiting')
+        phaseRef.current = 'exiting'
+      }
+
+      if (currentGeometryModeRef.current === 'stable') {
+        syncBubbleGeometry('motion').then(() => {
+          requestAnimationFrame(() => {
+            startExit()
+          })
+        })
+      } else {
+        startExit()
+      }
     }).then((fn) => {
       if (disposed) fn()
       else unlistenClose = fn
@@ -575,7 +955,7 @@ export default function MascotBubble() {
       unlistenClose?.()
       if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current)
     }
-  }, [])
+  }, [syncBubbleGeometry])
 
   // The active payload to render (retain last valid summary during exiting so DOM does not collapse early)
   const displaySummary = summary || (phase === 'exiting' ? lastValidSummaryRef.current : null)
@@ -598,15 +978,21 @@ export default function MascotBubble() {
       const height = Math.ceil(target.offsetHeight)
       if (width <= 0 || height <= 0) return
 
+      const isMotionActive = activeMotionTokensRef.current.size > 0 || phaseRef.current !== 'visible'
+      const targetMode: BubbleGeometryMode = isMotionActive ? 'motion' : 'stable'
+      currentGeometryModeRef.current = targetMode
+
       const last = lastSizeRef.current
       if (!last || last.width !== width || last.height !== height) {
         lastSizeRef.current = { width, height }
-        logBubbleDev(`[bubble ro] resize ${width}x${height}`)
+        logBubbleDev(`[bubble ro] resize ${width}x${height} mode=${targetMode}`)
+        const entryOffsetX = targetMode === 'motion' ? BUBBLE_MOTION.reserveX : 0
+        const entryOffsetY = targetMode === 'motion' ? BUBBLE_MOTION.reserveY : 0
         invoke('sync_mascot_bubble', {
           width,
           height,
-          entryOffsetX: BUBBLE_MOTION.reserveX,
-          entryOffsetY: BUBBLE_MOTION.reserveY,
+          entryOffsetX,
+          entryOffsetY,
         }).catch(() => {})
       }
 
@@ -636,21 +1022,83 @@ export default function MascotBubble() {
   }, [prefersReducedMotion, phase])
 
   const handleAnimationComplete = useCallback(() => {
+    // If multi-session, row animations control phase completion
+    if (isMultiSessionRef.current) return
+
     const currentPhase = phaseRef.current
     const currentId = transitionIdRef.current
 
     if (currentPhase === 'entering') {
+      activeMotionTokensRef.current.delete('global-entry')
       setPhase('visible')
       phaseRef.current = 'visible'
       logBubbleDev(`[bubble ${currentId}] visible`)
+      if (activeMotionTokensRef.current.size === 0) {
+        syncBubbleGeometry('stable')
+      }
     } else if (currentPhase === 'exiting') {
+      activeMotionTokensRef.current.delete('global-exit')
       setPhase('hidden')
       phaseRef.current = 'hidden'
       setSummary(null)
       logBubbleDev(`[bubble ${currentId}] exit complete`)
       emit('mascot-bubble-exit-complete', { transitionId: currentId }).catch(() => {})
     }
-  }, [])
+  }, [syncBubbleGeometry])
+
+  const handleRowAnimationComplete = useCallback(
+    (sessionId: string) => {
+      const currentPhase = phaseRef.current
+      const currentId = transitionIdRef.current
+
+      // If this was an incremental entry row
+      if (incrementalEntriesRef.current[sessionId]) {
+        activeMotionTokensRef.current.delete(`incremental:${sessionId}`)
+        setIncrementalEntries((prev) => {
+          if (!prev[sessionId]) return prev
+          const { [sessionId]: _, ...rest } = prev
+          return rest
+        })
+        if (activeMotionTokensRef.current.size === 0 && phaseRef.current === 'visible') {
+          syncBubbleGeometry('stable')
+        }
+      }
+
+      if (!isMultiSessionRef.current) return
+
+      if (currentPhase === 'entering') {
+        enteringCompletedSessionIdsRef.current.add(sessionId)
+        const currentSessions = sessionsToRenderRef.current
+        if (
+          currentSessions.length > 0 &&
+          currentSessions.every((s) => enteringCompletedSessionIdsRef.current.has(s.sessionId))
+        ) {
+          activeMotionTokensRef.current.delete('global-entry')
+          setPhase('visible')
+          phaseRef.current = 'visible'
+          logBubbleDev(`[bubble ${currentId}] multi-row visible`)
+          if (activeMotionTokensRef.current.size === 0) {
+            syncBubbleGeometry('stable')
+          }
+        }
+      } else if (currentPhase === 'exiting') {
+        exitingCompletedSessionIdsRef.current.add(sessionId)
+        const currentSessions = sessionsToRenderRef.current
+        if (
+          currentSessions.length > 0 &&
+          currentSessions.every((s) => exitingCompletedSessionIdsRef.current.has(s.sessionId))
+        ) {
+          activeMotionTokensRef.current.delete('global-exit')
+          setPhase('hidden')
+          phaseRef.current = 'hidden'
+          setSummary(null)
+          logBubbleDev(`[bubble ${currentId}] multi-row exit complete`)
+          emit('mascot-bubble-exit-complete', { transitionId: currentId }).catch(() => {})
+        }
+      }
+    },
+    [syncBubbleGeometry]
+  )
 
   if (!displaySummary || phase === 'hidden') {
     return <div className="mascot-bubble-root" />
@@ -679,6 +1127,10 @@ export default function MascotBubble() {
         : []
 
   const isDetailed = displaySummary.style === 'detailed' && sessionsToRender.length > 0
+  const isMultiSession = isDetailed && sessionsToRender.length > 1
+
+  isMultiSessionRef.current = isMultiSession
+  sessionsToRenderRef.current = sessionsToRender
 
   const getThinkingText = (sessionId: string) => {
     const rawPool = t('mini.thinkingPool', { returnObjects: true })
@@ -696,26 +1148,43 @@ export default function MascotBubble() {
         className="mascot-bubble-motion"
         initial={false}
         animate={
-          isBubbleShown
+          isMultiSession
             ? {
                 opacity: 1,
                 scale: 1,
                 x: 0,
                 y: 0,
               }
-            : {
-                opacity: 1,
-                scale: 1,
-                x: prefersReducedMotion ? 0 : entryOffset.x,
-                y: prefersReducedMotion ? 0 : entryOffset.y,
-              }
+            : isBubbleShown
+              ? {
+                  opacity: 1,
+                  scale: 1,
+                  x: 0,
+                  y: 0,
+                }
+              : {
+                  opacity: phase === 'exiting' ? 0 : 1,
+                  scale: 1,
+                  x: prefersReducedMotion ? 0 : entryOffset.x,
+                  y: prefersReducedMotion ? 0 : entryOffset.y,
+                }
         }
         transition={
-          prefersReducedMotion
+          isMultiSession || prefersReducedMotion
             ? { duration: 0 }
             : phase === 'exiting'
-              ? BUBBLE_MOTION.exitSpring
-              : BUBBLE_MOTION.spring
+              ? {
+                  x: BUBBLE_MOTION.exitSpring,
+                  y: BUBBLE_MOTION.exitSpring,
+                  opacity: {
+                    duration: BUBBLE_MOTION.exitFadeDuration,
+                    ease: 'easeOut',
+                    delay: BUBBLE_MOTION.exitFadeDelay,
+                  },
+                }
+              : phase === 'prepared'
+                ? { duration: 0 }
+                : BUBBLE_MOTION.spring
         }
         onAnimationComplete={handleAnimationComplete}
         style={{
@@ -758,85 +1227,27 @@ export default function MascotBubble() {
             <div className="mascot-bubble-stack">
               {sessionsToRender.map((session, idx) => {
                 const thinkingText = session.status === 'processing' ? getThinkingText(session.sessionId) : undefined
-                const { actionPrefix, actionContent, isWaiting, isProcessing } = getSessionLine2(session, t, thinkingText)
                 const isLast = idx === sessionsToRender.length - 1
                 const remainingOthers = Math.max(0, totalActive - sessionsToRender.length)
                 const showBadge = isLast && remainingOthers > 0
 
                 return (
-                  <motion.div
-                    key={session.sessionId || idx}
-                    className="mascot-bubble-row-motion"
-                    initial={{
-                      opacity: 0,
-                      y: prefersReducedMotion ? 0 : 4,
-                    }}
-                    animate={{
-                      opacity: 1,
-                      y: 0,
-                    }}
-                    transition={
-                      prefersReducedMotion
-                        ? { duration: 0 }
-                        : {
-                            delay: Math.min(idx, 3) * 0.035,
-                            duration: 0.18,
-                            ease: 'easeOut',
-                          }
-                    }
-                  >
-                    <div
-                      className="mascot-bubble-detailed"
-                      onClick={() => handleClick(session.sessionId)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter' || e.key === ' ') {
-                          e.preventDefault()
-                          handleClick(session.sessionId)
-                        }
-                      }}
-                      role="button"
-                      tabIndex={0}
-                      title={session.title}
-                    >
-                      <div className="mascot-bubble-content">
-                        {/* Line 1: Session Title / Topic + Metadata */}
-                        <div className="mascot-bubble-title-line">
-                          <CadencedShimmerText
-                            active={(session.status === 'processing' || session.status === 'tool_running') && !isWaiting}
-                            reducedMotion={Boolean(prefersReducedMotion)}
-                          >
-                            {session.title}
-                          </CadencedShimmerText>
-
-                          <div className="mascot-bubble-metadata-group">
-                            {showBadge && (
-                              <span
-                                className="mascot-bubble-badge"
-                                title={t('settings.bubbleActiveOthers', { count: remainingOthers })}
-                              >
-                                +{remainingOthers}
-                              </span>
-                            )}
-                            {(session.source === 'codex' || session.source === 'antigravity') && (
-                              <QuotaMiniBadge harness={session.source} />
-                            )}
-                          </div>
-                        </div>
-
-                        {/* Line 2: Current Action / Subagents */}
-                        {session.activeSubagents && session.activeSubagents.length > 0 ? (
-                          <SubagentsRow subagents={session.activeSubagents} />
-                        ) : (
-                          <div className={`mascot-bubble-action-line ${isWaiting ? 'is-waiting' : ''} ${isProcessing ? 'is-processing' : ''}`}>
-                            {actionPrefix && <span className="mascot-bubble-tool-prefix">{actionPrefix}:</span>}
-                            <span className="mascot-bubble-action-text truncate">
-                              {actionContent || (actionPrefix ? '' : t('mini.working', 'working...'))}
-                            </span>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  </motion.div>
+                  <SessionBubbleRow
+                    key={session.sessionId}
+                    session={session}
+                    idx={idx}
+                    phase={phase}
+                    isMultiSession={isMultiSession}
+                    incrementalEntry={incrementalEntries[session.sessionId]}
+                    prefersReducedMotion={Boolean(prefersReducedMotion)}
+                    entryOffset={entryOffset}
+                    onClick={handleClick}
+                    onAnimationComplete={handleRowAnimationComplete}
+                    t={t}
+                    thinkingText={thinkingText}
+                    showBadge={showBadge}
+                    remainingOthers={remainingOthers}
+                  />
                 )
               })}
             </div>
