@@ -4,7 +4,7 @@ import { load } from '@tauri-apps/plugin-store'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { LogicalPosition, LogicalSize } from '@tauri-apps/api/dpi'
 import { Maximize2 } from 'lucide-react'
-import { MiniPetMascot } from './components/MiniPetMascot'
+import { MiniPetMascot, type MascotReaction } from './components/MiniPetMascot'
 import { loadCodexPetById, loadDefaultCodexPet, type CodexPet, type CodexPetState } from './lib/codexPet'
 
 const isWindowsPlatform =
@@ -49,8 +49,19 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
   const [pet, setPet] = useState<CodexPet | null>(null)
   const [working, setWorking] = useState(false)
   const [waiting, setWaiting] = useState(false)
+  const [isReview, setIsReview] = useState(false)
+  const [syncedBaseState, setSyncedBaseState] = useState<CodexPetState | null>(null)
+  const [mascotReaction, setMascotReaction] = useState<MascotReaction | null>(null)
   const [walkDir, setWalkDir] = useState<-1 | 0 | 1>(0)
   const [dragging, setDragging] = useState(false)
+
+  const clearReaction = useCallback((reactionId?: number) => {
+    setMascotReaction((cur) => {
+      if (!cur) return null
+      if (reactionId !== undefined && cur.id !== reactionId) return cur
+      return null
+    })
+  }, [])
   const [resizeHandleHovered, setResizeHandleHovered] = useState(false)
   const [size, setSize] = useState(DEFAULT_MASCOT_SIZE)
   const dragActiveRef = useRef(false)
@@ -190,20 +201,43 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
   // window owns the claude/codex/cursor session polling and emits
   // `mini-pet-state` on every change (and every 2s as a heartbeat),
   // so listening here keeps every demo window perfectly in sync with
-  // the real mascot's working / waiting / idle without duplicating
+  // the real mascot's working / waiting / idle / review without duplicating
   // any poll loops on our side.
   useEffect(() => {
-    const unlisten = listen<{ state?: string }>('mini-pet-state', (ev) => {
-      const s = ev.payload?.state
-      if (s === 'waiting') {
+    const unlisten = listen<{
+      state?: string
+      baseState?: CodexPetState
+      reaction?: 'waving' | 'failed' | null
+      reactionId?: number | null
+    }>('mini-pet-state', (ev) => {
+      const p = ev.payload
+      if (p?.baseState) {
+        setSyncedBaseState(p.baseState)
+      }
+      const s = p?.state
+      if (s === 'review') {
+        setIsReview(true)
+        setWaiting(false)
+        setWorking(false)
+      } else if (s === 'waiting') {
+        setIsReview(false)
         setWaiting(true)
         setWorking(false)
       } else if (s === 'working' || s === 'compacting') {
+        setIsReview(false)
         setWaiting(false)
         setWorking(true)
       } else {
+        setIsReview(false)
         setWaiting(false)
         setWorking(false)
+      }
+
+      if (p?.reaction && typeof p.reactionId === 'number') {
+        const nextReaction: MascotReaction = { state: p.reaction, id: p.reactionId }
+        setMascotReaction((cur) => (cur?.id === nextReaction.id ? cur : nextReaction))
+      } else if (p?.reaction === null) {
+        setMascotReaction(null)
       }
     })
     return () => {
@@ -342,11 +376,15 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
     ? 'run-right'
     : walkDir === -1
       ? 'run-left'
-      : waiting
-        ? 'waiting'
-        : working
-          ? 'running'
-          : 'idle'
+      : syncedBaseState
+        ? syncedBaseState
+        : isReview
+          ? 'review'
+          : waiting
+            ? 'waiting'
+            : working
+              ? 'running'
+              : 'idle'
 
   if (!pet) return null
 
@@ -367,6 +405,8 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
       <MiniPetMascot
         pet={pet}
         baseState={baseState}
+        reaction={mascotReaction}
+        onReactionEnd={clearReaction}
         size={size}
         enableHoverJump
         suppressHover={dragging}
@@ -426,7 +466,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
             width: 5,
             height: 5,
             borderRadius: '50%',
-            background: waiting ? '#f59e0b' : working ? '#2ecc71' : '#777',
+            background: isReview ? '#c084fc' : waiting ? '#f59e0b' : working ? '#2ecc71' : '#777',
             border: '1.1px solid rgba(0,0,0,0.3)',
             pointerEvents: 'none',
           }}

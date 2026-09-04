@@ -6934,6 +6934,9 @@ pub struct ClaudeSession {
     /// Raw permission_suggestions JSON from the PermissionRequest hook event.
     #[serde(rename = "permissionSuggestions", skip_serializing_if = "Option::is_none")]
     pub permission_suggestions: Option<serde_json::Value>,
+    /// Whether this session is currently awaiting user review / permission / approval.
+    #[serde(rename = "needsReview", skip_serializing_if = "Option::is_none")]
+    pub needs_review: Option<bool>,
     /// AI's last response text (truncated), forwarded from the Stop hook event.
     /// Shown in the efficiency-mode completion reminder popup.
     #[serde(rename = "lastResponse", skip_serializing_if = "Option::is_none")]
@@ -9094,6 +9097,7 @@ pub fn load_recent_antigravity_sessions() -> Vec<ClaudeSession> {
             pid: None,
             pending_agents: 0,
             permission_suggestions: None,
+            needs_review: None,
             last_response: None,
             is_active_tab: false,
             terminal_id: None,
@@ -9522,10 +9526,12 @@ fn start_session_file_watcher(
 
                 if session.source == "codex" {
                     if let Some((tool, tool_input)) = codex_pending_approval(&path2) {
-                        if session.status != "waiting" {
-                            log::info!("File watcher: codex pending approval {}", sid2);
+                        let is_review = tool != "request_user_input" && tool != "requestUserInput";
+                        if session.status != "waiting" || session.needs_review != Some(is_review) {
+                            log::info!("File watcher: codex pending approval {} (review={})", sid2, is_review);
                             session.status = "waiting".to_string();
                             session.is_processing = false;
+                            session.needs_review = Some(is_review);
                             changed = true;
                         }
                         session.tool = Some(tool);
@@ -9536,6 +9542,7 @@ fn start_session_file_watcher(
                     } else if session.status == "waiting" {
                         session.status = "processing".to_string();
                         session.is_processing = true;
+                        session.needs_review = None;
                         changed = true;
                     }
                     if session.status != "waiting" && session.status != "stopped" {
@@ -9850,6 +9857,8 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
                         if let Some((tool, tool_input)) = codex_pending_approval(&path) {
                             session.status = "waiting".to_string();
                             session.is_processing = false;
+                            let is_review = tool != "request_user_input" && tool != "requestUserInput";
+                            session.needs_review = Some(is_review);
                             session.tool = Some(tool);
                             if !tool_input.is_empty() {
                                 session.tool_input = Some(tool_input);
@@ -10521,6 +10530,7 @@ fn load_recent_hermes_sessions_from_db() -> Result<Vec<ClaudeSession>, String> {
             pid: None,
             pending_agents: 0,
             permission_suggestions: None,
+            needs_review: None,
             last_response: asst_response,
             is_active_tab: false,
             terminal_id: None,
@@ -16046,6 +16056,7 @@ mod codex_adapter_tests {
             pid: None,
             pending_agents: 0,
             permission_suggestions: None,
+            needs_review: None,
             last_response: None,
             is_active_tab: false,
             source: "codex".to_string(),
@@ -16943,6 +16954,7 @@ fn process_claude_event(
                     is_active_tab: false,
                     source: source.clone(),
                     permission_suggestions: None,
+                    needs_review: None,
                     terminal_id: None,
                     host_terminal: None,
                     platform: None,
@@ -17323,6 +17335,10 @@ fn process_claude_event(
                             // else: keep existing last_response from afterAgentResponse
                         }
                     }
+                    if interrupted {
+                        session.status = "failed".to_string();
+                        status = "failed".to_string();
+                    }
                     stop_was_interrupted = interrupted;
                 } else if hook_event == "UserPromptSubmit" {
                     session.last_response = None;
@@ -17335,8 +17351,13 @@ fn process_claude_event(
                     session.permission_suggestions = event.get("permission_suggestions")
                         .or_else(|| event.get("permissionSuggestions"))
                         .cloned();
-                } else {
-                    session.permission_suggestions = None;
+                    let explicit_review = event.get("needs_review").or_else(|| event.get("needsReview")).and_then(|v| v.as_bool());
+                    session.needs_review = Some(explicit_review.unwrap_or(true));
+                } else if hook_event == "PreToolUse" && status == "waiting" {
+                    let explicit_review = event.get("needs_review").or_else(|| event.get("needsReview")).and_then(|v| v.as_bool());
+                    session.needs_review = Some(explicit_review.unwrap_or(pretool_needs_waiting));
+                } else if status != "waiting" {
+                    session.needs_review = None;
                 }
 
                 // For waiting/permission events, capture tab focus now (real-time,
@@ -17367,14 +17388,34 @@ fn process_claude_event(
             // session's terminal tab (same focus rule as the completion popup).
             && !wait_tab_active;
         let is_completion_stop = hook_event == "Stop" && status == "stopped" && pending_agents == 0 && !stop_was_interrupted;
+        let is_failed_stop = hook_event == "Stop" && pending_agents == 0 && stop_was_interrupted;
+
+        if was_processing && !was_compacting && is_failed_stop {
+            if cfg!(debug_assertions) {
+                log::info!(
+                    "[claude_event] emit claude-task-failed session={} source={} host={:?}",
+                    &session_id[..session_id.len().min(8)],
+                    session_source,
+                    session_host_terminal,
+                );
+            }
+            let _ = app.emit("claude-task-failed", serde_json::json!({
+                "sessionId": session_id,
+                "source": session_source,
+                "hostTerminal": session_host_terminal,
+            }));
+        }
+
         if was_processing && !was_compacting
             && (is_completion_stop || is_wait_event) {
             let is_waiting = is_wait_event;
+            let session_needs_review = hook_event == "PermissionRequest" || pretool_needs_waiting;
             if cfg!(debug_assertions) {
                 log::info!(
-                    "[claude_event] emit claude-task-complete session={} waiting={} source={} host={:?}",
+                    "[claude_event] emit claude-task-complete session={} waiting={} needsReview={} source={} host={:?}",
                     &session_id[..session_id.len().min(8)],
                     is_waiting,
+                    session_needs_review,
                     session_source,
                     session_host_terminal,
                 );
@@ -17382,6 +17423,7 @@ fn process_claude_event(
             let _ = app.emit("claude-task-complete", serde_json::json!({
                 "sessionId": session_id,
                 "waiting": is_waiting,
+                "needsReview": session_needs_review,
                 "source": session_source,
                 "hostTerminal": session_host_terminal,
             }));
@@ -18136,7 +18178,7 @@ const plugin = async (ctx) => {
           }
           case "session.error": {
             pendingWait = false;
-            emit(p.sessionID || rootSessionId, "Stop", "waiting_for_input");
+            emit(p.sessionID || rootSessionId, "Stop", "waiting_for_input", { error: "session_error" });
             return;
           }
           case "session.compacted": {
@@ -18151,7 +18193,7 @@ const plugin = async (ctx) => {
             pendingWait = true;
             const perm = p.permission || (p.metadata && p.metadata.title) || "";
             emit(p.sessionID || rootSessionId, "PermissionRequest", "waiting",
-              perm ? { tool_name: perm } : null, true);
+              perm ? { tool_name: perm, needs_review: true } : { needs_review: true }, true);
             return;
           }
           case "question.asked": {
@@ -18160,7 +18202,7 @@ const plugin = async (ctx) => {
               ? p.questions.map((q) => (q && (q.question || q.title)) || "").filter(Boolean).join("; ")
               : "";
             emit(p.sessionID || rootSessionId, "PermissionRequest", "waiting",
-              qtext ? { prompt: qtext } : null, true);
+              qtext ? { prompt: qtext, needs_review: false } : { needs_review: false }, true);
             return;
           }
           case "permission.replied":

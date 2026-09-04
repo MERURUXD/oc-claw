@@ -48,6 +48,28 @@ export const ANIMATION_ROWS: Record<CodexPetState, AnimationRow> = {
   'review':    { row: 8, frames: 6 },
 }
 
+export interface AnimationBehavior {
+  loop: boolean
+}
+
+export const ANIMATION_BEHAVIOR: Record<CodexPetState, AnimationBehavior> = {
+  'idle':      { loop: true },
+  'run-right': { loop: true },
+  'run-left':  { loop: true },
+  'waving':    { loop: false },
+  'jumping':   { loop: false },
+  'failed':    { loop: false },
+  'waiting':   { loop: true },
+  'running':   { loop: true },
+  'review':    { loop: true },
+}
+
+export const ONE_SHOT_STATES: ReadonlySet<CodexPetState> = new Set([
+  'jumping',
+  'waving',
+  'failed',
+])
+
 export const SPRITE_FPS = 12
 
 // Per-state fps overrides. States not listed fall back to SPRITE_FPS.
@@ -62,6 +84,9 @@ export const STATE_FPS: Partial<Record<CodexPetState, number>> = {
   waiting: 6,
   'run-left': 8,
   'run-right': 8,
+  waving: 6,
+  failed: 8,
+  review: 6,
 }
 
 export function fpsFor(state: CodexPetState): number {
@@ -99,10 +124,10 @@ export const DEFAULT_PET_QUEUE_IDS: string[] = [
   'taffy',
 ]
 
-// Maps Mini.tsx's `PetState` (idle/working/compacting/waiting) to a codex
+// Maps Mini.tsx's `PetState` (idle/working/compacting/waiting/review) to a codex
 // sprite state. Walking direction and hover are layered on top of this by
 // the wrapper component, not by this function.
-export type MiniPetSourceState = 'idle' | 'working' | 'compacting' | 'waiting'
+export type MiniPetSourceState = 'idle' | 'working' | 'compacting' | 'waiting' | 'review'
 
 export function petStateToCodexState(state: MiniPetSourceState): CodexPetState {
   switch (state) {
@@ -113,6 +138,8 @@ export function petStateToCodexState(state: MiniPetSourceState): CodexPetState {
       return 'running'
     case 'waiting':
       return 'waiting'
+    case 'review':
+      return 'review'
     default:
       return 'idle'
   }
