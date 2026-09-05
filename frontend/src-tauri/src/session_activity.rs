@@ -45,6 +45,14 @@ pub struct SessionActivity {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ApprovalActions {
+    pub can_deny: bool,
+    pub can_allow_turn: bool,
+    pub can_allow_session: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PendingInteraction {
     pub kind: String, // "approval" | "user_input"
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -63,6 +71,10 @@ pub struct PendingInteraction {
     pub detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub justification: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_actions: Option<ApprovalActions>,
 }
 
 /// Normalizes a raw reasoning summary string:
@@ -1226,6 +1238,8 @@ pub fn reconstruct_codex_pending_interaction(
                                     summary: Some(summary),
                                     detail: Some(detail),
                                     justification,
+                                    request_id: None,
+                                    approval_actions: None,
                                 });
                             }
                         }
@@ -1271,6 +1285,8 @@ pub fn reconstruct_codex_pending_interaction(
                                     summary: Some(summary),
                                     detail: Some(detail),
                                     justification,
+                                    request_id: None,
+                                    approval_actions: None,
                                 });
                             }
                         }
@@ -1295,6 +1311,8 @@ pub fn reconstruct_codex_pending_interaction(
                                         summary: Some(summary),
                                         detail: Some(detail),
                                         justification,
+                                        request_id: None,
+                                        approval_actions: None,
                                     });
                                 }
                             }
@@ -1376,6 +1394,8 @@ pub fn reconstruct_codex_pending_interaction(
                             summary,
                             detail,
                             justification,
+                            request_id: None,
+                            approval_actions: None,
                         });
                     }
 
@@ -1428,6 +1448,8 @@ pub fn reconstruct_codex_pending_interaction(
                         summary,
                         detail,
                         justification,
+                        request_id: None,
+                        approval_actions: None,
                     });
                 }
             }

@@ -1,6 +1,6 @@
-import type { BubbleSessionDetail, MascotBubblePayload, PendingInteraction, SessionActivity, SessionActivityKind, SessionActivitySource } from './types'
+import type { ApprovalActions, BubbleSessionDetail, MascotBubblePayload, PendingInteraction, SessionActivity, SessionActivityKind, SessionActivitySource } from './types'
 
-export type { PendingInteraction, SessionActivity, SessionActivityKind, SessionActivitySource }
+export type { ApprovalActions, PendingInteraction, SessionActivity, SessionActivityKind, SessionActivitySource }
 
 /**
  * Normalizes reasoning summary string for presentation in the mascot bubble:
@@ -262,6 +262,19 @@ export function isSameActivity(a?: SessionActivity | null, b?: SessionActivity |
   )
 }
 
+export function isSameApprovalActions(
+  a?: ApprovalActions | null,
+  b?: ApprovalActions | null
+): boolean {
+  if (!a && !b) return true
+  if (!a || !b) return false
+  return (
+    a.canDeny === b.canDeny &&
+    a.canAllowTurn === b.canAllowTurn &&
+    a.canAllowSession === b.canAllowSession
+  )
+}
+
 /**
  * Compare two PendingInteraction objects for structural equality.
  */
@@ -280,7 +293,9 @@ export function isSamePendingInteraction(
     a.tool === b.tool &&
     a.summary === b.summary &&
     a.detail === b.detail &&
-    a.justification === b.justification
+    a.justification === b.justification &&
+    a.requestId === b.requestId &&
+    isSameApprovalActions(a.approvalActions, b.approvalActions)
   )
 }
 

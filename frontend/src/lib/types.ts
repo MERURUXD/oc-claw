@@ -45,6 +45,12 @@ export interface SessionActivity {
 
 export type PendingInteractionKind = 'approval' | 'user_input'
 
+export interface ApprovalActions {
+  canDeny: boolean
+  canAllowTurn: boolean
+  canAllowSession: boolean
+}
+
 export interface PendingInteraction {
   kind: PendingInteractionKind
   interactionType?: string
@@ -55,6 +61,8 @@ export interface PendingInteraction {
   summary?: string
   detail?: string
   justification?: string
+  requestId?: string
+  approvalActions?: ApprovalActions
 }
 
 export interface ClaudeSession {
