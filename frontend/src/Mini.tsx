@@ -16,6 +16,13 @@ import { ChatList } from './components/ChatList'
 import { getStore, DEFAULT_CHAR, DEFAULT_CHAR_NAME, loadCharacters, loadOcConnections, saveOcConnections } from './lib/store'
 import type { AgentMetrics, BubbleSessionDetail, BubbleStyle, BubbleTransitionEvent, MascotBubblePayload, OcConnection, SubagentDetail } from './lib/types'
 import { deriveSessionActivity, isSameBubblePayload } from './lib/sessionActivity'
+import {
+  type BubbleLifecycleState,
+  handleFullscreenSuppressionChange,
+  handleBubbleReadyWhileSuppressed,
+  handleNativeShowResult,
+  handleBubbleVisible,
+} from './lib/bubbleSuppression'
 import { OnboardingModal } from './components/OnboardingModal'
 import { PetContextMenu, PomodoroOverlay } from './components/PetContextMenu'
 import {
@@ -576,6 +583,7 @@ export default function Mini() {
   const bubbleDesiredVisibleRef = useRef(false)
   const bubbleTransitionIdRef = useRef(0)
   const bubblePhaseRef = useRef<'hidden' | 'prepared' | 'entering' | 'visible' | 'exiting'>('hidden')
+  const bubbleFullscreenSuppressedRef = useRef(false)
 
   // Settings mode: native window grows, then a separate settings card animates in.
   const [settingsMode, setSettingsMode] = useState(false)
@@ -2193,6 +2201,7 @@ export default function Mini() {
       bubbleTransitionIdRef.current++
       bubblePhaseRef.current = 'hidden'
       bubbleNativeVisibleRef.current = false
+      bubbleFullscreenSuppressedRef.current = false
       invoke('set_mascot_bubble_visible', { visible: false }).catch(() => {})
       return
     }
@@ -2202,6 +2211,7 @@ export default function Mini() {
       bubbleTransitionIdRef.current++
       bubblePhaseRef.current = 'hidden'
       bubbleNativeVisibleRef.current = false
+      bubbleFullscreenSuppressedRef.current = false
       invoke('set_mascot_bubble_visible', { visible: false }).catch(() => {})
       return
     }
@@ -3116,24 +3126,77 @@ export default function Mini() {
     const unlistenBubbleSession = listen<{ sessionId?: string } | undefined>('mascot-bubble-session-click', (e) => {
       handleBubbleClick(e.payload)
     })
+    const getBubbleState = (): BubbleLifecycleState => ({
+      desiredVisible: bubbleDesiredVisibleRef.current,
+      phase: bubblePhaseRef.current,
+      nativeVisible: bubbleNativeVisibleRef.current,
+      transitionId: bubbleTransitionIdRef.current,
+      fullscreenSuppressed: bubbleFullscreenSuppressedRef.current,
+    })
+
     const unlistenBubbleReady = listen<BubbleTransitionEvent>('mascot-bubble-ready', async (e) => {
       const transitionId = e.payload?.transitionId
+      if (transitionId == null) return
+      const state = getBubbleState()
+      const { canShowNative, reason } = handleBubbleReadyWhileSuppressed(state, transitionId)
+      if (!canShowNative) {
+        if (reason === 'suppressed') {
+          bubbleNativeVisibleRef.current = false
+        }
+        return
+      }
+
+      const res = await invoke<string>('set_mascot_bubble_visible', { visible: true }).catch(() => 'error')
+      const shown = handleNativeShowResult(state, res)
+      bubbleNativeVisibleRef.current = shown
       if (
-        transitionId != null &&
+        shown &&
         transitionId === bubbleTransitionIdRef.current &&
         bubbleDesiredVisibleRef.current
       ) {
-        await invoke('set_mascot_bubble_visible', { visible: true }).catch(() => {})
-        bubbleNativeVisibleRef.current = true
-        if (
-          transitionId === bubbleTransitionIdRef.current &&
-          bubbleDesiredVisibleRef.current
-        ) {
-          bubblePhaseRef.current = 'entering'
-          emit('mascot-bubble-enter', { transitionId }).catch(() => {})
-        }
+        bubblePhaseRef.current = 'entering'
+        emit('mascot-bubble-enter', { transitionId }).catch(() => {})
       }
     })
+
+    const unlistenBubbleVisible = listen<BubbleTransitionEvent>('mascot-bubble-visible', (e) => {
+      const transitionId = e.payload?.transitionId
+      if (transitionId == null) return
+      const state = getBubbleState()
+      if (handleBubbleVisible(state, transitionId)) {
+        bubblePhaseRef.current = 'visible'
+      }
+    })
+
+    const unlistenFullscreenSuppression = listen<{ suppressed: boolean }>(
+      'mascot-fullscreen-suppression',
+      async (e) => {
+        const suppressed = !!e.payload?.suppressed
+        const state = getBubbleState()
+        const result = handleFullscreenSuppressionChange(state, suppressed)
+        bubbleFullscreenSuppressedRef.current = state.fullscreenSuppressed
+        bubbleNativeVisibleRef.current = state.nativeVisible
+        console.log(result.logMessage)
+
+        if (result.shouldShowNative) {
+          const transitionId = bubbleTransitionIdRef.current
+          const res = await invoke<string>('set_mascot_bubble_visible', { visible: true }).catch(() => 'error')
+          const shown = handleNativeShowResult(state, res)
+          bubbleNativeVisibleRef.current = shown
+
+          if (shown && result.shouldEmitEnter) {
+            if (
+              bubbleDesiredVisibleRef.current &&
+              bubbleTransitionIdRef.current === transitionId
+            ) {
+              bubblePhaseRef.current = 'entering'
+              emit('mascot-bubble-enter', { transitionId }).catch(() => {})
+            }
+          }
+        }
+      }
+    )
+
     const unlistenBubbleExit = listen<BubbleTransitionEvent>('mascot-bubble-exit-complete', async (e) => {
       const transitionId = e.payload?.transitionId
       if (
@@ -3151,6 +3214,8 @@ export default function Mini() {
       unlistenBubble.then((fn) => fn())
       unlistenBubbleSession.then((fn) => fn())
       unlistenBubbleReady.then((fn) => fn())
+      unlistenBubbleVisible.then((fn) => fn())
+      unlistenFullscreenSuppression.then((fn) => fn())
       unlistenBubbleExit.then((fn) => fn())
     }
   }, [])

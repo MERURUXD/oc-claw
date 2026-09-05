@@ -1090,7 +1090,7 @@ export default function MascotBubble() {
     return () => ro.disconnect()
   }, [displaySummary])
 
-  // Safety fallback for prefersReducedMotion: ensure exit completion is emitted without hanging
+  // Safety fallback for prefersReducedMotion: ensure exit/enter completion is emitted without hanging
   useEffect(() => {
     if (prefersReducedMotion && phase === 'exiting') {
       const currentId = transitionIdRef.current
@@ -1099,8 +1099,16 @@ export default function MascotBubble() {
       setSummary(null)
       logBubbleDev(`[bubble ${currentId}] exit complete (reduced-motion)`)
       emit('mascot-bubble-exit-complete', { transitionId: currentId }).catch(() => {})
+    } else if (prefersReducedMotion && phase === 'entering') {
+      const currentId = transitionIdRef.current
+      activeMotionTokensRef.current.delete('global-entry')
+      setPhase('visible')
+      phaseRef.current = 'visible'
+      logBubbleDev(`[bubble ${currentId}] visible (reduced-motion)`)
+      syncBubbleGeometry('stable', { preserveAnchor: true })
+      emit('mascot-bubble-visible', { transitionId: currentId }).catch(() => {})
     }
-  }, [prefersReducedMotion, phase])
+  }, [prefersReducedMotion, phase, syncBubbleGeometry])
 
   const handleAnimationComplete = useCallback(() => {
     // If multi-session, row animations control phase completion
@@ -1117,6 +1125,7 @@ export default function MascotBubble() {
       if (activeMotionTokensRef.current.size === 0) {
         syncBubbleGeometry('stable', { preserveAnchor: true })
       }
+      emit('mascot-bubble-visible', { transitionId: currentId }).catch(() => {})
     } else if (currentPhase === 'exiting') {
       activeMotionTokensRef.current.delete('global-exit')
       setPhase('hidden')
@@ -1161,6 +1170,7 @@ export default function MascotBubble() {
           if (activeMotionTokensRef.current.size === 0) {
             syncBubbleGeometry('stable', { preserveAnchor: true })
           }
+          emit('mascot-bubble-visible', { transitionId: currentId }).catch(() => {})
         }
       } else if (currentPhase === 'exiting') {
         exitingCompletedSessionIdsRef.current.add(sessionId)
