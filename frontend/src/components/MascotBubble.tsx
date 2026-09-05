@@ -729,6 +729,7 @@ export default function MascotBubble() {
 
   // Session tracking and incremental entry state
   const knownSessionIdsRef = useRef<Set<string>>(new Set())
+  const seenTurnKeysRef = useRef<Set<string>>(new Set())
   const [incrementalEntries, setIncrementalEntries] = useState<Record<string, { delay: number }>>({})
   const incrementalEntriesRef = useRef<Record<string, { delay: number }>>({})
   incrementalEntriesRef.current = incrementalEntries
@@ -826,10 +827,15 @@ export default function MascotBubble() {
       if (newPayload) {
         lastValidSummaryRef.current = newPayload
         setSummary(newPayload)
-        const initialSessionIds = getSessionIdsFromPayload(newPayload)
+        const initialSessions = getSessionsFromPayload(newPayload)
+        const initialSessionIds = initialSessions.map((s) => s.sessionId).filter(Boolean)
         knownSessionIdsRef.current = new Set(initialSessionIds)
+        seenTurnKeysRef.current = new Set(
+          initialSessions.map((s) => `${s.sessionId}:${s.turnId || 'legacy'}`)
+        )
       } else {
         knownSessionIdsRef.current.clear()
+        seenTurnKeysRef.current.clear()
       }
       setPhase('prepared')
       phaseRef.current = 'prepared'
@@ -868,15 +874,45 @@ export default function MascotBubble() {
           return
         }
         lastValidSummaryRef.current = p
-        const currentSessionIds = getSessionIdsFromPayload(p)
+        const currentSessions = getSessionsFromPayload(p)
+        const currentSessionIds = currentSessions.map((s) => s.sessionId).filter(Boolean)
         const currentPhase = phaseRef.current
 
+        // Check for removed sessions (were known, but no longer in current payload)
+        for (const prevId of knownSessionIdsRef.current) {
+          if (!currentSessionIds.includes(prevId)) {
+            logBubbleDev(`[bubble-membership] session=${prevId} action=remove`)
+          }
+        }
+
         if (currentPhase === 'visible') {
-          // Detect incremental sessions only when bubble is fully visible
-          const newIds = currentSessionIds.filter((id) => !knownSessionIdsRef.current.has(id))
-          if (newIds.length > 0) {
-            logBubbleDev(`[bubble] incremental sessions added:`, newIds)
-            newIds.forEach((id) => {
+          // Categorize sessions not in knownSessionIdsRef: truly new vs. reappear same turn
+          const trulyNewIncrementalSessions: BubbleSessionDetail[] = []
+          for (const session of currentSessions) {
+            const sid = session.sessionId
+            if (!knownSessionIdsRef.current.has(sid)) {
+              const turnKey = `${sid}:${session.turnId || 'legacy'}`
+              if (seenTurnKeysRef.current.has(turnKey)) {
+                // Same session + same turn returning after transient absence:
+                // DEFINITELY NO INCREMENTAL-ENTRY!
+                logBubbleDev(`[bubble-membership] session=${sid} turn=${session.turnId || 'legacy'} action=reappear_same_turn`)
+              } else {
+                // Brand-new session / new turn!
+                trulyNewIncrementalSessions.push(session)
+                logBubbleDev(`[bubble-membership] session=${sid} turn=${session.turnId || 'legacy'} action=add`)
+              }
+            }
+          }
+
+          // Register all current turns into seenTurnKeysRef
+          currentSessions.forEach((s) => {
+            seenTurnKeysRef.current.add(`${s.sessionId}:${s.turnId || 'legacy'}`)
+          })
+
+          const newIncrementalIds = trulyNewIncrementalSessions.map((s) => s.sessionId)
+          if (newIncrementalIds.length > 0) {
+            logBubbleDev(`[bubble] incremental sessions added:`, newIncrementalIds)
+            newIncrementalIds.forEach((id) => {
               activeMotionTokensRef.current.add(`incremental:${id}`)
             })
 
@@ -884,7 +920,7 @@ export default function MascotBubble() {
               if (disposed) return
               setIncrementalEntries((prev) => {
                 const next = { ...prev }
-                newIds.forEach((id, newIdx) => {
+                newIncrementalIds.forEach((id, newIdx) => {
                   next[id] = {
                     delay: Math.min(newIdx, 3) * BUBBLE_MOTION.staggerDelay,
                   }
@@ -911,7 +947,12 @@ export default function MascotBubble() {
           }
         }
 
-        // Normal payload update or non-visible phase
+        // Register all current turns into seenTurnKeysRef
+        currentSessions.forEach((s) => {
+          seenTurnKeysRef.current.add(`${s.sessionId}:${s.turnId || 'legacy'}`)
+        })
+
+        // Normal payload update or non-visible phase (or reappear-only update)
         knownSessionIdsRef.current = new Set(currentSessionIds)
         setSummary(p)
 
@@ -1132,6 +1173,8 @@ export default function MascotBubble() {
           setPhase('hidden')
           phaseRef.current = 'hidden'
           setSummary(null)
+          knownSessionIdsRef.current.clear()
+          seenTurnKeysRef.current.clear()
           logBubbleDev(`[bubble ${currentId}] multi-row exit complete`)
           emit('mascot-bubble-exit-complete', { transitionId: currentId }).catch(() => {})
         }

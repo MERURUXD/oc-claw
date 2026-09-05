@@ -2635,6 +2635,7 @@ export default function Mini() {
             activeSubagents: s.activeSubagents || undefined,
             otherCount: Math.max(0, totalActive - 1),
             activity,
+            turnId: s.turnId || undefined,
           }
         }
 
