@@ -43,6 +43,51 @@ export interface SessionActivity {
   source: SessionActivitySource
 }
 
+export type PendingInteractionKind = 'approval' | 'user_input'
+
+export interface PendingInteraction {
+  kind: PendingInteractionKind
+  interactionType?: string
+  turnId?: string
+  itemId?: string
+  callId?: string
+  tool?: string
+  summary?: string
+  detail?: string
+  justification?: string
+}
+
+export interface ClaudeSession {
+  sessionId: string
+  cwd: string
+  status: string
+  tool?: string
+  toolInput?: string
+  userPrompt?: string
+  customTitle?: string
+  interactive: boolean
+  updatedAt: number
+  isProcessing: boolean
+  pid?: number
+  pendingAgents?: number
+  permissionSuggestions?: any
+  needsReview?: boolean
+  lastResponse?: string
+  isActiveTab?: boolean
+  source: string
+  terminalId?: string
+  hostTerminal?: string
+  platform?: string
+  cursorPort?: number
+  cursorWorkspaceRoot?: string
+  cursorWorkspaceName?: string
+  cursorNativeHandle?: string
+  activeSubagents?: SubagentDetail[]
+  activity?: SessionActivity
+  turnId?: string
+  pendingInteraction?: PendingInteraction
+}
+
 export interface BubbleSessionDetail {
   sessionId: string
   title: string
@@ -60,6 +105,7 @@ export interface BubbleSessionDetail {
   otherCount?: number
   activity?: SessionActivity
   turnId?: string
+  pendingInteraction?: PendingInteraction
 }
 
 export interface MascotBubblePayload {

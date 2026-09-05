@@ -8,9 +8,10 @@ import {
   isSameActivity,
   isSameSessionDetail,
   isSameBubblePayload,
+  isSamePendingInteraction,
 } from './sessionActivity.ts'
 import { formatActivity } from './activityFormat.ts'
-import type { BubbleSessionDetail, MascotBubblePayload, SessionActivity } from './types.ts'
+import type { BubbleSessionDetail, MascotBubblePayload, PendingInteraction, SessionActivity } from './types.ts'
 
 test('normalizeActivitySummary handles headings, bullets, code, and emphasis', () => {
   assert.equal(
@@ -360,3 +361,139 @@ test('UI priority ladder maintains waiting > subagents > activity > thinkingPool
   }
   assert.equal(fallbackSession.activity, undefined)
 })
+
+test('isSamePendingInteraction verifies structural equality and detects mutations', () => {
+  assert.ok(isSamePendingInteraction(undefined, undefined))
+  assert.ok(isSamePendingInteraction(null, null))
+  assert.ok(isSamePendingInteraction(undefined, null))
+  assert.ok(isSamePendingInteraction(null, undefined))
+  assert.ok(!isSamePendingInteraction({ kind: 'approval' }, undefined))
+  assert.ok(!isSamePendingInteraction(undefined, { kind: 'approval' }))
+
+  const baseApproval: PendingInteraction = {
+    kind: 'approval',
+    interactionType: 'command',
+    turnId: 'turn-1',
+    itemId: 'item-1',
+    callId: 'call-1',
+    tool: 'exec_command',
+    summary: 'exec cargo build',
+    detail: 'cargo build --workspace',
+    justification: 'Compile verification needed',
+  }
+
+  const identicalApproval: PendingInteraction = { ...baseApproval }
+  assert.ok(isSamePendingInteraction(baseApproval, identicalApproval))
+
+  // Kind mismatch
+  assert.ok(!isSamePendingInteraction(baseApproval, { ...baseApproval, kind: 'user_input' }))
+  // Tool mismatch
+  assert.ok(!isSamePendingInteraction(baseApproval, { ...baseApproval, tool: 'other_tool' }))
+  // Summary mismatch
+  assert.ok(!isSamePendingInteraction(baseApproval, { ...baseApproval, summary: 'exec cargo test' }))
+  // Detail mismatch
+  assert.ok(!isSamePendingInteraction(baseApproval, { ...baseApproval, detail: 'different command' }))
+  // Justification mismatch
+  assert.ok(!isSamePendingInteraction(baseApproval, { ...baseApproval, justification: undefined }))
+  // TurnId mismatch
+  assert.ok(!isSamePendingInteraction(baseApproval, { ...baseApproval, turnId: 'turn-2' }))
+  // ItemId mismatch
+  assert.ok(!isSamePendingInteraction(baseApproval, { ...baseApproval, itemId: 'item-2' }))
+  // CallId mismatch
+  assert.ok(!isSamePendingInteraction(baseApproval, { ...baseApproval, callId: 'call-2' }))
+})
+
+test('isSameSessionDetail and isSameBubblePayload detect pendingInteraction updates', () => {
+  const approvalInter: PendingInteraction = {
+    kind: 'approval',
+    interactionType: 'command',
+    summary: 'exec cargo check',
+    detail: 'cargo check',
+    justification: 'Check types',
+  }
+  const userInputInter: PendingInteraction = {
+    kind: 'user_input',
+    interactionType: 'question',
+    summary: 'Which port to use?',
+    detail: 'Which port to use? [3000/8080]',
+  }
+
+  const sessionA: BubbleSessionDetail = {
+    sessionId: 'sess-1',
+    title: 'Codex Dev',
+    status: 'waiting',
+    pendingInteraction: approvalInter,
+  }
+
+  const sessionB: BubbleSessionDetail = {
+    sessionId: 'sess-1',
+    title: 'Codex Dev',
+    status: 'waiting',
+    pendingInteraction: { ...approvalInter },
+  }
+
+  const sessionC: BubbleSessionDetail = {
+    sessionId: 'sess-1',
+    title: 'Codex Dev',
+    status: 'waiting',
+    pendingInteraction: userInputInter,
+  }
+
+  const sessionNoInter: BubbleSessionDetail = {
+    sessionId: 'sess-1',
+    title: 'Codex Dev',
+    status: 'waiting',
+  }
+
+  assert.ok(isSameSessionDetail(sessionA, sessionB))
+  assert.ok(!isSameSessionDetail(sessionA, sessionC))
+  assert.ok(!isSameSessionDetail(sessionA, sessionNoInter))
+
+  const payloadA: MascotBubblePayload = {
+    style: 'compact',
+    running: 0,
+    waiting: 1,
+    activeSession: sessionA,
+    activeSessions: [sessionA],
+  }
+  const payloadB: MascotBubblePayload = {
+    style: 'compact',
+    running: 0,
+    waiting: 1,
+    activeSession: sessionB,
+    activeSessions: [sessionB],
+  }
+  const payloadC: MascotBubblePayload = {
+    style: 'compact',
+    running: 0,
+    waiting: 1,
+    activeSession: sessionC,
+    activeSessions: [sessionC],
+  }
+
+  assert.ok(isSameBubblePayload(payloadA, payloadB))
+  assert.ok(!isSameBubblePayload(payloadA, payloadC))
+})
+
+test('deriveSessionActivity with justification or prompt fields does not create waiting state', () => {
+  // Regression 1: Tool call with justification field must map to normal command/tool activity
+  const justAct = deriveSessionActivity({
+    tool: 'exec',
+    toolInput: JSON.stringify({ cmd: 'cargo check', justification: 'Routine verification' }),
+    status: 'tool_running',
+  })
+  assert.ok(justAct)
+  assert.equal(justAct.kind, 'command')
+  assert.equal(justAct.status, 'running')
+
+  // Regression 2: Tool call with prompt/questions parameters must not be treated as waiting/user_input
+  const promptAct = deriveSessionActivity({
+    tool: 'generate_code',
+    toolInput: JSON.stringify({ prompt: 'Write test suite', questions: ['Which format?'] }),
+    status: 'tool_running',
+  })
+  assert.ok(promptAct)
+  assert.equal(promptAct.status, 'running')
+})
+
+
