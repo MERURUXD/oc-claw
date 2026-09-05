@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub mod harness_quota;
 use harness_quota::get_harness_quota;
 pub mod session_activity;
+pub use session_activity::PendingInteraction;
 pub mod hermes;
 
 /// Whether the efficiency-mode notch hover tracking thread should be running.
@@ -6993,6 +6994,9 @@ pub struct ClaudeSession {
     /// Active turn ID for Hermes or other harnesses supporting per-turn lifecycles.
     #[serde(rename = "turnId", skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
+    /// Pending user interaction / approval blocking the current turn.
+    #[serde(rename = "pendingInteraction", skip_serializing_if = "Option::is_none")]
+    pub pending_interaction: Option<PendingInteraction>,
 }
 
 type PendingPermissions = Arc<Mutex<HashMap<String, std::sync::mpsc::Sender<String>>>>;
@@ -9191,6 +9195,7 @@ pub fn load_recent_antigravity_sessions() -> Vec<ClaudeSession> {
             activity: None,
             activity_origin: None,
             turn_id: None,
+            pending_interaction: None,
         };
 
         let is_active = update_antigravity_session_from_transcript(&mut session);
@@ -9329,105 +9334,11 @@ fn read_last_codex_assistant_message(path: &std::path::Path) -> Option<String> {
     None
 }
 
-fn codex_pending_approval(path: &std::path::Path) -> Option<(String, String)> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let mut completed_calls = std::collections::HashSet::<String>::new();
-
-    for line in content.lines().rev().take(240) {
-        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let Some(payload) = parsed.get("payload") else {
-            continue;
-        };
-        if parsed.get("type").and_then(|v| v.as_str()) == Some("event_msg")
-            && payload.get("type").and_then(|v| v.as_str()) == Some("mcp_tool_call_end")
-        {
-            if let Some(call_id) = payload.get("call_id").and_then(|v| v.as_str()) {
-                completed_calls.insert(call_id.to_string());
-            }
-            continue;
-        }
-        if parsed.get("type").and_then(|v| v.as_str()) != Some("response_item") {
-            continue;
-        }
-        match payload.get("type").and_then(|v| v.as_str()).unwrap_or("") {
-            "function_call_output" | "custom_tool_call_output" => {
-                if let Some(call_id) = payload.get("call_id").and_then(|v| v.as_str()) {
-                    completed_calls.insert(call_id.to_string());
-                }
-            }
-            "function_call" | "custom_tool_call" => {
-                let call_id = payload.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
-                if !call_id.is_empty() && completed_calls.contains(call_id) {
-                    continue;
-                }
-                let status = payload
-                    .get("status")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                if matches!(status.as_str(), "completed" | "failed" | "cancelled" | "canceled") {
-                    continue;
-                }
-
-                let args = parse_codex_tool_args(payload.get("arguments").or_else(|| payload.get("input")));
-
-                let sandbox_permissions = payload
-                    .get("sandbox_permissions")
-                    .or_else(|| payload.get("sandboxPermissions"))
-                    .or_else(|| args.get("sandbox_permissions"))
-                    .or_else(|| args.get("sandboxPermissions"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-
-                let status_needs_approval = matches!(
-                    status.as_str(),
-                    "pending" | "waiting" | "needs_approval" | "approval_required" | "requires_approval"
-                );
-                let args_need_approval = sandbox_permissions.eq_ignore_ascii_case("require_escalated")
-                    || sandbox_permissions.eq_ignore_ascii_case("escalated")
-                    || payload.get("requires_approval").and_then(|v| v.as_bool()).unwrap_or(false)
-                    || payload.get("requiresApproval").and_then(|v| v.as_bool()).unwrap_or(false)
-                    || args.get("requires_approval").and_then(|v| v.as_bool()).unwrap_or(false)
-                    || args.get("requiresApproval").and_then(|v| v.as_bool()).unwrap_or(false);
-
-                let tool = payload
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Tool")
-                    .to_string();
-
-                let is_user_input = tool == "request_user_input" || tool == "requestUserInput";
-
-                if !status_needs_approval && !args_need_approval && !is_user_input {
-                    continue;
-                }
-
-                let command = args
-                    .get("cmd")
-                    .or_else(|| args.get("command"))
-                    .or_else(|| args.get("prompt"))
-                    .or_else(|| args.get("message"))
-                    .or_else(|| args.get("url"))
-                    .or_else(|| args.get("path"))
-                    .or_else(|| args.get("target"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let justification = args
-                    .get("justification")
-                    .or_else(|| payload.get("justification"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let detail = if !command.is_empty() { command } else { justification };
-                return Some((tool, detail));
-            }
-            _ => {}
-        }
-    }
-    None
+pub fn codex_pending_approval(path: &std::path::Path) -> Option<(String, String)> {
+    let interaction = session_activity::reconstruct_codex_pending_interaction(path, None)?;
+    let tool = interaction.tool.unwrap_or_else(|| "Tool".to_string());
+    let detail = interaction.summary.or(interaction.detail).unwrap_or_default();
+    Some((tool, detail))
 }
 
 /// Determine whether a Stop event represents a user-aborted turn rather than a
@@ -9607,24 +9518,31 @@ fn start_session_file_watcher(
                 let mut changed = false;
 
                 if session.source == "codex" {
-                    if let Some((tool, tool_input)) = codex_pending_approval(&path2) {
-                        let is_review = tool != "request_user_input" && tool != "requestUserInput";
-                        if session.status != "waiting" || session.needs_review != Some(is_review) {
-                            log::info!("File watcher: codex pending approval {} (review={})", sid2, is_review);
+                    if let Some(interaction) = session_activity::reconstruct_codex_pending_interaction(&path2, session.turn_id.as_deref()) {
+                        let is_review = interaction.kind == "approval";
+                        let interaction_changed = session.pending_interaction.as_ref() != Some(&interaction);
+                        if session.status != "waiting" || session.needs_review != Some(is_review) || interaction_changed {
+                            log::info!("File watcher: codex pending interaction {} (kind={}, type={:?})", sid2, interaction.kind, interaction.interaction_type);
                             session.status = "waiting".to_string();
                             session.is_processing = false;
                             session.needs_review = Some(is_review);
+                            session.pending_interaction = Some(interaction.clone());
                             changed = true;
                         }
-                        session.tool = Some(tool);
-                        if !tool_input.is_empty() {
-                            session.tool_input = Some(tool_input);
+                        session.tool = interaction.tool.clone();
+                        let legacy_input = interaction.summary.clone().or_else(|| interaction.detail.clone()).unwrap_or_default();
+                        if !legacy_input.is_empty() {
+                            session.tool_input = Some(legacy_input);
                         }
                         session.activity = None;
-                    } else if session.status == "waiting" {
+                    } else if session.status == "waiting" && (session.pending_interaction.is_some() || session.needs_review.is_some()) {
+                        log::info!("File watcher: codex interaction resolved, resuming processing for {}", sid2);
                         session.status = "processing".to_string();
                         session.is_processing = true;
                         session.needs_review = None;
+                        session.pending_interaction = None;
+                        session.tool = None;
+                        session.tool_input = None;
                         changed = true;
                     }
                     if session.status != "waiting" && session.status != "stopped" {
@@ -9936,18 +9854,28 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
             if session.source == "cursor" || session.source == "codex" || session.source == "opencode" || session.source == "antigravity" || is_desktop_hosted {
                 if session.source == "codex" {
                     if let Some(path) = resolve_session_jsonl_path(&session.session_id, Some(&session.cwd)) {
-                        if let Some((tool, tool_input)) = codex_pending_approval(&path) {
+                        if let Some(interaction) = session_activity::reconstruct_codex_pending_interaction(&path, session.turn_id.as_deref()) {
                             session.status = "waiting".to_string();
                             session.is_processing = false;
-                            let is_review = tool != "request_user_input" && tool != "requestUserInput";
+                            let is_review = interaction.kind == "approval";
                             session.needs_review = Some(is_review);
-                            session.tool = Some(tool);
-                            if !tool_input.is_empty() {
-                                session.tool_input = Some(tool_input);
+                            session.tool = interaction.tool.clone();
+                            let legacy_input = interaction.summary.clone().or_else(|| interaction.detail.clone()).unwrap_or_default();
+                            if !legacy_input.is_empty() {
+                                session.tool_input = Some(legacy_input);
                             }
+                            session.pending_interaction = Some(interaction);
                             session.activity = None;
                             session.updated_at = now_ms;
                             continue;
+                        } else if session.status == "waiting" && (session.pending_interaction.is_some() || session.needs_review.is_some()) {
+                            session.status = "processing".to_string();
+                            session.is_processing = true;
+                            session.needs_review = None;
+                            session.pending_interaction = None;
+                            session.tool = None;
+                            session.tool_input = None;
+                            session.activity = session_activity::parse_codex_activity_from_transcript(&path);
                         } else if session.status == "processing" || session.status == "tool_running" {
                             session.activity = session_activity::parse_codex_activity_from_transcript(&path);
                         }
@@ -10569,6 +10497,7 @@ fn load_recent_hermes_sessions_from_db() -> Result<Vec<ClaudeSession>, String> {
             activity: None,
             activity_origin: None,
             turn_id,
+            pending_interaction: None,
         });
     }
 
@@ -15798,7 +15727,14 @@ fn codex_requires_escalation(event: &serde_json::Value) -> bool {
         {
             return true;
         }
-        if read_bool(
+        let status = read_string(v, &["status"]).unwrap_or("");
+        if matches!(
+            status.to_ascii_lowercase().as_str(),
+            "pending" | "waiting" | "needs_approval" | "approval_required" | "requires_approval"
+        ) {
+            return true;
+        }
+        read_bool(
             v,
             &[
                 "with_escalated_permissions",
@@ -15808,11 +15744,7 @@ fn codex_requires_escalation(event: &serde_json::Value) -> bool {
                 "approval_required",
                 "approvalRequired",
             ],
-        ) {
-            return true;
-        }
-        let justification = read_string(v, &["justification"]).unwrap_or("").trim();
-        !justification.is_empty()
+        )
     }
 
     fn parse_tool_input(event: &serde_json::Value) -> Option<serde_json::Value> {
@@ -16098,6 +16030,7 @@ mod codex_adapter_tests {
             activity: None,
             activity_origin: None,
             turn_id: None,
+            pending_interaction: None,
         };
         assert!(is_codex_internal_utility_session(&session));
     }
@@ -16157,6 +16090,176 @@ mod codex_adapter_tests {
         let (tool, detail) = pending_ui.unwrap();
         assert_eq!(tool, "request_user_input");
         assert_eq!(detail, "Which option do you prefer?");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_codex_pending_interaction_comprehensive_cases() {
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join("test_codex_pending_interaction_cases.jsonl");
+
+        // Case A: normal exec (no escalation, no waiting)
+        std::fs::write(&path, concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"id\":\"c1\",\"name\":\"exec\",\"input\":\"{\\\"cmd\\\":\\\"cargo check\\\"}\"}}\n"
+        )).unwrap();
+        assert_eq!(session_activity::reconstruct_codex_pending_interaction(&path, None), None);
+
+        // Case A2: require_escalated exec (approval pending)
+        std::fs::write(&path, concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"id\":\"c2\",\"name\":\"exec\",\"input\":\"const r = await tools.exec_command({\\\"cmd\\\":\\\"ssh root@vps\\\",\\\"sandbox_permissions\\\":\\\"require_escalated\\\",\\\"justification\\\":\\\"Remote maintenance\\\"});\"}}\n"
+        )).unwrap();
+        let pi = session_activity::reconstruct_codex_pending_interaction(&path, None).unwrap();
+        assert_eq!(pi.kind, "approval");
+        assert_eq!(pi.interaction_type.as_deref(), Some("command"));
+        assert_eq!(pi.tool.as_deref(), Some("exec"));
+        assert_eq!(pi.summary.as_deref(), Some("ssh root@vps"));
+        assert_eq!(pi.justification.as_deref(), Some("Remote maintenance"));
+
+        // Case A3: file change approval
+        std::fs::write(&path, concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"id\":\"c2_f\",\"name\":\"apply_patch\",\"status\":\"pending\",\"input\":\"{\\\"path\\\":\\\"src/lib.rs\\\"}\"}}\n"
+        )).unwrap();
+        let pi_file = session_activity::reconstruct_codex_pending_interaction(&path, None).unwrap();
+        assert_eq!(pi_file.kind, "approval");
+        assert_eq!(pi_file.interaction_type.as_deref(), Some("file_change"));
+        assert_eq!(pi_file.summary.as_deref(), Some("lib.rs"));
+
+        // Case B: user_input (request_user_input)
+        std::fs::write(&path, concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"id\":\"c3\",\"name\":\"request_user_input\",\"arguments\":{\"prompt\":\"Which option do you prefer?\"}}}\n"
+        )).unwrap();
+        let pi_ui = session_activity::reconstruct_codex_pending_interaction(&path, None).unwrap();
+        assert_eq!(pi_ui.kind, "user_input");
+        assert_eq!(pi_ui.interaction_type.as_deref(), Some("user_input"));
+        assert_eq!(pi_ui.summary.as_deref(), Some("Which option do you prefer?"));
+
+        // Case C: resolved approval (output present)
+        std::fs::write(&path, concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"id\":\"c4\",\"name\":\"exec\",\"input\":\"const r = await tools.exec_command({\\\"cmd\\\":\\\"cargo test\\\",\\\"sandbox_permissions\\\":\\\"require_escalated\\\"});\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\",\"call_id\":\"c4\",\"output\":\"test passed\"}}\n"
+        )).unwrap();
+        assert_eq!(session_activity::reconstruct_codex_pending_interaction(&path, None), None);
+
+        // Case D: rejection by user
+        std::fs::write(&path, concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"id\":\"c5\",\"name\":\"exec\",\"input\":\"const r = await tools.exec_command({\\\"cmd\\\":\\\"rm -rf /\\\",\\\"sandbox_permissions\\\":\\\"require_escalated\\\"});\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\",\"call_id\":\"c5\",\"content\":\"rejected by user\"}}\n"
+        )).unwrap();
+        assert_eq!(session_activity::reconstruct_codex_pending_interaction(&path, None), None);
+
+        // Case E: new turn contamination guard (Turn A approval, then Turn B started with user_message)
+        std::fs::write(&path, concat!(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"turn A request\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"id\":\"cA\",\"name\":\"exec\",\"input\":\"const r = await tools.exec_command({\\\"cmd\\\":\\\"ssh old@vps\\\",\\\"sandbox_permissions\\\":\\\"require_escalated\\\"});\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"turn B request\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_reasoning\",\"text\":\"Thinking about turn B\"}}\n"
+        )).unwrap();
+        assert_eq!(session_activity::reconstruct_codex_pending_interaction(&path, None), None);
+
+        // Case F: sequential approvals in same turn (only uncompleted B is pending)
+        std::fs::write(&path, concat!(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"start turn\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"id\":\"cA2\",\"name\":\"exec\",\"input\":\"const r = await tools.exec_command({\\\"cmd\\\":\\\"first\\\",\\\"sandbox_permissions\\\":\\\"require_escalated\\\"});\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\",\"call_id\":\"cA2\",\"output\":\"done\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"id\":\"cB2\",\"name\":\"exec\",\"input\":\"const r = await tools.exec_command({\\\"cmd\\\":\\\"second\\\",\\\"sandbox_permissions\\\":\\\"require_escalated\\\"});\"}}\n"
+        )).unwrap();
+        let pi_seq = session_activity::reconstruct_codex_pending_interaction(&path, None).unwrap();
+        assert_eq!(pi_seq.call_id.as_deref(), Some("cB2"));
+        assert_eq!(pi_seq.summary.as_deref(), Some("second"));
+
+        // Case G: completed turn (task_complete)
+        std::fs::write(&path, concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"id\":\"cG\",\"name\":\"exec\",\"input\":\"const r = await tools.exec_command({\\\"cmd\\\":\\\"deploy\\\",\\\"sandbox_permissions\\\":\\\"require_escalated\\\"});\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n"
+        )).unwrap();
+        assert_eq!(session_activity::reconstruct_codex_pending_interaction(&path, None), None);
+
+        // Case H: aborted turn (turn_aborted)
+        std::fs::write(&path, concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"id\":\"cH\",\"name\":\"exec\",\"input\":\"const r = await tools.exec_command({\\\"cmd\\\":\\\"deploy\\\",\\\"sandbox_permissions\\\":\\\"require_escalated\\\"});\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_aborted\"}}\n"
+        )).unwrap();
+        assert_eq!(session_activity::reconstruct_codex_pending_interaction(&path, None), None);
+
+        // Case I: turn_id matching isolation
+        std::fs::write(&path, concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"turn_id\":\"turn_1\",\"type\":\"custom_tool_call\",\"id\":\"cT1\",\"name\":\"exec\",\"input\":\"const r = await tools.exec_command({\\\"cmd\\\":\\\"t1\\\",\\\"sandbox_permissions\\\":\\\"require_escalated\\\"});\"}}\n"
+        )).unwrap();
+        // Requesting for turn_2 must ignore turn_1
+        assert_eq!(session_activity::reconstruct_codex_pending_interaction(&path, Some("turn_2")), None);
+        // Requesting for turn_1 must detect it
+        assert!(session_activity::reconstruct_codex_pending_interaction(&path, Some("turn_1")).is_some());
+
+        // Case J (Regression 1): justification alone must NOT trigger approval
+        std::fs::write(&path, concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"id\":\"cJ_just\",\"name\":\"exec\",\"input\":\"{\\\"cmd\\\":\\\"cargo check\\\",\\\"justification\\\":\\\"Routine code compilation check\\\"}\"}}\n"
+        )).unwrap();
+        assert_eq!(session_activity::reconstruct_codex_pending_interaction(&path, None), None);
+        let event_just: serde_json::Value = serde_json::json!({
+            "source": "codex",
+            "tool_input": "{\"cmd\":\"cargo check\",\"justification\":\"Routine check\"}"
+        });
+        assert!(!codex_requires_escalation(&event_just));
+
+        // Case K (Regression 2): prompt / questions in normal tool call must NOT be classified as user_input
+        std::fs::write(&path, concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"id\":\"cK_prompt\",\"name\":\"generate_test\",\"input\":\"{\\\"prompt\\\":\\\"Generate unit tests for auth\\\",\\\"questions\\\":[\\\"Is OAuth enabled?\\\",\\\"Which token format?\\\"],\\\"justification\\\":\\\"Test coverage\\\"}\"}}\n"
+        )).unwrap();
+        assert_eq!(session_activity::reconstruct_codex_pending_interaction(&path, None), None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_real_codex_session_trace_and_in_place_resolution() {
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join("test_real_codex_trace.jsonl");
+
+        // 1. Normal exec -> no PendingInteraction
+        std::fs::write(&path, concat!(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"check build\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"id\":\"call_exec_1\",\"name\":\"exec\",\"input\":\"{\\\"cmd\\\":\\\"cargo check\\\"}\"}}\n"
+        )).unwrap();
+        assert_eq!(session_activity::reconstruct_codex_pending_interaction(&path, None), None);
+
+        // 2. require_escalated -> waiting + approval
+        std::fs::write(&path, concat!(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"check build\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"id\":\"call_esc_1\",\"name\":\"exec\",\"input\":\"const r = await tools.exec_command({\\\"cmd\\\":\\\"sandbox setup --elevated\\\",\\\"sandbox_permissions\\\":\\\"require_escalated\\\",\\\"justification\\\":\\\"Fix sandbox UAC\\\"});\"}}\n"
+        )).unwrap();
+        let pi_approval = session_activity::reconstruct_codex_pending_interaction(&path, None).unwrap();
+        assert_eq!(pi_approval.kind, "approval");
+        assert_eq!(pi_approval.interaction_type.as_deref(), Some("command"));
+        assert_eq!(pi_approval.summary.as_deref(), Some("sandbox setup --elevated"));
+        assert_eq!(pi_approval.justification.as_deref(), Some("Fix sandbox UAC"));
+
+        // 3. User approves in Codex -> custom_tool_call_output appended -> PendingInteraction cleared
+        std::fs::write(&path, concat!(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"check build\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"id\":\"call_esc_1\",\"name\":\"exec\",\"input\":\"const r = await tools.exec_command({\\\"cmd\\\":\\\"sandbox setup --elevated\\\",\\\"sandbox_permissions\\\":\\\"require_escalated\\\",\\\"justification\\\":\\\"Fix sandbox UAC\\\"});\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\",\"call_id\":\"call_esc_1\",\"output\":\"exit_code=0\"}}\n"
+        )).unwrap();
+        assert_eq!(session_activity::reconstruct_codex_pending_interaction(&path, None), None);
+
+        // 4. request_user_input -> waiting + user_input with real prompt
+        std::fs::write(&path, concat!(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"check build\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"id\":\"call_q_1\",\"name\":\"request_user_input\",\"arguments\":{\"prompt\":\"Do you wish to enable elevated UAC permanently?\"}}}\n"
+        )).unwrap();
+        let pi_ui = session_activity::reconstruct_codex_pending_interaction(&path, None).unwrap();
+        assert_eq!(pi_ui.kind, "user_input");
+        assert_eq!(pi_ui.interaction_type.as_deref(), Some("user_input"));
+        assert_eq!(pi_ui.summary.as_deref(), Some("Do you wish to enable elevated UAC permanently?"));
+
+        // 5. New turn starts -> historic approval/interaction from older turn must NEVER revive
+        std::fs::write(&path, concat!(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"old turn\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"id\":\"call_old_esc\",\"name\":\"exec\",\"input\":\"const r = await tools.exec_command({\\\"cmd\\\":\\\"old admin cmd\\\",\\\"sandbox_permissions\\\":\\\"require_escalated\\\"});\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"new turn started\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_reasoning\",\"text\":\"Working on new turn\"}}\n"
+        )).unwrap();
+        assert_eq!(session_activity::reconstruct_codex_pending_interaction(&path, None), None);
 
         let _ = std::fs::remove_file(&path);
     }
@@ -16389,6 +16492,7 @@ mod codex_adapter_tests {
             activity: None,
             activity_origin: None,
             turn_id: None,
+            pending_interaction: None,
         });
 
         // Nested subagent C emits PreToolUse
@@ -16481,6 +16585,7 @@ mod codex_adapter_tests {
             activity: None,
             activity_origin: None,
             turn_id: None,
+            pending_interaction: None,
         });
         // Subagents accidentally in sessions map
         sessions.insert(b.to_string(), sessions.get(a).unwrap().clone());
@@ -16597,6 +16702,7 @@ mod codex_adapter_tests {
             activity: None,
             activity_origin: None,
             turn_id: None,
+            pending_interaction: None,
         });
 
         // Even though B is stopped, C event maintains Root A in tool_running
@@ -16655,6 +16761,7 @@ mod codex_adapter_tests {
             }),
             activity_origin: Some(session_activity::AntigravityActivityOrigin::Hook),
             turn_id: None,
+            pending_interaction: None,
         };
 
         assert_eq!(session.activity_origin, Some(session_activity::AntigravityActivityOrigin::Hook));
@@ -16755,6 +16862,7 @@ pub fn handle_antigravity_subagent_event(
             activity: None,
             activity_origin: None,
             turn_id: None,
+            pending_interaction: None,
         };
         update_antigravity_session_from_transcript(&mut new_session);
         sessions.insert(root_id.clone(), new_session);
@@ -17063,6 +17171,7 @@ fn process_claude_event(
                     activity: None,
                     activity_origin: None,
                     turn_id: None,
+                    pending_interaction: None,
                 });
                 // Only upgrade source, never downgrade:
                 // cc < codex < gemini < cursor.
@@ -17128,6 +17237,7 @@ fn process_claude_event(
                     session.tool_input = None;
                     session.activity = None;
                     session.activity_origin = None;
+                    session.pending_interaction = None;
                 } else if hook_event == "SubagentStart"
                     || (hook_event == "PreToolUse" && (tool_name == "Agent" || tool_name == "invoke_subagent"))
                     || raw_hook_event == "subagentStart"
@@ -17500,6 +17610,7 @@ fn process_claude_event(
                     session.needs_review = Some(explicit_review.unwrap_or(pretool_needs_waiting));
                 } else if status != "waiting" {
                     session.needs_review = None;
+                    session.pending_interaction = None;
                 }
 
                 // For waiting/permission events, capture tab focus now (real-time,

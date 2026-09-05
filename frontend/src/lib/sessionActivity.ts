@@ -1,6 +1,6 @@
-import type { BubbleSessionDetail, MascotBubblePayload, SessionActivity, SessionActivityKind, SessionActivitySource } from './types'
+import type { BubbleSessionDetail, MascotBubblePayload, PendingInteraction, SessionActivity, SessionActivityKind, SessionActivitySource } from './types'
 
-export type { SessionActivity, SessionActivityKind, SessionActivitySource }
+export type { PendingInteraction, SessionActivity, SessionActivityKind, SessionActivitySource }
 
 /**
  * Normalizes reasoning summary string for presentation in the mascot bubble:
@@ -263,6 +263,28 @@ export function isSameActivity(a?: SessionActivity | null, b?: SessionActivity |
 }
 
 /**
+ * Compare two PendingInteraction objects for structural equality.
+ */
+export function isSamePendingInteraction(
+  a?: PendingInteraction | null,
+  b?: PendingInteraction | null
+): boolean {
+  if (!a && !b) return true
+  if (!a || !b) return false
+  return (
+    a.kind === b.kind &&
+    a.interactionType === b.interactionType &&
+    a.turnId === b.turnId &&
+    a.itemId === b.itemId &&
+    a.callId === b.callId &&
+    a.tool === b.tool &&
+    a.summary === b.summary &&
+    a.detail === b.detail &&
+    a.justification === b.justification
+  )
+}
+
+/**
  * Compare two BubbleSessionDetail objects for structural equality to avoid jitter / redundant re-renders.
  */
 export function isSameSessionDetail(
@@ -285,6 +307,10 @@ export function isSameSessionDetail(
     a.toolInput !== b.toolInput ||
     a.otherCount !== b.otherCount
   ) {
+    return false
+  }
+
+  if (!isSamePendingInteraction(a.pendingInteraction, b.pendingInteraction)) {
     return false
   }
 

@@ -43,6 +43,28 @@ pub struct SessionActivity {
     pub source: SessionActivitySource,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingInteraction {
+    pub kind: String, // "approval" | "user_input"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interaction_type: Option<String>, // "command" | "file_change" | "permissions" | "mcp" | "user_input" | "unknown"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub justification: Option<String>,
+}
+
 /// Normalizes a raw reasoning summary string:
 /// - Strips Markdown headings (e.g. ### ...)
 /// - Strips Markdown emphasis (**...**, *...*, __...__, _..._)
@@ -771,6 +793,233 @@ pub fn parse_codex_activity_from_transcript(path: &Path) -> Option<SessionActivi
     // If an uncompleted tool was running, it takes precedence over earlier reasoning in the same turn.
     // Otherwise, return reasoning summary.
     latest_uncompleted_tool.or(latest_reasoning)
+}
+
+/// Reconstructs a Codex PendingInteraction from transcript JSONL.
+/// Strictly turn-scoped: halts reverse scanning on completed/aborted turns,
+/// user message prompt boundaries, or turn ID mismatches so historic approval
+/// requests never pollute the current turn.
+pub fn reconstruct_codex_pending_interaction(
+    path: &Path,
+    current_turn_id: Option<&str>,
+) -> Option<PendingInteraction> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let lines: Vec<&str> = content.lines().collect();
+
+    let mut completed_calls = std::collections::HashSet::<String>::new();
+    let mut observed_turn_id: Option<String> = None;
+
+    for line in lines.iter().rev().take(240) {
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+
+        let event_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let payload = parsed.get("payload");
+
+        // Turn ID isolation: if an event carries an explicit turn ID, ensure it matches.
+        let line_turn_id = payload
+            .and_then(|p| p.get("turn_id").or_else(|| p.get("turnId")))
+            .or_else(|| parsed.get("turn_id"))
+            .or_else(|| parsed.get("turnId"))
+            .and_then(|v| v.as_str());
+
+        if let Some(expected) = current_turn_id {
+            if let Some(ltid) = line_turn_id {
+                if ltid != expected {
+                    break;
+                }
+            }
+        } else if let Some(ltid) = line_turn_id {
+            if let Some(ref obs) = observed_turn_id {
+                if ltid != obs.as_str() {
+                    break;
+                }
+            } else {
+                observed_turn_id = Some(ltid.to_string());
+            }
+        }
+
+        // Turn boundary guards: if turn has completed/aborted or a new user prompt began,
+        // stop scanning to avoid leaking prior turns' pending approvals!
+        if event_type == "event_msg" {
+            if let Some(p) = payload {
+                let p_type = p.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if p_type == "task_complete" || p_type == "turn_completed" || p_type == "turn_aborted" || p_type == "user_message" {
+                    break;
+                }
+                if p_type == "mcp_tool_call_end" {
+                    if let Some(cid) = p.get("call_id").or_else(|| p.get("id")).and_then(|v| v.as_str()) {
+                        completed_calls.insert(cid.to_string());
+                    }
+                }
+            }
+        }
+        if event_type == "turn_aborted" || event_type == "turn_completed" || event_type == "task_complete" || event_type == "user" {
+            break;
+        }
+
+        if event_type == "response_item" {
+            if let Some(p) = payload {
+                let role = p.get("role").and_then(|v| v.as_str()).unwrap_or("");
+                if role == "user" {
+                    break;
+                }
+
+                let p_type = p.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if p_type == "custom_tool_call_output" || p_type == "function_call_output" {
+                    if let Some(cid) = p.get("call_id").or_else(|| p.get("id")).and_then(|v| v.as_str()) {
+                        completed_calls.insert(cid.to_string());
+                    }
+                }
+
+                if p_type == "custom_tool_call" || p_type == "function_call" {
+                    let call_id = p.get("call_id").or_else(|| p.get("id")).and_then(|v| v.as_str()).unwrap_or("");
+                    if !call_id.is_empty() && completed_calls.contains(call_id) {
+                        continue;
+                    }
+
+                    let status = p.get("status").and_then(|v| v.as_str()).unwrap_or("").to_ascii_lowercase();
+                    if matches!(status.as_str(), "completed" | "failed" | "cancelled" | "canceled") {
+                        continue;
+                    }
+
+                    let args = parse_codex_args_value(p.get("arguments").or_else(|| p.get("input")));
+                    let tool = p.get("name").or_else(|| p.get("tool")).and_then(|v| v.as_str()).unwrap_or("Tool").to_string();
+                    let is_user_input = tool == "request_user_input" || tool == "requestUserInput";
+
+                    let sandbox_permissions = p.get("sandbox_permissions")
+                        .or_else(|| p.get("sandboxPermissions"))
+                        .or_else(|| args.get("sandbox_permissions"))
+                        .or_else(|| args.get("sandboxPermissions"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    let status_needs_approval = matches!(
+                        status.as_str(),
+                        "pending" | "waiting" | "needs_approval" | "approval_required" | "requires_approval"
+                    );
+                    let args_need_approval = sandbox_permissions.eq_ignore_ascii_case("require_escalated")
+                        || sandbox_permissions.eq_ignore_ascii_case("escalated")
+                        || p.get("requires_approval").and_then(|v| v.as_bool()).unwrap_or(false)
+                        || p.get("requiresApproval").and_then(|v| v.as_bool()).unwrap_or(false)
+                        || args.get("requires_approval").and_then(|v| v.as_bool()).unwrap_or(false)
+                        || args.get("requiresApproval").and_then(|v| v.as_bool()).unwrap_or(false)
+                        || p.get("with_escalated_permissions").and_then(|v| v.as_bool()).unwrap_or(false)
+                        || p.get("withEscalatedPermissions").and_then(|v| v.as_bool()).unwrap_or(false)
+                        || args.get("with_escalated_permissions").and_then(|v| v.as_bool()).unwrap_or(false)
+                        || args.get("withEscalatedPermissions").and_then(|v| v.as_bool()).unwrap_or(false)
+                        || p.get("approval_required").and_then(|v| v.as_bool()).unwrap_or(false)
+                        || p.get("approvalRequired").and_then(|v| v.as_bool()).unwrap_or(false)
+                        || args.get("approval_required").and_then(|v| v.as_bool()).unwrap_or(false)
+                        || args.get("approvalRequired").and_then(|v| v.as_bool()).unwrap_or(false);
+
+                    if !status_needs_approval && !args_need_approval && !is_user_input {
+                        continue;
+                    }
+
+                    let item_id = p.get("item_id").or_else(|| p.get("id")).or_else(|| parsed.get("item_id")).or_else(|| parsed.get("id")).and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let resolved_turn_id = line_turn_id.or(current_turn_id).map(|s| s.to_string());
+                    let call_id_opt = if !call_id.is_empty() { Some(call_id.to_string()) } else { None };
+
+                    let justification = args.get("justification")
+                        .or_else(|| p.get("justification"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+
+                    if is_user_input {
+                        let mut prompt_text = String::new();
+                        if let Some(arr) = args.get("questions").and_then(|v| v.as_array()) {
+                            if let Some(first) = arr.first() {
+                                if let Some(s) = first.as_str() {
+                                    prompt_text = s.to_string();
+                                } else if let Some(s) = first.get("question").and_then(|v| v.as_str()) {
+                                    prompt_text = s.to_string();
+                                }
+                            }
+                        }
+                        if prompt_text.is_empty() {
+                            if let Some(s) = args.get("prompt").or_else(|| args.get("message")).or_else(|| args.get("question")).and_then(|v| v.as_str()) {
+                                prompt_text = s.to_string();
+                            }
+                        }
+                        if prompt_text.is_empty() {
+                            if let Some(s) = p.get("prompt").or_else(|| p.get("message")).and_then(|v| v.as_str()) {
+                                prompt_text = s.to_string();
+                            }
+                        }
+                        let summary = if !prompt_text.is_empty() { Some(prompt_text.clone()) } else { None };
+                        let detail = if !prompt_text.is_empty() { Some(prompt_text) } else { None };
+
+                        return Some(PendingInteraction {
+                            kind: "user_input".to_string(),
+                            interaction_type: Some("user_input".to_string()),
+                            turn_id: resolved_turn_id,
+                            item_id,
+                            call_id: call_id_opt,
+                            tool: Some(tool),
+                            summary,
+                            detail,
+                            justification,
+                        });
+                    }
+
+                    // Approval interaction
+                    let tool_lower = tool.to_ascii_lowercase();
+                    let is_command = tool_lower == "exec" || tool_lower == "exec_command" || tool_lower == "shell_command" || tool_lower == "bash" || tool_lower == "cmd" || tool_lower == "powershell";
+                    let is_file = tool_lower == "apply_patch" || tool_lower == "write_file" || tool_lower == "edit_file" || tool_lower == "create_file" || tool_lower == "save_file";
+                    let is_mcp = tool_lower.starts_with("mcp__") || tool_lower.starts_with("mcp_") || tool_lower.contains("mcp");
+
+                    let interaction_type = if is_command {
+                        Some("command".to_string())
+                    } else if is_file {
+                        Some("file_change".to_string())
+                    } else if is_mcp {
+                        Some("mcp".to_string())
+                    } else if args_need_approval && (sandbox_permissions.eq_ignore_ascii_case("require_escalated") || sandbox_permissions.eq_ignore_ascii_case("escalated")) {
+                        Some("permissions".to_string())
+                    } else {
+                        Some("unknown".to_string())
+                    };
+
+                    let cmd = args.get("cmd").or_else(|| args.get("command")).and_then(|v| v.as_str()).unwrap_or("");
+                    let file_target = args.get("path").or_else(|| args.get("file_path")).or_else(|| args.get("target")).and_then(|v| v.as_str()).unwrap_or("");
+
+                    let summary = if !cmd.is_empty() {
+                        Some(cmd.to_string())
+                    } else if !file_target.is_empty() {
+                        Some(extract_basename(file_target))
+                    } else if let Some(ref just) = justification {
+                        Some(just.clone())
+                    } else {
+                        Some(tool.clone())
+                    };
+
+                    let detail = if !cmd.is_empty() {
+                        Some(cmd.to_string())
+                    } else if !file_target.is_empty() {
+                        Some(file_target.to_string())
+                    } else {
+                        justification.clone()
+                    };
+
+                    return Some(PendingInteraction {
+                        kind: "approval".to_string(),
+                        interaction_type,
+                        turn_id: resolved_turn_id,
+                        item_id,
+                        call_id: call_id_opt,
+                        tool: Some(tool),
+                        summary,
+                        detail,
+                        justification,
+                    });
+                }
+            }
+        }
+    }
+
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

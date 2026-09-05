@@ -207,8 +207,50 @@ function getSessionLine2(
   const isRunning = session.status === 'processing' || session.status === 'tool_running'
   const isProcessing = session.status === 'processing'
 
-  // 1. Waiting for user interaction / question
+  // 1. Waiting for user interaction / question / approval
   if (isWaiting) {
+    if (session.pendingInteraction?.kind === 'approval') {
+      const isFileChange = session.pendingInteraction.interactionType === 'file_change'
+      const icon = isFileChange ? '✏️' : '🔐'
+      const label = isFileChange
+        ? t('mini.waitingFileApproval', '等待确认修改')
+        : t('mini.waitingApproval', '等待批准')
+      const target =
+        session.pendingInteraction.summary ||
+        session.pendingInteraction.tool ||
+        session.pendingInteraction.detail ||
+        session.questionText ||
+        session.userPrompt ||
+        t('settings.bubbleJumpToTerminal', 'Waiting for input...')
+      const firstLine = target.split('\n')[0].trim()
+      const displayTarget = firstLine.length > 80 ? firstLine.slice(0, 80) + '...' : firstLine
+      return {
+        actionPrefix: null,
+        actionContent: `${icon} ${label} · ${displayTarget}`,
+        isWaiting: true,
+        isProcessing: false,
+      }
+    }
+
+    if (session.pendingInteraction?.kind === 'user_input') {
+      const icon = '❓'
+      const label = t('mini.waitingYourAnswer', '等你回答')
+      const target =
+        session.pendingInteraction.summary ||
+        session.pendingInteraction.detail ||
+        session.questionText ||
+        session.userPrompt ||
+        t('settings.bubbleJumpToTerminal', 'Waiting for input...')
+      const firstLine = target.split('\n')[0].trim()
+      const displayTarget = firstLine.length > 80 ? firstLine.slice(0, 80) + '...' : firstLine
+      return {
+        actionPrefix: null,
+        actionContent: `${icon} ${label} · ${displayTarget}`,
+        isWaiting: true,
+        isProcessing: false,
+      }
+    }
+
     return {
       actionPrefix: null,
       actionContent: session.questionText || session.userPrompt || t('settings.bubbleJumpToTerminal', 'Waiting for input...'),

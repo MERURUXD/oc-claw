@@ -121,15 +121,17 @@ type PetState = 'idle' | 'working' | 'compacting' | 'waiting' | 'review'
 
 function isSessionReview(cs: any): boolean {
   if (cs.status !== 'waiting') return false
+  if (cs.pendingInteraction?.kind === 'approval') return true
+  if (cs.pendingInteraction?.kind === 'user_input') return false
   if (cs.needsReview === true) return true
   if (cs.permissionSuggestions != null) return true
   if (cs.source === 'codex' && typeof cs.toolInput === 'string') {
     return (
       cs.toolInput.includes('require_escalated') ||
       cs.toolInput.includes('with_escalated_permissions') ||
-      cs.toolInput.includes('justification') ||
       cs.toolInput.includes('requires_approval') ||
-      cs.toolInput.includes('approval_required')
+      cs.toolInput.includes('approval_required') ||
+      cs.toolInput.includes('needs_approval')
     )
   }
   return false
@@ -2636,6 +2638,7 @@ export default function Mini() {
             otherCount: Math.max(0, totalActive - 1),
             activity,
             turnId: s.turnId || undefined,
+            pendingInteraction: s.pendingInteraction || undefined,
           }
         }
 
@@ -2644,8 +2647,14 @@ export default function Mini() {
           .filter(Boolean)
           .slice(0, 3)
         const activeSessionDetails: BubbleSessionDetail[] = activeRawSessions.map(buildBubbleSessionDetail)
-        const topSession = activeRawSessions[0] || null
-        const activeSessionDetail = activeSessionDetails[0] || null
+        // In compact mode, prioritize review / waiting sessions over general running sessions
+        const reviewSessionDetail = activeSessionDetails.find((d) => {
+          const raw = activeSessionsMap.get(d.sessionId)
+          return raw && isSessionReview(raw)
+        })
+        const waitingSessionDetail = activeSessionDetails.find((d) => d.status === 'waiting')
+        const activeSessionDetail = reviewSessionDetail || waitingSessionDetail || activeSessionDetails[0] || null
+        const topSession = (activeSessionDetail ? activeSessionsMap.get(activeSessionDetail.sessionId) : null) || activeRawSessions[0] || null
         lastActiveSessionRef.current = topSession
 
         const bubbleActive = totalActive > 0
@@ -5788,12 +5797,13 @@ export default function Mini() {
                                   ? `[${cs.cursorWorkspaceName}] ${projectName}`
                                   : projectName
                                 const isActive = item.active
-                                const isWaiting = cs.status === 'waiting'
+                                const isReview = isSessionReview(cs)
+                                const isWaiting = cs.status === 'waiting' && !isReview
                                 const isCompacting = cs.status === 'compacting'
-                                const isWorking = isActive || isWaiting || isCompacting
+                                const isWorking = isActive || isWaiting || isCompacting || isReview
                                 const recentlyDone = !isWorking && cs.status === 'stopped' && cs.updatedAt && Date.now() - cs.updatedAt < 5 * 60 * 1000
                                 const showCharGif = isWorking || recentlyDone
-                                const petState: PetState = isWaiting ? 'waiting' : isCompacting ? 'compacting' : isActive ? 'working' : 'idle'
+                                const petState: PetState = isReview ? 'review' : isWaiting ? 'waiting' : isCompacting ? 'compacting' : isActive ? 'working' : 'idle'
                                 const claudeSpriteState: CodexPetState = petStateToCodexState(petState)
                                 const subtitle = cs.userPrompt || ''
                                 const timeAgo = formatTimeAgo(cs.updatedAt ? (typeof cs.updatedAt === 'string' ? new Date(cs.updatedAt).getTime() : cs.updatedAt) : 0)
@@ -6020,13 +6030,84 @@ export default function Mini() {
                                        用途：让用户无需切换到终端即可快速处理权限请求。 */}
                                     {isWaiting && cs.source !== 'cursor' && !dismissedWaitingIds.has(cs.sessionId) && (
                                       <div className="mt-2 flex flex-col" style={{ maxHeight: panelMaxHeight - 140 }}>
-                                        {cs.tool && (
-                                          <div className="flex items-center gap-1.5 mb-2">
-                                            <span className="text-amber-400 text-[12px]">⚠</span>
-                                            <span className="text-amber-400 text-[12px] font-bold">{cs.tool}</span>
+                                        {cs.source === 'codex' ? (
+                                          <div className="flex flex-col gap-2 mb-2" style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
+                                            {cs.pendingInteraction?.kind === 'approval' ? (
+                                              <>
+                                                <div className="flex items-center gap-2">
+                                                  <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-purple-900/60 text-purple-300 border border-purple-700/50">
+                                                    {t('mini.reviewRequired', '需要批准')}
+                                                  </span>
+                                                  <span className="text-[12px] font-medium text-slate-200">
+                                                    {cs.pendingInteraction.interactionType === 'file_change'
+                                                      ? t('mini.waitingFileApproval', '等待确认修改')
+                                                      : t('mini.waitingApproval', '等待命令执行批准')}
+                                                  </span>
+                                                  {cs.pendingInteraction.tool && (
+                                                    <span className="text-[11px] text-slate-400 font-mono ml-auto">
+                                                      {cs.pendingInteraction.tool}
+                                                    </span>
+                                                  )}
+                                                </div>
+                                                {cs.pendingInteraction.detail && (
+                                                  <div className="p-2.5 rounded-lg bg-[#141416] border border-[#27272a] overflow-auto scrollbar-thin" style={{ maxHeight: 110 }}>
+                                                    <pre className="text-[11px] text-slate-300 font-mono whitespace-pre-wrap break-all leading-relaxed">
+                                                      {cs.pendingInteraction.detail}
+                                                    </pre>
+                                                  </div>
+                                                )}
+                                                {cs.pendingInteraction.justification && (
+                                                  <div className="p-2 rounded-lg bg-amber-950/30 border border-amber-800/40 overflow-auto scrollbar-thin" style={{ maxHeight: 70 }}>
+                                                    <div className="text-[10px] text-amber-400 font-medium mb-0.5">
+                                                      {t('mini.justification', '原因说明')}
+                                                    </div>
+                                                    <p className="text-[11px] text-amber-200/90 leading-normal">
+                                                      {cs.pendingInteraction.justification}
+                                                    </p>
+                                                  </div>
+                                                )}
+                                              </>
+                                            ) : cs.pendingInteraction?.kind === 'user_input' ? (
+                                              <>
+                                                <div className="flex items-center gap-2">
+                                                  <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-900/60 text-amber-300 border border-amber-700/50">
+                                                    {t('mini.waitingInput', '等待回答')}
+                                                  </span>
+                                                  <span className="text-[12px] font-medium text-slate-200">
+                                                    {t('mini.waitingYourAnswer', 'Codex 正在等你回答')}
+                                                  </span>
+                                                </div>
+                                                <div className="p-2.5 rounded-lg bg-[#141416] border border-[#27272a] overflow-auto scrollbar-thin" style={{ maxHeight: 120 }}>
+                                                  <p className="text-[11px] text-slate-300 whitespace-pre-wrap leading-relaxed">
+                                                    {cs.pendingInteraction.detail || cs.pendingInteraction.summary || cs.questionText || cs.userPrompt}
+                                                  </p>
+                                                </div>
+                                              </>
+                                            ) : (
+                                              <>
+                                                <div className="flex items-center gap-1.5 mb-1">
+                                                  <span className="text-amber-400 text-[12px]">⚠</span>
+                                                  <span className="text-amber-400 text-[12px] font-bold">
+                                                    {cs.tool || t('mini.waiting', '等待中')}
+                                                  </span>
+                                                </div>
+                                                <div className="p-2.5 rounded-lg bg-[#141416] border border-[#27272a] overflow-auto scrollbar-thin" style={{ maxHeight: 120 }}>
+                                                  <pre className="text-[11px] text-slate-300 font-mono whitespace-pre-wrap break-all leading-tight">
+                                                    {cs.questionText || cs.userPrompt || cs.toolInput}
+                                                  </pre>
+                                                </div>
+                                              </>
+                                            )}
                                           </div>
-                                        )}
-                                        <div style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
+                                        ) : (
+                                          <>
+                                            {cs.tool && (
+                                              <div className="flex items-center gap-1.5 mb-2">
+                                                <span className="text-amber-400 text-[12px]">⚠</span>
+                                                <span className="text-amber-400 text-[12px] font-bold">{cs.tool}</span>
+                                              </div>
+                                            )}
+                                            <div style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
                                         {cs.toolInput &&
                                           (() => {
                                             try {
@@ -6087,12 +6168,15 @@ export default function Mini() {
                                             }
                                           })()}
                                         </div>
+                                          </>
+                                        )}
                                         <div className="flex gap-2 shrink-0 mt-2">
                                           {(() => {
                                             // Immediately clear the waiting state locally so
                                             // the permission popup closes without waiting for
                                             // the next 2s poll cycle.
                                             const resolvePermission = (decision: string) => {
+                                              if (cs.source === 'codex') return
                                               invoke('resolve_claude_permission', { sessionId: cs.sessionId, decision }).catch(() => {})
                                               // Clear waiting state locally so popup disappears instantly
                                               setClaudeSessions((prev) => prev.map((s) => (s.sessionId === cs.sessionId ? { ...s, status: 'processing', tool: undefined, toolInput: undefined } : s)))
