@@ -10315,16 +10315,30 @@ fn is_interactive_tool(tool: &str) -> bool {
 ///   2. No event has arrived within 180s (staleness timeout), OR
 ///   3. The last non-internal event reports a non-active status
 ///
-/// Helper to load raw events per session from ooclaw-status.json
+/// Helper to load raw events per session from ooclaw-lifecycle.jsonl or ooclaw-status.json
 fn load_ooclaw_raw_events(hermes_dir: &std::path::Path) -> HashMap<String, Vec<serde_json::Value>> {
     let mut result = HashMap::new();
-    let status_path = hermes_dir.join("ooclaw-status.json");
-    if let Ok(data) = std::fs::read_to_string(&status_path) {
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
-            if let Some(obj) = parsed.as_object() {
-                for (sid, events) in obj {
-                    if let Some(arr) = events.as_array() {
-                        result.insert(sid.clone(), arr.clone());
+    let journal_path = hermes_dir.join("ooclaw-lifecycle.jsonl");
+    if let Ok(data) = std::fs::read_to_string(&journal_path) {
+        for line in data.lines() {
+            let line = line.trim();
+            if line.is_empty() { continue; }
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(sid) = parsed.get("sessionId").or_else(|| parsed.get("session_id")).and_then(|s| s.as_str()) {
+                    result.entry(sid.to_string()).or_insert_with(Vec::new).push(parsed);
+                }
+            }
+        }
+    }
+    if result.is_empty() {
+        let status_path = hermes_dir.join("ooclaw-status.json");
+        if let Ok(data) = std::fs::read_to_string(&status_path) {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
+                if let Some(obj) = parsed.as_object() {
+                    for (sid, events) in obj {
+                        if let Some(arr) = events.as_array() {
+                            result.insert(sid.clone(), arr.clone());
+                        }
                     }
                 }
             }
@@ -18963,18 +18977,79 @@ print(json.dumps(rows))
     })
 }
 
+struct HermesRemoteCacheEntry {
+    sessions: Vec<serde_json::Value>,
+    timestamp: std::time::Instant,
+}
+
+static REMOTE_HERMES_CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, HermesRemoteCacheEntry>>> =
+    std::sync::OnceLock::new();
+
 /// Poll active Hermes sessions on a remote server via SSH.
-/// Reads ~/.hermes/sessions/sessions.json for gateway session list,
-/// and checks gateway.log for recent activity.
+/// Reads ~/.hermes/ooclaw-lifecycle.jsonl (or ooclaw-status.json) and state.db for canonical metadata.
 #[tauri::command]
 async fn get_hermes_remote_sessions(ssh_host: String, ssh_user: String) -> Result<Vec<serde_json::Value>, String> {
+    let cache_key = format!("{}@{}", ssh_user, ssh_host);
     let py_script = hermes::build_hermes_remote_collector_script();
     let cmd = format!("python3 -c {}", shell_escape_single(py_script));
-    let output = ssh_exec(&ssh_host, &ssh_user, &cmd).await?;
-    let trimmed = output.trim();
-    let sessions: Vec<serde_json::Value> = serde_json::from_str(trimmed)
-        .map_err(|e| format!("parse hermes remote sessions: {} (output: {})", e, truncate_chars(trimmed, 300)))?;
-    Ok(sessions)
+    let exec_res = ssh_exec(&ssh_host, &ssh_user, &cmd).await;
+
+    match exec_res {
+        Ok(output) => {
+            let trimmed = output.trim();
+            match serde_json::from_str::<Vec<serde_json::Value>>(trimmed) {
+                Ok(sessions) => {
+                    let cache = REMOTE_HERMES_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+                    if let Ok(mut lock) = cache.lock() {
+                        lock.insert(
+                            cache_key,
+                            HermesRemoteCacheEntry {
+                                sessions: sessions.clone(),
+                                timestamp: std::time::Instant::now(),
+                            },
+                        );
+                    }
+                    Ok(sessions)
+                }
+                Err(e) => {
+                    let cache = REMOTE_HERMES_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+                    if let Ok(lock) = cache.lock() {
+                        if let Some(entry) = lock.get(&cache_key) {
+                            if entry.timestamp.elapsed() < std::time::Duration::from_secs(10) {
+                                log::warn!(
+                                    "[hermes-remote] parse failed: {}, using cached sessions ({} items)",
+                                    e,
+                                    entry.sessions.len()
+                                );
+                                return Ok(entry.sessions.clone());
+                            }
+                        }
+                    }
+                    Err(format!(
+                        "parse hermes remote sessions: {} (output: {})",
+                        e,
+                        truncate_chars(trimmed, 300)
+                    ))
+                }
+            }
+        }
+        Err(e) => {
+            let cache = REMOTE_HERMES_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+            if let Ok(lock) = cache.lock() {
+                if let Some(entry) = lock.get(&cache_key) {
+                    if entry.timestamp.elapsed() < std::time::Duration::from_secs(10) {
+                        log::warn!(
+                            "[hermes-remote] ssh_exec failed: {}, using cached sessions ({} items)",
+                            e,
+                            entry.sessions.len()
+                        );
+                        return Ok(entry.sessions.clone());
+                    }
+                }
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Test Hermes SSH connectivity: check if ~/.hermes exists, state.db readable,
@@ -19015,7 +19090,7 @@ for _cd in _check_dirs:
                             checks['plugin_version'] = line.split(':', 1)[1].strip()
                             break
             except: pass
-        if checks['plugin_version'] and checks['plugin_version'] != '0.3.0':
+        if checks['plugin_version'] and checks['plugin_version'] != '0.3.1':
             checks['plugin_outdated'] = True
         # Check if enabled via hermes CLI (look for enabled marker or config reference)
         _cfg = os.path.join(_cd, 'config.yaml')
@@ -19043,14 +19118,16 @@ if os.path.isdir(profiles_root):
         if os.path.isdir(os.path.join(profiles_root, name)):
             profiles.append(name)
 checks['profiles'] = profiles
-# Check ooclaw-status.json presence per profile
+# Check ooclaw-lifecycle.jsonl or ooclaw-status.json presence per profile
 status_files = {}
 for p in profiles:
     if p == 'default':
+        jf = os.path.join(hermes_dir, 'ooclaw-lifecycle.jsonl')
         sf = os.path.join(hermes_dir, 'ooclaw-status.json')
     else:
+        jf = os.path.join(profiles_root, p, 'ooclaw-lifecycle.jsonl')
         sf = os.path.join(profiles_root, p, 'ooclaw-status.json')
-    status_files[p] = os.path.exists(sf)
+    status_files[p] = os.path.exists(jf) or os.path.exists(sf)
 checks['status_files'] = status_files
 # Check session count in state.db
 if checks['state_db']:

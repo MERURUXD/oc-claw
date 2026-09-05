@@ -59,6 +59,7 @@ export interface BubbleSessionDetail {
   activeSubagents?: SubagentDetail[]
   otherCount?: number
   activity?: SessionActivity
+  turnId?: string
 }
 
 export interface MascotBubblePayload {

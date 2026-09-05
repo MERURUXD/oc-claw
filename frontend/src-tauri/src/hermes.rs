@@ -14,7 +14,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-pub const HERMES_PLUGIN_VERSION: &str = "0.3.0";
+pub const HERMES_PLUGIN_VERSION: &str = "0.3.1";
 pub const HERMES_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +35,24 @@ impl HermesStatus {
             HermesStatus::Waiting => "waiting",
             HermesStatus::Stopped => "stopped",
             HermesStatus::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnOwner {
+    Gateway,
+    Plugin,
+    Legacy,
+}
+
+impl From<TurnOwner> for LifecycleSource {
+    fn from(owner: TurnOwner) -> Self {
+        match owner {
+            TurnOwner::Gateway => LifecycleSource::Gateway,
+            TurnOwner::Plugin => LifecycleSource::Plugin,
+            TurnOwner::Legacy => LifecycleSource::Legacy,
         }
     }
 }
@@ -186,261 +204,273 @@ pub fn reduce_hermes_events(
         e.get("schemaVersion").and_then(|v| v.as_u64()).unwrap_or(0) >= 2 || e.get("turnId").is_some()
     });
 
-    // ── Check Gateway lifecycle events ──
-    let has_gateway_events = events_to_use.iter().any(|e| {
-        e.get("lifecycleSource").and_then(|v| v.as_str()) == Some("gateway")
-            || e.get("event").and_then(|v| v.as_str()).map(|s| s.starts_with("GatewayAgent")).unwrap_or(false)
-    });
-
-    if has_gateway_events {
-        // Find latest GatewayAgentStart
-        let mut last_gw_start_idx: Option<usize> = None;
-        let mut last_gw_turn_id: Option<String> = None;
-
-        for (i, e) in events_to_use.iter().enumerate() {
-            let ev = e.get("event").and_then(|v| v.as_str()).unwrap_or("");
-            if ev == "GatewayAgentStart" || (ev == "UserPromptSubmit" && e.get("lifecycleSource").and_then(|v| v.as_str()) == Some("gateway")) {
-                last_gw_start_idx = Some(i);
-                last_gw_turn_id = e.get("turnId").and_then(|v| v.as_str()).map(|s| s.to_string());
-            }
-        }
-
-        if let Some(start_idx) = last_gw_start_idx {
-            let turn_id = last_gw_turn_id.clone();
-            // Check if there is a matching GatewayAgentEnd after start_idx
-            let end_event = events_to_use[start_idx + 1..].iter().find(|e| {
-                let ev = e.get("event").and_then(|v| v.as_str()).unwrap_or("");
-                if ev == "GatewayAgentEnd" || (ev == "Stop" && e.get("lifecycleSource").and_then(|v| v.as_str()) == Some("gateway")) {
-                    if let (Some(ref t_start), Some(t_end)) = (&turn_id, e.get("turnId").and_then(|v| v.as_str())) {
-                        t_start == t_end
-                    } else {
-                        true
-                    }
-                } else {
-                    false
-                }
-            });
-
-            if let Some(end_e) = end_event {
-                let interrupted = end_e.get("interrupted").and_then(|v| v.as_bool()).unwrap_or(false);
-                let claude_status = end_e.get("claudeStatus").and_then(|v| v.as_str()).unwrap_or("");
-                let status = if interrupted || claude_status == "failed" {
-                    HermesStatus::Failed
-                } else {
-                    HermesStatus::Stopped
-                };
-                return HermesReducedState {
-                    turn_id,
-                    status,
-                    active: false,
-                    lifecycle_source: LifecycleSource::Gateway,
-                    latest_timestamp: latest_ts,
-                    user_prompt,
-                    last_response,
-                    diagnostic_reason: Some("gateway_agent_ended".to_string()),
-                };
-            }
-
-            // Gateway turn is OPEN! Check crash recovery
-            if process_alive == Some(false) {
-                return HermesReducedState {
-                    turn_id,
-                    status: HermesStatus::Failed,
-                    active: false,
-                    lifecycle_source: LifecycleSource::Gateway,
-                    latest_timestamp: latest_ts,
-                    user_prompt,
-                    last_response,
-                    diagnostic_reason: Some("process_dead".to_string()),
-                };
-            }
-
-            // In open gateway turn, scan events after start_idx for waiting or tool_running
-            let mut current_status = HermesStatus::Processing;
-            for e in &events_to_use[start_idx..] {
-                let ev = e.get("event").and_then(|v| v.as_str()).unwrap_or("");
-                let tool = e.get("tool").or_else(|| e.get("tool_name")).and_then(|v| v.as_str()).unwrap_or("");
-                if ev == "PermissionRequest" || (ev == "PreToolUse" && is_hermes_interactive_tool(tool)) {
-                    current_status = HermesStatus::Waiting;
-                } else if ev == "PreToolUse" {
-                    current_status = HermesStatus::ToolRunning;
-                } else if ev == "PostToolUse" || ev == "HermesPostLlm" || ev == "GatewayAgentStep" {
-                    current_status = HermesStatus::Processing;
-                }
-            }
-
-            return HermesReducedState {
-                turn_id,
-                status: current_status,
-                active: true,
-                lifecycle_source: LifecycleSource::Gateway,
-                latest_timestamp: latest_ts,
-                user_prompt,
-                last_response,
-                diagnostic_reason: Some("gateway_turn_open".to_string()),
-            };
-        }
+    struct ActiveTurnTracker {
+        owner: TurnOwner,
+        turn_id: Option<String>,
+        status: HermesStatus,
+        user_prompt: Option<String>,
+        last_response: Option<String>,
+        diagnostic_reason: Option<String>,
     }
 
-    // ── Check Plugin v2 lifecycle events ──
-    if has_v2 {
-        // Find latest turn start event (UserPromptSubmit)
-        let mut last_start_idx: Option<usize> = None;
-        let mut last_turn_id: Option<String> = None;
-
-        for (i, e) in events_to_use.iter().enumerate() {
-            let ev = e.get("event").and_then(|v| v.as_str()).unwrap_or("");
-            if ev == "UserPromptSubmit" {
-                last_start_idx = Some(i);
-                last_turn_id = e.get("turnId").and_then(|v| v.as_str()).map(|s| s.to_string());
-            }
-        }
-
-        if let Some(start_idx) = last_start_idx {
-            let turn_id = last_turn_id.clone();
-            // Check if there is a matching canonical Stop / on_session_end event after start_idx
-            let end_event = events_to_use[start_idx + 1..].iter().find(|e| {
-                let ev = e.get("event").and_then(|v| v.as_str()).unwrap_or("");
-                if ev == "Stop" || ev == "SessionEnd" {
-                    if let (Some(ref t_start), Some(t_end)) = (&turn_id, e.get("turnId").and_then(|v| v.as_str())) {
-                        t_start == t_end
-                    } else if turn_id.is_none() {
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            });
-
-            if let Some(end_e) = end_event {
-                let interrupted = end_e.get("interrupted").and_then(|v| v.as_bool()).unwrap_or(false);
-                let claude_status = end_e.get("claudeStatus").and_then(|v| v.as_str()).unwrap_or("");
-                let status = if interrupted || claude_status == "failed" {
-                    HermesStatus::Failed
-                } else {
-                    HermesStatus::Stopped
-                };
-                return HermesReducedState {
-                    turn_id,
-                    status,
-                    active: false,
-                    lifecycle_source: LifecycleSource::Plugin,
-                    latest_timestamp: latest_ts,
-                    user_prompt,
-                    last_response,
-                    diagnostic_reason: Some("canonical_session_ended".to_string()),
-                };
-            }
-
-            // Plugin turn is OPEN! Check crash recovery
-            if process_alive == Some(false) {
-                return HermesReducedState {
-                    turn_id,
-                    status: HermesStatus::Failed,
-                    active: false,
-                    lifecycle_source: LifecycleSource::Plugin,
-                    latest_timestamp: latest_ts,
-                    user_prompt,
-                    last_response,
-                    diagnostic_reason: Some("process_dead".to_string()),
-                };
-            }
-
-            // Turn is OPEN and alive: determine latest state within the turn
-            let mut current_status = HermesStatus::Processing;
-            for e in &events_to_use[start_idx..] {
-                let ev = e.get("event").and_then(|v| v.as_str()).unwrap_or("");
-                let tool = e.get("tool").or_else(|| e.get("tool_name")).and_then(|v| v.as_str()).unwrap_or("");
-                if ev == "PermissionRequest" || (ev == "PreToolUse" && is_hermes_interactive_tool(tool)) {
-                    current_status = HermesStatus::Waiting;
-                } else if ev == "PreToolUse" {
-                    current_status = HermesStatus::ToolRunning;
-                } else if ev == "PostToolUse" || ev == "HermesPostLlm" || ev == "UserPromptSubmit" {
-                    current_status = HermesStatus::Processing;
-                }
-            }
-
-            return HermesReducedState {
-                turn_id,
-                status: current_status,
-                active: true,
-                lifecycle_source: LifecycleSource::Plugin,
-                latest_timestamp: latest_ts,
-                user_prompt,
-                last_response,
-                diagnostic_reason: Some("plugin_turn_open".to_string()),
-            };
-        }
+    struct CompletedTurnTracker {
+        owner: TurnOwner,
+        turn_id: Option<String>,
+        status: HermesStatus,
+        user_prompt: Option<String>,
+        last_response: Option<String>,
+        diagnostic_reason: Option<String>,
     }
 
-    // ── Legacy fallback (events before schemaVersion 2 without turnId) ──
-    // Use strict boundary ordering: find latest explicit start vs explicit end
-    let mut last_start_ts = 0.0f64;
-    let mut last_end_ts = 0.0f64;
-    let mut last_status = HermesStatus::Stopped;
+    let mut current_turn: Option<ActiveTurnTracker> = None;
+    let mut last_completed: Option<CompletedTurnTracker> = None;
 
     for e in &events_to_use {
         let ev = e.get("event").and_then(|v| v.as_str()).unwrap_or("");
-        let ts = e.get("timestamp").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let src = e.get("lifecycleSource").and_then(|v| v.as_str()).unwrap_or("");
+        let tid = e.get("turnId").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let prompt = e
+            .get("userPrompt")
+            .or_else(|| e.get("prompt"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string());
+        let resp = e
+            .get("lastResponse")
+            .or_else(|| e.get("response"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string());
         let tool = e.get("tool").or_else(|| e.get("tool_name")).and_then(|v| v.as_str()).unwrap_or("");
+        let interrupted = e.get("interrupted").and_then(|v| v.as_bool()).unwrap_or(false);
+        let claude_status = e.get("claudeStatus").and_then(|v| v.as_str()).unwrap_or("");
 
-        if ev == "UserPromptSubmit" {
-            if ts >= last_start_ts {
-                last_start_ts = ts;
-                last_status = HermesStatus::Processing;
+        // Turn start candidates
+        if ev == "GatewayAgentStart" || (ev == "UserPromptSubmit" && src == "gateway") {
+            if let Some(ref mut turn) = current_turn {
+                if turn.owner == TurnOwner::Plugin {
+                    // Ownership upgrade: Plugin -> Gateway while preserving active status and prompt
+                    log::debug!("[hermes-lifecycle] owner_upgraded_plugin_to_gateway turn={:?}", tid.as_deref().or(turn.turn_id.as_deref()));
+                    turn.owner = TurnOwner::Gateway;
+                    if tid.is_some() {
+                        turn.turn_id = tid;
+                    }
+                    turn.status = HermesStatus::Processing;
+                    if turn.user_prompt.is_none() && prompt.is_some() {
+                        turn.user_prompt = prompt;
+                    }
+                    turn.diagnostic_reason = Some("owner_upgraded_plugin_to_gateway".to_string());
+                } else {
+                    // Rollover to new gateway turn
+                    last_completed = Some(CompletedTurnTracker {
+                        owner: turn.owner,
+                        turn_id: turn.turn_id.clone(),
+                        status: HermesStatus::Stopped,
+                        user_prompt: turn.user_prompt.clone(),
+                        last_response: turn.last_response.clone(),
+                        diagnostic_reason: Some("previous_gateway_turn_rolled_over".to_string()),
+                    });
+                    current_turn = Some(ActiveTurnTracker {
+                        owner: TurnOwner::Gateway,
+                        turn_id: tid,
+                        status: HermesStatus::Processing,
+                        user_prompt: prompt,
+                        last_response: resp,
+                        diagnostic_reason: Some("gateway_turn_open".to_string()),
+                    });
+                }
+            } else {
+                current_turn = Some(ActiveTurnTracker {
+                    owner: TurnOwner::Gateway,
+                    turn_id: tid,
+                    status: HermesStatus::Processing,
+                    user_prompt: prompt,
+                    last_response: resp,
+                    diagnostic_reason: Some("gateway_turn_open".to_string()),
+                });
+            }
+        } else if ev == "UserPromptSubmit" {
+            if let Some(ref mut turn) = current_turn {
+                if turn.owner == TurnOwner::Gateway {
+                    // Enrichment event for already-open gateway turn
+                    if turn.user_prompt.is_none() && prompt.is_some() {
+                        turn.user_prompt = prompt;
+                    }
+                    turn.status = HermesStatus::Processing;
+                } else if turn.owner == TurnOwner::Plugin {
+                    if tid.is_some() && tid == turn.turn_id {
+                        if turn.user_prompt.is_none() && prompt.is_some() {
+                            turn.user_prompt = prompt;
+                        }
+                    } else {
+                        last_completed = Some(CompletedTurnTracker {
+                            owner: turn.owner,
+                            turn_id: turn.turn_id.clone(),
+                            status: HermesStatus::Stopped,
+                            user_prompt: turn.user_prompt.clone(),
+                            last_response: turn.last_response.clone(),
+                            diagnostic_reason: Some("previous_plugin_turn_superseded".to_string()),
+                        });
+                        current_turn = Some(ActiveTurnTracker {
+                            owner: TurnOwner::Plugin,
+                            turn_id: tid,
+                            status: HermesStatus::Processing,
+                            user_prompt: prompt,
+                            last_response: resp,
+                            diagnostic_reason: Some("plugin_turn_open".to_string()),
+                        });
+                    }
+                } else {
+                    current_turn = Some(ActiveTurnTracker {
+                        owner: TurnOwner::Legacy,
+                        turn_id: tid,
+                        status: HermesStatus::Processing,
+                        user_prompt: prompt,
+                        last_response: resp,
+                        diagnostic_reason: Some("legacy_turn_open".to_string()),
+                    });
+                }
+            } else {
+                let owner = if has_v2 { TurnOwner::Plugin } else { TurnOwner::Legacy };
+                current_turn = Some(ActiveTurnTracker {
+                    owner,
+                    turn_id: tid,
+                    status: HermesStatus::Processing,
+                    user_prompt: prompt,
+                    last_response: resp,
+                    diagnostic_reason: Some("plugin_turn_open".to_string()),
+                });
+            }
+        } else if ev == "PreToolUse" || ev == "PostToolUse" || ev == "HermesPostLlm" || ev == "PermissionRequest" || ev == "GatewayAgentStep" {
+            if let Some(ref mut turn) = current_turn {
+                if ev == "PermissionRequest" || (ev == "PreToolUse" && is_hermes_interactive_tool(tool)) {
+                    turn.status = HermesStatus::Waiting;
+                } else if ev == "PreToolUse" {
+                    turn.status = HermesStatus::ToolRunning;
+                } else if ev == "PostToolUse" || ev == "HermesPostLlm" || ev == "GatewayAgentStep" {
+                    turn.status = HermesStatus::Processing;
+                }
+                if resp.is_some() {
+                    turn.last_response = resp;
+                }
+            } else {
+                // Open-turn boundary preservation fallback: synthesize open turn from active step
+                let owner = if src == "gateway" || ev == "GatewayAgentStep" { TurnOwner::Gateway } else { TurnOwner::Plugin };
+                let st = if ev == "PermissionRequest" || (ev == "PreToolUse" && is_hermes_interactive_tool(tool)) {
+                    HermesStatus::Waiting
+                } else if ev == "PreToolUse" {
+                    HermesStatus::ToolRunning
+                } else {
+                    HermesStatus::Processing
+                };
+                current_turn = Some(ActiveTurnTracker {
+                    owner,
+                    turn_id: tid,
+                    status: st,
+                    user_prompt: prompt,
+                    last_response: resp,
+                    diagnostic_reason: Some("synthesized_open_turn_from_active_event".to_string()),
+                });
+            }
+        } else if ev == "GatewayAgentEnd" {
+            if let Some(turn) = current_turn.take() {
+                let matches_turn = match (&turn.turn_id, &tid) {
+                    (Some(t_start), Some(t_end)) => t_start == t_end,
+                    _ => true,
+                };
+                if matches_turn {
+                    let is_failed = interrupted || claude_status == "failed";
+                    let status = if is_failed { HermesStatus::Failed } else { HermesStatus::Stopped };
+                    last_completed = Some(CompletedTurnTracker {
+                        owner: TurnOwner::Gateway,
+                        turn_id: turn.turn_id,
+                        status,
+                        user_prompt: turn.user_prompt,
+                        last_response: resp.or(turn.last_response),
+                        diagnostic_reason: Some("gateway_agent_ended".to_string()),
+                    });
+                } else {
+                    current_turn = Some(turn);
+                }
             }
         } else if ev == "Stop" || ev == "SessionEnd" {
-            if ts >= last_end_ts {
-                last_end_ts = ts;
-            }
-        } else if ts >= last_start_ts {
-            if ev == "PermissionRequest" || (ev == "PreToolUse" && is_hermes_interactive_tool(tool)) {
-                last_status = HermesStatus::Waiting;
-            } else if ev == "PreToolUse" {
-                last_status = HermesStatus::ToolRunning;
-            } else if ev == "PostToolUse" || ev == "HermesPostLlm" {
-                last_status = HermesStatus::Processing;
+            if let Some(turn) = current_turn.take() {
+                if turn.owner == TurnOwner::Gateway {
+                    // Core Rule 10: Plugin Stop cannot terminate an open gateway turn!
+                    log::debug!("[hermes-lifecycle] ignored_plugin_end_during_gateway_turn turn={:?}", turn.turn_id);
+                    current_turn = Some(turn);
+                } else {
+                    let matches_turn = match (&turn.turn_id, &tid) {
+                        (Some(t_start), Some(t_end)) => t_start == t_end,
+                        _ => true,
+                    };
+                    if matches_turn {
+                        let is_failed = interrupted || claude_status == "failed";
+                        let status = if is_failed { HermesStatus::Failed } else { HermesStatus::Stopped };
+                        last_completed = Some(CompletedTurnTracker {
+                            owner: turn.owner,
+                            turn_id: turn.turn_id,
+                            status,
+                            user_prompt: turn.user_prompt,
+                            last_response: resp.or(turn.last_response),
+                            diagnostic_reason: Some("canonical_session_ended".to_string()),
+                        });
+                    } else {
+                        current_turn = Some(turn);
+                    }
+                }
             }
         }
     }
 
-    if last_start_ts > last_end_ts {
-        // Open legacy turn. Check crash recovery
-        if process_alive == Some(false) {
+    if let Some(turn) = current_turn {
+        // Crash recovery check: only fail if process_alive is false and turn is plugin-owned
+        if process_alive == Some(false) && turn.owner == TurnOwner::Plugin {
             return HermesReducedState {
-                turn_id: None,
+                turn_id: turn.turn_id,
                 status: HermesStatus::Failed,
                 active: false,
-                lifecycle_source: LifecycleSource::Legacy,
+                lifecycle_source: turn.owner.into(),
                 latest_timestamp: latest_ts,
-                user_prompt,
-                last_response,
+                user_prompt: turn.user_prompt.or(user_prompt),
+                last_response: turn.last_response.or(last_response),
                 diagnostic_reason: Some("process_dead".to_string()),
             };
         }
-        HermesReducedState {
-            turn_id: None,
-            status: last_status,
+        return HermesReducedState {
+            turn_id: turn.turn_id,
+            status: turn.status,
             active: true,
-            lifecycle_source: LifecycleSource::Legacy,
+            lifecycle_source: turn.owner.into(),
             latest_timestamp: latest_ts,
-            user_prompt,
-            last_response,
-            diagnostic_reason: Some("legacy_turn_open".to_string()),
-        }
-    } else {
-        HermesReducedState {
-            turn_id: None,
-            status: HermesStatus::Stopped,
+            user_prompt: turn.user_prompt.or(user_prompt),
+            last_response: turn.last_response.or(last_response),
+            diagnostic_reason: turn.diagnostic_reason.or_else(|| Some("current_turn_open".to_string())),
+        };
+    }
+
+    if let Some(completed) = last_completed {
+        return HermesReducedState {
+            turn_id: completed.turn_id,
+            status: completed.status,
             active: false,
-            lifecycle_source: LifecycleSource::Legacy,
+            lifecycle_source: completed.owner.into(),
             latest_timestamp: latest_ts,
-            user_prompt,
-            last_response,
-            diagnostic_reason: Some("legacy_turn_closed".to_string()),
-        }
+            user_prompt: completed.user_prompt.or(user_prompt),
+            last_response: completed.last_response.or(last_response),
+            diagnostic_reason: completed.diagnostic_reason.or_else(|| Some("canonical_turn_ended".to_string())),
+        };
+    }
+
+    HermesReducedState {
+        turn_id: None,
+        status: HermesStatus::Stopped,
+        active: false,
+        lifecycle_source: if has_v2 { LifecycleSource::Plugin } else { LifecycleSource::Legacy },
+        latest_timestamp: latest_ts,
+        user_prompt,
+        last_response,
+        diagnostic_reason: Some("no_events_or_empty".to_string()),
     }
 }
 
@@ -669,8 +699,8 @@ pub fn resolve_canonical_title(
 
 pub fn build_hermes_plugin_yaml() -> &'static str {
     r#"name: ooclaw
-version: 0.3.0
-description: "Forward Hermes Agent lifecycle events to oc-claw (local socket + status file)."
+version: 0.3.1
+description: "Forward Hermes Agent lifecycle events to oc-claw (local socket + lifecycle journal)."
 hooks:
   - on_session_start
   - pre_llm_call
@@ -703,42 +733,29 @@ _thread_local = threading.local()
 _turn_lock = threading.Lock()
 _active_turns: Dict[str, str] = {{}}  # session_id -> turn_id
 
-def _status_file_path():
-    """Find the ooclaw status file path under active profile or hermes home."""
+def _journal_file_path():
+    """Find the ooclaw lifecycle journal path under active profile or hermes home."""
     hermes_home = os.environ.get("HERMES_HOME", "") or os.path.expanduser("~/.hermes")
     profile = os.environ.get("HERMES_PROFILE", "")
     if profile:
-        return os.path.join(hermes_home, "profiles", profile, "ooclaw-status.json")
-    return os.path.join(hermes_home, "ooclaw-status.json")
+        return os.path.join(hermes_home, "profiles", profile, "ooclaw-lifecycle.jsonl")
+    return os.path.join(hermes_home, "ooclaw-lifecycle.jsonl")
 
-_MAX_EVENTS_PER_SESSION = 100
-_MAX_SESSIONS = 20
-
-def _write_status(payload):
+def _append_journal(payload):
     try:
-        status_path = _status_file_path()
-        session_id = payload.get("sessionId", "unknown")
-        data = {{}}
-        if os.path.exists(status_path):
+        jp = _journal_file_path()
+        os.makedirs(os.path.dirname(jp), exist_ok=True)
+        line = json.dumps(payload, ensure_ascii=False) + "\n"
+        with open(jp, "a", encoding="utf-8") as f:
             try:
-                with open(status_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if not isinstance(data, dict):
-                    data = {{}}
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                f.write(line)
+                f.flush()
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
             except Exception:
-                data = {{}}
-        if session_id not in data:
-            data[session_id] = []
-        data[session_id].append(payload)
-        if len(data[session_id]) > _MAX_EVENTS_PER_SESSION:
-            data[session_id] = data[session_id][-_MAX_EVENTS_PER_SESSION:]
-        if len(data) > _MAX_SESSIONS:
-            by_ts = sorted(data.items(), key=lambda kv: (kv[1][-1].get("timestamp", 0) if kv[1] else 0), reverse=True)
-            data = dict(by_ts[:_MAX_SESSIONS])
-        tmp_path = status_path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-        os.replace(tmp_path, status_path)
+                f.write(line)
+                f.flush()
     except Exception:
         pass
 
@@ -783,7 +800,7 @@ def _handle(event_name, **kwargs):
             "timestamp": time.time(),
         }}
         _send(end_payload)
-        _write_status(end_payload)
+        _append_journal(end_payload)
     _thread_local.last_session_id = session_id
 
     # Resolve or create turn_id
@@ -884,7 +901,7 @@ def _handle(event_name, **kwargs):
     payload.update(extra)
 
     _send(payload)
-    _write_status(payload)
+    _append_journal(payload)
 
 def _make_cb(event_name):
     def cb(**kwargs):
@@ -947,41 +964,28 @@ def _log(msg):
 
 {connect_code}
 
-def _status_file_path():
+def _journal_file_path():
     hermes_home = os.environ.get("HERMES_HOME", "") or os.path.expanduser("~/.hermes")
     profile = os.environ.get("HERMES_PROFILE", "")
     if profile:
-        return os.path.join(hermes_home, "profiles", profile, "ooclaw-status.json")
-    return os.path.join(hermes_home, "ooclaw-status.json")
+        return os.path.join(hermes_home, "profiles", profile, "ooclaw-lifecycle.jsonl")
+    return os.path.join(hermes_home, "ooclaw-lifecycle.jsonl")
 
-_MAX_EVENTS_PER_SESSION = 50
-_MAX_SESSIONS = 20
-
-def _write_status(payload):
+def _append_journal(payload):
     try:
-        status_path = _status_file_path()
-        session_id = payload.get("sessionId", "unknown")
-        data = {{}}
-        if os.path.exists(status_path):
+        jp = _journal_file_path()
+        os.makedirs(os.path.dirname(jp), exist_ok=True)
+        line = json.dumps(payload, ensure_ascii=False) + "\n"
+        with open(jp, "a", encoding="utf-8") as f:
             try:
-                with open(status_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if not isinstance(data, dict):
-                    data = {{}}
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                f.write(line)
+                f.flush()
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
             except Exception:
-                data = {{}}
-        if session_id not in data:
-            data[session_id] = []
-        data[session_id].append(payload)
-        if len(data[session_id]) > _MAX_EVENTS_PER_SESSION:
-            data[session_id] = data[session_id][-_MAX_EVENTS_PER_SESSION:]
-        if len(data) > _MAX_SESSIONS:
-            by_ts = sorted(data.items(), key=lambda kv: (kv[1][-1].get("timestamp", 0) if kv[1] else 0), reverse=True)
-            data = dict(by_ts[:_MAX_SESSIONS])
-        tmp_path = status_path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-        os.replace(tmp_path, status_path)
+                f.write(line)
+                f.flush()
     except Exception:
         pass
 
@@ -1060,7 +1064,7 @@ def handle(event_type, context):
         }}
         payload.update(extra)
         _send_to_ooclaw(payload)
-        _write_status(payload)
+        _append_journal(payload)
     except Exception as e:
         _log(f"handler exception: {{e}}")
 "##,
@@ -1119,106 +1123,212 @@ def reduce_events(events, pid_alive):
     filtered = [e for e in events if not is_internal(e.get('tool', ''))]
     evts = filtered if filtered else events
 
-    has_gw = any(e.get('lifecycleSource') == 'gateway' or e.get('event', '').startswith('GatewayAgent') for e in evts)
-    if has_gw:
-        last_start_idx = None
-        last_turn_id = ''
-        for i, e in enumerate(evts):
-            ev = e.get('event', '')
-            if ev == 'GatewayAgentStart' or (ev == 'UserPromptSubmit' and e.get('lifecycleSource') == 'gateway'):
-                last_start_idx = i
-                last_turn_id = e.get('turnId', '')
-        if last_start_idx is not None:
-            # Look for matching GatewayAgentEnd
-            end_evt = None
-            for e in evts[last_start_idx + 1:]:
-                ev = e.get('event', '')
-                if ev == 'GatewayAgentEnd' or (ev == 'Stop' and e.get('lifecycleSource') == 'gateway'):
-                    if not last_turn_id or e.get('turnId') == last_turn_id:
-                        end_evt = e
-                        break
-            if end_evt:
-                is_failed = end_evt.get('interrupted', False) or end_evt.get('claudeStatus') == 'failed'
-                return {'status': 'failed' if is_failed else 'stopped', 'active': False, 'turnId': last_turn_id, 'lifecycleSource': 'gateway'}
+    has_v2 = any(e.get('schemaVersion', 0) >= 2 or 'turnId' in e or e.get('lifecycleSource') in ('plugin', 'gateway') for e in evts)
 
-            if pid_alive is False:
-                return {'status': 'failed', 'active': False, 'turnId': last_turn_id, 'lifecycleSource': 'gateway', 'reason': 'process_dead'}
+    current_turn = None
+    last_completed = None
 
-            cur_st = 'processing'
-            for e in evts[last_start_idx:]:
-                ev = e.get('event', '')
-                tool = e.get('tool', '')
-                if ev == 'PermissionRequest' or (ev == 'PreToolUse' and is_interactive(tool)):
-                    cur_st = 'waiting'
-                elif ev == 'PreToolUse':
-                    cur_st = 'tool_running'
-                elif ev in ('PostToolUse', 'HermesPostLlm', 'GatewayAgentStep'):
-                    cur_st = 'processing'
-            return {'status': cur_st, 'active': True, 'turnId': last_turn_id, 'lifecycleSource': 'gateway'}
+    user_prompt = ''
+    last_response = ''
+    latest_ts = 0.0
 
-    # Plugin v2 check
-    has_v2 = any(e.get('schemaVersion', 0) >= 2 or 'turnId' in e for e in evts)
-    if has_v2:
-        last_start_idx = None
-        last_turn_id = ''
-        for i, e in enumerate(evts):
-            if e.get('event') == 'UserPromptSubmit':
-                last_start_idx = i
-                last_turn_id = e.get('turnId', '')
-        if last_start_idx is not None:
-            end_evt = None
-            for e in evts[last_start_idx + 1:]:
-                if e.get('event') in ('Stop', 'SessionEnd'):
-                    if not last_turn_id or e.get('turnId') == last_turn_id:
-                        end_evt = e
-                        break
-            if end_evt:
-                is_failed = end_evt.get('interrupted', False) or end_evt.get('claudeStatus') == 'failed'
-                return {'status': 'failed' if is_failed else 'stopped', 'active': False, 'turnId': last_turn_id, 'lifecycleSource': 'plugin'}
-
-            if pid_alive is False:
-                return {'status': 'failed', 'active': False, 'turnId': last_turn_id, 'lifecycleSource': 'plugin', 'reason': 'process_dead'}
-
-            cur_st = 'processing'
-            for e in evts[last_start_idx:]:
-                ev = e.get('event', '')
-                tool = e.get('tool', '')
-                if ev == 'PermissionRequest' or (ev == 'PreToolUse' and is_interactive(tool)):
-                    cur_st = 'waiting'
-                elif ev == 'PreToolUse':
-                    cur_st = 'tool_running'
-                elif ev in ('PostToolUse', 'HermesPostLlm', 'UserPromptSubmit'):
-                    cur_st = 'processing'
-            return {'status': cur_st, 'active': True, 'turnId': last_turn_id, 'lifecycleSource': 'plugin'}
-
-    # Legacy boundary check
-    last_start_ts = 0.0
-    last_end_ts = 0.0
-    cur_st = 'stopped'
     for e in evts:
         ev = e.get('event', '')
-        ts = e.get('timestamp', 0) or 0.0
-        tool = e.get('tool', '')
-        if ev == 'UserPromptSubmit':
-            if ts >= last_start_ts:
-                last_start_ts = ts
-                cur_st = 'processing'
-        elif ev in ('Stop', 'SessionEnd'):
-            if ts >= last_end_ts:
-                last_end_ts = ts
-        elif ts >= last_start_ts:
-            if ev == 'PermissionRequest' or (ev == 'PreToolUse' and is_interactive(tool)):
-                cur_st = 'waiting'
-            elif ev == 'PreToolUse':
-                cur_st = 'tool_running'
-            elif ev in ('PostToolUse', 'HermesPostLlm'):
-                cur_st = 'processing'
+        ts = e.get('timestamp')
+        if ts is not None:
+            try:
+                latest_ts = max(latest_ts, float(ts))
+            except Exception:
+                pass
 
-    if last_start_ts > last_end_ts:
-        if pid_alive is False:
-            return {'status': 'failed', 'active': False, 'turnId': '', 'lifecycleSource': 'legacy', 'reason': 'process_dead'}
-        return {'status': cur_st, 'active': True, 'turnId': '', 'lifecycleSource': 'legacy'}
-    return {'status': 'stopped', 'active': False, 'turnId': '', 'lifecycleSource': 'legacy'}
+        tid = e.get('turnId') or ''
+        src = e.get('lifecycleSource', '')
+        tool = e.get('tool', '')
+        interrupted = e.get('interrupted', False)
+        claude_status = e.get('claudeStatus', '')
+        prompt = e.get('userPrompt') or ''
+        resp = e.get('lastResponse') or ''
+
+        if prompt and not user_prompt:
+            user_prompt = prompt
+        if resp and not last_response:
+            last_response = resp
+
+        if ev == 'GatewayAgentStart':
+            if current_turn:
+                if current_turn['owner'] == 'plugin':
+                    current_turn['owner'] = 'gateway'
+                    if tid:
+                        current_turn['turn_id'] = tid
+                    current_turn['status'] = 'processing'
+                    if not current_turn['user_prompt'] and prompt:
+                        current_turn['user_prompt'] = prompt
+                    current_turn['diagnostic_reason'] = 'owner_upgraded_plugin_to_gateway'
+                else:
+                    last_completed = {
+                        'owner': current_turn['owner'],
+                        'turn_id': current_turn['turn_id'],
+                        'status': 'stopped',
+                        'user_prompt': current_turn['user_prompt'],
+                        'last_response': current_turn['last_response'],
+                        'diagnostic_reason': 'previous_gateway_turn_rolled_over'
+                    }
+                    current_turn = {
+                        'owner': 'gateway',
+                        'turn_id': tid,
+                        'status': 'processing',
+                        'user_prompt': prompt,
+                        'last_response': resp,
+                        'diagnostic_reason': 'gateway_turn_open'
+                    }
+            else:
+                current_turn = {
+                    'owner': 'gateway',
+                    'turn_id': tid,
+                    'status': 'processing',
+                    'user_prompt': prompt,
+                    'last_response': resp,
+                    'diagnostic_reason': 'gateway_turn_open'
+                }
+        elif ev == 'UserPromptSubmit':
+            if current_turn:
+                if current_turn['owner'] == 'gateway':
+                    if not current_turn['user_prompt'] and prompt:
+                        current_turn['user_prompt'] = prompt
+                    current_turn['status'] = 'processing'
+                elif current_turn['owner'] == 'plugin':
+                    if tid and tid == current_turn['turn_id']:
+                        if not current_turn['user_prompt'] and prompt:
+                            current_turn['user_prompt'] = prompt
+                    else:
+                        last_completed = {
+                            'owner': current_turn['owner'],
+                            'turn_id': current_turn['turn_id'],
+                            'status': 'stopped',
+                            'user_prompt': current_turn['user_prompt'],
+                            'last_response': current_turn['last_response'],
+                            'diagnostic_reason': 'previous_plugin_turn_superseded'
+                        }
+                        current_turn = {
+                            'owner': 'plugin',
+                            'turn_id': tid,
+                            'status': 'processing',
+                            'user_prompt': prompt,
+                            'last_response': resp,
+                            'diagnostic_reason': 'plugin_turn_open'
+                        }
+                else:
+                    current_turn = {
+                        'owner': 'legacy',
+                        'turn_id': tid,
+                        'status': 'processing',
+                        'user_prompt': prompt,
+                        'last_response': resp,
+                        'diagnostic_reason': 'legacy_turn_open'
+                    }
+            else:
+                owner = 'plugin' if has_v2 else 'legacy'
+                current_turn = {
+                    'owner': owner,
+                    'turn_id': tid,
+                    'status': 'processing',
+                    'user_prompt': prompt,
+                    'last_response': resp,
+                    'diagnostic_reason': 'plugin_turn_open'
+                }
+        elif ev in ('PreToolUse', 'PostToolUse', 'HermesPostLlm', 'PermissionRequest', 'GatewayAgentStep'):
+            if current_turn:
+                if ev == 'PermissionRequest' or (ev == 'PreToolUse' and is_interactive(tool)):
+                    current_turn['status'] = 'waiting'
+                elif ev == 'PreToolUse':
+                    current_turn['status'] = 'tool_running'
+                elif ev in ('PostToolUse', 'HermesPostLlm', 'GatewayAgentStep'):
+                    current_turn['status'] = 'processing'
+                if resp:
+                    current_turn['last_response'] = resp
+            else:
+                owner = 'gateway' if (src == 'gateway' or ev == 'GatewayAgentStep') else 'plugin'
+                if ev == 'PermissionRequest' or (ev == 'PreToolUse' and is_interactive(tool)):
+                    st = 'waiting'
+                elif ev == 'PreToolUse':
+                    st = 'tool_running'
+                else:
+                    st = 'processing'
+                current_turn = {
+                    'owner': owner,
+                    'turn_id': tid,
+                    'status': st,
+                    'user_prompt': prompt,
+                    'last_response': resp,
+                    'diagnostic_reason': 'synthesized_open_turn_from_active_event'
+                }
+        elif ev == 'GatewayAgentEnd':
+            if current_turn:
+                matches_turn = (current_turn['turn_id'] == tid) if (current_turn['turn_id'] and tid) else True
+                if matches_turn:
+                    is_failed = interrupted or claude_status == 'failed'
+                    st = 'failed' if is_failed else 'stopped'
+                    last_completed = {
+                        'owner': 'gateway',
+                        'turn_id': current_turn['turn_id'],
+                        'status': st,
+                        'user_prompt': current_turn['user_prompt'],
+                        'last_response': resp or current_turn['last_response'],
+                        'diagnostic_reason': 'gateway_agent_ended'
+                    }
+                    current_turn = None
+        elif ev in ('Stop', 'SessionEnd'):
+            if current_turn:
+                if current_turn['owner'] == 'gateway':
+                    pass
+                else:
+                    matches_turn = (current_turn['turn_id'] == tid) if (current_turn['turn_id'] and tid) else True
+                    if matches_turn:
+                        is_failed = interrupted or claude_status == 'failed'
+                        st = 'failed' if is_failed else 'stopped'
+                        last_completed = {
+                            'owner': current_turn['owner'],
+                            'turn_id': current_turn['turn_id'],
+                            'status': st,
+                            'user_prompt': current_turn['user_prompt'],
+                            'last_response': resp or current_turn['last_response'],
+                            'diagnostic_reason': 'canonical_session_ended'
+                        }
+                        current_turn = None
+
+    if current_turn:
+        if pid_alive is False and current_turn['owner'] == 'plugin':
+            return {
+                'status': 'failed',
+                'active': False,
+                'turnId': current_turn['turn_id'],
+                'lifecycleSource': current_turn['owner'],
+                'reason': 'process_dead'
+            }
+        return {
+            'status': current_turn['status'],
+            'active': True,
+            'turnId': current_turn['turn_id'],
+            'lifecycleSource': current_turn['owner'],
+            'reason': current_turn.get('diagnostic_reason', 'current_turn_open')
+        }
+
+    if last_completed:
+        return {
+            'status': last_completed['status'],
+            'active': False,
+            'turnId': last_completed['turn_id'],
+            'lifecycleSource': last_completed['owner'],
+            'reason': last_completed.get('diagnostic_reason', 'canonical_turn_ended')
+        }
+
+    return {
+        'status': 'stopped',
+        'active': False,
+        'turnId': '',
+        'lifecycleSource': 'plugin' if has_v2 else 'legacy',
+        'reason': 'no_events_or_empty'
+    }
 
 def table_columns(conn, table):
     try:
@@ -1317,20 +1427,48 @@ for pdir in profile_dirs:
     pname = os.path.basename(pdir) if pdir != hermes_home else 'default'
     pfx = '' if pname == 'default' else f"{pname}:"
 
-    # Step 1: Read ooclaw-status.json
-    sf = os.path.join(pdir, 'ooclaw-status.json')
-    if not os.path.exists(sf) and pname == 'default':
-        sf = os.path.join(hermes_home, 'ooclaw-status.json')
-
+    # Step 1: Read ooclaw-lifecycle.jsonl, fallback to ooclaw-status.json
     status_data = {}
-    if os.path.exists(sf):
+    jf = os.path.join(pdir, 'ooclaw-lifecycle.jsonl')
+    if not os.path.exists(jf) and pname == 'default':
+        jf = os.path.join(hermes_home, 'ooclaw-lifecycle.jsonl')
+
+    if os.path.exists(jf):
         try:
-            with open(sf, 'r', encoding='utf-8') as f:
-                d = json.load(f)
-                if isinstance(d, dict):
-                    status_data = d
+            with open(jf, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        evt = json.loads(line)
+                        if isinstance(evt, dict):
+                            sid = evt.get('sessionId') or evt.get('session_id') or 'unknown'
+                            if sid not in status_data:
+                                status_data[sid] = []
+                            status_data[sid].append(evt)
+                    except Exception:
+                        continue
         except Exception:
             pass
+
+    if not status_data:
+        sf = os.path.join(pdir, 'ooclaw-status.json')
+        if not os.path.exists(sf) and pname == 'default':
+            sf = os.path.join(hermes_home, 'ooclaw-status.json')
+        if os.path.exists(sf):
+            try:
+                with open(sf, 'r', encoding='utf-8') as f:
+                    d = json.load(f)
+                    if isinstance(d, dict):
+                        status_data = d
+            except Exception:
+                pass
+
+    # Cap at last 200 events per session to retain full turn history without memory bloat
+    for sid in list(status_data.keys()):
+        if len(status_data[sid]) > 200:
+            status_data[sid] = status_data[sid][-200:]
 
     # Step 2: Read sessions.json as routing index only
     routing_map = {}
@@ -2023,6 +2161,326 @@ mod tests {
 
         assert_eq!(res_a.canonical_title, "Profile A Title");
         assert_eq!(res_b.canonical_title, "Profile B Title");
+    }
+
+    // ── Regression Test Cases (Current-Turn Ownership & Gateway Lifecycle) ──
+
+    #[test]
+    fn test_ownership_upgrade_plugin_to_gateway_preserves_active() {
+        // Plugin UserPromptSubmit arrives first, followed by GatewayAgentStart for the same turn.
+        // Status must stay Processing, active remains true, and owner upgrades to Gateway.
+        let events = vec![
+            json!({
+                "sessionId": "s_up",
+                "turnId": "turn_1",
+                "event": "UserPromptSubmit",
+                "claudeStatus": "processing",
+                "lifecycleSource": "plugin",
+                "schemaVersion": 2,
+                "timestamp": 100.0,
+                "userPrompt": "Hello world"
+            }),
+            json!({
+                "sessionId": "s_up",
+                "turnId": "turn_1",
+                "event": "GatewayAgentStart",
+                "claudeStatus": "processing",
+                "lifecycleSource": "gateway",
+                "schemaVersion": 2,
+                "timestamp": 101.0,
+            }),
+        ];
+
+        let state = reduce_hermes_events(&events, Some(true));
+        assert_eq!(state.status, HermesStatus::Processing);
+        assert!(state.active);
+        assert_eq!(state.lifecycle_source, LifecycleSource::Gateway);
+        assert_eq!(state.user_prompt.as_deref(), Some("Hello world"));
+    }
+
+    #[test]
+    fn test_gateway_turn_ignores_plugin_stop() {
+        // Core Rule 10: In a gateway turn, a plugin Stop event (e.g. from internal LLM call or worker)
+        // must NOT terminate the turn.
+        let events = vec![
+            json!({
+                "sessionId": "s_gw_stop",
+                "turnId": "gw_turn_1",
+                "event": "GatewayAgentStart",
+                "claudeStatus": "processing",
+                "lifecycleSource": "gateway",
+                "schemaVersion": 2,
+                "timestamp": 100.0,
+            }),
+            json!({
+                "sessionId": "s_gw_stop",
+                "turnId": "gw_turn_1",
+                "event": "Stop",
+                "claudeStatus": "waiting_for_input",
+                "lifecycleSource": "plugin",
+                "schemaVersion": 2,
+                "timestamp": 102.0,
+            }),
+        ];
+
+        let state = reduce_hermes_events(&events, Some(true));
+        assert_eq!(state.status, HermesStatus::Processing);
+        assert!(state.active);
+        assert_eq!(state.lifecycle_source, LifecycleSource::Gateway);
+    }
+
+    #[test]
+    fn test_gateway_agent_end_terminates_gateway_turn() {
+        // Only GatewayAgentEnd properly terminates a gateway turn.
+        let events = vec![
+            json!({
+                "sessionId": "s_gw_end",
+                "turnId": "gw_turn_1",
+                "event": "GatewayAgentStart",
+                "claudeStatus": "processing",
+                "lifecycleSource": "gateway",
+                "schemaVersion": 2,
+                "timestamp": 100.0,
+            }),
+            json!({
+                "sessionId": "s_gw_end",
+                "turnId": "gw_turn_1",
+                "event": "GatewayAgentEnd",
+                "claudeStatus": "waiting_for_input",
+                "lastResponse": "Gateway execution complete",
+                "lifecycleSource": "gateway",
+                "schemaVersion": 2,
+                "timestamp": 110.0,
+            }),
+        ];
+
+        let state = reduce_hermes_events(&events, Some(true));
+        assert_eq!(state.status, HermesStatus::Stopped);
+        assert!(!state.active);
+        assert_eq!(state.lifecycle_source, LifecycleSource::Gateway);
+        assert_eq!(state.last_response.as_deref(), Some("Gateway execution complete"));
+    }
+
+    #[test]
+    fn test_user_prompt_submit_enriches_gateway_turn() {
+        // GatewayAgentStart might start without userPrompt text; incoming UserPromptSubmit
+        // enriches the turn with prompt text without changing owner.
+        let events = vec![
+            json!({
+                "sessionId": "s_gw_enrich",
+                "turnId": "gw_turn_1",
+                "event": "GatewayAgentStart",
+                "claudeStatus": "processing",
+                "lifecycleSource": "gateway",
+                "schemaVersion": 2,
+                "timestamp": 100.0,
+            }),
+            json!({
+                "sessionId": "s_gw_enrich",
+                "turnId": "gw_turn_1",
+                "event": "UserPromptSubmit",
+                "claudeStatus": "processing",
+                "lifecycleSource": "plugin",
+                "userPrompt": "Enriched prompt text",
+                "schemaVersion": 2,
+                "timestamp": 101.0,
+            }),
+        ];
+
+        let state = reduce_hermes_events(&events, Some(true));
+        assert_eq!(state.status, HermesStatus::Processing);
+        assert!(state.active);
+        assert_eq!(state.lifecycle_source, LifecycleSource::Gateway);
+        assert_eq!(state.user_prompt.as_deref(), Some("Enriched prompt text"));
+    }
+
+    #[test]
+    fn test_historical_gateway_turn_does_not_close_new_plugin_turn() {
+        // Historical turn A was Gateway (closed with GatewayAgentEnd).
+        // New turn B is Plugin (started with UserPromptSubmit).
+        // Having historical gateway events in history must NOT cause Turn B to be treated as closed.
+        let events = vec![
+            json!({
+                "sessionId": "s_hist",
+                "turnId": "gw_turn_A",
+                "event": "GatewayAgentStart",
+                "claudeStatus": "processing",
+                "lifecycleSource": "gateway",
+                "schemaVersion": 2,
+                "timestamp": 100.0,
+            }),
+            json!({
+                "sessionId": "s_hist",
+                "turnId": "gw_turn_A",
+                "event": "GatewayAgentEnd",
+                "claudeStatus": "waiting_for_input",
+                "lifecycleSource": "gateway",
+                "schemaVersion": 2,
+                "timestamp": 105.0,
+            }),
+            json!({
+                "sessionId": "s_hist",
+                "turnId": "plugin_turn_B",
+                "event": "UserPromptSubmit",
+                "claudeStatus": "processing",
+                "lifecycleSource": "plugin",
+                "schemaVersion": 2,
+                "timestamp": 120.0,
+            }),
+        ];
+
+        let state = reduce_hermes_events(&events, Some(true));
+        assert_eq!(state.status, HermesStatus::Processing);
+        assert!(state.active);
+        assert_eq!(state.turn_id.as_deref(), Some("plugin_turn_B"));
+        assert_eq!(state.lifecycle_source, LifecycleSource::Plugin);
+    }
+
+    #[test]
+    fn test_synthesize_open_turn_from_active_step_boundary_capping() {
+        // If event log pruning pruned GatewayAgentStart, but GatewayAgentStep or PreToolUse arrives,
+        // it must synthesize an active open turn instead of collapsing to stopped.
+        let events = vec![
+            json!({
+                "sessionId": "s_syn",
+                "turnId": "gw_turn_pruned",
+                "event": "GatewayAgentStep",
+                "claudeStatus": "processing",
+                "lifecycleSource": "gateway",
+                "schemaVersion": 2,
+                "timestamp": 200.0,
+            }),
+            json!({
+                "sessionId": "s_syn",
+                "turnId": "gw_turn_pruned",
+                "event": "PreToolUse",
+                "claudeStatus": "running_tool",
+                "tool": "bash",
+                "lifecycleSource": "plugin",
+                "schemaVersion": 2,
+                "timestamp": 201.0,
+            }),
+        ];
+
+        let state = reduce_hermes_events(&events, Some(true));
+        assert_eq!(state.status, HermesStatus::ToolRunning);
+        assert!(state.active);
+        assert_eq!(state.turn_id.as_deref(), Some("gw_turn_pruned"));
+    }
+
+    #[test]
+    fn test_crash_recovery_only_kills_plugin_not_gateway() {
+        // A dead plugin worker PID should not mark a gateway supervisor turn as failed.
+        let events = vec![json!({
+            "sessionId": "s_gw_crash",
+            "turnId": "gw_turn_1",
+            "event": "GatewayAgentStart",
+            "claudeStatus": "processing",
+            "lifecycleSource": "gateway",
+            "schemaVersion": 2,
+            "timestamp": 100.0,
+        })];
+
+        let state = reduce_hermes_events(&events, Some(false));
+        assert_eq!(state.status, HermesStatus::Processing);
+        assert!(state.active);
+        assert_eq!(state.lifecycle_source, LifecycleSource::Gateway);
+    }
+
+    #[test]
+    fn test_out_of_order_stale_plugin_stop_ignored_by_different_turn() {
+        // Turn 1 starts, Turn 2 starts. A delayed Turn 1 Stop must not close Turn 2.
+        let events = vec![
+            json!({
+                "sessionId": "s_ooo",
+                "turnId": "turn_1",
+                "event": "UserPromptSubmit",
+                "claudeStatus": "processing",
+                "lifecycleSource": "plugin",
+                "schemaVersion": 2,
+                "timestamp": 100.0,
+            }),
+            json!({
+                "sessionId": "s_ooo",
+                "turnId": "turn_2",
+                "event": "UserPromptSubmit",
+                "claudeStatus": "processing",
+                "lifecycleSource": "plugin",
+                "schemaVersion": 2,
+                "timestamp": 105.0,
+            }),
+            json!({
+                "sessionId": "s_ooo",
+                "turnId": "turn_1",
+                "event": "Stop",
+                "claudeStatus": "waiting_for_input",
+                "lifecycleSource": "plugin",
+                "schemaVersion": 2,
+                "timestamp": 106.0,
+            }),
+        ];
+
+        let state = reduce_hermes_events(&events, Some(true));
+        assert_eq!(state.status, HermesStatus::Processing);
+        assert!(state.active);
+        assert_eq!(state.turn_id.as_deref(), Some("turn_2"));
+    }
+
+    #[test]
+    fn test_interactive_tool_sets_waiting() {
+        let events = vec![
+            json!({
+                "sessionId": "s_interact",
+                "turnId": "turn_ask",
+                "event": "UserPromptSubmit",
+                "claudeStatus": "processing",
+                "lifecycleSource": "plugin",
+                "schemaVersion": 2,
+                "timestamp": 100.0,
+            }),
+            json!({
+                "sessionId": "s_interact",
+                "turnId": "turn_ask",
+                "event": "PreToolUse",
+                "tool": "ask_user",
+                "claudeStatus": "waiting",
+                "lifecycleSource": "plugin",
+                "schemaVersion": 2,
+                "timestamp": 101.0,
+            }),
+        ];
+
+        let state = reduce_hermes_events(&events, Some(true));
+        assert_eq!(state.status, HermesStatus::Waiting);
+        assert!(state.active);
+    }
+
+    #[test]
+    fn test_session_end_event_terminates_plugin_turn() {
+        let events = vec![
+            json!({
+                "sessionId": "s_end",
+                "turnId": "turn_1",
+                "event": "UserPromptSubmit",
+                "claudeStatus": "processing",
+                "lifecycleSource": "plugin",
+                "schemaVersion": 2,
+                "timestamp": 100.0,
+            }),
+            json!({
+                "sessionId": "s_end",
+                "turnId": "turn_1",
+                "event": "SessionEnd",
+                "claudeStatus": "ended",
+                "lifecycleSource": "plugin",
+                "schemaVersion": 2,
+                "timestamp": 110.0,
+            }),
+        ];
+
+        let state = reduce_hermes_events(&events, Some(true));
+        assert_eq!(state.status, HermesStatus::Stopped);
+        assert!(!state.active);
     }
 
     #[test]
