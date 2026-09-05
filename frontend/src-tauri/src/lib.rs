@@ -9535,15 +9535,22 @@ fn start_session_file_watcher(
                             session.tool_input = Some(legacy_input);
                         }
                         session.activity = None;
-                    } else if session.status == "waiting" && (session.pending_interaction.is_some() || session.needs_review.is_some()) {
-                        log::info!("File watcher: codex interaction resolved, resuming processing for {}", sid2);
-                        session.status = "processing".to_string();
-                        session.is_processing = true;
-                        session.needs_review = None;
-                        session.pending_interaction = None;
-                        session.tool = None;
-                        session.tool_input = None;
-                        changed = true;
+                    } else {
+                        let is_live_permission_waiting = session.status == "waiting"
+                            && session.pending_interaction.as_ref().map_or(false, |pi| {
+                                pi.kind == "approval" && (pi.interaction_type.as_deref() == Some("permissions") || pi.tool.as_deref() == Some("request_permissions"))
+                            });
+
+                        if !is_live_permission_waiting && session.status == "waiting" && (session.pending_interaction.is_some() || session.needs_review.is_some()) {
+                            log::info!("File watcher: codex interaction resolved, resuming processing for {}", sid2);
+                            session.status = "processing".to_string();
+                            session.is_processing = true;
+                            session.needs_review = None;
+                            session.pending_interaction = None;
+                            session.tool = None;
+                            session.tool_input = None;
+                            changed = true;
+                        }
                     }
                     if session.status != "waiting" && session.status != "stopped" {
                         let prev_act = session.activity.clone();
@@ -9868,16 +9875,23 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
                             session.activity = None;
                             session.updated_at = now_ms;
                             continue;
-                        } else if session.status == "waiting" && (session.pending_interaction.is_some() || session.needs_review.is_some()) {
-                            session.status = "processing".to_string();
-                            session.is_processing = true;
-                            session.needs_review = None;
-                            session.pending_interaction = None;
-                            session.tool = None;
-                            session.tool_input = None;
-                            session.activity = session_activity::parse_codex_activity_from_transcript(&path);
-                        } else if session.status == "processing" || session.status == "tool_running" {
-                            session.activity = session_activity::parse_codex_activity_from_transcript(&path);
+                        } else {
+                            let is_live_permission_waiting = session.status == "waiting"
+                                && session.pending_interaction.as_ref().map_or(false, |pi| {
+                                    pi.kind == "approval" && (pi.interaction_type.as_deref() == Some("permissions") || pi.tool.as_deref() == Some("request_permissions"))
+                                });
+
+                            if !is_live_permission_waiting && session.status == "waiting" && (session.pending_interaction.is_some() || session.needs_review.is_some()) {
+                                session.status = "processing".to_string();
+                                session.is_processing = true;
+                                session.needs_review = None;
+                                session.pending_interaction = None;
+                                session.tool = None;
+                                session.tool_input = None;
+                                session.activity = session_activity::parse_codex_activity_from_transcript(&path);
+                            } else if session.status == "processing" || session.status == "tool_running" {
+                                session.activity = session_activity::parse_codex_activity_from_transcript(&path);
+                            }
                         }
                     }
                 }
@@ -15722,6 +15736,82 @@ except:
     Ok(())
 }
 
+pub fn parse_codex_permission_request(event: &serde_json::Value) -> Option<PendingInteraction> {
+    let is_codex_event = event.get("turn_id").is_some()
+        || event.get("source").and_then(|v| v.as_str()).unwrap_or("").eq_ignore_ascii_case("codex")
+        || event.get("source").map(|v| v.is_object()).unwrap_or(false);
+    if !is_codex_event {
+        return None;
+    }
+
+    let tool_name = event.get("tool")
+        .or_else(|| event.get("tool_name"))
+        .or_else(|| event.get("toolCall").and_then(|tc| tc.get("name")))
+        .or_else(|| event.get("tool_call").and_then(|tc| tc.get("name")))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if tool_name != "request_permissions" && tool_name != "requestPermissions" {
+        return None;
+    }
+
+    let tool_input_val = event.get("tool_input")
+        .or_else(|| event.get("toolInput"))
+        .or_else(|| event.get("arguments"))
+        .or_else(|| event.get("parameters"))
+        .or_else(|| {
+            event.get("toolCall")
+                .or_else(|| event.get("tool_call"))
+                .and_then(|tc| tc.get("args").or_else(|| tc.get("arguments")))
+        });
+
+    let tool_input_obj = if let Some(val) = tool_input_val {
+        if val.is_object() {
+            val.clone()
+        } else if let Some(raw) = val.as_str() {
+            serde_json::from_str::<serde_json::Value>(raw).unwrap_or(serde_json::json!({}))
+        } else {
+            serde_json::json!({})
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    let perms_val = tool_input_obj.get("permissions").or_else(|| event.get("permissions"))?;
+    let reason_val = tool_input_obj.get("reason").or_else(|| event.get("reason")).and_then(|v| v.as_str());
+
+    let (summary, detail, justification) = session_activity::parse_codex_permission_payload(perms_val, reason_val)?;
+
+    let incoming_turn_id = event.get("turnId")
+        .or_else(|| event.get("turn_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let item_id = event.get("item_id")
+        .or_else(|| event.get("itemId"))
+        .or_else(|| event.get("id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let call_id = event.get("call_id")
+        .or_else(|| event.get("callId"))
+        .or_else(|| event.get("toolCall").and_then(|tc| tc.get("id").or_else(|| tc.get("call_id"))))
+        .or_else(|| event.get("tool_call").and_then(|tc| tc.get("id").or_else(|| tc.get("call_id"))))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    Some(PendingInteraction {
+        kind: "approval".to_string(),
+        interaction_type: Some("permissions".to_string()),
+        turn_id: incoming_turn_id,
+        item_id,
+        call_id,
+        tool: Some(tool_name.to_string()),
+        summary: Some(summary),
+        detail: Some(detail),
+        justification,
+    })
+}
+
 fn codex_requires_escalation(event: &serde_json::Value) -> bool {
     fn read_bool(v: &serde_json::Value, keys: &[&str]) -> bool {
         keys.iter()
@@ -15788,22 +15878,12 @@ fn codex_requires_escalation(event: &serde_json::Value) -> bool {
         return false;
     }
 
-    // Only trust explicit approval/escalation fields that Codex itself sets
-    // on the event or inside tool_input. Anything beyond that is a guess.
-    //
-    // The previous fallback inspected the bash command string and flagged
-    // anything containing `/Users/`, `$HOME/`, `Desktop/` or a redirect
-    // operator as needing approval. That heuristic was meant to catch
-    // out-of-workspace writes in `default` permission mode, but on macOS
-    // virtually every read command (`sed -n '/Users/...'`, `ls /Users/...`,
-    // `cat /Users/...`) tripped it. Skills like hatch-pet that live under
-    // `~/.codex/skills/` would fire `is_wait_event` on every Bash tool call
-    // and play the waiting sound dozens of times per task.
-    //
-    // Codex already owns the real permission flow: when approval is
-    // actually required it fires a separate `PermissionRequest` hook event,
-    // which `is_wait_event` picks up via its `hook_event == "PermissionRequest"`
-    // branch. We don't need to second-guess based on command shape.
+    // 1. Granular permission request check (Modern Codex Desktop with request_permissions)
+    if parse_codex_permission_request(event).is_some() {
+        return true;
+    }
+
+    // 2. Legacy / fallback escalation markers
     if has_explicit_escalation_markers(event) {
         return true;
     }
@@ -16276,6 +16356,207 @@ mod codex_adapter_tests {
         assert_eq!(session_activity::reconstruct_codex_pending_interaction(&path, None), None);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_codex_granular_permission_payload_parser() {
+        // 1. Network permission
+        let net_perms = serde_json::json!({
+            "network": { "enabled": true }
+        });
+        let (summary, detail, justification) = session_activity::parse_codex_permission_payload(&net_perms, Some("Access curl")).unwrap();
+        assert_eq!(summary, "网络访问");
+        assert!(detail.contains("网络访问"));
+        assert_eq!(justification.as_deref(), Some("Access curl"));
+
+        // 2. File system write
+        let fs_perms = serde_json::json!({
+            "file_system": {
+                "write": ["C:\\Users\\test\\Desktop"]
+            }
+        });
+        let (summary_fs, detail_fs, _) = session_activity::parse_codex_permission_payload(&fs_perms, None).unwrap();
+        assert_eq!(summary_fs, "文件写入 Desktop");
+        assert!(detail_fs.contains("Desktop"));
+
+        // 3. Empty permissions: {} must return None (regression guard against false alarms)
+        let empty_perms = serde_json::json!({});
+        assert_eq!(session_activity::parse_codex_permission_payload(&empty_perms, Some("empty")), None);
+
+        // 4. Null values only must return None
+        let null_perms = serde_json::json!({
+            "network": null,
+            "file_system": null
+        });
+        assert_eq!(session_activity::parse_codex_permission_payload(&null_perms, None), None);
+    }
+
+    #[test]
+    fn test_codex_js_request_permissions_extractor() {
+        // Test B: network access with unquoted keys
+        let js_net = "const r = await tools.request_permissions({\n  permissions: { network: { enabled: true } },\n  reason: \"按你的要求，通过终端执行 curl.exe https://example.com。\"\n});\ntext(r);\n";
+        let (perms_net, reason_net) = session_activity::extract_request_permissions_from_js(js_net).unwrap();
+        assert_eq!(perms_net.get("network").and_then(|n| n.get("enabled")).and_then(|v| v.as_bool()), Some(true));
+        assert!(reason_net.unwrap().contains("curl.exe"));
+
+        // Test A: file write with unquoted keys
+        let js_fs = "const r = await tools.request_permissions({\n  permissions: {\n    file_system: {\n      write: [\"C:\\\\Users\\\\Mei_LuLuXD\\\\Desktop\"]\n    }\n  },\n  reason: \"在桌面创建 occlaw-approval-test.txt。\"\n});\ntext(r);\n";
+        let (perms_fs, reason_fs) = session_activity::extract_request_permissions_from_js(js_fs).unwrap();
+        let writes = perms_fs.get("file_system").and_then(|f| f.get("write")).and_then(|w| w.as_array()).unwrap();
+        assert_eq!(writes.len(), 1);
+        assert!(reason_fs.unwrap().contains("occlaw-approval-test.txt"));
+    }
+
+    #[test]
+    fn test_codex_requires_escalation_granular_and_empty_guard() {
+        // Valid granular permission PreToolUse -> true
+        let event_valid = serde_json::json!({
+            "source": "codex",
+            "tool_name": "request_permissions",
+            "tool_input": {
+                "permissions": { "network": { "enabled": true } },
+                "reason": "Need network access"
+            }
+        });
+        assert!(codex_requires_escalation(&event_valid));
+        let pi = parse_codex_permission_request(&event_valid).unwrap();
+        assert_eq!(pi.kind, "approval");
+        assert_eq!(pi.interaction_type.as_deref(), Some("permissions"));
+        assert_eq!(pi.summary.as_deref(), Some("网络访问"));
+        assert_eq!(pi.justification.as_deref(), Some("Need network access"));
+
+        // Empty permissions {} -> false (no false alarm!)
+        let event_empty = serde_json::json!({
+            "source": "codex",
+            "tool_name": "request_permissions",
+            "tool_input": {
+                "permissions": {}
+            }
+        });
+        assert!(!codex_requires_escalation(&event_empty));
+        assert!(parse_codex_permission_request(&event_empty).is_none());
+    }
+
+    #[test]
+    fn test_codex_cold_start_recovery_async_cell_exec_wait() {
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join("test_codex_cold_start_recovery.jsonl");
+
+        // Step 1: exec tool call (Script running with cell ID 2) followed by in-flight wait call
+        std::fs::write(&path, concat!(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"run curl test\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"id\":\"ctc_1\",\"status\":\"completed\",\"call_id\":\"call_exec_net\",\"name\":\"exec\",\"input\":\"const r = await tools.request_permissions({\\n  permissions: { network: { enabled: true } },\\n  reason: \\\"按你的要求执行 curl\\\"\\n});\\ntext(r);\\n\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\",\"call_id\":\"call_exec_net\",\"output\":\"Script running with cell ID 2\\n\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"name\":\"wait\",\"arguments\":\"{\\\"cell_id\\\":\\\"2\\\",\\\"yield_time_ms\\\":30000}\",\"call_id\":\"call_wait_1\"}}\n"
+        )).unwrap();
+
+        let pi = session_activity::reconstruct_codex_pending_interaction(&path, None).unwrap();
+        assert_eq!(pi.kind, "approval");
+        assert_eq!(pi.interaction_type.as_deref(), Some("permissions"));
+        assert_eq!(pi.summary.as_deref(), Some("网络访问"));
+        assert_eq!(pi.tool.as_deref(), Some("request_permissions"));
+        assert_eq!(pi.justification.as_deref(), Some("按你的要求执行 curl"));
+
+        // Step 2: User responds in Codex Desktop -> function_call_output arrives for wait -> resolved!
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        use std::io::Write;
+        writeln!(f, "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"function_call_output\",\"call_id\":\"call_wait_1\",\"output\":\"Script completed\"}}}}").unwrap();
+        drop(f);
+
+        assert_eq!(session_activity::reconstruct_codex_pending_interaction(&path, None), None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_codex_failed_user_input_followed_by_request_permissions() {
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join("test_codex_failed_ui_then_perm.jsonl");
+
+        // Exact replay of real test trace:
+        // 1. request_user_input fails because it is unavailable in Default mode
+        // 2. Codex then requests permission via exec + wait
+        std::fs::write(&path, concat!(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"create file on desktop\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"id\":\"ctc_ui\",\"name\":\"request_user_input\",\"status\":\"completed\",\"call_id\":\"call_ui_fail\",\"input\":\"{\\\"prompt\\\":\\\"May I access Desktop?\\\"}\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\",\"call_id\":\"call_ui_fail\",\"output\":\"error: Tool request_user_input is not available in mode default\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"id\":\"ctc_fs\",\"status\":\"completed\",\"call_id\":\"call_exec_fs\",\"name\":\"exec\",\"input\":\"const r = await tools.request_permissions({\\n  permissions: {\\n    file_system: {\\n      write: [\\\"C:\\\\\\\\Users\\\\\\\\Mei_LuLuXD\\\\\\\\Desktop\\\"]\\n    }\\n  },\\n  reason: \\\"在桌面创建文件\\\"\\n});\\ntext(r);\\n\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\",\"call_id\":\"call_exec_fs\",\"output\":\"Script running with cell ID 1\\n\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"id\":\"fc_w\",\"name\":\"wait\",\"arguments\":\"{\\\"cell_id\\\":\\\"1\\\",\\\"yield_time_ms\\\":30000}\",\"call_id\":\"call_wait_fs\"}}\n"
+        )).unwrap();
+
+        let pi = session_activity::reconstruct_codex_pending_interaction(&path, None).unwrap();
+        // Crucial: Must be approval/permissions, NOT the failed user_input!
+        assert_eq!(pi.kind, "approval");
+        assert_eq!(pi.interaction_type.as_deref(), Some("permissions"));
+        assert_eq!(pi.summary.as_deref(), Some("文件写入 Desktop"));
+        assert_eq!(pi.justification.as_deref(), Some("在桌面创建文件"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_live_permission_waiting_protection() {
+        let mut session = ClaudeSession {
+            session_id: "test_sid".to_string(),
+            cwd: "C:/test".to_string(),
+            status: "waiting".to_string(),
+            tool: Some("request_permissions".to_string()),
+            tool_input: Some("{\"permissions\":{\"network\":{\"enabled\":true}}}".to_string()),
+            user_prompt: None,
+            custom_title: None,
+            interactive: true,
+            updated_at: 0,
+            is_processing: false,
+            pid: None,
+            pending_agents: 0,
+            permission_suggestions: None,
+            needs_review: Some(true),
+            last_response: None,
+            is_active_tab: false,
+            source: "codex".to_string(),
+            terminal_id: None,
+            host_terminal: None,
+            platform: None,
+            cursor_port: None,
+            cursor_workspace_root: None,
+            cursor_workspace_name: None,
+            cursor_native_handle: None,
+            active_subagents: None,
+            activity: None,
+            activity_origin: None,
+            turn_id: Some("turn_live".to_string()),
+            pending_interaction: Some(PendingInteraction {
+                kind: "approval".to_string(),
+                interaction_type: Some("permissions".to_string()),
+                turn_id: Some("turn_live".to_string()),
+                item_id: None,
+                call_id: None,
+                tool: Some("request_permissions".to_string()),
+                summary: Some("网络访问".to_string()),
+                detail: Some("网络访问".to_string()),
+                justification: Some("curl baidu".to_string()),
+            }),
+        };
+
+        // When transcript reconstruction returns None (e.g. before wait is flushed):
+        let reconstructed_from_transcript = None::<PendingInteraction>;
+
+        let is_live_permission_waiting = session.status == "waiting"
+            && session.pending_interaction.as_ref().map_or(false, |pi| {
+                pi.kind == "approval" && (pi.interaction_type.as_deref() == Some("permissions") || pi.tool.as_deref() == Some("request_permissions"))
+            });
+
+        assert!(is_live_permission_waiting);
+
+        // Under live protection rule, status must NOT be reset to processing:
+        if reconstructed_from_transcript.is_none() && !is_live_permission_waiting {
+            session.status = "processing".to_string();
+            session.pending_interaction = None;
+        }
+
+        assert_eq!(session.status, "waiting");
+        assert!(session.pending_interaction.is_some());
     }
 
     #[test]
@@ -17053,7 +17334,13 @@ fn process_claude_event(
             matches!(cmd, "/clear" | "/compact" | "/help" | "/cost" | "/status" | "/vim" | "/fast" | "/model" | "/login" | "/logout")
         } else { false };
 
-        let pretool_needs_waiting = hook_event == "PreToolUse" && codex_requires_escalation(&event);
+        let parsed_codex_permission = if hook_event == "PreToolUse" {
+            parse_codex_permission_request(&event)
+        } else {
+            None
+        };
+        let pretool_needs_waiting = hook_event == "PreToolUse"
+            && (parsed_codex_permission.is_some() || codex_requires_escalation(&event));
         let mut status = match hook_event.as_str() {
             "UserPromptSubmit" | "GatewayAgentStart" => {
                 if is_local_slash { "stopped".to_string() } else { "processing".to_string() }
@@ -17496,6 +17783,10 @@ fn process_claude_event(
                     session.tool_input = None;
                     session.activity = None;
                     session.activity_origin = None;
+                    if hook_event == "PostToolUse" && (tool_name == "request_permissions" || tool_name == "requestPermissions") {
+                        session.pending_interaction = None;
+                        session.needs_review = None;
+                    }
                 }
 
                 // Store AI's last response for the completion reminder popup.
@@ -17622,6 +17913,9 @@ fn process_claude_event(
                 } else if hook_event == "PreToolUse" && status == "waiting" {
                     let explicit_review = event.get("needs_review").or_else(|| event.get("needsReview")).and_then(|v| v.as_bool());
                     session.needs_review = Some(explicit_review.unwrap_or(pretool_needs_waiting));
+                    if let Some(interaction) = parsed_codex_permission {
+                        session.pending_interaction = Some(interaction);
+                    }
                 } else if status != "waiting" {
                     session.needs_review = None;
                     session.pending_interaction = None;

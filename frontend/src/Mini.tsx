@@ -6106,6 +6106,8 @@ export default function Mini() {
                                                   <span className="text-[12px] font-medium text-slate-200">
                                                     {cs.pendingInteraction.interactionType === 'file_change'
                                                       ? t('mini.waitingFileApproval', '等待确认修改')
+                                                      : cs.pendingInteraction.interactionType === 'permissions'
+                                                      ? t('mini.waitingPermissionApproval', '等待权限批准')
                                                       : t('mini.waitingApproval', '等待命令执行批准')}
                                                   </span>
                                                   {cs.pendingInteraction.tool && (
