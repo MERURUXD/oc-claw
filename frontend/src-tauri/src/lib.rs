@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub mod harness_quota;
 use harness_quota::get_harness_quota;
 pub mod session_activity;
-pub use session_activity::PendingInteraction;
+pub use session_activity::{ApprovalActions, PendingInteraction};
 pub mod hermes;
 
 /// Whether the efficiency-mode notch hover tracking thread should be running.
@@ -7001,9 +7001,98 @@ pub struct ClaudeSession {
 
 type PendingPermissions = Arc<Mutex<HashMap<String, std::sync::mpsc::Sender<String>>>>;
 
+#[derive(Debug)]
+pub struct PendingCodexApproval {
+    pub session_id: String,
+    pub turn_id: String,
+    pub request_id: String,
+    pub permissions: serde_json::Value,
+    pub reason: Option<String>,
+    pub created_at: u64,
+    pub responder: Option<std::sync::mpsc::Sender<String>>,
+}
+
+pub type CodexPendingApprovals = Arc<Mutex<HashMap<String, PendingCodexApproval>>>;
+
+pub trait CodexApprovalTransport: Send + Sync {
+    fn resolve(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        request_id: &str,
+        decision: &str,
+    ) -> Result<(), String>;
+}
+
+pub struct HookApprovalTransport {
+    pub pending_approvals: CodexPendingApprovals,
+}
+
+impl CodexApprovalTransport for HookApprovalTransport {
+    fn resolve(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        request_id: &str,
+        decision: &str,
+    ) -> Result<(), String> {
+        let mut map = self.pending_approvals.lock().map_err(|e| e.to_string())?;
+        let entry = map.get_mut(session_id).ok_or_else(|| {
+            format!("No pending permission request for session {}", session_id)
+        })?;
+
+        if !entry.turn_id.is_empty() && !turn_id.is_empty() && entry.turn_id != turn_id {
+            return Err(format!(
+                "Turn ID mismatch: expected {}, got {}",
+                entry.turn_id, turn_id
+            ));
+        }
+
+        if entry.request_id != request_id {
+            return Err(format!(
+                "Request ID mismatch: expected {}, got {}",
+                entry.request_id, request_id
+            ));
+        }
+
+        let sender = entry.responder.take().ok_or_else(|| {
+            "Permission request has already been resolved".to_string()
+        })?;
+
+        let payload = match decision {
+            "allow" => serde_json::json!({
+                "continue": true,
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": {
+                        "behavior": "allow"
+                    }
+                }
+            })
+            .to_string(),
+            "deny" => serde_json::json!({
+                "continue": true,
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": {
+                        "behavior": "deny"
+                    }
+                }
+            })
+            .to_string(),
+            "fallback" | "view_in_codex" => serde_json::json!({}).to_string(),
+            _ => return Err(format!("Invalid decision '{}': must be 'allow', 'deny', or 'fallback'", decision)),
+        };
+
+        sender.send(payload).map_err(|e| format!("Failed to send approval response: {}", e))?;
+        Ok(())
+    }
+}
+
 struct ClaudeState {
     sessions: Arc<Mutex<HashMap<String, ClaudeSession>>>,
     pending_permissions: PendingPermissions,
+    pub codex_pending_approvals: CodexPendingApprovals,
     /// Session IDs dismissed by the user (trash icon). Prevents DB-loaded
     /// Hermes sessions from reappearing after removal.
     dismissed: Arc<Mutex<std::collections::HashSet<String>>>,
@@ -10648,6 +10737,41 @@ async fn resolve_claude_permission(
         log::warn!("[resolve_permission] no pending permission for session={}", &session_id[..session_id.len().min(8)]);
     }
 
+    Ok(())
+}
+
+/// Resolve a pending PermissionRequest for a Codex session.
+/// `decision` is one of: "allow", "deny", "fallback"
+/// The response JSON is sent back to the blocking hook script via the channel.
+#[tauri::command]
+async fn resolve_codex_permission(
+    session_id: String,
+    turn_id: String,
+    request_id: String,
+    decision: String,
+    state: tauri::State<'_, ClaudeState>,
+) -> Result<(), String> {
+    {
+        let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+        let s = sessions.get(&session_id).ok_or_else(|| format!("Session not found: {}", session_id))?;
+        if s.source != "codex" {
+            return Err(format!("Cannot use resolve_codex_permission for session source '{}'", s.source));
+        }
+    }
+
+    let transport = HookApprovalTransport {
+        pending_approvals: Arc::clone(&state.codex_pending_approvals),
+    };
+
+    transport.resolve(&session_id, &turn_id, &request_id, &decision)?;
+
+    log::info!(
+        "[resolve_codex_permission] resolved session={} turn={} request={} decision={}",
+        &session_id[..session_id.len().min(8)],
+        turn_id,
+        request_id,
+        decision
+    );
     Ok(())
 }
 
@@ -15689,18 +15813,20 @@ except:
     #[cfg(windows)]
     let make_hook_def = |event_name: &str| {
         let hook_command = format!("{} {}", hook_command_windows_base, event_name);
+        let timeout = if event_name == "PermissionRequest" { 600 } else { 5 };
         serde_json::json!({
             "type": "command",
             "command": hook_command.clone(),
-            "timeout": 5,
+            "timeout": timeout,
         })
     };
     #[cfg(not(windows))]
-    let make_hook_def = |_event_name: &str| {
+    let make_hook_def = |event_name: &str| {
+        let timeout = if event_name == "PermissionRequest" { 600 } else { 5 };
         serde_json::json!({
             "type": "command",
             "command": hook_command_base.clone(),
-            "timeout": 5,
+            "timeout": timeout,
         })
     };
 
@@ -15750,7 +15876,20 @@ pub fn parse_codex_permission_request(event: &serde_json::Value) -> Option<Pendi
         .or_else(|| event.get("tool_call").and_then(|tc| tc.get("name")))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if tool_name != "request_permissions" && tool_name != "requestPermissions" {
+    let hook_event_name = event.get("hook_event_name")
+        .or_else(|| event.get("hook_event"))
+        .or_else(|| event.get("event"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let is_perm_hook = hook_event_name == "PermissionRequest";
+
+    let is_req_perm = tool_name == "request_permissions"
+        || tool_name == "requestPermissions"
+        || tool_name.ends_with("request_permissions")
+        || tool_name.ends_with("requestPermissions")
+        || (is_perm_hook && !tool_name.is_empty());
+
+    if !is_req_perm {
         return None;
     }
 
@@ -15805,10 +15944,16 @@ pub fn parse_codex_permission_request(event: &serde_json::Value) -> Option<Pendi
         turn_id: incoming_turn_id,
         item_id,
         call_id,
-        tool: Some(tool_name.to_string()),
+        tool: Some(if tool_name.is_empty() { "request_permissions".to_string() } else { tool_name.to_string() }),
         summary: Some(summary),
         detail: Some(detail),
         justification,
+        request_id: None,
+        approval_actions: Some(ApprovalActions {
+            can_deny: true,
+            can_allow_turn: true,
+            can_allow_session: false,
+        }),
     })
 }
 
@@ -16536,6 +16681,8 @@ mod codex_adapter_tests {
                 summary: Some("网络访问".to_string()),
                 detail: Some("网络访问".to_string()),
                 justification: Some("curl baidu".to_string()),
+                request_id: None,
+                approval_actions: None,
             }),
         };
 
@@ -16570,6 +16717,178 @@ mod codex_adapter_tests {
         assert!(check_interrupted(&path));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_codex_permission_relay_allow_turn() {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let approvals: CodexPendingApprovals = Arc::new(Mutex::new(HashMap::new()));
+        approvals.lock().unwrap().insert("sess_1".to_string(), PendingCodexApproval {
+            session_id: "sess_1".to_string(),
+            turn_id: "turn_1".to_string(),
+            request_id: "req_1".to_string(),
+            permissions: serde_json::json!({ "network": { "enabled": true } }),
+            reason: Some("curl test".to_string()),
+            created_at: 1000,
+            responder: Some(tx),
+        });
+
+        let transport = HookApprovalTransport {
+            pending_approvals: Arc::clone(&approvals),
+        };
+
+        let res = transport.resolve("sess_1", "turn_1", "req_1", "allow");
+        assert!(res.is_ok());
+
+        let payload_str = rx.recv().unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&payload_str).unwrap();
+        assert_eq!(payload.get("continue").and_then(|v| v.as_bool()), Some(true));
+        let specific = payload.get("hookSpecificOutput").unwrap();
+        assert_eq!(specific.get("hookEventName").and_then(|v| v.as_str()), Some("PermissionRequest"));
+        let decision = specific.get("decision").unwrap();
+        assert_eq!(decision.get("behavior").and_then(|v| v.as_str()), Some("allow"));
+        // Confirm no invalid fields:
+        assert!(specific.get("updatedPermissions").is_none());
+        assert!(specific.get("updatedInput").is_none());
+    }
+
+    #[test]
+    fn test_codex_permission_relay_deny() {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let approvals: CodexPendingApprovals = Arc::new(Mutex::new(HashMap::new()));
+        approvals.lock().unwrap().insert("sess_1".to_string(), PendingCodexApproval {
+            session_id: "sess_1".to_string(),
+            turn_id: "turn_1".to_string(),
+            request_id: "req_1".to_string(),
+            permissions: serde_json::json!({ "file_system": { "write": ["C:/test"] } }),
+            reason: Some("write file".to_string()),
+            created_at: 1000,
+            responder: Some(tx),
+        });
+
+        let transport = HookApprovalTransport {
+            pending_approvals: Arc::clone(&approvals),
+        };
+
+        let res = transport.resolve("sess_1", "turn_1", "req_1", "deny");
+        assert!(res.is_ok());
+
+        let payload_str = rx.recv().unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&payload_str).unwrap();
+        assert_eq!(payload.get("continue").and_then(|v| v.as_bool()), Some(true));
+        let specific = payload.get("hookSpecificOutput").unwrap();
+        assert_eq!(specific.get("hookEventName").and_then(|v| v.as_str()), Some("PermissionRequest"));
+        let decision = specific.get("decision").unwrap();
+        assert_eq!(decision.get("behavior").and_then(|v| v.as_str()), Some("deny"));
+    }
+
+    #[test]
+    fn test_codex_permission_relay_fallback() {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let approvals: CodexPendingApprovals = Arc::new(Mutex::new(HashMap::new()));
+        approvals.lock().unwrap().insert("sess_1".to_string(), PendingCodexApproval {
+            session_id: "sess_1".to_string(),
+            turn_id: "turn_1".to_string(),
+            request_id: "req_1".to_string(),
+            permissions: serde_json::json!({ "network": { "enabled": true } }),
+            reason: None,
+            created_at: 1000,
+            responder: Some(tx),
+        });
+
+        let transport = HookApprovalTransport {
+            pending_approvals: Arc::clone(&approvals),
+        };
+
+        let res = transport.resolve("sess_1", "turn_1", "req_1", "fallback");
+        assert!(res.is_ok());
+
+        let payload_str = rx.recv().unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&payload_str).unwrap();
+        assert_eq!(payload, serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_codex_permission_relay_double_click_rejected() {
+        let (tx, _rx) = std::sync::mpsc::channel::<String>();
+        let approvals: CodexPendingApprovals = Arc::new(Mutex::new(HashMap::new()));
+        approvals.lock().unwrap().insert("sess_1".to_string(), PendingCodexApproval {
+            session_id: "sess_1".to_string(),
+            turn_id: "turn_1".to_string(),
+            request_id: "req_1".to_string(),
+            permissions: serde_json::json!({}),
+            reason: None,
+            created_at: 1000,
+            responder: Some(tx),
+        });
+
+        let transport = HookApprovalTransport {
+            pending_approvals: Arc::clone(&approvals),
+        };
+
+        let first = transport.resolve("sess_1", "turn_1", "req_1", "allow");
+        assert!(first.is_ok());
+
+        let second = transport.resolve("sess_1", "turn_1", "req_1", "allow");
+        assert!(second.is_err());
+        assert!(second.unwrap_err().contains("already been resolved"));
+    }
+
+    #[test]
+    fn test_codex_permission_relay_stale_turn_rejected() {
+        let (tx, _rx) = std::sync::mpsc::channel::<String>();
+        let approvals: CodexPendingApprovals = Arc::new(Mutex::new(HashMap::new()));
+        approvals.lock().unwrap().insert("sess_1".to_string(), PendingCodexApproval {
+            session_id: "sess_1".to_string(),
+            turn_id: "turn_2".to_string(),
+            request_id: "req_2".to_string(),
+            permissions: serde_json::json!({}),
+            reason: None,
+            created_at: 1000,
+            responder: Some(tx),
+        });
+
+        let transport = HookApprovalTransport {
+            pending_approvals: Arc::clone(&approvals),
+        };
+
+        let res = transport.resolve("sess_1", "turn_1", "req_2", "allow");
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("Turn ID mismatch"));
+    }
+
+    #[test]
+    fn test_codex_permission_relay_session_isolation() {
+        let (tx, _rx) = std::sync::mpsc::channel::<String>();
+        let approvals: CodexPendingApprovals = Arc::new(Mutex::new(HashMap::new()));
+        approvals.lock().unwrap().insert("sess_A".to_string(), PendingCodexApproval {
+            session_id: "sess_A".to_string(),
+            turn_id: "turn_1".to_string(),
+            request_id: "req_A".to_string(),
+            permissions: serde_json::json!({}),
+            reason: None,
+            created_at: 1000,
+            responder: Some(tx),
+        });
+
+        let transport = HookApprovalTransport {
+            pending_approvals: Arc::clone(&approvals),
+        };
+
+        let res = transport.resolve("sess_B", "turn_1", "req_A", "allow");
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("No pending permission request"));
+    }
+
+    #[test]
+    fn test_claude_permission_isolation() {
+        let approvals: CodexPendingApprovals = Arc::new(Mutex::new(HashMap::new()));
+        let transport = HookApprovalTransport {
+            pending_approvals: Arc::clone(&approvals),
+        };
+        let res = transport.resolve("cc_session_1", "turn_1", "req_1", "allow");
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("No pending permission request for session cc_session_1"));
     }
 
     #[test]
@@ -17334,12 +17653,12 @@ fn process_claude_event(
             matches!(cmd, "/clear" | "/compact" | "/help" | "/cost" | "/status" | "/vim" | "/fast" | "/model" | "/login" | "/logout")
         } else { false };
 
-        let parsed_codex_permission = if hook_event == "PreToolUse" {
+        let parsed_codex_permission = if hook_event == "PreToolUse" || hook_event == "PermissionRequest" {
             parse_codex_permission_request(&event)
         } else {
             None
         };
-        let pretool_needs_waiting = hook_event == "PreToolUse"
+        let pretool_needs_waiting = (hook_event == "PreToolUse" || hook_event == "PermissionRequest")
             && (parsed_codex_permission.is_some() || codex_requires_escalation(&event));
         let mut status = match hook_event.as_str() {
             "UserPromptSubmit" | "GatewayAgentStart" => {
@@ -17910,6 +18229,9 @@ fn process_claude_event(
                         .cloned();
                     let explicit_review = event.get("needs_review").or_else(|| event.get("needsReview")).and_then(|v| v.as_bool());
                     session.needs_review = Some(explicit_review.unwrap_or(true));
+                    if let Some(interaction) = parsed_codex_permission {
+                        session.pending_interaction = Some(interaction);
+                    }
                 } else if hook_event == "PreToolUse" && status == "waiting" {
                     let explicit_review = event.get("needs_review").or_else(|| event.get("needsReview")).and_then(|v| v.as_bool());
                     session.needs_review = Some(explicit_review.unwrap_or(pretool_needs_waiting));
@@ -20618,15 +20940,126 @@ fn start_antigravity_socket_server(
 /// Start the Claude IPC server.
 /// On macOS/Linux: Unix domain socket at /tmp/ooclaw-claude.sock
 /// On Windows: TCP server on localhost:19283
+fn handle_codex_permission_relay<W: std::io::Write>(
+    session_id: &str,
+    raw_text: &str,
+    state: &Arc<Mutex<HashMap<String, ClaudeSession>>>,
+    codex_approvals: &CodexPendingApprovals,
+    app: &tauri::AppHandle,
+    stream: &mut W,
+) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let parsed_event: serde_json::Value = serde_json::from_str(raw_text).unwrap_or(serde_json::json!({}));
+    let turn_id = parsed_event.get("turn_id")
+        .or_else(|| parsed_event.get("turnId"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let request_id = format!("req_{}_{}", if turn_id.is_empty() { "default" } else { &turn_id }, now_ms);
+
+    let tool_input_val = parsed_event.get("tool_input")
+        .or_else(|| parsed_event.get("toolInput"))
+        .or_else(|| parsed_event.get("arguments"))
+        .or_else(|| parsed_event.get("parameters"));
+    let tool_input_obj = match tool_input_val {
+        Some(val) if val.is_object() => val.clone(),
+        Some(val) if val.is_string() => {
+            serde_json::from_str::<serde_json::Value>(val.as_str().unwrap()).unwrap_or(serde_json::json!({}))
+        }
+        _ => serde_json::json!({}),
+    };
+    let perms_val = tool_input_obj.get("permissions").or_else(|| parsed_event.get("permissions")).cloned().unwrap_or(serde_json::json!({}));
+    let reason_str = tool_input_obj.get("reason").or_else(|| parsed_event.get("reason")).and_then(|v| v.as_str()).map(|s| s.to_string());
+
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    {
+        let mut sessions = state.lock().unwrap();
+        if let Some(session) = sessions.get_mut(session_id) {
+            if let Some(ref mut pi) = session.pending_interaction {
+                pi.request_id = Some(request_id.clone());
+                pi.approval_actions = Some(ApprovalActions {
+                    can_deny: true,
+                    can_allow_turn: true,
+                    can_allow_session: false,
+                });
+                if pi.turn_id.is_none() && !turn_id.is_empty() {
+                    pi.turn_id = Some(turn_id.clone());
+                }
+            }
+        }
+    }
+    {
+        let mut approvals = codex_approvals.lock().unwrap();
+        approvals.insert(session_id.to_string(), PendingCodexApproval {
+            session_id: session_id.to_string(),
+            turn_id: turn_id.clone(),
+            request_id: request_id.clone(),
+            permissions: perms_val,
+            reason: reason_str,
+            created_at: now_ms,
+            responder: Some(tx),
+        });
+    }
+
+    let _ = app.emit("claude-session-update", session_id);
+
+    log::info!(
+        "[codex_relay] blocking for PermissionRequest session={} turn={} request={}",
+        &session_id[..session_id.len().min(8)],
+        turn_id,
+        request_id
+    );
+
+    match rx.recv_timeout(std::time::Duration::from_secs(300)) {
+        Ok(response_json) => {
+            log::info!(
+                "[codex_relay] sending permission response for session={}: {}",
+                &session_id[..session_id.len().min(8)],
+                response_json
+            );
+            let _ = stream.write_all(response_json.as_bytes());
+            let _ = stream.flush();
+        }
+        Err(_) => {
+            log::warn!(
+                "[codex_relay] permission timeout for session={}, fallback to native UI",
+                &session_id[..session_id.len().min(8)]
+            );
+            let _ = stream.write_all(b"{}");
+            let _ = stream.flush();
+        }
+    }
+
+    let mut approvals = codex_approvals.lock().unwrap();
+    approvals.remove(session_id);
+}
+
+fn cleanup_codex_approval(session_id: &str, codex_approvals: &CodexPendingApprovals) {
+    let mut approvals = codex_approvals.lock().unwrap();
+    if let Some(mut approval) = approvals.remove(session_id) {
+        if let Some(tx) = approval.responder.take() {
+            let _ = tx.send("{}".to_string());
+        }
+    }
+}
+
+/// Start the Claude IPC server.
+/// On macOS/Linux: Unix domain socket at /tmp/ooclaw-claude.sock
+/// On Windows: TCP server on localhost:19283
 fn start_claude_socket_server(
     claude_state: Arc<Mutex<HashMap<String, ClaudeSession>>>,
     pending_permissions: PendingPermissions,
+    codex_pending_approvals: CodexPendingApprovals,
     app_handle: tauri::AppHandle,
 ) {
     #[cfg(unix)]
     {
         let state = claude_state;
         let pending = pending_permissions;
+        let codex_approvals = codex_pending_approvals;
         let app = app_handle;
         std::thread::spawn(move || {
             let sock_path = "/tmp/ooclaw-claude.sock";
@@ -20644,12 +21077,16 @@ fn start_claude_socket_server(
                         let state = state.clone();
                         let app = app.clone();
                         let pending = pending.clone();
+                        let codex_approvals = codex_approvals.clone();
                         std::thread::spawn(move || {
                             use std::io::{Read, Write};
                             let mut s = s;
                             let mut buf = String::new();
                             let _ = s.read_to_string(&mut buf);
                             if let Some((session_id, hook_event)) = process_claude_event(&buf, &state, &app, None) {
+                                if hook_event == "PostToolUse" || hook_event == "Stop" || hook_event == "UserPromptSubmit" {
+                                    cleanup_codex_approval(&session_id, &codex_approvals);
+                                }
                                 if hook_event == "PermissionRequest" {
                                     let source = {
                                         let sessions = state.lock().unwrap();
@@ -20659,11 +21096,7 @@ fn start_claude_socket_server(
                                             .unwrap_or_else(|| "cc".to_string())
                                     };
                                     if source == "codex" {
-                                        // Codex decisions are made in Codex native UI.
-                                        // Return an empty hook payload immediately so
-                                        // Codex can continue with its own approval flow.
-                                        let _ = s.write_all(b"{}");
-                                        let _ = s.flush();
+                                        handle_codex_permission_relay(&session_id, &buf, &state, &codex_approvals, &app, &mut s);
                                         return;
                                     }
                                     let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -20698,6 +21131,7 @@ fn start_claude_socket_server(
     {
         let state = claude_state;
         let pending = pending_permissions;
+        let codex_approvals = codex_pending_approvals;
         let app = app_handle;
         std::thread::spawn(move || {
             use std::net::TcpListener;
@@ -20713,6 +21147,7 @@ fn start_claude_socket_server(
                         let state = state.clone();
                         let app = app.clone();
                         let pending = pending.clone();
+                        let codex_approvals = codex_approvals.clone();
                         std::thread::spawn(move || {
                             use std::io::{Read, Write};
                             s.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
@@ -20747,6 +21182,9 @@ fn start_claude_socket_server(
                                 return;
                             }
                             if let Some((session_id, hook_event)) = process_claude_event(&text, &state, &app, None) {
+                                if hook_event == "PostToolUse" || hook_event == "Stop" || hook_event == "UserPromptSubmit" {
+                                    cleanup_codex_approval(&session_id, &codex_approvals);
+                                }
                                 if hook_event == "PermissionRequest" {
                                     let source = {
                                         let sessions = state.lock().unwrap();
@@ -20756,10 +21194,8 @@ fn start_claude_socket_server(
                                             .unwrap_or_else(|| "cc".to_string())
                                     };
                                     if source == "codex" {
-                                        // Keep behavior aligned with Unix implementation:
-                                        // Codex approvals should remain in Codex UI.
-                                        let _ = s.write_all(b"{}");
-                                        let _ = s.flush();
+                                        s.set_read_timeout(None).ok();
+                                        handle_codex_permission_relay(&session_id, &text, &state, &codex_approvals, &app, &mut s);
                                         return;
                                     }
                                     let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -21302,7 +21738,8 @@ pub fn run() {
                 let claude_state = app.state::<ClaudeState>();
                 let sessions_arc = Arc::clone(&claude_state.sessions);
                 let pending_arc = Arc::clone(&claude_state.pending_permissions);
-                start_claude_socket_server(sessions_arc, pending_arc, app.handle().clone());
+                let codex_pending_arc = Arc::clone(&claude_state.codex_pending_approvals);
+                start_claude_socket_server(sessions_arc, pending_arc, codex_pending_arc, app.handle().clone());
             }
 
             // Start Cursor socket server (shares ClaudeState for unified session tracking).
@@ -21418,9 +21855,14 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_antigravity_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, sync_mascot_bubble, ensure_mascot_bubble, set_mascot_bubble_visible, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs, fetch_petdex_manifest, download_codex_pet, delete_custom_codex_pet, get_hermes_remote_conversation, get_harness_quota])
+        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_antigravity_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, resolve_codex_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, sync_mascot_bubble, ensure_mascot_bubble, set_mascot_bubble_visible, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs, fetch_petdex_manifest, download_codex_pet, delete_custom_codex_pet, get_hermes_remote_conversation, get_harness_quota])
         .manage(ActiveAgentPid { pid: Mutex::new(None) })
-        .manage(ClaudeState { sessions: Arc::new(Mutex::new(HashMap::new())), pending_permissions: Arc::new(Mutex::new(HashMap::new())), dismissed: Arc::new(Mutex::new(std::collections::HashSet::new())) })
+        .manage(ClaudeState {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            pending_permissions: Arc::new(Mutex::new(HashMap::new())),
+            codex_pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+            dismissed: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

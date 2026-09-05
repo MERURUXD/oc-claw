@@ -401,6 +401,14 @@ test('isSamePendingInteraction verifies structural equality and detects mutation
   assert.ok(!isSamePendingInteraction(baseApproval, { ...baseApproval, itemId: 'item-2' }))
   // CallId mismatch
   assert.ok(!isSamePendingInteraction(baseApproval, { ...baseApproval, callId: 'call-2' }))
+  // RequestId mismatch
+  assert.ok(!isSamePendingInteraction(baseApproval, { ...baseApproval, requestId: 'req-1' }))
+  // ApprovalActions mismatch
+  assert.ok(!isSamePendingInteraction(baseApproval, { ...baseApproval, approvalActions: { canDeny: true, canAllowTurn: true, canAllowSession: false } }))
+  assert.ok(isSamePendingInteraction(
+    { ...baseApproval, requestId: 'req-1', approvalActions: { canDeny: true, canAllowTurn: true, canAllowSession: false } },
+    { ...baseApproval, requestId: 'req-1', approvalActions: { canDeny: true, canAllowTurn: true, canAllowSession: false } }
+  ))
 })
 
 test('isSameSessionDetail and isSameBubblePayload detect pendingInteraction updates', () => {

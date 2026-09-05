@@ -2993,6 +2993,9 @@ export default function Mini() {
   // The session itself stays in the waiting state, but we hide the action
   // buttons until it leaves waiting and re-enters (next request).
   const [dismissedWaitingIds, setDismissedWaitingIds] = useState<Set<string>>(new Set())
+  // In-flight Codex permission resolution states: { [sessionId]: 'allow' | 'deny' | 'fallback' }
+  const [resolvingCodex, setResolvingCodex] = useState<Record<string, 'allow' | 'deny' | 'fallback'>>({})
+  const [codexError, setCodexError] = useState<Record<string, string>>({})
   // Clear dismissals once the session is no longer waiting, so the next
   // permission/clarify cycle re-shows the buttons.
   useEffect(() => {
@@ -3010,6 +3013,35 @@ export default function Mini() {
     }
     if (changed) setDismissedWaitingIds(next)
   }, [claudeSessions, dismissedWaitingIds])
+
+  // Clear in-flight resolving states when session leaves waiting or closes
+  useEffect(() => {
+    const waitingIds = new Set(
+      claudeSessions.filter((s: any) => s.status === 'waiting').map((s: any) => s.sessionId)
+    )
+    setResolvingCodex((prev) => {
+      let changed = false
+      const next = { ...prev }
+      for (const id of Object.keys(next)) {
+        if (!waitingIds.has(id)) {
+          delete next[id]
+          changed = true
+        }
+      }
+      return changed ? next : prev
+    })
+    setCodexError((prev) => {
+      let changed = false
+      const next = { ...prev }
+      for (const id of Object.keys(next)) {
+        if (!waitingIds.has(id)) {
+          delete next[id]
+          changed = true
+        }
+      }
+      return changed ? next : prev
+    })
+  }, [claudeSessions])
   const setCompletionSessionId = useCallback((id: string | null) => {
     completionSessionIdRef.current = id
     _setCompletionSessionId(id)
@@ -6251,10 +6283,155 @@ export default function Mini() {
                                               hoverExpandedRef.current = false
                                               collapse()
                                             }
-                                            // Codex / Gemini / OpenCode / Hermes, and Antigravity interactive questions,
-                                            // require approval / input in their own UI.
-                                            // Regular Antigravity tool approvals can be directly approved/denied via oc-claw.
-                                            if (cs.source === 'codex' || cs.source === 'gemini' || cs.source === 'opencode' || cs.source === 'hermes' || cs.source === 'antigravity') {
+                                             // Codex granular permission approval relay: allow/deny directly in panel
+                                             if (cs.source === 'codex' && cs.pendingInteraction?.kind === 'approval') {
+                                               const currentResolving = resolvingCodex[cs.sessionId]
+                                               const isBusy = !!currentResolving
+                                               const err = codexError[cs.sessionId]
+                                               const canDeny = cs.pendingInteraction.approvalActions?.canDeny ?? true
+                                               const canAllowTurn = cs.pendingInteraction.approvalActions?.canAllowTurn ?? true
+                                               const canAllowSession = cs.pendingInteraction.approvalActions?.canAllowSession ?? false
+                                               const hasRelayRequest = !!(cs.pendingInteraction.requestId && cs.pendingInteraction.turnId)
+
+                                               const handleResolveCodex = async (decision: 'allow' | 'deny' | 'fallback') => {
+                                                 if (!cs.pendingInteraction?.requestId || !cs.pendingInteraction?.turnId) {
+                                                   invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
+                                                   hoverExpandedRef.current = false
+                                                   collapse()
+                                                   return
+                                                 }
+                                                 setResolvingCodex((prev) => ({ ...prev, [cs.sessionId]: decision }))
+                                                 setCodexError((prev) => {
+                                                   const next = { ...prev }
+                                                   delete next[cs.sessionId]
+                                                   return next
+                                                 })
+                                                 try {
+                                                   await invoke('resolve_codex_permission', {
+                                                     sessionId: cs.sessionId,
+                                                     turnId: cs.pendingInteraction.turnId,
+                                                     requestId: cs.pendingInteraction.requestId,
+                                                     decision,
+                                                   })
+                                                   if (decision === 'fallback') {
+                                                     invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
+                                                   }
+                                                   hoverExpandedRef.current = false
+                                                   collapse()
+                                                 } catch (err: any) {
+                                                   console.error('Failed to resolve Codex permission:', err)
+                                                   setCodexError((prev) => ({ ...prev, [cs.sessionId]: String(err) }))
+                                                 } finally {
+                                                   setResolvingCodex((prev) => {
+                                                     const next = { ...prev }
+                                                     delete next[cs.sessionId]
+                                                     return next
+                                                   })
+                                                 }
+                                               }
+
+                                               return (
+                                                 <div className="flex flex-col gap-1.5 w-full">
+                                                   {err && (
+                                                     <div className="text-[11px] text-rose-400 bg-rose-950/40 border border-rose-800/40 rounded px-2 py-1 mb-1">
+                                                       {err}
+                                                     </div>
+                                                   )}
+                                                   <div className="flex gap-2 w-full">
+                                                     {canDeny && (
+                                                       <button
+                                                         data-no-drag
+                                                         disabled={isBusy}
+                                                         onClick={(e) => {
+                                                           e.stopPropagation()
+                                                           handleResolveCodex('deny')
+                                                         }}
+                                                         className={`flex-1 py-1.5 rounded-md text-[12px] font-normal transition-colors ${
+                                                           isBusy && currentResolving === 'deny'
+                                                             ? 'bg-rose-900/40 text-rose-300 animate-pulse'
+                                                             : isBusy
+                                                             ? 'bg-[#27272a]/50 text-slate-500 cursor-not-allowed'
+                                                             : 'bg-rose-900/30 text-rose-300 hover:bg-rose-800/40 border border-rose-700/30'
+                                                         }`}
+                                                       >
+                                                         {isBusy && currentResolving === 'deny' ? t('mini.denying', '正在拒绝...') : t('mini.deny', '拒绝')}
+                                                       </button>
+                                                     )}
+                                                     {canAllowTurn && (
+                                                       <button
+                                                         data-no-drag
+                                                         disabled={isBusy}
+                                                         onClick={(e) => {
+                                                           e.stopPropagation()
+                                                           handleResolveCodex('allow')
+                                                         }}
+                                                         className={`flex-1 py-1.5 rounded-md text-[12px] font-medium transition-colors ${
+                                                           isBusy && currentResolving === 'allow'
+                                                             ? 'bg-emerald-900/60 text-emerald-300 animate-pulse'
+                                                             : isBusy
+                                                             ? 'bg-emerald-900/20 text-emerald-600 cursor-not-allowed'
+                                                             : 'bg-emerald-800/60 text-emerald-200 hover:bg-emerald-700/70 border border-emerald-600/40 shadow-sm'
+                                                         }`}
+                                                       >
+                                                         {isBusy && currentResolving === 'allow' ? t('mini.allowing', '正在提交...') : t('mini.allowTurn', '允许本次')}
+                                                       </button>
+                                                     )}
+                                                     {canAllowSession && (
+                                                       <button
+                                                         data-no-drag
+                                                         disabled={isBusy}
+                                                         onClick={(e) => {
+                                                           e.stopPropagation()
+                                                           handleResolveCodex('allow')
+                                                         }}
+                                                         className="flex-1 py-1.5 rounded-md text-[12px] font-normal bg-purple-900/40 text-purple-300 hover:bg-purple-800/50 transition-colors border border-purple-700/40"
+                                                       >
+                                                         {t('mini.allowSession', '本会话允许')}
+                                                       </button>
+                                                     )}
+                                                     <button
+                                                       data-no-drag
+                                                       disabled={isBusy}
+                                                       onClick={(e) => {
+                                                         e.stopPropagation()
+                                                         if (hasRelayRequest) {
+                                                           handleResolveCodex('fallback')
+                                                         } else {
+                                                           invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
+                                                           hoverExpandedRef.current = false
+                                                           collapse()
+                                                         }
+                                                       }}
+                                                       className="px-2.5 py-1.5 rounded-md text-[11px] font-normal bg-[#27272a] text-slate-400 hover:text-slate-200 hover:bg-[#303033] transition-colors"
+                                                       title={t('mini.viewInCodexTooltip', '在 Codex Desktop 原生界面中处理')}
+                                                     >
+                                                       {t('mini.viewInCodex', '前往 Codex')}
+                                                     </button>
+                                                     <button
+                                                       data-no-drag
+                                                       disabled={isBusy}
+                                                       onClick={(e) => {
+                                                         e.stopPropagation()
+                                                         setDismissedWaitingIds((prev) => {
+                                                           const next = new Set(prev)
+                                                           next.add(cs.sessionId)
+                                                           return next
+                                                         })
+                                                         hoverExpandedRef.current = false
+                                                         collapse()
+                                                       }}
+                                                       className="px-2 py-1.5 rounded-md text-[11px] font-normal bg-[#202023] text-slate-400 hover:bg-[#27272a] hover:text-slate-300 transition-colors"
+                                                     >
+                                                       {t('mini.later', '稍后处理')}
+                                                     </button>
+                                                   </div>
+                                                 </div>
+                                               )
+                                             }
+                                             // Codex / Gemini / OpenCode / Hermes, and Antigravity interactive questions,
+                                             // require approval / input in their own UI.
+                                             // Regular Antigravity tool approvals can be directly approved/denied via oc-claw.
+                                             if (cs.source === 'codex' || cs.source === 'gemini' || cs.source === 'opencode' || cs.source === 'hermes' || cs.source === 'antigravity') {
                                               const hermesPlatLabel = (() => {
                                                 if (cs.source !== 'hermes' || !cs.platform) return ''
                                                 const p = (cs.platform || '').toLowerCase()
