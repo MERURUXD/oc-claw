@@ -795,6 +795,333 @@ pub fn parse_codex_activity_from_transcript(path: &Path) -> Option<SessionActivi
     latest_uncompleted_tool.or(latest_reasoning)
 }
 
+/// Parses a Codex permission payload (e.g. from PreToolUse or JS tools.request_permissions)
+/// and extracts summary, detail, and justification.
+/// Returns None if permissions is empty or lacks actionable permissions (preventing false alarms).
+pub fn parse_codex_permission_payload(
+    permissions_val: &serde_json::Value,
+    reason_val: Option<&str>,
+) -> Option<(String, String, Option<String>)> {
+    let permissions_obj = if permissions_val.is_object() {
+        permissions_val
+    } else if let Some(raw) = permissions_val.as_str() {
+        return serde_json::from_str::<serde_json::Value>(raw)
+            .ok()
+            .and_then(|p| parse_codex_permission_payload(&p, reason_val));
+    } else {
+        return None;
+    };
+
+    let mut has_permission = false;
+    let mut summary_parts = Vec::new();
+    let mut detail_parts = Vec::new();
+
+    if let Some(net) = permissions_obj.get("network") {
+        let enabled = net.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+        if enabled {
+            has_permission = true;
+            summary_parts.push("网络访问".to_string());
+            detail_parts.push("网络访问 (Network access)".to_string());
+        }
+    }
+
+    if let Some(fs) = permissions_obj.get("file_system").or_else(|| permissions_obj.get("fileSystem")) {
+        if let Some(writes) = fs.get("write").and_then(|v| v.as_array()) {
+            let write_targets: Vec<String> = writes.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect();
+            if !write_targets.is_empty() {
+                has_permission = true;
+                let basenames: Vec<String> = write_targets.iter().map(|p| extract_basename(p)).collect();
+                let summary_str = if basenames.len() == 1 {
+                    format!("文件写入 {}", basenames[0])
+                } else {
+                    format!("文件写入 ({} 处)", basenames.len())
+                };
+                summary_parts.push(summary_str);
+                detail_parts.push(format!("文件写入: {}", write_targets.join(", ")));
+            }
+        }
+        if let Some(reads) = fs.get("read").and_then(|v| v.as_array()) {
+            let read_targets: Vec<String> = reads.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect();
+            if !read_targets.is_empty() {
+                has_permission = true;
+                let basenames: Vec<String> = read_targets.iter().map(|p| extract_basename(p)).collect();
+                let summary_str = if basenames.len() == 1 {
+                    format!("文件读取 {}", basenames[0])
+                } else {
+                    format!("文件读取 ({} 处)", basenames.len())
+                };
+                summary_parts.push(summary_str);
+                detail_parts.push(format!("文件读取: {}", read_targets.join(", ")));
+            }
+        }
+    }
+
+    // Generic fallback if permissions object has keys with non-null values
+    if !has_permission {
+        if let Some(obj) = permissions_obj.as_object() {
+            let non_null_keys: Vec<&String> = obj.iter().filter(|(_, v)| !v.is_null()).map(|(k, _)| k).collect();
+            if !non_null_keys.is_empty() {
+                has_permission = true;
+                summary_parts.push(format!("权限申请 ({})", non_null_keys.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", ")));
+                detail_parts.push(format!("权限申请: {:?}", non_null_keys));
+            }
+        }
+    }
+
+    if !has_permission {
+        return None;
+    }
+
+    let reason = reason_val.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let summary = if !summary_parts.is_empty() {
+        summary_parts.join(" · ")
+    } else if let Some(ref r) = reason {
+        r.clone()
+    } else {
+        "权限申请".to_string()
+    };
+
+    let detail = if !detail_parts.is_empty() {
+        detail_parts.join(" \n ")
+    } else if let Some(ref r) = reason {
+        r.clone()
+    } else {
+        summary.clone()
+    };
+
+    Some((summary, detail, reason))
+}
+
+/// Extracts permissions object and optional reason from a JavaScript code string
+/// calling `tools.request_permissions(...)`. Supports unquoted JS keys and JSON.
+pub fn extract_request_permissions_from_js(js_code: &str) -> Option<(serde_json::Value, Option<String>)> {
+    let req_idx = js_code.find("request_permissions")?;
+    let after_req = &js_code[req_idx..];
+    let open_brace = after_req.find('{')?;
+    let start = req_idx + open_brace;
+
+    // Find matching closing brace
+    let mut depth = 0;
+    let mut in_str = false;
+    let mut str_char = '\0';
+    let mut escape = false;
+    let mut end = None;
+
+    for (i, c) in js_code[start..].char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if c == '\\' && in_str {
+            escape = true;
+            continue;
+        }
+        if in_str {
+            if c == str_char {
+                in_str = false;
+            }
+            continue;
+        }
+        if c == '"' || c == '\'' || c == '`' {
+            in_str = true;
+            str_char = c;
+            continue;
+        }
+        if c == '{' {
+            depth += 1;
+        } else if c == '}' {
+            depth -= 1;
+            if depth == 0 {
+                end = Some(start + i + 1);
+                break;
+            }
+        }
+    }
+
+    let block = if let Some(end_idx) = end {
+        &js_code[start..end_idx]
+    } else {
+        &js_code[start..]
+    };
+
+    // 1. Direct JSON parse attempt
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(block) {
+        if let Some(perms) = v.get("permissions") {
+            let reason = v.get("reason").and_then(|r| r.as_str()).map(|s| s.to_string());
+            return Some((perms.clone(), reason));
+        }
+    }
+
+    // 2. Normalize unquoted JS keys to JSON keys
+    let mut normalized = String::with_capacity(block.len() + 32);
+    let mut in_s = false;
+    let mut sc = '\0';
+    let mut esc = false;
+    let chars: Vec<char> = block.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+        if esc {
+            normalized.push(c);
+            esc = false;
+            i += 1;
+            continue;
+        }
+        if c == '\\' && in_s {
+            normalized.push(c);
+            esc = true;
+            i += 1;
+            continue;
+        }
+        if in_s {
+            normalized.push(c);
+            if c == sc {
+                in_s = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '"' || c == '\'' || c == '`' {
+            in_s = true;
+            sc = c;
+            normalized.push('"');
+            i += 1;
+            continue;
+        }
+
+        // Unquoted identifier followed by ':'
+        if c.is_alphabetic() || c == '_' {
+            let mut id = String::new();
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                id.push(chars[i]);
+                i += 1;
+            }
+            let mut j = i;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if j < chars.len() && chars[j] == ':' {
+                normalized.push('"');
+                normalized.push_str(&id);
+                normalized.push('"');
+                while i < j {
+                    normalized.push(chars[i]);
+                    i += 1;
+                }
+                normalized.push(':');
+                i += 1;
+                continue;
+            } else {
+                normalized.push_str(&id);
+                continue;
+            }
+        }
+
+        // Strip trailing commas before } or ]
+        if c == ',' {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if j < chars.len() && (chars[j] == '}' || chars[j] == ']') {
+                i += 1;
+                continue;
+            }
+        }
+
+        normalized.push(c);
+        i += 1;
+    }
+
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&normalized) {
+        if let Some(perms) = v.get("permissions") {
+            let reason = v.get("reason").and_then(|r| r.as_str()).map(|s| s.to_string());
+            return Some((perms.clone(), reason));
+        }
+    }
+
+    // 3. Fallback: robust pattern extraction
+    let mut perms_map = serde_json::Map::new();
+    let has_network = block.contains("network") && block.contains("enabled") && block.contains("true");
+    if has_network {
+        perms_map.insert("network".to_string(), serde_json::json!({ "enabled": true }));
+    }
+
+    if block.contains("file_system") || block.contains("fileSystem") {
+        let mut fs_map = serde_json::Map::new();
+        if let Some(w_idx) = block.find("write") {
+            if let Some(bracket_start) = block[w_idx..].find('[') {
+                let actual_start = w_idx + bracket_start;
+                if let Some(bracket_end) = block[actual_start..].find(']') {
+                    let arr_str = &block[actual_start..actual_start + bracket_end + 1];
+                    let unquoted_arr = arr_str.replace('\\', "/");
+                    let paths: Vec<serde_json::Value> = unquoted_arr
+                        .trim_matches(['[', ']'])
+                        .split(',')
+                        .map(|s| s.trim().trim_matches(['"', '\'', '`']).to_string())
+                        .filter(|s| !s.is_empty())
+                        .map(serde_json::Value::String)
+                        .collect();
+                    if !paths.is_empty() {
+                        fs_map.insert("write".to_string(), serde_json::Value::Array(paths));
+                    }
+                }
+            }
+        }
+        if let Some(r_idx) = block.find("read") {
+            if let Some(bracket_start) = block[r_idx..].find('[') {
+                let actual_start = r_idx + bracket_start;
+                if let Some(bracket_end) = block[actual_start..].find(']') {
+                    let arr_str = &block[actual_start..actual_start + bracket_end + 1];
+                    let unquoted_arr = arr_str.replace('\\', "/");
+                    let paths: Vec<serde_json::Value> = unquoted_arr
+                        .trim_matches(['[', ']'])
+                        .split(',')
+                        .map(|s| s.trim().trim_matches(['"', '\'', '`']).to_string())
+                        .filter(|s| !s.is_empty())
+                        .map(serde_json::Value::String)
+                        .collect();
+                    if !paths.is_empty() {
+                        fs_map.insert("read".to_string(), serde_json::Value::Array(paths));
+                    }
+                }
+            }
+        }
+        if !fs_map.is_empty() {
+            perms_map.insert("file_system".to_string(), serde_json::Value::Object(fs_map));
+        }
+    }
+
+    let reason = if let Some(r_idx) = block.find("reason") {
+        let after_r = &block[r_idx..];
+        if let Some(col_idx) = after_r.find(':') {
+            let val_str = after_r[col_idx + 1..].trim();
+            if val_str.starts_with('"') || val_str.starts_with('\'') || val_str.starts_with('`') {
+                let quote = val_str.chars().next().unwrap();
+                let inner = &val_str[1..];
+                if let Some(end_quote) = inner.find(quote) {
+                    Some(inner[..end_quote].to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if !perms_map.is_empty() {
+        Some((serde_json::Value::Object(perms_map), reason))
+    } else {
+        None
+    }
+}
+
 /// Reconstructs a Codex PendingInteraction from transcript JSONL.
 /// Strictly turn-scoped: halts reverse scanning on completed/aborted turns,
 /// user message prompt boundaries, or turn ID mismatches so historic approval
@@ -808,6 +1135,7 @@ pub fn reconstruct_codex_pending_interaction(
 
     let mut completed_calls = std::collections::HashSet::<String>::new();
     let mut observed_turn_id: Option<String> = None;
+    let mut pending_wait_call_info: Option<(String, Option<String>, Option<String>)> = None; // (call_id, turn_id, item_id)
 
     for line in lines.iter().rev().take(240) {
         let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -875,7 +1203,45 @@ pub fn reconstruct_codex_pending_interaction(
 
                 if p_type == "custom_tool_call" || p_type == "function_call" {
                     let call_id = p.get("call_id").or_else(|| p.get("id")).and_then(|v| v.as_str()).unwrap_or("");
+                    let tool = p.get("name").or_else(|| p.get("tool")).and_then(|v| v.as_str()).unwrap_or("Tool").to_string();
+
+                    // Handle preceding exec if we encountered an in-flight wait call:
+                    // Note: exec itself completed with "Script running with cell ID N" (so its call_id is in completed_calls),
+                    // but the async cell is still executing and being waited on by wait!
+                    if pending_wait_call_info.is_some() && (tool == "exec" || tool == "exec_command") {
+                        let input_str = p.get("input").and_then(|v| v.as_str()).unwrap_or("");
+                        if let Some((perms_val, reason_val)) = extract_request_permissions_from_js(input_str) {
+                            if let Some((summary, detail, justification)) = parse_codex_permission_payload(&perms_val, reason_val.as_deref()) {
+                                let (w_call_id, w_turn_id, w_item_id) = pending_wait_call_info.take().unwrap();
+                                let resolved_turn_id = w_turn_id.or_else(|| line_turn_id.or(current_turn_id).map(|s| s.to_string()));
+                                let item_id = w_item_id.or_else(|| p.get("item_id").or_else(|| p.get("id")).or_else(|| parsed.get("item_id")).or_else(|| parsed.get("id")).and_then(|v| v.as_str()).map(|s| s.to_string()));
+                                let call_id_opt = if !w_call_id.is_empty() { Some(w_call_id) } else if !call_id.is_empty() { Some(call_id.to_string()) } else { None };
+                                return Some(PendingInteraction {
+                                    kind: "approval".to_string(),
+                                    interaction_type: Some("permissions".to_string()),
+                                    turn_id: resolved_turn_id,
+                                    item_id,
+                                    call_id: call_id_opt,
+                                    tool: Some("request_permissions".to_string()),
+                                    summary: Some(summary),
+                                    detail: Some(detail),
+                                    justification,
+                                });
+                            }
+                        }
+                    }
+
                     if !call_id.is_empty() && completed_calls.contains(call_id) {
+                        continue;
+                    }
+
+                    // Handle uncompleted 'wait' call:
+                    // In modern Codex with granular permissions, requesting permission launches an async cell
+                    // and yields via function_call wait(cell_id: N). If wait has no function_call_output, it is in-flight!
+                    if tool == "wait" {
+                        let item_id = p.get("item_id").or_else(|| p.get("id")).or_else(|| parsed.get("item_id")).or_else(|| parsed.get("id")).and_then(|v| v.as_str()).map(|s| s.to_string());
+                        let resolved_turn_id = line_turn_id.or(current_turn_id).map(|s| s.to_string());
+                        pending_wait_call_info = Some((call_id.to_string(), resolved_turn_id, item_id));
                         continue;
                     }
 
@@ -885,7 +1251,56 @@ pub fn reconstruct_codex_pending_interaction(
                     }
 
                     let args = parse_codex_args_value(p.get("arguments").or_else(|| p.get("input")));
-                    let tool = p.get("name").or_else(|| p.get("tool")).and_then(|v| v.as_str()).unwrap_or("Tool").to_string();
+
+                    // Handle direct request_permissions tool calls
+                    if tool == "request_permissions" || tool == "requestPermissions" {
+                        let perms_val = args.get("permissions").or_else(|| p.get("permissions"));
+                        if let Some(perms) = perms_val {
+                            let reason_val = args.get("reason").or_else(|| p.get("reason")).and_then(|v| v.as_str());
+                            if let Some((summary, detail, justification)) = parse_codex_permission_payload(perms, reason_val) {
+                                let item_id = p.get("item_id").or_else(|| p.get("id")).or_else(|| parsed.get("item_id")).or_else(|| parsed.get("id")).and_then(|v| v.as_str()).map(|s| s.to_string());
+                                let resolved_turn_id = line_turn_id.or(current_turn_id).map(|s| s.to_string());
+                                let call_id_opt = if !call_id.is_empty() { Some(call_id.to_string()) } else { None };
+                                return Some(PendingInteraction {
+                                    kind: "approval".to_string(),
+                                    interaction_type: Some("permissions".to_string()),
+                                    turn_id: resolved_turn_id,
+                                    item_id,
+                                    call_id: call_id_opt,
+                                    tool: Some("request_permissions".to_string()),
+                                    summary: Some(summary),
+                                    detail: Some(detail),
+                                    justification,
+                                });
+                            }
+                        }
+                    }
+
+                    // Direct in-flight exec calling tools.request_permissions
+                    if tool == "exec" || tool == "exec_command" {
+                        let input_str = p.get("input").and_then(|v| v.as_str()).unwrap_or("");
+                        if input_str.contains("request_permissions") {
+                            if let Some((perms_val, reason_val)) = extract_request_permissions_from_js(input_str) {
+                                if let Some((summary, detail, justification)) = parse_codex_permission_payload(&perms_val, reason_val.as_deref()) {
+                                    let item_id = p.get("item_id").or_else(|| p.get("id")).or_else(|| parsed.get("item_id")).or_else(|| parsed.get("id")).and_then(|v| v.as_str()).map(|s| s.to_string());
+                                    let resolved_turn_id = line_turn_id.or(current_turn_id).map(|s| s.to_string());
+                                    let call_id_opt = if !call_id.is_empty() { Some(call_id.to_string()) } else { None };
+                                    return Some(PendingInteraction {
+                                        kind: "approval".to_string(),
+                                        interaction_type: Some("permissions".to_string()),
+                                        turn_id: resolved_turn_id,
+                                        item_id,
+                                        call_id: call_id_opt,
+                                        tool: Some("request_permissions".to_string()),
+                                        summary: Some(summary),
+                                        detail: Some(detail),
+                                        justification,
+                                    });
+                                }
+                            }
+                        }
+                    }
+
                     let is_user_input = tool == "request_user_input" || tool == "requestUserInput";
 
                     let sandbox_permissions = p.get("sandbox_permissions")
