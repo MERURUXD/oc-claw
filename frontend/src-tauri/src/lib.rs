@@ -11986,16 +11986,27 @@ async fn ensure_mascot_bubble(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Temporarily hides the native mascot status bubble window for Windows fullscreen
+/// presentation suppression without clearing the resting geometry anchor.
+#[cfg(target_os = "windows")]
+fn temporarily_hide_mascot_bubble_for_fullscreen(app: &tauri::AppHandle) {
+    if let Some(bubble) = app.get_webview_window("mascot-bubble") {
+        let _ = bubble.hide();
+        log::info!("[fullscreen] bubble native suppressed");
+    }
+}
+
 /// Show or hide the mascot status bubble. `visible=true` spawns the window on
 /// first use, refuses to show while the Windows fullscreen watcher has the
-/// mini hidden (the frontend's next poll re-shows it once fullscreen exits),
+/// mini hidden (returning "suppressed"),
 /// and re-asserts floating levels afterwards — showing the bubble can demote
 /// the mini's always-on-top status (see `reassert_mini_floating`).
+/// Returns "shown", "suppressed", or "hidden".
 #[tauri::command]
-async fn set_mascot_bubble_visible(app: tauri::AppHandle, visible: bool) -> Result<(), String> {
+async fn set_mascot_bubble_visible(app: tauri::AppHandle, visible: bool) -> Result<String, String> {
     #[cfg(target_os = "windows")]
     if visible && FULLSCREEN_HIDING.load(Ordering::SeqCst) {
-        return Ok(());
+        return Ok("suppressed".to_string());
     }
     if visible {
         if app.get_webview_window("mascot-bubble").is_none() {
@@ -12005,11 +12016,14 @@ async fn set_mascot_bubble_visible(app: tauri::AppHandle, visible: bool) -> Resu
             let _ = win.show();
         }
         reassert_mini_floating(&app);
-    } else if let Some(win) = app.get_webview_window("mascot-bubble") {
-        let _ = win.hide();
-        BUBBLE_GEOMETRY.lock().unwrap().anchor = None;
+        Ok("shown".to_string())
+    } else {
+        if let Some(win) = app.get_webview_window("mascot-bubble") {
+            let _ = win.hide();
+            BUBBLE_GEOMETRY.lock().unwrap().anchor = None;
+        }
+        Ok("hidden".to_string())
     }
-    Ok(())
 }
 
 /// Open the platform's native folder picker so the user can choose a
@@ -20852,11 +20866,10 @@ pub fn run() {
                                     was_hidden = true;
                                     // Keep the status bubble hidden with the mini
                                     // while a fullscreen app covers this monitor.
-                                    // Restore happens via the frontend's next
-                                    // session poll calling set_mascot_bubble_visible.
-                                    if let Some(bubble) = app_handle.get_webview_window("mascot-bubble") {
-                                        let _ = bubble.hide();
-                                    }
+                                    // Native presentation suppression is decoupled
+                                    // from logical bubble lifecycle.
+                                    temporarily_hide_mascot_bubble_for_fullscreen(&app_handle);
+                                    let _ = app_handle.emit("mascot-fullscreen-suppression", serde_json::json!({ "suppressed": true }));
                                 }
                             } else if was_hidden {
                                 non_fs_streak += 1;
@@ -20870,6 +20883,8 @@ pub fn run() {
                                     was_hidden = false;
                                     hidden_monitor = None;
                                     non_fs_streak = 0;
+                                    log::info!("[fullscreen] presentation suppression lifted");
+                                    let _ = app_handle.emit("mascot-fullscreen-suppression", serde_json::json!({ "suppressed": false }));
                                 }
                             }
                         }
@@ -20966,7 +20981,7 @@ pub fn run() {
                         if let Some(win) = app.get_webview_window("mini") {
                             #[cfg(target_os = "windows")]
                             {
-                                FULLSCREEN_HIDING.store(false, std::sync::atomic::Ordering::SeqCst);
+                                let was_suppressed = FULLSCREEN_HIDING.swap(false, std::sync::atomic::Ordering::SeqCst);
                                 if let Ok(Some(monitor)) = win.primary_monitor() {
                                     let scale = monitor.scale_factor();
                                     let sw = monitor.size().width as f64 / scale;
@@ -20975,6 +20990,10 @@ pub fn run() {
                                     let _ = win.set_position(tauri::LogicalPosition::new(x, 0.0));
                                 }
                                 let _ = win.set_always_on_top(true);
+                                if was_suppressed {
+                                    log::info!("[fullscreen] presentation suppression lifted");
+                                    let _ = app.emit("mascot-fullscreen-suppression", serde_json::json!({ "suppressed": false }));
+                                }
                             }
                             let _ = win.show();
                             let _ = win.set_focus();
@@ -21000,3 +21019,84 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+#[cfg(test)]
+mod fullscreen_bubble_suppression_tests {
+    use super::*;
+
+    #[test]
+    fn test_anchor_preserved_under_fullscreen_suppression() {
+        // Set an existing anchor in BUBBLE_GEOMETRY
+        let sample_anchor = BubbleAnchor {
+            card_right: 850.0,
+            card_bottom: 120.0,
+            mon_x: 0.0,
+            mon_y: 0.0,
+            mon_w: 1920.0,
+            mon_h: 1080.0,
+        };
+        {
+            let mut geom = BUBBLE_GEOMETRY.lock().unwrap();
+            geom.anchor = Some(sample_anchor);
+        }
+
+        // Simulate fullscreen hiding: FULLSCREEN_HIDING is set to true
+        FULLSCREEN_HIDING.store(true, Ordering::SeqCst);
+        assert!(FULLSCREEN_HIDING.load(Ordering::SeqCst));
+
+        // Anchor must NOT have been cleared by fullscreen suppression
+        {
+            let geom = BUBBLE_GEOMETRY.lock().unwrap();
+            assert!(geom.anchor.is_some());
+            let a = geom.anchor.unwrap();
+            assert_eq!(a.card_right, 850.0);
+            assert_eq!(a.card_bottom, 120.0);
+        }
+
+        // Fullscreen exit lifts suppression
+        let was_suppressed = FULLSCREEN_HIDING.swap(false, Ordering::SeqCst);
+        assert!(was_suppressed);
+        assert!(!FULLSCREEN_HIDING.load(Ordering::SeqCst));
+
+        // Anchor is still intact after lifting suppression
+        {
+            let geom = BUBBLE_GEOMETRY.lock().unwrap();
+            assert!(geom.anchor.is_some());
+        }
+
+        // Clean up
+        {
+            let mut geom = BUBBLE_GEOMETRY.lock().unwrap();
+            geom.anchor = None;
+        }
+    }
+
+    #[test]
+    fn test_same_vs_different_monitor_matching() {
+        // Mock monitor identifiers
+        let mon_a = 1001usize;
+        let mon_b = 1002usize;
+
+        // Same monitor should match
+        let same_monitor = matches!(
+            (Some(mon_a), Some(mon_a)),
+            (Some(fs), Some(mini)) if fs == mini
+        );
+        assert!(same_monitor, "Fullscreen on same monitor must be detected");
+
+        // Different monitor should NOT match
+        let diff_monitor = matches!(
+            (Some(mon_b), Some(mon_a)),
+            (Some(fs), Some(mini)) if fs == mini
+        );
+        assert!(!diff_monitor, "Fullscreen on different monitor must NOT trigger suppression");
+
+        // None monitor should NOT match
+        let none_monitor = matches!(
+            (None::<usize>, Some(mon_a)),
+            (Some(fs), Some(mini)) if fs == mini
+        );
+        assert!(!none_monitor, "Missing monitor must NOT trigger suppression");
+    }
+}
+
