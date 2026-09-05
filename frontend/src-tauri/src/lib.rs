@@ -6987,6 +6987,9 @@ pub struct ClaudeSession {
     /// Normalized activity subtitle state for the mascot bubble.
     #[serde(rename = "activity", skip_serializing_if = "Option::is_none")]
     pub activity: Option<session_activity::SessionActivity>,
+    /// Internal activity origin tracking for Antigravity (Hook vs ExecutionStep vs PlannerFallback).
+    #[serde(skip)]
+    pub activity_origin: Option<session_activity::AntigravityActivityOrigin>,
     /// Active turn ID for Hermes or other harnesses supporting per-turn lifecycles.
     #[serde(rename = "turnId", skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
@@ -8836,6 +8839,8 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
         }
     }
 
+    let mut latest_planner_processed = false;
+
     // Scan backward for latest turn state
     for line in lines.iter().rev().take(120) {
         let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
@@ -8853,7 +8858,8 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
         }
 
         if source_field == "MODEL" && msg_type == "PLANNER_RESPONSE" {
-            if !last_turn_was_user && latest_model_content.is_none() {
+            if !last_turn_was_user && !latest_planner_processed {
+                latest_planner_processed = true;
                 if let Some(content_str) = parsed.get("content").and_then(|c| c.as_str()) {
                     let trimmed = content_str.trim();
                     if !trimmed.is_empty() {
@@ -8864,21 +8870,6 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
                     || parsed.get("truncated_fields").and_then(|t| t.as_array()).map(|arr| arr.iter().any(|v| v == "tool_calls")).unwrap_or(false);
                 if has_tools {
                     is_intermediate_tool_turn = true;
-                    if let Some(first_tool) = parsed.get("tool_calls")
-                        .and_then(|t| t.as_array())
-                        .and_then(|arr| arr.first())
-                    {
-                        if let Some(n) = first_tool.get("name").and_then(|n| n.as_str()) {
-                            if session.tool.is_none() {
-                                session.tool = Some(n.to_string());
-                            }
-                            let args_val = first_tool.get("args").cloned().unwrap_or(serde_json::json!({}));
-                            if session.tool_input.is_none() {
-                                session.tool_input = Some(args_val.to_string());
-                            }
-                            session.activity = session_activity::normalize_antigravity_tool_activity(n, &args_val);
-                        }
-                    }
                 }
             }
         } else if (source_field == "USER_EXPLICIT" || source_field == "USER") && (msg_type == "USER_INPUT" || msg_type == "user") {
@@ -8893,11 +8884,94 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
         }
     }
 
+    let agy_exec = session_activity::extract_antigravity_execution_activity(&lines);
+
     if last_turn_was_user {
         session.tool = None;
         session.tool_input = None;
         session.activity = None;
+        session.activity_origin = None;
         is_intermediate_tool_turn = false;
+    } else {
+        // Enforce activity data source priority: Hook >= ExecutionStep > PlannerFallback
+        let current_origin = session.activity_origin;
+        let is_hook_active = current_origin == Some(session_activity::AntigravityActivityOrigin::Hook);
+
+        if is_hook_active {
+            // A real-time Hook event is active.
+            // If transcript contains an active ExecutionStep that is currently RUNNING, update to match it.
+            // If transcript only has PlannerFallback or a completed execution step, preserve the hook activity!
+            if agy_exec.origin == session_activity::AntigravityActivityOrigin::ExecutionStep && agy_exec.is_running {
+                session.tool = agy_exec.tool;
+                session.tool_input = agy_exec.tool_input;
+                session.activity = agy_exec.activity;
+                session.activity_origin = Some(session_activity::AntigravityActivityOrigin::ExecutionStep);
+                log::info!(
+                    "[agy activity] sid={} step={:?} origin=execution tool={:?} status=RUNNING kind={:?} target={:?} query={:?}",
+                    &session.session_id[..session.session_id.len().min(8)],
+                    agy_exec.step_index,
+                    session.tool,
+                    session.activity.as_ref().map(|a| &a.kind),
+                    session.activity.as_ref().and_then(|a| a.target.as_deref()),
+                    session.activity.as_ref().and_then(|a| a.query.as_deref()),
+                );
+            }
+        } else {
+            // Not a Hook origin (no active Hook event)
+            match agy_exec.origin {
+                session_activity::AntigravityActivityOrigin::ExecutionStep => {
+                    if agy_exec.is_running {
+                        session.tool = agy_exec.tool;
+                        session.tool_input = agy_exec.tool_input;
+                        session.activity = agy_exec.activity;
+                        session.activity_origin = Some(session_activity::AntigravityActivityOrigin::ExecutionStep);
+                        log::info!(
+                            "[agy activity] sid={} step={:?} origin=execution tool={:?} status=RUNNING kind={:?} target={:?} query={:?}",
+                            &session.session_id[..session.session_id.len().min(8)],
+                            agy_exec.step_index,
+                            session.tool,
+                            session.activity.as_ref().map(|a| &a.kind),
+                            session.activity.as_ref().and_then(|a| a.target.as_deref()),
+                            session.activity.as_ref().and_then(|a| a.query.as_deref()),
+                        );
+                    } else {
+                        // Execution step done -> clear activity to allow thinkingPool
+                        session.tool = None;
+                        session.tool_input = None;
+                        session.activity = None;
+                        session.activity_origin = None;
+                        log::info!(
+                            "[agy activity] sid={} step={:?} execution done",
+                            &session.session_id[..session.session_id.len().min(8)],
+                            agy_exec.step_index,
+                        );
+                    }
+                }
+                session_activity::AntigravityActivityOrigin::PlannerFallback => {
+                    if agy_exec.is_running {
+                        session.tool = agy_exec.tool;
+                        session.tool_input = agy_exec.tool_input;
+                        session.activity = agy_exec.activity;
+                        session.activity_origin = Some(session_activity::AntigravityActivityOrigin::PlannerFallback);
+                        log::info!(
+                            "[agy activity] sid={} step={:?} origin=planner-fallback tool={:?} kind={:?} target={:?} query={:?}",
+                            &session.session_id[..session.session_id.len().min(8)],
+                            agy_exec.step_index,
+                            session.tool,
+                            session.activity.as_ref().map(|a| &a.kind),
+                            session.activity.as_ref().and_then(|a| a.target.as_deref()),
+                            session.activity.as_ref().and_then(|a| a.query.as_deref()),
+                        );
+                    } else {
+                        session.tool = None;
+                        session.tool_input = None;
+                        session.activity = None;
+                        session.activity_origin = None;
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     if let Some(t) = custom_title {
@@ -9004,6 +9078,7 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
             session.tool = None;
             session.tool_input = None;
             session.activity = None;
+            session.activity_origin = None;
         }
         return false;
     }
@@ -9027,6 +9102,7 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
             session.tool = None;
             session.tool_input = None;
             session.activity = None;
+            session.activity_origin = None;
         }
         false
     }
@@ -9113,6 +9189,7 @@ pub fn load_recent_antigravity_sessions() -> Vec<ClaudeSession> {
             cursor_native_handle: None,
             active_subagents: None,
             activity: None,
+            activity_origin: None,
             turn_id: None,
         };
 
@@ -10476,6 +10553,7 @@ fn load_recent_hermes_sessions_from_db() -> Result<Vec<ClaudeSession>, String> {
             cursor_native_handle: None,
             active_subagents: None,
             activity: None,
+            activity_origin: None,
             turn_id,
         });
     }
@@ -16004,6 +16082,7 @@ mod codex_adapter_tests {
             cursor_native_handle: None,
             active_subagents: None,
             activity: None,
+            activity_origin: None,
             turn_id: None,
         };
         assert!(is_codex_internal_utility_session(&session));
@@ -16294,6 +16373,7 @@ mod codex_adapter_tests {
             cursor_native_handle: None,
             active_subagents: None,
             activity: None,
+            activity_origin: None,
             turn_id: None,
         });
 
@@ -16385,6 +16465,7 @@ mod codex_adapter_tests {
             cursor_native_handle: None,
             active_subagents: None,
             activity: None,
+            activity_origin: None,
             turn_id: None,
         });
         // Subagents accidentally in sessions map
@@ -16500,6 +16581,7 @@ mod codex_adapter_tests {
             cursor_native_handle: None,
             active_subagents: None,
             activity: None,
+            activity_origin: None,
             turn_id: None,
         });
 
@@ -16517,6 +16599,53 @@ mod codex_adapter_tests {
         let (active_subs, status) = aggregate_antigravity_root_subagents(a);
         assert_eq!(status, "stopped");
         assert!(active_subs.is_empty());
+    }
+
+    #[test]
+    fn test_antigravity_watcher_does_not_overwrite_hook_activity() {
+        let session = ClaudeSession {
+            session_id: "test-race-session".to_string(),
+            cwd: "/repo".to_string(),
+            status: "tool_running".to_string(),
+            tool: Some("grep_search".to_string()),
+            tool_input: Some("{\"Query\":\"MySearch\"}".to_string()),
+            user_prompt: Some("Find code".to_string()),
+            custom_title: None,
+            interactive: true,
+            updated_at: 100,
+            is_processing: true,
+            pid: None,
+            pending_agents: 0,
+            permission_suggestions: None,
+            needs_review: None,
+            last_response: None,
+            is_active_tab: false,
+            source: "antigravity".to_string(),
+            terminal_id: None,
+            host_terminal: None,
+            platform: None,
+            cursor_port: None,
+            cursor_workspace_root: None,
+            cursor_workspace_name: None,
+            cursor_native_handle: None,
+            active_subagents: None,
+            activity: Some(session_activity::SessionActivity {
+                kind: session_activity::SessionActivityKind::Search,
+                target: None,
+                query: Some("MySearch".to_string()),
+                count: None,
+                summary: None,
+                tool_name: None,
+                status: "running".to_string(),
+                source: session_activity::SessionActivitySource::ToolCall,
+            }),
+            activity_origin: Some(session_activity::AntigravityActivityOrigin::Hook),
+            turn_id: None,
+        };
+
+        assert_eq!(session.activity_origin, Some(session_activity::AntigravityActivityOrigin::Hook));
+        assert_eq!(session.tool.as_deref(), Some("grep_search"));
+        assert_eq!(session.activity.as_ref().map(|a| &a.kind), Some(&session_activity::SessionActivityKind::Search));
     }
 }
 
@@ -16610,6 +16739,7 @@ pub fn handle_antigravity_subagent_event(
             cursor_native_handle: None,
             active_subagents: None,
             activity: None,
+            activity_origin: None,
             turn_id: None,
         };
         update_antigravity_session_from_transcript(&mut new_session);
@@ -16917,6 +17047,7 @@ fn process_claude_event(
                     cursor_native_handle: None,
                     active_subagents: None,
                     activity: None,
+                    activity_origin: None,
                     turn_id: None,
                 });
                 // Only upgrade source, never downgrade:
@@ -16982,6 +17113,7 @@ fn process_claude_event(
                     session.tool = None;
                     session.tool_input = None;
                     session.activity = None;
+                    session.activity_origin = None;
                 } else if hook_event == "SubagentStart"
                     || (hook_event == "PreToolUse" && (tool_name == "Agent" || tool_name == "invoke_subagent"))
                     || raw_hook_event == "subagentStart"
@@ -17129,6 +17261,17 @@ fn process_claude_event(
                             .and_then(|inp| serde_json::from_str::<serde_json::Value>(inp).ok())
                             .unwrap_or(serde_json::json!({}));
                         session.activity = session_activity::generic_tool_activity(t, &parsed_input);
+                        if session.source == "antigravity" {
+                            session.activity_origin = Some(session_activity::AntigravityActivityOrigin::Hook);
+                            log::info!(
+                                "[agy activity] sid={} step=hook origin=hook tool={} kind={:?} target={:?} query={:?}",
+                                &session_id[..session_id.len().min(8)],
+                                t,
+                                session.activity.as_ref().map(|a| &a.kind),
+                                session.activity.as_ref().and_then(|a| a.target.as_deref()),
+                                session.activity.as_ref().and_then(|a| a.query.as_deref()),
+                            );
+                        }
                     }
                 }
                 if let Some(t) = event.get("userPrompt")
@@ -17214,6 +17357,7 @@ fn process_claude_event(
                     session.tool = None;
                     session.tool_input = None;
                     session.activity = None;
+                    session.activity_origin = None;
                 }
 
                 // Store AI's last response for the completion reminder popup.
@@ -17255,6 +17399,7 @@ fn process_claude_event(
                             session.tool = None;
                             session.tool_input = None;
                             session.activity = None;
+                            session.activity_origin = None;
                             session.last_response = None;
                             status = "stopped".to_string();
                         } else {
@@ -17273,6 +17418,7 @@ fn process_claude_event(
                                 session.tool = None;
                                 session.tool_input = None;
                                 session.activity = None;
+                                session.activity_origin = None;
                             }
                         }
                     } else if session.source == "hermes" {
