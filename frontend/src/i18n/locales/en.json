@@ -51,6 +51,7 @@
     "allowing": "Submitting...",
     "denying": "Denying...",
     "viewInCodexTooltip": "Review in native Codex Desktop",
+    "codexNativeRequired": "Approval must be completed in Codex Desktop",
     "cursorDone": "Cursor has finished working. Click to view.",
     "codeDone": "Code has finished working. Click to view.",
     "unassigned": "Unassigned",

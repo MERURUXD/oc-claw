@@ -10766,7 +10766,7 @@ async fn resolve_codex_permission(
     transport.resolve(&session_id, &turn_id, &request_id, &decision)?;
 
     log::info!(
-        "[resolve_codex_permission] resolved session={} turn={} request={} decision={}",
+        "[codex-relay] response submitted: session={} turn={} request_id={} decision={}",
         &session_id[..session_id.len().min(8)],
         turn_id,
         request_id,
@@ -15949,12 +15949,55 @@ pub fn parse_codex_permission_request(event: &serde_json::Value) -> Option<Pendi
         detail: Some(detail),
         justification,
         request_id: None,
-        approval_actions: Some(ApprovalActions {
+        approval_actions: None,
+    })
+}
+
+pub fn apply_codex_permission_relay_to_session(
+    session: &mut ClaudeSession,
+    parsed_event: &serde_json::Value,
+    turn_id: &str,
+    request_id: &str,
+    tool_name: &str,
+    reason_str: Option<String>,
+) {
+    if let Some(ref mut pi) = session.pending_interaction {
+        pi.request_id = Some(request_id.to_string());
+        pi.approval_actions = Some(ApprovalActions {
             can_deny: true,
             can_allow_turn: true,
             can_allow_session: false,
-        }),
-    })
+        });
+        if pi.turn_id.is_none() && !turn_id.is_empty() {
+            pi.turn_id = Some(turn_id.to_string());
+        }
+    } else {
+        // Case C: PermissionRequest arrived without preceding PreToolUse or pending_interaction was None
+        let mut pi = parse_codex_permission_request(parsed_event).unwrap_or_else(|| {
+            PendingInteraction {
+                kind: "approval".to_string(),
+                interaction_type: Some("permissions".to_string()),
+                turn_id: if turn_id.is_empty() { None } else { Some(turn_id.to_string()) },
+                item_id: None,
+                call_id: None,
+                tool: Some(tool_name.to_string()),
+                summary: Some("Codex requested permissions".to_string()),
+                detail: None,
+                justification: reason_str,
+                request_id: None,
+                approval_actions: None,
+            }
+        });
+        pi.request_id = Some(request_id.to_string());
+        pi.approval_actions = Some(ApprovalActions {
+            can_deny: true,
+            can_allow_turn: true,
+            can_allow_session: false,
+        });
+        session.pending_interaction = Some(pi);
+        session.status = "waiting".to_string();
+        session.needs_review = Some(true);
+    }
 }
 
 fn codex_requires_escalation(event: &serde_json::Value) -> bool {
@@ -16892,6 +16935,152 @@ mod codex_adapter_tests {
     }
 
     #[test]
+    fn test_codex_permission_in_place_upgrade() {
+        let event = serde_json::json!({
+            "source": "codex",
+            "tool_name": "request_permissions",
+            "turn_id": "turn_abc",
+            "tool_input": {
+                "permissions": { "network": { "enabled": true } },
+                "reason": "curl request"
+            }
+        });
+
+        // 1. Detection-only phase (PreToolUse)
+        let pi = parse_codex_permission_request(&event).unwrap();
+        assert_eq!(pi.kind, "approval");
+        assert_eq!(pi.interaction_type.as_deref(), Some("permissions"));
+        assert_eq!(pi.summary.as_deref(), Some("网络访问"));
+        assert_eq!(pi.justification.as_deref(), Some("curl request"));
+        assert_eq!(pi.request_id, None);
+        assert_eq!(pi.approval_actions, None);
+
+        let mut session = ClaudeSession {
+            session_id: "sess_upgrade".to_string(),
+            cwd: "C:/test".to_string(),
+            status: "waiting".to_string(),
+            tool: Some("request_permissions".to_string()),
+            tool_input: None,
+            user_prompt: None,
+            custom_title: None,
+            interactive: true,
+            updated_at: 0,
+            is_processing: false,
+            pid: None,
+            pending_agents: 0,
+            permission_suggestions: None,
+            needs_review: Some(true),
+            last_response: None,
+            is_active_tab: false,
+            source: "codex".to_string(),
+            terminal_id: None,
+            host_terminal: None,
+            platform: None,
+            cursor_port: None,
+            cursor_workspace_root: None,
+            cursor_workspace_name: None,
+            cursor_native_handle: None,
+            active_subagents: None,
+            activity: None,
+            activity_origin: None,
+            turn_id: Some("turn_abc".to_string()),
+            pending_interaction: Some(pi),
+        };
+
+        // 2. Relay phase (PermissionRequest arrives) -> in-place upgrade
+        let relay_event = serde_json::json!({
+            "turn_id": "turn_abc",
+            "tool_name": "request_permissions",
+            "permissions": { "network": { "enabled": true } },
+            "reason": "curl request"
+        });
+        apply_codex_permission_relay_to_session(
+            &mut session,
+            &relay_event,
+            "turn_abc",
+            "req_turn_abc_12345",
+            "request_permissions",
+            Some("curl request".to_string()),
+        );
+
+        let upgraded_pi = session.pending_interaction.as_ref().unwrap();
+        assert_eq!(upgraded_pi.kind, "approval");
+        assert_eq!(upgraded_pi.summary.as_deref(), Some("网络访问"));
+        assert_eq!(upgraded_pi.request_id.as_deref(), Some("req_turn_abc_12345"));
+        let actions = upgraded_pi.approval_actions.as_ref().unwrap();
+        assert!(actions.can_deny);
+        assert!(actions.can_allow_turn);
+        assert!(!actions.can_allow_session);
+        assert_eq!(session.status, "waiting");
+        assert_eq!(session.needs_review, Some(true));
+    }
+
+    #[test]
+    fn test_codex_permission_relay_case_c_out_of_order() {
+        let mut session = ClaudeSession {
+            session_id: "sess_case_c".to_string(),
+            cwd: "C:/test".to_string(),
+            status: "processing".to_string(),
+            tool: None,
+            tool_input: None,
+            user_prompt: None,
+            custom_title: None,
+            interactive: true,
+            updated_at: 0,
+            is_processing: true,
+            pid: None,
+            pending_agents: 0,
+            permission_suggestions: None,
+            needs_review: None,
+            last_response: None,
+            is_active_tab: false,
+            source: "codex".to_string(),
+            terminal_id: None,
+            host_terminal: None,
+            platform: None,
+            cursor_port: None,
+            cursor_workspace_root: None,
+            cursor_workspace_name: None,
+            cursor_native_handle: None,
+            active_subagents: None,
+            activity: None,
+            activity_origin: None,
+            turn_id: None,
+            pending_interaction: None,
+        };
+
+        // PermissionRequest arrives directly without preceding PreToolUse
+        let relay_event = serde_json::json!({
+            "turn_id": "turn_xyz",
+            "tool_name": "request_permissions",
+            "tool_input": {
+                "permissions": { "file_system": { "write": ["C:\\test\\file.txt"] } },
+                "reason": "save file"
+            }
+        });
+
+        apply_codex_permission_relay_to_session(
+            &mut session,
+            &relay_event,
+            "turn_xyz",
+            "req_turn_xyz_67890",
+            "request_permissions",
+            Some("save file".to_string()),
+        );
+
+        assert_eq!(session.status, "waiting");
+        assert_eq!(session.needs_review, Some(true));
+        let pi = session.pending_interaction.as_ref().unwrap();
+        assert_eq!(pi.kind, "approval");
+        assert_eq!(pi.interaction_type.as_deref(), Some("permissions"));
+        assert_eq!(pi.request_id.as_deref(), Some("req_turn_xyz_67890"));
+        let actions = pi.approval_actions.as_ref().unwrap();
+        assert!(actions.can_deny);
+        assert!(actions.can_allow_turn);
+        assert!(!actions.can_allow_session);
+    }
+
+    #[test]
     fn read_last_codex_assistant_message_extracts_latest_text() {
         let temp_dir = std::env::temp_dir();
         let path = temp_dir.join("test_codex_assistant_msg.jsonl");
@@ -17734,6 +17923,7 @@ fn process_claude_event(
         let pending_agents;
         let session_source: String;
         let session_host_terminal: Option<String>;
+        let session_pending_interaction: Option<PendingInteraction>;
         let stop_was_interrupted;
         // Whether the user is already looking at this session's terminal tab at
         // the moment a waiting/permission event arrives — used to suppress the
@@ -17755,6 +17945,7 @@ fn process_claude_event(
                 session_host_terminal = prev.and_then(|s| s.host_terminal.clone());
                 sessions.remove(&session_id);
                 pending_agents = 0;
+                session_pending_interaction = None;
                 stop_was_interrupted = false;
             } else {
                 // Determine source: explicit override from socket server, or from JSON, or default "cc"
@@ -18254,6 +18445,7 @@ fn process_claude_event(
                 pending_agents = session.pending_agents;
                 session_source = session.source.clone();
                 session_host_terminal = session.host_terminal.clone();
+                session_pending_interaction = session.pending_interaction.clone();
             }
         }
 
@@ -18309,6 +18501,7 @@ fn process_claude_event(
                 "needsReview": session_needs_review,
                 "source": session_source,
                 "hostTerminal": session_host_terminal,
+                "pendingInteraction": session_pending_interaction,
             }));
         }
 
@@ -20960,6 +21153,19 @@ fn handle_codex_permission_relay<W: std::io::Write>(
         .to_string();
     let request_id = format!("req_{}_{}", if turn_id.is_empty() { "default" } else { &turn_id }, now_ms);
 
+    let tool_name = parsed_event.get("tool_name")
+        .or_else(|| parsed_event.get("tool"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("request_permissions");
+    let sess_prefix = &session_id[..session_id.len().min(8)];
+
+    log::info!(
+        "[codex-relay] permission request received: session={} turn={} tool={}",
+        sess_prefix,
+        turn_id,
+        tool_name
+    );
+
     let tool_input_val = parsed_event.get("tool_input")
         .or_else(|| parsed_event.get("toolInput"))
         .or_else(|| parsed_event.get("arguments"))
@@ -20978,17 +21184,14 @@ fn handle_codex_permission_relay<W: std::io::Write>(
     {
         let mut sessions = state.lock().unwrap();
         if let Some(session) = sessions.get_mut(session_id) {
-            if let Some(ref mut pi) = session.pending_interaction {
-                pi.request_id = Some(request_id.clone());
-                pi.approval_actions = Some(ApprovalActions {
-                    can_deny: true,
-                    can_allow_turn: true,
-                    can_allow_session: false,
-                });
-                if pi.turn_id.is_none() && !turn_id.is_empty() {
-                    pi.turn_id = Some(turn_id.clone());
-                }
-            }
+            apply_codex_permission_relay_to_session(
+                session,
+                &parsed_event,
+                &turn_id,
+                &request_id,
+                tool_name,
+                reason_str.clone(),
+            );
         }
     }
     {
@@ -21007,17 +21210,30 @@ fn handle_codex_permission_relay<W: std::io::Write>(
     let _ = app.emit("claude-session-update", session_id);
 
     log::info!(
-        "[codex_relay] blocking for PermissionRequest session={} turn={} request={}",
-        &session_id[..session_id.len().min(8)],
+        "[codex-relay] responder created: session={} turn={} request_id={}",
+        sess_prefix,
         turn_id,
+        request_id
+    );
+    log::info!(
+        "[codex-relay] requestId attached: session={} turn={} request_id={}",
+        sess_prefix,
+        turn_id,
+        request_id
+    );
+    log::info!(
+        "[codex-relay] frontend actionable: session={} request_id={}",
+        sess_prefix,
         request_id
     );
 
     match rx.recv_timeout(std::time::Duration::from_secs(300)) {
         Ok(response_json) => {
             log::info!(
-                "[codex_relay] sending permission response for session={}: {}",
-                &session_id[..session_id.len().min(8)],
+                "[codex-relay] response submitted: session={} turn={} request_id={} decision={}",
+                sess_prefix,
+                turn_id,
+                request_id,
                 response_json
             );
             let _ = stream.write_all(response_json.as_bytes());
@@ -21025,8 +21241,10 @@ fn handle_codex_permission_relay<W: std::io::Write>(
         }
         Err(_) => {
             log::warn!(
-                "[codex_relay] permission timeout for session={}, fallback to native UI",
-                &session_id[..session_id.len().min(8)]
+                "[codex-relay] native fallback: session={} turn={} request_id={}",
+                sess_prefix,
+                turn_id,
+                request_id
             );
             let _ = stream.write_all(b"{}");
             let _ = stream.flush();
