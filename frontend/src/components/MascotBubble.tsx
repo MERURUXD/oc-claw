@@ -12,7 +12,14 @@ import type {
 } from '../lib/types'
 import { formatActivity } from '../lib/activityFormat'
 import { isSameBubblePayload } from '../lib/sessionActivity'
+import {
+  BUBBLE_WIDTH,
+  BUBBLE_WIDTH_MOTION,
+  resolveBubbleWidthTarget,
+} from '../lib/bubbleWidth'
 import { QuotaMiniBadge } from './QuotaCapsule'
+
+export { BUBBLE_WIDTH, BUBBLE_WIDTH_MOTION }
 
 /**
  * Centralized motion and geometry constants for the mascot status bubble.
@@ -43,11 +50,6 @@ export const BUBBLE_MOTION = {
   staggerDelay: 0.035,
   exitFadeDuration: 0.18,
   exitFadeDelay: 0.08,
-}
-
-export const BUBBLE_WIDTH = {
-  min: 190,
-  max: 345,
 }
 
 export const SHIMMER_TIMING = {
@@ -738,6 +740,72 @@ function SessionBubbleRow({
   )
 }
 
+interface MeasureSessionBubbleRowProps {
+  session: BubbleSessionDetail
+  t: TFunction
+  fallbackThinkingText?: string
+  showBadge: boolean
+  remainingOthers: number
+}
+
+function MeasureSessionBubbleRow({
+  session,
+  t,
+  fallbackThinkingText,
+  showBadge,
+  remainingOthers,
+}: MeasureSessionBubbleRowProps) {
+  const { actionPrefix, actionContent, isWaiting, isProcessing } = getSessionLine2(session, t, fallbackThinkingText)
+
+  return (
+    <div className="mascot-bubble-row-motion">
+      <div className="mascot-bubble-detailed">
+        <div className="mascot-bubble-content">
+          {/* Line 1: Session Title + Metadata */}
+          <div className="mascot-bubble-title-line">
+            <div className="mascot-bubble-title-wrapper">
+              <span className="mascot-bubble-main-title" style={{ whiteSpace: 'nowrap' }}>
+                {session.title}
+              </span>
+            </div>
+
+            <div className="mascot-bubble-metadata-group">
+              {showBadge && (
+                <span className="mascot-bubble-badge">+{remainingOthers}</span>
+              )}
+              {(session.source === 'codex' || session.source === 'antigravity') && (
+                <QuotaMiniBadge harness={session.source} />
+              )}
+            </div>
+          </div>
+
+          {/* Line 2: Current Action / Subagents */}
+          {session.activeSubagents && session.activeSubagents.length > 0 ? (
+            <div className="mascot-bubble-subagents-row" style={{ width: 'max-content' }}>
+              {session.activeSubagents.map((sub, idx) => {
+                const isWorking = sub.status === 'tool_running' || sub.status === 'processing'
+                return (
+                  <span key={sub.id || idx} className="mascot-bubble-subagent-chip">
+                    {isWorking && <span className="mascot-bubble-subagent-dot" />}
+                    <span className="mascot-bubble-subagent-role">{sub.role}</span>
+                  </span>
+                )
+              })}
+            </div>
+          ) : (
+            <div className={`mascot-bubble-action-line ${isWaiting ? 'is-waiting' : ''} ${isProcessing ? 'is-processing' : ''}`}>
+              {actionPrefix && <span className="mascot-bubble-tool-prefix">{actionPrefix}:</span>}
+              <span className="mascot-bubble-action-text" style={{ whiteSpace: 'nowrap' }}>
+                {actionContent || (actionPrefix ? '' : t('mini.working', 'working...'))}
+              </span>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 /**
  * Mascot status bubble — an interactive status capsule/card stack for the `mascot-bubble` window
  * (`index.html#/mascot-bubble`).
@@ -787,6 +855,71 @@ export default function MascotBubble() {
   const isMultiSessionRef = useRef<boolean>(false)
   const sessionsToRenderRef = useRef<BubbleSessionDetail[]>([])
 
+  // Dynamic width spring state and measurement refs
+  const [targetWidth, setTargetWidth] = useState<number | null>(null)
+  const [shouldAnimateWidth, setShouldAnimateWidth] = useState<boolean>(false)
+  const targetWidthRef = useRef<number | null>(null)
+  const isWidthAnimatingRef = useRef<boolean>(false)
+  const measureStackRef = useRef<HTMLDivElement>(null)
+
+  // Native geometry sync coalescing (single sync per animation frame + in-flight guard)
+  const pendingSyncRef = useRef<{
+    width: number
+    height: number
+    mode: BubbleGeometryMode
+    preserveAnchor: boolean
+  } | null>(null)
+  const syncRafIdRef = useRef<number | null>(null)
+  const isSyncInFlightRef = useRef<boolean>(false)
+  const lastSyncedGeometryRef = useRef<{
+    width: number
+    height: number
+    mode: BubbleGeometryMode
+  } | null>(null)
+
+  // Dispatches coalesced geometry synchronization without queuing redundant calls
+  const dispatchCoalescedGeometrySync = useCallback(() => {
+    if (isSyncInFlightRef.current) {
+      // An IPC call is currently in flight; pendingSyncRef holds the latest geometry
+      // and will be dispatched as soon as the in-flight call resolves.
+      return
+    }
+
+    const pending = pendingSyncRef.current
+    if (!pending) return
+
+    const last = lastSyncedGeometryRef.current
+    if (last && last.width === pending.width && last.height === pending.height && last.mode === pending.mode) {
+      pendingSyncRef.current = null
+      return
+    }
+
+    pendingSyncRef.current = null
+    lastSyncedGeometryRef.current = { width: pending.width, height: pending.height, mode: pending.mode }
+    lastSizeRef.current = { width: pending.width, height: pending.height }
+    currentGeometryModeRef.current = pending.mode
+
+    const entryOffsetX = pending.mode === 'motion' ? BUBBLE_MOTION.reserveX : 0
+    const entryOffsetY = pending.mode === 'motion' ? BUBBLE_MOTION.reserveY : 0
+
+    logBubbleDev(`[bubble ro-coalesced] sync ${pending.width}x${pending.height} mode=${pending.mode} preserve=${pending.preserveAnchor}`)
+
+    isSyncInFlightRef.current = true
+    invoke('sync_mascot_bubble', {
+      width: pending.width,
+      height: pending.height,
+      entryOffsetX,
+      entryOffsetY,
+      preserveAnchor: pending.preserveAnchor,
+    })
+      .finally(() => {
+        isSyncInFlightRef.current = false
+        if (pendingSyncRef.current) {
+          dispatchCoalescedGeometrySync()
+        }
+      })
+  }, [])
+
   // Unified geometry synchronization helper
   const syncBubbleGeometry = useCallback((mode: BubbleGeometryMode, options?: { preserveAnchor?: boolean }) => {
     const el = contentRef.current
@@ -797,6 +930,7 @@ export default function MascotBubble() {
 
     currentGeometryModeRef.current = mode
     lastSizeRef.current = { width, height }
+    lastSyncedGeometryRef.current = { width, height, mode }
 
     const entryOffsetX = mode === 'motion' ? BUBBLE_MOTION.reserveX : 0
     const entryOffsetY = mode === 'motion' ? BUBBLE_MOTION.reserveY : 0
@@ -822,6 +956,7 @@ export default function MascotBubble() {
 
     currentGeometryModeRef.current = 'motion'
     lastSizeRef.current = { width, height }
+    lastSyncedGeometryRef.current = { width, height, mode: 'motion' }
 
     logBubbleDev(`[bubble ${tid}] geometry ${width}x${height} (motion mode, fresh anchor)`)
 
@@ -1081,6 +1216,74 @@ export default function MascotBubble() {
   // The active payload to render (retain last valid summary during exiting so DOM does not collapse early)
   const displaySummary = summary || (phase === 'exiting' ? lastValidSummaryRef.current : null)
 
+  const sessionsToRender =
+    displaySummary?.activeSessions && displaySummary.activeSessions.length > 0
+      ? displaySummary.activeSessions
+      : displaySummary?.activeSession
+        ? [displaySummary.activeSession]
+        : []
+
+  const isDetailed = displaySummary?.style === 'detailed' && sessionsToRender.length > 0
+  const isMultiSession = isDetailed && sessionsToRender.length > 1
+
+  isMultiSessionRef.current = isMultiSession
+  sessionsToRenderRef.current = sessionsToRender
+
+  // Measure intrinsic target width whenever displaySummary or sessionsToRender change
+  const updateTargetWidth = useCallback(() => {
+    if (!isDetailed) {
+      if (targetWidthRef.current !== null) {
+        targetWidthRef.current = null
+        setTargetWidth(null)
+        setShouldAnimateWidth(false)
+        isWidthAnimatingRef.current = false
+      }
+      return
+    }
+
+    const el = measureStackRef.current
+    if (!el) return
+
+    const measured = Math.ceil(el.offsetWidth)
+    if (measured <= 0) return
+
+    const current = targetWidthRef.current
+    const currentPhase = phaseRef.current
+    const isPreparedOrEntering = currentPhase === 'prepared' || currentPhase === 'entering'
+    const isExiting = currentPhase === 'exiting'
+
+    const resolution = resolveBubbleWidthTarget(measured, current, {
+      isPreparedOrEntering,
+      isExiting,
+      prefersReducedMotion: Boolean(prefersReducedMotion),
+      isCurrentlyAnimating: isWidthAnimatingRef.current,
+      instantThreshold: BUBBLE_WIDTH_MOTION.instantThreshold,
+    })
+
+    if (resolution.targetWidth !== targetWidthRef.current || resolution.shouldAnimate !== shouldAnimateWidth) {
+      logBubbleDev(`[bubble width] measured=${measured} prev=${current} next=${resolution.targetWidth} animate=${resolution.shouldAnimate}`)
+      targetWidthRef.current = resolution.targetWidth
+      isWidthAnimatingRef.current = resolution.shouldAnimate
+      setTargetWidth(resolution.targetWidth)
+      setShouldAnimateWidth(resolution.shouldAnimate)
+    }
+  }, [isDetailed, prefersReducedMotion, shouldAnimateWidth])
+
+  useLayoutEffect(() => {
+    updateTargetWidth()
+  }, [updateTargetWidth, displaySummary, isDetailed])
+
+  // Continuous ResizeObserver on measureStackRef for font-loading, badge count, or asynchronous chip changes
+  useEffect(() => {
+    const el = measureStackRef.current
+    if (!el || !isDetailed) return
+    const ro = new ResizeObserver(() => {
+      updateTargetWidth()
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [updateTargetWidth, isDetailed])
+
   // Measure geometry on commit whenever prepared
   useLayoutEffect(() => {
     if (phase === 'prepared') {
@@ -1088,7 +1291,7 @@ export default function MascotBubble() {
     }
   }, [phase, displaySummary, syncGeometryAndNotifyReady])
 
-  // Continuous ResizeObserver to synchronize size changes with Rust untransformed
+  // Continuous ResizeObserver to synchronize size changes with Rust untransformed via rAF coalescing
   useEffect(() => {
     const el = contentRef.current
     if (!el || !displaySummary) return
@@ -1101,36 +1304,55 @@ export default function MascotBubble() {
 
       const isMotionActive = activeMotionTokensRef.current.size > 0 || phaseRef.current !== 'visible'
       const targetMode: BubbleGeometryMode = isMotionActive ? 'motion' : 'stable'
-      currentGeometryModeRef.current = targetMode
-
-      const last = lastSizeRef.current
-      if (!last || last.width !== width || last.height !== height) {
-        lastSizeRef.current = { width, height }
-        logBubbleDev(`[bubble ro] resize ${width}x${height} mode=${targetMode}`)
-        const entryOffsetX = targetMode === 'motion' ? BUBBLE_MOTION.reserveX : 0
-        const entryOffsetY = targetMode === 'motion' ? BUBBLE_MOTION.reserveY : 0
-        const preserveAnchor = phaseRef.current !== 'prepared'
-        invoke('sync_mascot_bubble', {
-          width,
-          height,
-          entryOffsetX,
-          entryOffsetY,
-          preserveAnchor,
-        }).catch(() => {})
-      }
+      const preserveAnchor = phaseRef.current !== 'prepared'
 
       if (phaseRef.current === 'prepared') {
+        const last = lastSizeRef.current
+        if (!last || last.width !== width || last.height !== height) {
+          lastSizeRef.current = { width, height }
+          lastSyncedGeometryRef.current = { width, height, mode: 'motion' }
+          currentGeometryModeRef.current = 'motion'
+          invoke('sync_mascot_bubble', {
+            width,
+            height,
+            entryOffsetX: BUBBLE_MOTION.reserveX,
+            entryOffsetY: BUBBLE_MOTION.reserveY,
+            preserveAnchor: false,
+          }).catch(() => {})
+        }
         const tid = transitionIdRef.current
         if (readySentForTransitionRef.current !== tid) {
           readySentForTransitionRef.current = tid
           logBubbleDev(`[bubble ${tid}] ready (ro)`)
           emit('mascot-bubble-ready', { transitionId: tid }).catch(() => {})
         }
+        return
+      }
+
+      // Buffer pending geometry for rAF coalescing
+      pendingSyncRef.current = {
+        width,
+        height,
+        mode: targetMode,
+        preserveAnchor,
+      }
+
+      if (syncRafIdRef.current == null) {
+        syncRafIdRef.current = requestAnimationFrame(() => {
+          syncRafIdRef.current = null
+          dispatchCoalescedGeometrySync()
+        })
       }
     })
     ro.observe(el)
-    return () => ro.disconnect()
-  }, [displaySummary])
+    return () => {
+      ro.disconnect()
+      if (syncRafIdRef.current) {
+        cancelAnimationFrame(syncRafIdRef.current)
+        syncRafIdRef.current = null
+      }
+    }
+  }, [displaySummary, dispatchCoalescedGeometrySync])
 
   // Safety fallback for prefersReducedMotion: ensure exit/enter completion is emitted without hanging
   useEffect(() => {
@@ -1173,6 +1395,10 @@ export default function MascotBubble() {
       setPhase('hidden')
       phaseRef.current = 'hidden'
       setSummary(null)
+      targetWidthRef.current = null
+      setTargetWidth(null)
+      setShouldAnimateWidth(false)
+      isWidthAnimatingRef.current = false
       logBubbleDev(`[bubble ${currentId}] exit complete`)
       emit('mascot-bubble-exit-complete', { transitionId: currentId }).catch(() => {})
     }
@@ -1225,6 +1451,10 @@ export default function MascotBubble() {
           setPhase('hidden')
           phaseRef.current = 'hidden'
           setSummary(null)
+          targetWidthRef.current = null
+          setTargetWidth(null)
+          setShouldAnimateWidth(false)
+          isWidthAnimatingRef.current = false
           knownSessionIdsRef.current.clear()
           seenTurnKeysRef.current.clear()
           logBubbleDev(`[bubble ${currentId}] multi-row exit complete`)
@@ -1253,19 +1483,6 @@ export default function MascotBubble() {
     emit('mascot-bubble-click', { sessionId }).catch(() => {})
     emit('mascot-bubble-session-click', { sessionId }).catch(() => {})
   }
-
-  const sessionsToRender =
-    displaySummary.activeSessions && displaySummary.activeSessions.length > 0
-      ? displaySummary.activeSessions
-      : displaySummary.activeSession
-        ? [displaySummary.activeSession]
-        : []
-
-  const isDetailed = displaySummary.style === 'detailed' && sessionsToRender.length > 0
-  const isMultiSession = isDetailed && sessionsToRender.length > 1
-
-  isMultiSessionRef.current = isMultiSession
-  sessionsToRenderRef.current = sessionsToRender
 
   const getFallbackThinkingText = (sessionId: string) => {
     const rawPool = t('mini.thinkingPool', { returnObjects: true })
@@ -1359,7 +1576,21 @@ export default function MascotBubble() {
               )}
             </div>
           ) : (
-            <div className="mascot-bubble-stack">
+            <motion.div
+              className="mascot-bubble-stack"
+              animate={{
+                width: targetWidth ?? undefined,
+              }}
+              transition={
+                shouldAnimateWidth && !prefersReducedMotion
+                  ? BUBBLE_WIDTH_MOTION.spring
+                  : { duration: 0 }
+              }
+              onAnimationComplete={() => {
+                isWidthAnimatingRef.current = false
+                setShouldAnimateWidth(false)
+              }}
+            >
               {sessionsToRender.map((session, idx) => {
                 const fallbackThinkingText = session.status === 'processing' ? getFallbackThinkingText(session.sessionId) : undefined
                 const isLast = idx === sessionsToRender.length - 1
@@ -1386,10 +1617,48 @@ export default function MascotBubble() {
                   />
                 )
               })}
-            </div>
+            </motion.div>
           )}
         </div>
       </motion.div>
+
+      {/* Off-screen intrinsic measurement stack for detailed bubble */}
+      {isDetailed && (
+        <div
+          className="mascot-bubble-measure-layer"
+          aria-hidden="true"
+          style={{
+            position: 'fixed',
+            top: -9999,
+            left: -9999,
+            visibility: 'hidden',
+            pointerEvents: 'none',
+            opacity: 0,
+            zIndex: -9999,
+            width: 'max-content',
+          }}
+        >
+          <div ref={measureStackRef} className="mascot-bubble-stack">
+            {sessionsToRender.map((session, idx) => {
+              const fallbackThinkingText = session.status === 'processing' ? getFallbackThinkingText(session.sessionId) : undefined
+              const isLast = idx === sessionsToRender.length - 1
+              const remainingOthers = Math.max(0, totalActive - sessionsToRender.length)
+              const showBadge = isLast && remainingOthers > 0
+
+              return (
+                <MeasureSessionBubbleRow
+                  key={session.sessionId}
+                  session={session}
+                  t={t}
+                  fallbackThinkingText={fallbackThinkingText}
+                  showBadge={showBadge}
+                  remainingOthers={remainingOthers}
+                />
+              )
+            })}
+          </div>
+        </div>
+      )}
     </div>
   )
 }
