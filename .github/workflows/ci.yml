@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend checks
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.1
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The repository currently has pre-existing ESLint findings. Keep this
+      # visible in CI without preventing compile/test validation from running.
+      - name: Lint (advisory baseline)
+        continue-on-error: true
+        run: pnpm lint
+
+      - name: Test
+        run: pnpm test
+
+      - name: Build frontend
+        run: pnpm build
+
+  rust:
+    name: Rust checks
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: frontend/src-tauri
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: frontend/src-tauri -> target
+
+      # The repository currently has pre-existing rustfmt differences. Keep
+      # reporting them while cargo check/test remain the blocking gates.
+      - name: cargo fmt (advisory baseline)
+        continue-on-error: true
+        run: cargo fmt --check
+
+      - name: cargo check
+        run: cargo check --locked
+
+      - name: cargo test
+        run: cargo test --locked
+
+  tauri-build:
+    name: Tauri release compile
+    runs-on: windows-latest
+    needs: [frontend, rust]
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.1
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: frontend/src-tauri -> target
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Tauri release binary
+        run: pnpm exec tauri build --no-bundle
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: oc-claw-windows-release-binary
+          path: frontend/src-tauri/target/release/oc_claw.exe
+          if-no-files-found: error
+          retention-days: 14
