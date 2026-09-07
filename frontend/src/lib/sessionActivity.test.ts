@@ -504,4 +504,23 @@ test('deriveSessionActivity with justification or prompt fields does not create 
   assert.equal(promptAct.status, 'running')
 })
 
+test('isSameSessionDetail distinguishes same session/content/status with different turn IDs', () => {
+  const baseSession: BubbleSessionDetail = {
+    sessionId: 'sess-turn-test',
+    title: 'Codex Session',
+    source: 'codex',
+    status: 'processing',
+    turnId: 'turn-alpha',
+  }
+
+  const sameTurn = { ...baseSession }
+  const differentTurn = { ...baseSession, turnId: 'turn-beta' }
+  const noTurn = { ...baseSession, turnId: undefined }
+
+  assert.ok(isSameSessionDetail(baseSession, sameTurn), 'Identical turnId should be equal')
+  assert.ok(!isSameSessionDetail(baseSession, differentTurn), 'Different turnId must not be deduplicated')
+  assert.ok(!isSameSessionDetail(baseSession, noTurn), 'Presence vs absence of turnId must not be deduplicated')
+})
+
+
 

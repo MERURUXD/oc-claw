@@ -311,6 +311,7 @@ export function isSameSessionDetail(
   if (
     a.sessionId !== b.sessionId ||
     a.title !== b.title ||
+    a.subtitle !== b.subtitle ||
     a.source !== b.source ||
     a.status !== b.status ||
     a.role !== b.role ||
@@ -320,7 +321,8 @@ export function isSameSessionDetail(
     a.actionText !== b.actionText ||
     a.tool !== b.tool ||
     a.toolInput !== b.toolInput ||
-    a.otherCount !== b.otherCount
+    a.otherCount !== b.otherCount ||
+    a.turnId !== b.turnId
   ) {
     return false
   }

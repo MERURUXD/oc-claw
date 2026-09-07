@@ -861,6 +861,7 @@ export default function MascotBubble() {
   const targetWidthRef = useRef<number | null>(null)
   const isWidthAnimatingRef = useRef<boolean>(false)
   const measureStackRef = useRef<HTMLDivElement>(null)
+  const stackRef = useRef<HTMLDivElement>(null)
 
   // Native geometry sync coalescing (single sync per animation frame + in-flight guard)
   const pendingSyncRef = useRef<{
@@ -1247,10 +1248,19 @@ export default function MascotBubble() {
     const measured = Math.ceil(el.offsetWidth)
     if (measured <= 0) return
 
-    const current = targetWidthRef.current
-    const currentPhase = phaseRef.current
+    const currentPhase = phase
     const isPreparedOrEntering = currentPhase === 'prepared' || currentPhase === 'entering'
     const isExiting = currentPhase === 'exiting'
+
+    // When exiting, capture the exact current rendered/interpolated width from DOM
+    // to stop and freeze the mid-spring width instead of snapping or letting the spring continue
+    let current = targetWidthRef.current
+    if (isExiting && stackRef.current) {
+      const rendered = Math.round(stackRef.current.getBoundingClientRect().width)
+      if (rendered > 0) {
+        current = rendered
+      }
+    }
 
     const resolution = resolveBubbleWidthTarget(measured, current, {
       isPreparedOrEntering,
@@ -1260,18 +1270,22 @@ export default function MascotBubble() {
       instantThreshold: BUBBLE_WIDTH_MOTION.instantThreshold,
     })
 
-    if (resolution.targetWidth !== targetWidthRef.current || resolution.shouldAnimate !== shouldAnimateWidth) {
+    if (
+      resolution.targetWidth !== targetWidthRef.current ||
+      resolution.shouldAnimate !== shouldAnimateWidth ||
+      isExiting
+    ) {
       logBubbleDev(`[bubble width] measured=${measured} prev=${current} next=${resolution.targetWidth} animate=${resolution.shouldAnimate}`)
       targetWidthRef.current = resolution.targetWidth
       isWidthAnimatingRef.current = resolution.shouldAnimate
       setTargetWidth(resolution.targetWidth)
       setShouldAnimateWidth(resolution.shouldAnimate)
     }
-  }, [isDetailed, prefersReducedMotion, shouldAnimateWidth])
+  }, [isDetailed, prefersReducedMotion, shouldAnimateWidth, phase])
 
   useLayoutEffect(() => {
     updateTargetWidth()
-  }, [updateTargetWidth, displaySummary, isDetailed])
+  }, [updateTargetWidth, displaySummary, isDetailed, phase])
 
   // Continuous ResizeObserver on measureStackRef for font-loading, badge count, or asynchronous chip changes
   useEffect(() => {
@@ -1577,6 +1591,7 @@ export default function MascotBubble() {
             </div>
           ) : (
             <motion.div
+              ref={stackRef}
               className="mascot-bubble-stack"
               animate={{
                 width: targetWidth ?? undefined,

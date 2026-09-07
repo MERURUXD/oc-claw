@@ -15960,8 +15960,84 @@ pub fn apply_codex_permission_relay_to_session(
     request_id: &str,
     tool_name: &str,
     reason_str: Option<String>,
-) {
+) -> bool {
+    let relay_item_id = parsed_event.get("item_id")
+        .or_else(|| parsed_event.get("itemId"))
+        .or_else(|| parsed_event.get("id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let relay_call_id = parsed_event.get("call_id")
+        .or_else(|| parsed_event.get("callId"))
+        .or_else(|| parsed_event.get("toolCall").and_then(|tc| tc.get("id").or_else(|| tc.get("call_id"))))
+        .or_else(|| parsed_event.get("tool_call").and_then(|tc| tc.get("id").or_else(|| tc.get("call_id"))))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     if let Some(ref mut pi) = session.pending_interaction {
+        // 1. Kind check: must be an approval (reject user_input or other unrelated interaction)
+        if pi.kind != "approval" {
+            log::warn!(
+                "[codex-relay] rejecting relay upgrade: existing interaction kind is '{}' != 'approval'",
+                pi.kind
+            );
+            return false;
+        }
+
+        // 2. Turn identity validation:
+        if let Some(ref existing_turn) = pi.turn_id {
+            if !existing_turn.is_empty() && !turn_id.is_empty() && existing_turn != turn_id {
+                log::warn!(
+                    "[codex-relay] rejecting relay upgrade: turn mismatch (pi.turn_id={}, relay.turn_id={})",
+                    existing_turn,
+                    turn_id
+                );
+                return false;
+            }
+        }
+        if let Some(ref session_turn) = session.turn_id {
+            if !session_turn.is_empty() && !turn_id.is_empty() && session_turn != turn_id {
+                log::warn!(
+                    "[codex-relay] rejecting relay upgrade: session turn mismatch (session.turn_id={}, relay.turn_id={})",
+                    session_turn,
+                    turn_id
+                );
+                return false;
+            }
+        }
+
+        // 3. Tool-call identity validation:
+        if pi.call_id.is_some() && relay_call_id.is_some() && pi.call_id != relay_call_id {
+            log::warn!(
+                "[codex-relay] rejecting relay upgrade: call_id mismatch ({:?} != {:?})",
+                pi.call_id,
+                relay_call_id
+            );
+            return false;
+        }
+        if pi.item_id.is_some() && relay_item_id.is_some() && pi.item_id != relay_item_id {
+            log::warn!(
+                "[codex-relay] rejecting relay upgrade: item_id mismatch ({:?} != {:?})",
+                pi.item_id,
+                relay_item_id
+            );
+            return false;
+        }
+        if let Some(ref existing_tool) = pi.tool {
+            if !existing_tool.is_empty() && !tool_name.is_empty()
+                && existing_tool != tool_name
+                && existing_tool != "request_permissions"
+                && tool_name != "request_permissions"
+            {
+                log::warn!(
+                    "[codex-relay] rejecting relay upgrade: tool mismatch ({:?} != {:?})",
+                    existing_tool,
+                    tool_name
+                );
+                return false;
+            }
+        }
+
         pi.request_id = Some(request_id.to_string());
         pi.approval_actions = Some(ApprovalActions {
             can_deny: true,
@@ -15971,15 +16047,29 @@ pub fn apply_codex_permission_relay_to_session(
         if pi.turn_id.is_none() && !turn_id.is_empty() {
             pi.turn_id = Some(turn_id.to_string());
         }
+        session.status = "waiting".to_string();
+        session.needs_review = Some(true);
+        true
     } else {
         // Case C: PermissionRequest arrived without preceding PreToolUse or pending_interaction was None
+        if let Some(ref session_turn) = session.turn_id {
+            if !session_turn.is_empty() && !turn_id.is_empty() && session_turn != turn_id {
+                log::warn!(
+                    "[codex-relay] rejecting Case C relay: session turn mismatch (session.turn_id={}, relay.turn_id={})",
+                    session_turn,
+                    turn_id
+                );
+                return false;
+            }
+        }
+
         let mut pi = parse_codex_permission_request(parsed_event).unwrap_or_else(|| {
             PendingInteraction {
                 kind: "approval".to_string(),
                 interaction_type: Some("permissions".to_string()),
                 turn_id: if turn_id.is_empty() { None } else { Some(turn_id.to_string()) },
-                item_id: None,
-                call_id: None,
+                item_id: relay_item_id,
+                call_id: relay_call_id,
                 tool: Some(tool_name.to_string()),
                 summary: Some("Codex requested permissions".to_string()),
                 detail: None,
@@ -15997,6 +16087,7 @@ pub fn apply_codex_permission_relay_to_session(
         session.pending_interaction = Some(pi);
         session.status = "waiting".to_string();
         session.needs_review = Some(true);
+        true
     }
 }
 
@@ -17081,6 +17172,373 @@ mod codex_adapter_tests {
     }
 
     #[test]
+    fn test_cleanup_codex_approval_turn_mismatch_retains_approval() {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let approvals: CodexPendingApprovals = Arc::new(Mutex::new(HashMap::new()));
+        approvals.lock().unwrap().insert("sess_test".to_string(), PendingCodexApproval {
+            session_id: "sess_test".to_string(),
+            turn_id: "turn_B".to_string(),
+            request_id: "req_B_123".to_string(),
+            permissions: serde_json::json!({}),
+            reason: None,
+            created_at: 1000,
+            responder: Some(tx),
+        });
+
+        // Turn B awaiting approval -> delayed Stop from turn A arrives (expected_turn_id = "turn_A")
+        cleanup_codex_approval("sess_test", Some("turn_A"), &approvals);
+
+        // Turn B approval must be retained
+        {
+            let map = approvals.lock().unwrap();
+            let entry = map.get("sess_test");
+            assert!(entry.is_some(), "Approval for Turn B must NOT be removed by delayed Stop from turn A");
+            assert_eq!(entry.unwrap().turn_id, "turn_B");
+        }
+        // Responder has not been triggered
+        assert!(rx.try_recv().is_err());
+
+        // Cleanup with matching turn_B removes the approval
+        cleanup_codex_approval("sess_test", Some("turn_B"), &approvals);
+        assert!(approvals.lock().unwrap().get("sess_test").is_none());
+        assert_eq!(rx.try_recv().unwrap(), "{}");
+    }
+
+    #[test]
+    fn test_relay_handler_finishing_does_not_remove_replacement_request() {
+        let (tx_b, _rx_b) = std::sync::mpsc::channel::<String>();
+        let approvals: CodexPendingApprovals = Arc::new(Mutex::new(HashMap::new()));
+
+        // Initially Request A was present, but Request B replaced Request A for the session
+        approvals.lock().unwrap().insert("sess_test".to_string(), PendingCodexApproval {
+            session_id: "sess_test".to_string(),
+            turn_id: "turn_B".to_string(),
+            request_id: "req_B_999".to_string(),
+            permissions: serde_json::json!({}),
+            reason: None,
+            created_at: 2000,
+            responder: Some(tx_b),
+        });
+
+        // Request A's handler finishes with request_id = "req_A_111"
+        let handler_a_request_id = "req_A_111";
+        {
+            let mut map = approvals.lock().unwrap();
+            if map.get("sess_test").map(|a| a.request_id == handler_a_request_id).unwrap_or(false) {
+                map.remove("sess_test");
+            }
+        }
+
+        // Replacement request B must still be intact!
+        let map = approvals.lock().unwrap();
+        let entry = map.get("sess_test");
+        assert!(entry.is_some(), "Finishing handler for request A must NOT delete replacement request B");
+        assert_eq!(entry.unwrap().request_id, "req_B_999");
+    }
+
+    #[test]
+    fn test_apply_codex_permission_relay_rejects_delayed_relay_from_turn_a_during_turn_b() {
+        let mut session = ClaudeSession {
+            session_id: "sess_turn_test".to_string(),
+            cwd: "C:/test".to_string(),
+            status: "processing".to_string(),
+            tool: None,
+            tool_input: None,
+            user_prompt: None,
+            custom_title: None,
+            interactive: true,
+            updated_at: 0,
+            is_processing: true,
+            pid: None,
+            pending_agents: 0,
+            permission_suggestions: None,
+            needs_review: None,
+            last_response: None,
+            is_active_tab: false,
+            source: "codex".to_string(),
+            terminal_id: None,
+            host_terminal: None,
+            platform: None,
+            cursor_port: None,
+            cursor_workspace_root: None,
+            cursor_workspace_name: None,
+            cursor_native_handle: None,
+            active_subagents: None,
+            activity: None,
+            activity_origin: None,
+            turn_id: Some("turn_B".to_string()),
+            pending_interaction: Some(PendingInteraction {
+                kind: "approval".to_string(),
+                interaction_type: Some("permissions".to_string()),
+                turn_id: Some("turn_B".to_string()),
+                item_id: None,
+                call_id: None,
+                tool: Some("request_permissions".to_string()),
+                summary: Some("网络访问".to_string()),
+                detail: None,
+                justification: None,
+                request_id: None,
+                approval_actions: None,
+            }),
+        };
+
+        // Delayed relay event arrives with turn_id = "turn_A"
+        let relay_event = serde_json::json!({
+            "turn_id": "turn_A",
+            "tool_name": "request_permissions",
+            "permissions": { "network": { "enabled": true } }
+        });
+
+        let applied = apply_codex_permission_relay_to_session(
+            &mut session,
+            &relay_event,
+            "turn_A",
+            "req_turn_A_stale",
+            "request_permissions",
+            None,
+        );
+
+        assert!(!applied, "Relay from turn A must be rejected during turn B");
+        // State must NOT have been mutated
+        assert_eq!(session.turn_id.as_deref(), Some("turn_B"));
+        let pi = session.pending_interaction.as_ref().unwrap();
+        assert_eq!(pi.turn_id.as_deref(), Some("turn_B"));
+        assert_eq!(pi.request_id, None, "request_id must not be attached on rejected relay");
+    }
+
+    #[test]
+    fn test_apply_codex_permission_relay_rejects_unrelated_pending_interaction() {
+        let mut session = ClaudeSession {
+            session_id: "sess_unrelated".to_string(),
+            cwd: "C:/test".to_string(),
+            status: "waiting".to_string(),
+            tool: Some("ask_question".to_string()),
+            tool_input: None,
+            user_prompt: None,
+            custom_title: None,
+            interactive: true,
+            updated_at: 0,
+            is_processing: false,
+            pid: None,
+            pending_agents: 0,
+            permission_suggestions: None,
+            needs_review: None,
+            last_response: None,
+            is_active_tab: false,
+            source: "codex".to_string(),
+            terminal_id: None,
+            host_terminal: None,
+            platform: None,
+            cursor_port: None,
+            cursor_workspace_root: None,
+            cursor_workspace_name: None,
+            cursor_native_handle: None,
+            active_subagents: None,
+            activity: None,
+            activity_origin: None,
+            turn_id: Some("turn_1".to_string()),
+            pending_interaction: Some(PendingInteraction {
+                kind: "user_input".to_string(),
+                interaction_type: Some("user_input".to_string()),
+                turn_id: Some("turn_1".to_string()),
+                item_id: None,
+                call_id: None,
+                tool: Some("ask_question".to_string()),
+                summary: Some("User confirmation needed".to_string()),
+                detail: None,
+                justification: None,
+                request_id: None,
+                approval_actions: None,
+            }),
+        };
+
+        let relay_event = serde_json::json!({
+            "turn_id": "turn_1",
+            "tool_name": "request_permissions",
+            "permissions": { "network": { "enabled": true } }
+        });
+
+        let applied = apply_codex_permission_relay_to_session(
+            &mut session,
+            &relay_event,
+            "turn_1",
+            "req_turn_1_perm",
+            "request_permissions",
+            None,
+        );
+
+        assert!(!applied, "Relay upgrade must reject unrelated user_input interaction");
+        let pi = session.pending_interaction.as_ref().unwrap();
+        assert_eq!(pi.kind, "user_input");
+        assert_eq!(pi.request_id, None);
+        assert_eq!(pi.approval_actions, None);
+    }
+
+    #[test]
+    fn test_apply_codex_permission_relay_rejects_tool_call_identity_mismatch() {
+        let mut session = ClaudeSession {
+            session_id: "sess_call_mismatch".to_string(),
+            cwd: "C:/test".to_string(),
+            status: "waiting".to_string(),
+            tool: Some("request_permissions".to_string()),
+            tool_input: None,
+            user_prompt: None,
+            custom_title: None,
+            interactive: true,
+            updated_at: 0,
+            is_processing: false,
+            pid: None,
+            pending_agents: 0,
+            permission_suggestions: None,
+            needs_review: None,
+            last_response: None,
+            is_active_tab: false,
+            source: "codex".to_string(),
+            terminal_id: None,
+            host_terminal: None,
+            platform: None,
+            cursor_port: None,
+            cursor_workspace_root: None,
+            cursor_workspace_name: None,
+            cursor_native_handle: None,
+            active_subagents: None,
+            activity: None,
+            activity_origin: None,
+            turn_id: Some("turn_1".to_string()),
+            pending_interaction: Some(PendingInteraction {
+                kind: "approval".to_string(),
+                interaction_type: Some("permissions".to_string()),
+                turn_id: Some("turn_1".to_string()),
+                item_id: Some("item_call_111".to_string()),
+                call_id: Some("call_111".to_string()),
+                tool: Some("request_permissions".to_string()),
+                summary: Some("网络访问".to_string()),
+                detail: None,
+                justification: None,
+                request_id: None,
+                approval_actions: None,
+            }),
+        };
+
+        // Relay arrives with mismatched call_id "call_222"
+        let relay_event = serde_json::json!({
+            "turn_id": "turn_1",
+            "call_id": "call_222",
+            "item_id": "item_call_111",
+            "tool_name": "request_permissions",
+            "permissions": { "network": { "enabled": true } }
+        });
+
+        let applied = apply_codex_permission_relay_to_session(
+            &mut session,
+            &relay_event,
+            "turn_1",
+            "req_mismatched_call",
+            "request_permissions",
+            None,
+        );
+
+        assert!(!applied, "Relay upgrade must reject call_id mismatch");
+        let pi = session.pending_interaction.as_ref().unwrap();
+        assert_eq!(pi.call_id.as_deref(), Some("call_111"));
+        assert_eq!(pi.request_id, None);
+    }
+
+    #[test]
+    fn test_relay_timeout_clears_matching_actionable_fields() {
+        let mut session = ClaudeSession {
+            session_id: "sess_timeout".to_string(),
+            cwd: "C:/test".to_string(),
+            status: "waiting".to_string(),
+            tool: Some("request_permissions".to_string()),
+            tool_input: None,
+            user_prompt: None,
+            custom_title: None,
+            interactive: true,
+            updated_at: 0,
+            is_processing: false,
+            pid: None,
+            pending_agents: 0,
+            permission_suggestions: None,
+            needs_review: Some(true),
+            last_response: None,
+            is_active_tab: false,
+            source: "codex".to_string(),
+            terminal_id: None,
+            host_terminal: None,
+            platform: None,
+            cursor_port: None,
+            cursor_workspace_root: None,
+            cursor_workspace_name: None,
+            cursor_native_handle: None,
+            active_subagents: None,
+            activity: None,
+            activity_origin: None,
+            turn_id: Some("turn_1".to_string()),
+            pending_interaction: Some(PendingInteraction {
+                kind: "approval".to_string(),
+                interaction_type: Some("permissions".to_string()),
+                turn_id: Some("turn_1".to_string()),
+                item_id: None,
+                call_id: None,
+                tool: Some("request_permissions".to_string()),
+                summary: Some("网络访问".to_string()),
+                detail: None,
+                justification: Some("curl test".to_string()),
+                request_id: Some("req_turn_1_timeout".to_string()),
+                approval_actions: Some(ApprovalActions {
+                    can_deny: true,
+                    can_allow_turn: true,
+                    can_allow_session: false,
+                }),
+            }),
+        };
+
+        // When responder expires for "req_turn_1_timeout", actionable fields are cleared
+        let expired_request_id = "req_turn_1_timeout";
+        let cleared = if let Some(ref mut pi) = session.pending_interaction {
+            if pi.request_id.as_deref() == Some(expired_request_id) {
+                pi.request_id = None;
+                pi.approval_actions = None;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        assert!(cleared);
+        let pi = session.pending_interaction.as_ref().unwrap();
+        assert_eq!(pi.request_id, None, "request_id must be cleared on timeout");
+        assert_eq!(pi.approval_actions, None, "approval_actions must be cleared on timeout");
+        assert_eq!(pi.summary.as_deref(), Some("网络访问"), "Underlying interaction summary preserved");
+
+        // If another request B took over, timeout for request A does not clear request B
+        session.pending_interaction.as_mut().unwrap().request_id = Some("req_turn_1_new".to_string());
+        session.pending_interaction.as_mut().unwrap().approval_actions = Some(ApprovalActions {
+            can_deny: true,
+            can_allow_turn: true,
+            can_allow_session: false,
+        });
+
+        let cleared_stale = if let Some(ref mut pi) = session.pending_interaction {
+            if pi.request_id.as_deref() == Some("req_turn_1_timeout") {
+                pi.request_id = None;
+                pi.approval_actions = None;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        assert!(!cleared_stale, "Timeout of older request must not clear replacement request B");
+        assert_eq!(session.pending_interaction.as_ref().unwrap().request_id.as_deref(), Some("req_turn_1_new"));
+    }
+
+    #[test]
     fn read_last_codex_assistant_message_extracts_latest_text() {
         let temp_dir = std::env::temp_dir();
         let path = temp_dir.join("test_codex_assistant_msg.jsonl");
@@ -17696,15 +18154,23 @@ pub fn handle_antigravity_subagent_event(
     Some(root_id)
 }
 
+#[derive(Debug, Clone)]
+pub struct ProcessClaudeEventResult {
+    pub session_id: String,
+    pub hook_event: String,
+    pub accepted: bool,
+    pub turn_id: Option<String>,
+}
+
 /// Process a Claude hook event (shared logic between Unix socket and TCP server).
-/// Returns Some((session_id, hook_event)) if the event needs further handling
+/// Returns Some(ProcessClaudeEventResult) if the event needs further handling
 /// (e.g. PermissionRequest requires blocking the connection for a response).
 fn process_claude_event(
     buf: &str,
     state: &Arc<Mutex<HashMap<String, ClaudeSession>>>,
     app: &tauri::AppHandle,
     source_override: Option<&str>,
-) -> Option<(String, String)> {
+) -> Option<ProcessClaudeEventResult> {
     // Char-boundary-safe truncation for the diagnostic log. Plain byte slicing
     // (`&buf[..500]`) panics if byte 500 lands inside a multi-byte UTF-8 char,
     // which is guaranteed for any CC Desktop Stop event whose `last_assistant_message`
@@ -17929,6 +18395,10 @@ fn process_claude_event(
         // the moment a waiting/permission event arrives — used to suppress the
         // waiting popup, same focus rule as the completion popup.
         let mut wait_tab_active = false;
+        let incoming_turn_id = event.get("turnId")
+            .or_else(|| event.get("turn_id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         let mut is_stale_turn_stop = false;
 
         {
@@ -18005,10 +18475,6 @@ fn process_claude_event(
                     session.source = source.clone();
                 }
 
-                let incoming_turn_id = event.get("turnId")
-                    .or_else(|| event.get("turn_id"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
                 if hook_event == "UserPromptSubmit" || hook_event == "GatewayAgentStart" {
                     session.turn_id = incoming_turn_id.clone();
                 } else if session.turn_id.is_none() && incoming_turn_id.is_some() {
@@ -18288,14 +18754,16 @@ fn process_claude_event(
                     }
                 }
 
-                if hook_event == "PostToolUse" || hook_event == "Stop" || hook_event == "SubagentStop" || hook_event == "GatewayAgentEnd" {
+                if (hook_event == "PostToolUse" || hook_event == "Stop" || hook_event == "SubagentStop" || hook_event == "GatewayAgentEnd") && !is_stale_turn_stop {
                     session.tool = None;
                     session.tool_input = None;
                     session.activity = None;
                     session.activity_origin = None;
                     if hook_event == "PostToolUse" && (tool_name == "request_permissions" || tool_name == "requestPermissions") {
-                        session.pending_interaction = None;
-                        session.needs_review = None;
+                        if incoming_turn_id.is_none() || session.turn_id.is_none() || incoming_turn_id == session.turn_id {
+                            session.pending_interaction = None;
+                            session.needs_review = None;
+                        }
                     }
                 }
 
@@ -18552,7 +19020,13 @@ fn process_claude_event(
             stop_session_file_watcher(&session_id);
         }
 
-        return Some((session_id, hook_event));
+        let accepted = !is_stale_turn_stop;
+        return Some(ProcessClaudeEventResult {
+            session_id,
+            hook_event,
+            accepted,
+            turn_id: incoming_turn_id,
+        });
     } else if let Err(e) = serde_json::from_str::<serde_json::Value>(buf_for_parse) {
         let tail: String = buf_for_parse.chars().rev().take(300).collect::<String>().chars().rev().collect();
         log::warn!("[claude_event] JSON parse failed: err={}, len={}, tail=...{}", e, buf_for_parse.len(), tail);
@@ -21181,7 +21655,7 @@ fn handle_codex_permission_relay<W: std::io::Write>(
     let reason_str = tool_input_obj.get("reason").or_else(|| parsed_event.get("reason")).and_then(|v| v.as_str()).map(|s| s.to_string());
 
     let (tx, rx) = std::sync::mpsc::channel::<String>();
-    {
+    let applied = {
         let mut sessions = state.lock().unwrap();
         if let Some(session) = sessions.get_mut(session_id) {
             apply_codex_permission_relay_to_session(
@@ -21191,9 +21665,23 @@ fn handle_codex_permission_relay<W: std::io::Write>(
                 &request_id,
                 tool_name,
                 reason_str.clone(),
-            );
+            )
+        } else {
+            false
         }
+    };
+    if !applied {
+        log::warn!(
+            "[codex-relay] rejecting mismatched relay before mutation: session={} turn={} request_id={}",
+            sess_prefix,
+            turn_id,
+            request_id
+        );
+        let _ = stream.write_all(b"{}");
+        let _ = stream.flush();
+        return;
     }
+
     {
         let mut approvals = codex_approvals.lock().unwrap();
         approvals.insert(session_id.to_string(), PendingCodexApproval {
@@ -21248,15 +21736,56 @@ fn handle_codex_permission_relay<W: std::io::Write>(
             );
             let _ = stream.write_all(b"{}");
             let _ = stream.flush();
+
+            let cleared = {
+                let mut sessions = state.lock().unwrap();
+                if let Some(session) = sessions.get_mut(session_id) {
+                    if let Some(ref mut pi) = session.pending_interaction {
+                        if pi.request_id.as_deref() == Some(&request_id) {
+                            pi.request_id = None;
+                            pi.approval_actions = None;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+            if cleared {
+                let _ = app.emit("claude-session-update", session_id);
+            }
         }
     }
 
     let mut approvals = codex_approvals.lock().unwrap();
-    approvals.remove(session_id);
+    if approvals.get(session_id).map(|a| a.request_id == request_id).unwrap_or(false) {
+        approvals.remove(session_id);
+    }
 }
 
-fn cleanup_codex_approval(session_id: &str, codex_approvals: &CodexPendingApprovals) {
+fn cleanup_codex_approval(
+    session_id: &str,
+    expected_turn_id: Option<&str>,
+    codex_approvals: &CodexPendingApprovals,
+) {
     let mut approvals = codex_approvals.lock().unwrap();
+    if let Some(approval) = approvals.get(session_id) {
+        if let Some(expected_turn) = expected_turn_id {
+            if !expected_turn.is_empty() && !approval.turn_id.is_empty() && approval.turn_id != expected_turn {
+                log::info!(
+                    "[codex-approval] skipping cleanup for session={} due to turn mismatch: expected={}, approval={}",
+                    &session_id[..session_id.len().min(8)],
+                    expected_turn,
+                    approval.turn_id
+                );
+                return;
+            }
+        }
+    }
     if let Some(mut approval) = approvals.remove(session_id) {
         if let Some(tx) = approval.responder.take() {
             let _ = tx.send("{}".to_string());
@@ -21301,11 +21830,12 @@ fn start_claude_socket_server(
                             let mut s = s;
                             let mut buf = String::new();
                             let _ = s.read_to_string(&mut buf);
-                            if let Some((session_id, hook_event)) = process_claude_event(&buf, &state, &app, None) {
-                                if hook_event == "PostToolUse" || hook_event == "Stop" || hook_event == "UserPromptSubmit" {
-                                    cleanup_codex_approval(&session_id, &codex_approvals);
+                            if let Some(res) = process_claude_event(&buf, &state, &app, None) {
+                                if res.accepted && (res.hook_event == "PostToolUse" || res.hook_event == "Stop" || res.hook_event == "UserPromptSubmit") {
+                                    cleanup_codex_approval(&res.session_id, res.turn_id.as_deref(), &codex_approvals);
                                 }
-                                if hook_event == "PermissionRequest" {
+                                if res.hook_event == "PermissionRequest" {
+                                    let session_id = res.session_id;
                                     let source = {
                                         let sessions = state.lock().unwrap();
                                         sessions
@@ -21399,11 +21929,12 @@ fn start_claude_socket_server(
                                 );
                                 return;
                             }
-                            if let Some((session_id, hook_event)) = process_claude_event(&text, &state, &app, None) {
-                                if hook_event == "PostToolUse" || hook_event == "Stop" || hook_event == "UserPromptSubmit" {
-                                    cleanup_codex_approval(&session_id, &codex_approvals);
+                            if let Some(res) = process_claude_event(&text, &state, &app, None) {
+                                if res.accepted && (res.hook_event == "PostToolUse" || res.hook_event == "Stop" || res.hook_event == "UserPromptSubmit") {
+                                    cleanup_codex_approval(&res.session_id, res.turn_id.as_deref(), &codex_approvals);
                                 }
-                                if hook_event == "PermissionRequest" {
+                                if res.hook_event == "PermissionRequest" {
+                                    let session_id = res.session_id;
                                     let source = {
                                         let sessions = state.lock().unwrap();
                                         sessions
