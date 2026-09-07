@@ -147,3 +147,56 @@ test('8. Multi-session stack intrinsic width resolution', () => {
   assert.equal(shrinkRes.targetWidth, 230)
   assert.equal(shrinkRes.shouldAnimate, true)
 })
+
+test('9. Close mid-spring: freezes at current interpolated width and halts spring', () => {
+  // Scenario: Bubble was springing from 200 toward 320.
+  // Mid-flight, current rendered width is at 254px when user triggers close (isExiting = true).
+  // Target width must freeze at 254px and shouldAnimate must be false.
+  const midSpringExit = resolveBubbleWidthTarget(320, 254, {
+    isExiting: true,
+    isCurrentlyAnimating: true,
+  })
+  assert.equal(midSpringExit.targetWidth, 254, 'Must freeze at intermediate rendered width, not spring target')
+  assert.equal(midSpringExit.shouldAnimate, false, 'Must halt spring on exit')
+})
+
+test('10. Reopen before exit completes: re-enables spring to content target', () => {
+  // Scenario: Bubble was frozen at 254px during exit.
+  // Before exit completes, a new notification or interaction reopens it to 'visible' phase.
+  // Content requires 320px. Since |320 - 254| = 66 >= 6, a spring animation must be re-triggered.
+  const reopened = resolveBubbleWidthTarget(320, 254, {
+    isPreparedOrEntering: false,
+    isExiting: false,
+  })
+  assert.equal(reopened.targetWidth, 320, 'Must target full content width on reopen')
+  assert.equal(reopened.shouldAnimate, true, 'Must re-enable spring from frozen width to target width')
+})
+
+test('11. Unchanged-content phase transitions: phase changes reconcile width animation', () => {
+  const contentWidth = 300
+  const initialWidth = 200
+
+  // 1. In visible phase: delta is 100 -> spring triggers
+  const visibleRes = resolveBubbleWidthTarget(contentWidth, initialWidth, {
+    isPreparedOrEntering: false,
+    isExiting: false,
+  })
+  assert.equal(visibleRes.targetWidth, 300)
+  assert.equal(visibleRes.shouldAnimate, true)
+
+  // 2. Content is identical (contentWidth still 300), but phase changes to exiting while at 260px:
+  // Must freeze at 260px with shouldAnimate = false
+  const exitRes = resolveBubbleWidthTarget(contentWidth, 260, {
+    isExiting: true,
+  })
+  assert.equal(exitRes.targetWidth, 260)
+  assert.equal(exitRes.shouldAnimate, false)
+
+  // 3. Phase changes back to prepared: instant assignment without spring
+  const preparedRes = resolveBubbleWidthTarget(contentWidth, 260, {
+    isPreparedOrEntering: true,
+  })
+  assert.equal(preparedRes.targetWidth, 300)
+  assert.equal(preparedRes.shouldAnimate, false)
+})
+
