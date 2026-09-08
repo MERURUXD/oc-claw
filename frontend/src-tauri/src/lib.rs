@@ -15635,24 +15635,23 @@ try {
     if (-not $hookName -and $HookEvent) { $hookName = $HookEvent }
 
     try {
-        $client = [System.Net.Sockets.TcpClient]::new('127.0.0.1', 19283)
+        $client = [System.Net.Sockets.TcpClient]::new()
+        if (-not $client.ConnectAsync('127.0.0.1', 19283).Wait(500)) { throw 'OC-Claw connect timeout' }
+        $client.SendTimeout = 500
         $stream = $client.GetStream()
         $payload = [System.Text.Encoding]::UTF8.GetBytes($raw)
         $stream.Write($payload, 0, $payload.Length)
         $stream.Flush()
         $client.Client.Shutdown([System.Net.Sockets.SocketShutdown]::Send)
 
-        if ($hookName -eq 'PermissionRequest') {
-            $reader = [System.IO.StreamReader]::new($stream, [System.Text.Encoding]::UTF8)
-            $response = $reader.ReadToEnd()
-            if ($response) { [Console]::Out.Write($response) } else { [Console]::Out.Write('{}') }
-            $reader.Close()
-        } else {
-            [Console]::Out.Write('{}')
-        }
+        # Observation only: never wait for an approval decision from OC-Claw.
+        # Empty output leaves Codex's native approval policy in control.
+        [Console]::Out.Write('{}')
         $client.Close()
     } catch {
         [Console]::Out.Write('{}')
+    } finally {
+        if ($client) { $client.Dispose() }
     }
 } catch {
     try { [Console]::Out.Write('{}') } catch {}
@@ -15730,26 +15729,14 @@ payload = json.dumps(data)
 
 try:
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(0.5)
     sock.connect('$SOCKET_PATH')
     sock.sendall(payload.encode('utf-8'))
 
-    if hook_event == 'PermissionRequest':
-        sock.shutdown(socket.SHUT_WR)
-        response = b''
-        while True:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            response += chunk
-        sock.close()
-        if response:
-            sys.stdout.write(response.decode('utf-8', errors='replace'))
-        else:
-            sys.stdout.write('{}')
-    else:
-        sock.shutdown(socket.SHUT_WR)
-        sock.close()
-        sys.stdout.write('{}')
+    # Observation only, including PermissionRequest. Do not read a decision.
+    sock.shutdown(socket.SHUT_WR)
+    sock.close()
+    sys.stdout.write('{}')
 except:
     sys.stdout.write('{}')
 "
@@ -15813,7 +15800,7 @@ except:
     #[cfg(windows)]
     let make_hook_def = |event_name: &str| {
         let hook_command = format!("{} {}", hook_command_windows_base, event_name);
-        let timeout = if event_name == "PermissionRequest" { 600 } else { 5 };
+        let timeout = 5;
         serde_json::json!({
             "type": "command",
             "command": hook_command.clone(),
@@ -15821,8 +15808,8 @@ except:
         })
     };
     #[cfg(not(windows))]
-    let make_hook_def = |event_name: &str| {
-        let timeout = if event_name == "PermissionRequest" { 600 } else { 5 };
+    let make_hook_def = |_event_name: &str| {
+        let timeout = 5;
         serde_json::json!({
             "type": "command",
             "command": hook_command_base.clone(),
@@ -17169,6 +17156,35 @@ mod codex_adapter_tests {
         assert!(actions.can_deny);
         assert!(actions.can_allow_turn);
         assert!(!actions.can_allow_session);
+    }
+
+    #[test]
+    fn test_codex_native_fallback_does_not_create_an_approval_gate() {
+        let approvals: CodexPendingApprovals = Arc::new(Mutex::new(HashMap::new()));
+        let mut response = Vec::new();
+        handle_codex_permission_relay("sess_test", &approvals, &mut response);
+        assert_eq!(response, b"{}");
+        assert!(approvals.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_codex_native_fallback_releases_existing_waiter_without_allowing() {
+        let approvals: CodexPendingApprovals = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        approvals.lock().unwrap().insert("sess_test".into(), PendingCodexApproval {
+            session_id: "sess_test".into(),
+            turn_id: "old_turn".into(),
+            request_id: "old_request".into(),
+            permissions: serde_json::json!({}),
+            reason: None,
+            created_at: 0,
+            responder: Some(tx),
+        });
+        let mut response = Vec::new();
+        handle_codex_permission_relay("sess_test", &approvals, &mut response);
+        assert_eq!(response, b"{}");
+        assert_eq!(rx.try_recv().unwrap(), "{}");
+        assert!(approvals.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -21609,162 +21625,17 @@ fn start_antigravity_socket_server(
 /// On Windows: TCP server on localhost:19283
 fn handle_codex_permission_relay<W: std::io::Write>(
     session_id: &str,
-    raw_text: &str,
-    state: &Arc<Mutex<HashMap<String, ClaudeSession>>>,
     codex_approvals: &CodexPendingApprovals,
-    app: &tauri::AppHandle,
     stream: &mut W,
 ) {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let parsed_event: serde_json::Value = serde_json::from_str(raw_text).unwrap_or(serde_json::json!({}));
-    let turn_id = parsed_event.get("turn_id")
-        .or_else(|| parsed_event.get("turnId"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let request_id = format!("req_{}_{}", if turn_id.is_empty() { "default" } else { &turn_id }, now_ms);
-
-    let tool_name = parsed_event.get("tool_name")
-        .or_else(|| parsed_event.get("tool"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("request_permissions");
-    let sess_prefix = &session_id[..session_id.len().min(8)];
-
-    log::info!(
-        "[codex-relay] permission request received: session={} turn={} tool={}",
-        sess_prefix,
-        turn_id,
-        tool_name
-    );
-
-    let tool_input_val = parsed_event.get("tool_input")
-        .or_else(|| parsed_event.get("toolInput"))
-        .or_else(|| parsed_event.get("arguments"))
-        .or_else(|| parsed_event.get("parameters"));
-    let tool_input_obj = match tool_input_val {
-        Some(val) if val.is_object() => val.clone(),
-        Some(val) if val.is_string() => {
-            serde_json::from_str::<serde_json::Value>(val.as_str().unwrap()).unwrap_or(serde_json::json!({}))
-        }
-        _ => serde_json::json!({}),
-    };
-    let perms_val = tool_input_obj.get("permissions").or_else(|| parsed_event.get("permissions")).cloned().unwrap_or(serde_json::json!({}));
-    let reason_str = tool_input_obj.get("reason").or_else(|| parsed_event.get("reason")).and_then(|v| v.as_str()).map(|s| s.to_string());
-
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    let applied = {
-        let mut sessions = state.lock().unwrap();
-        if let Some(session) = sessions.get_mut(session_id) {
-            apply_codex_permission_relay_to_session(
-                session,
-                &parsed_event,
-                &turn_id,
-                &request_id,
-                tool_name,
-                reason_str.clone(),
-            )
-        } else {
-            false
-        }
-    };
-    if !applied {
-        log::warn!(
-            "[codex-relay] rejecting mismatched relay before mutation: session={} turn={} request_id={}",
-            sess_prefix,
-            turn_id,
-            request_id
-        );
-        let _ = stream.write_all(b"{}");
-        let _ = stream.flush();
-        return;
-    }
-
-    {
-        let mut approvals = codex_approvals.lock().unwrap();
-        approvals.insert(session_id.to_string(), PendingCodexApproval {
-            session_id: session_id.to_string(),
-            turn_id: turn_id.clone(),
-            request_id: request_id.clone(),
-            permissions: perms_val,
-            reason: reason_str,
-            created_at: now_ms,
-            responder: Some(tx),
-        });
-    }
-
-    let _ = app.emit("claude-session-update", session_id);
-
-    log::info!(
-        "[codex-relay] responder created: session={} turn={} request_id={}",
-        sess_prefix,
-        turn_id,
-        request_id
-    );
-    log::info!(
-        "[codex-relay] requestId attached: session={} turn={} request_id={}",
-        sess_prefix,
-        turn_id,
-        request_id
-    );
-    log::info!(
-        "[codex-relay] frontend actionable: session={} request_id={}",
-        sess_prefix,
-        request_id
-    );
-
-    match rx.recv_timeout(std::time::Duration::from_secs(300)) {
-        Ok(response_json) => {
-            log::info!(
-                "[codex-relay] response submitted: session={} turn={} request_id={} decision={}",
-                sess_prefix,
-                turn_id,
-                request_id,
-                response_json
-            );
-            let _ = stream.write_all(response_json.as_bytes());
-            let _ = stream.flush();
-        }
-        Err(_) => {
-            log::warn!(
-                "[codex-relay] native fallback: session={} turn={} request_id={}",
-                sess_prefix,
-                turn_id,
-                request_id
-            );
-            let _ = stream.write_all(b"{}");
-            let _ = stream.flush();
-
-            let cleared = {
-                let mut sessions = state.lock().unwrap();
-                if let Some(session) = sessions.get_mut(session_id) {
-                    if let Some(ref mut pi) = session.pending_interaction {
-                        if pi.request_id.as_deref() == Some(&request_id) {
-                            pi.request_id = None;
-                            pi.approval_actions = None;
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            };
-            if cleared {
-                let _ = app.emit("claude-session-update", session_id);
-            }
-        }
-    }
-
-    let mut approvals = codex_approvals.lock().unwrap();
-    if approvals.get(session_id).map(|a| a.request_id == request_id).unwrap_or(false) {
-        approvals.remove(session_id);
-    }
+    // PermissionRequest runs before Codex's native approval prompt. OC-Claw
+    // observes the event in process_claude_event, but must not own that gate.
+    // Do not create a responder or actionable relay buttons. This also releases
+    // old hook scripts which still wait for a socket response.
+    cleanup_codex_approval(session_id, None, codex_approvals);
+    let _ = stream.write_all(b"{}");
+    let _ = stream.flush();
+    log::info!("[codex-relay] native fallback: session={} reason=observation-only", session_id);
 }
 
 fn cleanup_codex_approval(
@@ -21844,7 +21715,7 @@ fn start_claude_socket_server(
                                             .unwrap_or_else(|| "cc".to_string())
                                     };
                                     if source == "codex" {
-                                        handle_codex_permission_relay(&session_id, &buf, &state, &codex_approvals, &app, &mut s);
+                                        handle_codex_permission_relay(&session_id, &codex_approvals, &mut s);
                                         return;
                                     }
                                     let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -21944,7 +21815,7 @@ fn start_claude_socket_server(
                                     };
                                     if source == "codex" {
                                         s.set_read_timeout(None).ok();
-                                        handle_codex_permission_relay(&session_id, &text, &state, &codex_approvals, &app, &mut s);
+                                        handle_codex_permission_relay(&session_id, &codex_approvals, &mut s);
                                         return;
                                     }
                                     let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -22695,4 +22566,3 @@ mod fullscreen_bubble_suppression_tests {
         assert!(!none_monitor, "Missing monitor must NOT trigger suppression");
     }
 }
-
