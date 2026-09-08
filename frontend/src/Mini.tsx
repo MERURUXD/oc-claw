@@ -401,13 +401,11 @@ export default function Mini() {
   const debugInjectSessionsRef = useRef<any[]>([])
   debugInjectSessionsRef.current = debugInjectSessions
   const applyDebugInjectPreset = useCallback((preset: DebugInjectPreset) => {
+    // v1: single-session only — replace the entire inject table
     const next = buildDebugSession(preset)
-    setDebugInjectSessions((prev) => {
-      const filtered = prev.filter((s) => s.sessionId !== next.sessionId)
-      const inject = [...filtered, next]
-      setClaudeSessions((cur) => mergeSessionsWithDebugInject(cur, inject))
-      return inject
-    })
+    const inject = [next]
+    setDebugInjectSessions(inject)
+    setClaudeSessions((cur) => mergeSessionsWithDebugInject(cur, inject))
   }, [])
   const clearDebugInjectSessions = useCallback(() => {
     setDebugInjectSessions([])

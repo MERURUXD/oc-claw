@@ -64,7 +64,6 @@ export function buildDebugSession(preset: DebugInjectPreset, now = Date.now()): 
         sessionId: `${DEBUG_SESSION_PREFIX}waiting-approval`,
         status: 'waiting',
         isProcessing: false,
-        needsReview: true,
         pendingInteraction: {
           kind: 'approval',
           interactionType: 'command',
@@ -88,7 +87,6 @@ export function buildDebugSession(preset: DebugInjectPreset, now = Date.now()): 
           summary: 'Which approach should we take?',
           detail: 'debug inject user_input',
         },
-        questionText: 'Which approach should we take?',
       }
   }
 }
