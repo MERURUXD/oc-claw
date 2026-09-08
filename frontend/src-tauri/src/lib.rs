@@ -22109,7 +22109,28 @@ pub fn run() {
         std::env::set_var(key, merged);
     }
 
-    tauri::Builder::default()
+    // Single-instance MUST be registered first so a second Start Menu /
+    // Desktop / exe launch exits instead of stacking another oc_claw.exe
+    // (which leaves the old windows visible and looks like hide/fullscreen
+    // failure). If presentation is already suppressed (tray Hide /
+    // fullscreen), keep it suppressed — do not force-show.
+    let mut builder = tauri::Builder::default();
+    #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+    {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if PRESENTATION.active() {
+                log::info!(
+                    "[single-instance] secondary launch while presentation suppressed; keeping hidden"
+                );
+                return;
+            }
+            if let Some(win) = app.get_webview_window("mini") {
+                let _ = win.set_always_on_top(true);
+                show_mascot_without_activation(&win);
+            }
+        }));
+    }
+    builder
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_dialog::init())
         // Autostart: enabled via the settings toggle. We pass
