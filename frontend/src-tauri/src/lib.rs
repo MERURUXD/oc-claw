@@ -4,8 +4,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-#[cfg(target_os = "windows")]
-static FULLSCREEN_HIDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+mod presentation;
+static PRESENTATION: presentation::Suppression = presentation::Suppression::new();
+static EXTRA_MASCOTS_HIDDEN: AtomicBool = AtomicBool::new(false);
 use percent_encoding::percent_decode_str;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -3093,7 +3094,9 @@ async fn open_mini(app: tauri::AppHandle) -> Result<(), String> {
                         let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(win_w, win_h));
                         unsafe {
                             let _: () = msg_send![obj, setFrame: frame, display: true];
-                            let _: () = msg_send![obj, orderFrontRegardless];
+                            if !PRESENTATION.active() {
+                                let _: () = msg_send![obj, orderFrontRegardless];
+                            }
                         }
                     }
                 }
@@ -3123,10 +3126,7 @@ async fn open_mini(app: tauri::AppHandle) -> Result<(), String> {
                 );
                 let _ = win.set_position(tauri::LogicalPosition::new(x, 0.0));
             }
-            if !FULLSCREEN_HIDING.load(std::sync::atomic::Ordering::SeqCst) {
-                win.show().map_err(|e| e.to_string())?;
-                win.set_focus().map_err(|e| e.to_string())?;
-            }
+            show_primary_mascot_if_allowed(&app, win.clone(), true)?;
         }
         return Ok(());
     }
@@ -3214,7 +3214,9 @@ async fn open_mini(app: tauri::AppHandle) -> Result<(), String> {
                 }
 
                 unsafe {
-                    let _: () = msg_send![obj, orderFrontRegardless];
+                    if !PRESENTATION.active() {
+                        let _: () = msg_send![obj, orderFrontRegardless];
+                    }
                 }
             }
         });
@@ -3239,9 +3241,7 @@ async fn open_mini(app: tauri::AppHandle) -> Result<(), String> {
             );
             let _ = win.set_position(tauri::LogicalPosition::new(x, 0.0));
         }
-        if !FULLSCREEN_HIDING.load(std::sync::atomic::Ordering::SeqCst) {
-            let _ = win.show();
-        }
+        show_primary_mascot_if_allowed(&app, win.clone(), false)?;
     }
 
     Ok(())
@@ -3788,9 +3788,11 @@ async fn set_mini_expanded(app: tauri::AppHandle, expanded: bool, position: Opti
                             let _: () = msg_send![obj, setFrame: frame, display: true, animate: false];
                             let ns_app_cls = AnyClass::get(c"NSApplication").unwrap();
                             let ns_app: *mut AnyObject = msg_send![ns_app_cls, sharedApplication];
-                            let _: () = msg_send![&*ns_app, activateIgnoringOtherApps: true];
                             let null: *mut AnyObject = std::ptr::null_mut();
-                            let _: () = msg_send![obj, makeKeyAndOrderFront: null];
+                            if !PRESENTATION.active() {
+                                let _: () = msg_send![&*ns_app, activateIgnoringOtherApps: true];
+                                let _: () = msg_send![obj, makeKeyAndOrderFront: null];
+                            }
                         }
                         (x, y, win_w, win_h)
                     } else {
@@ -3905,7 +3907,7 @@ async fn set_mini_expanded(app: tauri::AppHandle, expanded: bool, position: Opti
                 }
             }
         }
-        if !FULLSCREEN_HIDING.load(std::sync::atomic::Ordering::SeqCst) {
+        if !PRESENTATION.active() {
             let _ = win.set_always_on_top(true);
         }
     }
@@ -5318,7 +5320,9 @@ async fn set_pet_mode_window(
                             }
                             let _: () = msg_send![obj, setFrame: frame, display: true, animate: false];
                             let _: () = msg_send![obj, setLevel: 27isize];
-                            let _: () = msg_send![obj, orderFrontRegardless];
+                            if !PRESENTATION.active() {
+                                let _: () = msg_send![obj, orderFrontRegardless];
+                            }
                         }
                         if let Ok(mut f) = MINI_WINDOW_FRAME.lock() {
                             *f = Some((x, y, win_w, win_h));
@@ -5349,10 +5353,7 @@ async fn set_pet_mode_window(
                     let _ = win.set_position(tauri::LogicalPosition::new(x, y));
                 }
             }
-            if !FULLSCREEN_HIDING.load(std::sync::atomic::Ordering::SeqCst) {
-                let _ = win.set_always_on_top(true);
-                let _ = win.show();
-            }
+            show_primary_mascot_if_allowed(&app, win.clone(), false)?;
         }
 
         // Start the click-through poll thread.
@@ -5887,7 +5888,7 @@ async fn set_mini_size(
                                         let _: () = msg_send![obj, setAlphaValue: 0.0f64];
                                         let _: () = msg_send![obj, setLevel: if want_top { 27isize } else { 0isize }];
                                         let _: () = msg_send![obj, setFrame: frame, display: true, animate: false];
-                                        if want_top {
+                                        if want_top && !PRESENTATION.active() {
                                             let _: () = msg_send![obj, orderFrontRegardless];
                                         }
                                     }
@@ -5921,7 +5922,7 @@ async fn set_mini_size(
                                 let _: () = msg_send![obj, setAlphaValue: 0.0f64];
                                 let _: () = msg_send![obj, setLevel: if want_top { 27isize } else { 0isize }];
                                 let _: () = msg_send![obj, setFrame: frame, display: true, animate: false];
-                                if want_top {
+                                if want_top && !PRESENTATION.active() {
                                     let _: () = msg_send![obj, orderFrontRegardless];
                                 }
                             }
@@ -5955,7 +5956,7 @@ async fn set_mini_size(
                                 let _: () = msg_send![obj, setAlphaValue: 0.0f64];
                                 let _: () = msg_send![obj, setLevel: if want_top { 27isize } else { 0isize }];
                                 let _: () = msg_send![obj, setFrame: frame, display: true, animate: false];
-                                if want_top {
+                                if want_top && !PRESENTATION.active() {
                                     let _: () = msg_send![obj, orderFrontRegardless];
                                 }
                             }
@@ -5985,7 +5986,7 @@ async fn set_mini_size(
                         unsafe {
                             let _: () = msg_send![obj, setLevel: if want_top { 27isize } else { 0isize }];
                             let _: () = msg_send![obj, setFrame: frame, display: true, animate: false];
-                            if want_top {
+                            if want_top && !PRESENTATION.active() {
                                 let _: () = msg_send![obj, orderFrontRegardless];
                             }
                         }
@@ -6005,7 +6006,7 @@ async fn set_mini_size(
                         unsafe {
                             let _: () = msg_send![obj, setLevel: if want_top { 27isize } else { 0isize }];
                             let _: () = msg_send![obj, setFrame: frame, display: true, animate: false];
-                            if want_top {
+                            if want_top && !PRESENTATION.active() {
                                 let _: () = msg_send![obj, orderFrontRegardless];
                             }
                         }
@@ -6041,7 +6042,7 @@ async fn set_mini_size(
                 let win_w = (base_w * ui).round();
                 let win_h = (base_h * ui).round();
                 let _ = win.set_size(tauri::LogicalSize::new(win_w, win_h));
-                let _ = win.set_always_on_top(want_top && !FULLSCREEN_HIDING.load(std::sync::atomic::Ordering::SeqCst));
+                let _ = win.set_always_on_top(want_top && !PRESENTATION.active());
                 if large_mascot.unwrap_or(false) {
                     let margin = (10.0 * ui).round();
                     let x = mx + sw - win_w - margin;
@@ -6059,7 +6060,7 @@ async fn set_mini_size(
                 let win_w = (sw * 0.85).round();
                 let win_h = (sh * 0.85).round();
                 let x = mx + (sw - win_w) / 2.0;
-                let _ = win.set_always_on_top(want_top && !FULLSCREEN_HIDING.load(std::sync::atomic::Ordering::SeqCst));
+                let _ = win.set_always_on_top(want_top && !PRESENTATION.active());
                 let _ = win.set_size(tauri::LogicalSize::new(win_w, win_h));
                 let _ = win.set_position(tauri::LogicalPosition::new(x, my));
             }
@@ -11568,7 +11569,13 @@ fn spawn_mascot_window(app: tauri::AppHandle, label: String, url: String, n: u64
     }
     #[cfg(not(target_os = "macos"))]
     let _ = over_fullscreen;
-    let _ = win.show();
+    let presentation_win = win.clone();
+    let is_extra = label.starts_with("extra-mascot-");
+    app.run_on_main_thread(move || {
+        if !is_extra || (!PRESENTATION.active() && !EXTRA_MASCOTS_HIDDEN.load(Ordering::SeqCst)) {
+            show_mascot_without_activation(&presentation_win);
+        }
+    }).map_err(|e| e.to_string())?;
     Ok(label)
 }
 
@@ -11651,21 +11658,16 @@ async fn close_extra_mascots(app: tauri::AppHandle) -> Result<u32, String> {
 /// collapses).
 #[tauri::command]
 async fn set_extra_mascots_hidden(app: tauri::AppHandle, hidden: bool) -> Result<(), String> {
-    let labels: Vec<String> = app
-        .webview_windows()
-        .keys()
-        .filter(|l| l.starts_with("extra-mascot-"))
-        .cloned()
-        .collect();
-    for label in labels {
-        if let Some(win) = app.get_webview_window(&label) {
-            if hidden {
-                let _ = win.hide();
-            } else {
-                let _ = win.show();
+    let presentation_app = app.clone();
+    app.run_on_main_thread(move || {
+        EXTRA_MASCOTS_HIDDEN.store(hidden, Ordering::SeqCst);
+        for (label, win) in presentation_app.webview_windows() {
+            if label.starts_with("extra-mascot-") {
+                if hidden || PRESENTATION.active() { let _ = win.hide(); }
+                else { show_mascot_without_activation(&win); }
             }
         }
-    }
+    }).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -12035,7 +12037,7 @@ async fn sync_mascot_bubble(
     // Don't re-assert always-on-top while the Windows fullscreen watcher has
     // the mini hidden — the bubble must stay off the fullscreen app too.
     #[cfg(target_os = "windows")]
-    let want_top = !FULLSCREEN_HIDING.load(Ordering::SeqCst);
+    let want_top = !PRESENTATION.active();
     #[cfg(not(target_os = "windows"))]
     let want_top = true;
     let _ = win.set_always_on_top(want_top);
@@ -12053,44 +12055,85 @@ async fn ensure_mascot_bubble(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Temporarily hides the native mascot status bubble window for Windows fullscreen
-/// presentation suppression without clearing the resting geometry anchor.
-#[cfg(target_os = "windows")]
-fn temporarily_hide_mascot_bubble_for_fullscreen(app: &tauri::AppHandle) {
-    if let Some(bubble) = app.get_webview_window("mascot-bubble") {
-        let _ = bubble.hide();
-        log::info!("[fullscreen] bubble native suppressed");
+/// All presentation mutations run on the UI thread, including bubble show, so
+/// a pending show cannot overtake a tray/fullscreen hide after checking the mask.
+fn set_presentation_suppressed(app: &tauri::AppHandle, reason: u8, hidden: bool) {
+    PRESENTATION.set(reason, hidden);
+    let suppressed = PRESENTATION.active();
+    for (label, win) in app.webview_windows() {
+        match presentation::window_action(&label, suppressed, EXTRA_MASCOTS_HIDDEN.load(Ordering::SeqCst)) {
+            presentation::WindowAction::Hide => {
+                let _ = win.hide();
+            }
+            presentation::WindowAction::Show => {
+                show_mascot_without_activation(&win);
+            }
+            presentation::WindowAction::ReconcileBubble | presentation::WindowAction::Ignore => {}
+        }
     }
+    // Bubble restoration is owned by its current frontend lifecycle, even if
+    // polling has produced no new payload during the entire hidden interval.
+    let _ = app.emit("mascot-presentation-suppression", serde_json::json!({ "suppressed": suppressed }));
+}
+
+fn show_mascot_without_activation(win: &tauri::WebviewWindow) {
+    #[cfg(target_os = "windows")]
+    if let Ok(hwnd) = win.hwnd() {
+        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE};
+        unsafe { let _ = ShowWindow(windows::Win32::Foundation::HWND(hwnd.0), SW_SHOWNOACTIVATE); }
+        return;
+    }
+    let _ = win.show();
+}
+
+#[cfg(target_os = "windows")]
+fn show_primary_mascot_if_allowed(app: &tauri::AppHandle, win: tauri::WebviewWindow, focus: bool) -> Result<(), String> {
+    app.run_on_main_thread(move || {
+        if !PRESENTATION.active() {
+            let _ = win.set_always_on_top(true);
+            show_mascot_without_activation(&win);
+            if focus { let _ = win.set_focus(); }
+        }
+    }).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_mascot_presentation_suppressed() -> bool {
+    PRESENTATION.active()
 }
 
 /// Show or hide the mascot status bubble. `visible=true` spawns the window on
-/// first use, refuses to show while the Windows fullscreen watcher has the
-/// mini hidden (returning "suppressed"),
+/// first use, refuses to show while any presentation suppression reason is
+/// active (returning "suppressed"),
 /// and re-asserts floating levels afterwards — showing the bubble can demote
 /// the mini's always-on-top status (see `reassert_mini_floating`).
 /// Returns "shown", "suppressed", or "hidden".
 #[tauri::command]
 async fn set_mascot_bubble_visible(app: tauri::AppHandle, visible: bool) -> Result<String, String> {
-    #[cfg(target_os = "windows")]
-    if visible && FULLSCREEN_HIDING.load(Ordering::SeqCst) {
-        return Ok("suppressed".to_string());
+    if visible && app.get_webview_window("mascot-bubble").is_none() {
+        spawn_mascot_bubble(app.clone())?;
     }
-    if visible {
-        if app.get_webview_window("mascot-bubble").is_none() {
-            spawn_mascot_bubble(app.clone())?;
-        }
-        if let Some(win) = app.get_webview_window("mascot-bubble") {
-            let _ = win.show();
-        }
-        reassert_mini_floating(&app);
-        Ok("shown".to_string())
-    } else {
-        if let Some(win) = app.get_webview_window("mascot-bubble") {
-            let _ = win.hide();
-            BUBBLE_GEOMETRY.lock().unwrap().anchor = None;
-        }
-        Ok("hidden".to_string())
-    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let presentation_app = app.clone();
+    app.run_on_main_thread(move || {
+        let result = if visible && PRESENTATION.active() {
+            Ok("suppressed".to_string())
+        } else if let Some(win) = presentation_app.get_webview_window("mascot-bubble") {
+            if visible {
+                win.show().map(|_| {
+                    reassert_mini_floating(&presentation_app);
+                    "shown".to_string()
+                }).map_err(|e| e.to_string())
+            } else {
+                win.hide().map(|_| {
+                    BUBBLE_GEOMETRY.lock().unwrap().anchor = None;
+                    "hidden".to_string()
+                }).map_err(|e| e.to_string())
+            }
+        } else { Ok("hidden".to_string()) };
+        let _ = tx.send(result);
+    }).map_err(|e| e.to_string())?;
+    rx.await.map_err(|e| e.to_string())?
 }
 
 /// Open the platform's native folder picker so the user can choose a
@@ -12150,7 +12193,7 @@ fn reassert_mini_floating(app: &tauri::AppHandle) {
             }
             #[cfg(not(target_os = "macos"))]
             let _ = over_fullscreen;
-            let _ = win_clone.set_always_on_top(true);
+            let _ = win_clone.set_always_on_top(!PRESENTATION.active());
         });
     }
 }
@@ -22238,7 +22281,9 @@ pub fn run() {
                             let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(win_w, win_h));
                             unsafe {
                                 let _: () = msg_send![obj, setFrame: frame, display: true];
-                                let _: () = msg_send![obj, orderFrontRegardless];
+                                if !PRESENTATION.active() {
+                                    let _: () = msg_send![obj, orderFrontRegardless];
+                                }
                             }
                         }
                     }
@@ -22260,9 +22305,9 @@ pub fn run() {
                 let _ = win.show();
             }
 
-            // Windows: move window off-screen when a fullscreen app is on the SAME
-            // monitor as the mini window.  We avoid hide()/show() because show()
-            // triggers a focus event which causes the panel to expand.
+            // Windows: suppress presentation when a fullscreen app is on the SAME
+            // monitor as the mini window. Restore without activation to avoid
+            // a focus event expanding the panel. Native positions remain intact.
             #[cfg(target_os = "windows")]
             {
                 let app_handle = app.handle().clone();
@@ -22271,7 +22316,6 @@ pub fn run() {
                     use windows::Win32::Foundation::POINT;
 
                     let mut was_hidden = false;
-                    let mut saved_pos: Option<tauri::LogicalPosition<f64>> = None;
                     let mut hidden_monitor: Option<HMONITOR> = None;
                     // Debounce counter: require several consecutive non-fullscreen
                     // polls before restoring, so brief foreground changes (mouse
@@ -22304,8 +22348,7 @@ pub fn run() {
                             if same_monitor {
                                 non_fs_streak = 0;
                                 if !was_hidden {
-                                    log::info!("[fullscreen] detected fullscreen app on same monitor, moving mini off-screen");
-                                    FULLSCREEN_HIDING.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    log::info!("[fullscreen] detected fullscreen app on same monitor, suppressing mascot presentation");
                                     if let Ok(pos) = win.outer_position() {
                                         hidden_monitor = Some(unsafe {
                                             MonitorFromPoint(
@@ -22314,38 +22357,28 @@ pub fn run() {
                                             )
                                         });
                                     }
-                                    if let Ok(Some(pos)) = win.outer_position().map(|p| {
-                                        win.current_monitor().ok().flatten().map(|m| {
-                                            let s = m.scale_factor();
-                                            tauri::LogicalPosition::new(p.x as f64 / s, p.y as f64 / s)
-                                        })
-                                    }) {
-                                        saved_pos = Some(pos);
-                                    }
-                                    let _ = win.set_always_on_top(false);
-                                    let _ = win.set_position(tauri::LogicalPosition::new(-9999.0_f64, -9999.0_f64));
+                                    let presentation_app = app_handle.clone();
+                                    let _ = app_handle.run_on_main_thread(move || {
+                                        set_presentation_suppressed(&presentation_app, presentation::FULLSCREEN, true);
+                                    });
                                     was_hidden = true;
                                     // Keep the status bubble hidden with the mini
                                     // while a fullscreen app covers this monitor.
                                     // Native presentation suppression is decoupled
                                     // from logical bubble lifecycle.
-                                    temporarily_hide_mascot_bubble_for_fullscreen(&app_handle);
-                                    let _ = app_handle.emit("mascot-fullscreen-suppression", serde_json::json!({ "suppressed": true }));
                                 }
                             } else if was_hidden {
                                 non_fs_streak += 1;
                                 if non_fs_streak >= RESTORE_THRESHOLD {
-                                    log::info!("[fullscreen] fullscreen exited or on different monitor, restoring mini position");
-                                    FULLSCREEN_HIDING.store(false, std::sync::atomic::Ordering::SeqCst);
-                                    if let Some(pos) = saved_pos.take() {
-                                        let _ = win.set_position(pos);
-                                    }
-                                    let _ = win.set_always_on_top(true);
+                                    log::info!("[fullscreen] fullscreen exited or on different monitor, reconciling mascot presentation");
+                                    let presentation_app = app_handle.clone();
+                                    let _ = app_handle.run_on_main_thread(move || {
+                                        set_presentation_suppressed(&presentation_app, presentation::FULLSCREEN, false);
+                                    });
                                     was_hidden = false;
                                     hidden_monitor = None;
                                     non_fs_streak = 0;
-                                    log::info!("[fullscreen] presentation suppression lifted");
-                                    let _ = app_handle.emit("mascot-fullscreen-suppression", serde_json::json!({ "suppressed": false }));
+                                    log::info!("[fullscreen] fullscreen reason lifted");
                                 }
                             }
                         }
@@ -22439,33 +22472,8 @@ pub fn run() {
                 .icon(tray_icon)
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => {
-                        if let Some(win) = app.get_webview_window("mini") {
-                            #[cfg(target_os = "windows")]
-                            {
-                                let was_suppressed = FULLSCREEN_HIDING.swap(false, std::sync::atomic::Ordering::SeqCst);
-                                if let Ok(Some(monitor)) = win.primary_monitor() {
-                                    let scale = monitor.scale_factor();
-                                    let sw = monitor.size().width as f64 / scale;
-                                    let ui = win_ui_scale(&monitor);
-                                    let x = sw / 2.0 + (80.0 * ui).round();
-                                    let _ = win.set_position(tauri::LogicalPosition::new(x, 0.0));
-                                }
-                                let _ = win.set_always_on_top(true);
-                                if was_suppressed {
-                                    log::info!("[fullscreen] presentation suppression lifted");
-                                    let _ = app.emit("mascot-fullscreen-suppression", serde_json::json!({ "suppressed": false }));
-                                }
-                            }
-                            let _ = win.show();
-                            let _ = win.set_focus();
-                        }
-                    }
-                    "hide" => {
-                        if let Some(win) = app.get_webview_window("mini") {
-                            let _ = win.hide();
-                        }
-                    }
+                    "show" => set_presentation_suppressed(app, presentation::USER, false),
+                    "hide" => set_presentation_suppressed(app, presentation::USER, true),
                     "quit" => {
                         app.exit(0);
                     }
@@ -22475,7 +22483,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_antigravity_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, resolve_codex_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, sync_mascot_bubble, ensure_mascot_bubble, set_mascot_bubble_visible, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs, fetch_petdex_manifest, download_codex_pet, delete_custom_codex_pet, get_hermes_remote_conversation, get_harness_quota])
+        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_antigravity_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, resolve_codex_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, sync_mascot_bubble, ensure_mascot_bubble, set_mascot_bubble_visible, get_mascot_presentation_suppressed, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs, fetch_petdex_manifest, download_codex_pet, delete_custom_codex_pet, get_hermes_remote_conversation, get_harness_quota])
         .manage(ActiveAgentPid { pid: Mutex::new(None) })
         .manage(ClaudeState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -22507,9 +22515,9 @@ mod fullscreen_bubble_suppression_tests {
             geom.anchor = Some(sample_anchor);
         }
 
-        // Simulate fullscreen hiding: FULLSCREEN_HIDING is set to true
-        FULLSCREEN_HIDING.store(true, Ordering::SeqCst);
-        assert!(FULLSCREEN_HIDING.load(Ordering::SeqCst));
+        // Simulate fullscreen and tray hiding as independent reasons
+        PRESENTATION.set(presentation::FULLSCREEN, true);
+        assert!(PRESENTATION.active());
 
         // Anchor must NOT have been cleared by fullscreen suppression
         {
@@ -22520,10 +22528,13 @@ mod fullscreen_bubble_suppression_tests {
             assert_eq!(a.card_bottom, 120.0);
         }
 
-        // Fullscreen exit lifts suppression
-        let was_suppressed = FULLSCREEN_HIDING.swap(false, Ordering::SeqCst);
-        assert!(was_suppressed);
-        assert!(!FULLSCREEN_HIDING.load(Ordering::SeqCst));
+        PRESENTATION.set(presentation::USER, true);
+        // Fullscreen exit alone cannot lift tray suppression or clear the anchor.
+        PRESENTATION.set(presentation::FULLSCREEN, false);
+        assert!(PRESENTATION.active());
+        assert_eq!(BUBBLE_GEOMETRY.lock().unwrap().anchor.unwrap().card_right, 850.0);
+        PRESENTATION.set(presentation::USER, false);
+        assert!(!PRESENTATION.active());
 
         // Anchor is still intact after lifting suppression
         {
