@@ -35,7 +35,6 @@
     "show": "Show",
     "hide": "Hide"
   },
-
   "mini": {
     "geminiDone": "Gemini has finished working. Click to view.",
     "opencodeDone": "opencode has finished working. Click to view.",
@@ -126,7 +125,6 @@
     "ipGenshin": "Genshin Impact",
     "ipUmaMusume": "Uma Musume"
   },
-
   "charNames": {
     "派蒙": "Paimon",
     "温迪": "Venti",
@@ -145,7 +143,6 @@
     "香企鹅": "Penguingum",
     "诗歌剧": "Shigeki"
   },
-
   "settings": {
     "ocConnections": "OpenClaw Connections",
     "noConnections": "No connections. Click \"Add\" to connect an OpenClaw instance.",
@@ -165,7 +162,6 @@
     "step2": "2. Copy the public key to the remote server",
     "step3": "3. Verify passwordless login",
     "step4": "4. Enter the username and server address, then click \"Test\"",
-
     "claudeCode": "Claude Code",
     "enableClaudeCode": "Enable Claude Code",
     "enableClaudeCodeDesc": "Monitor local Claude Code sessions via Hooks",
@@ -178,7 +174,6 @@
     "enableCodexDesc": "Monitor local Codex sessions via Hooks",
     "hookInstalled": "Hook installed",
     "hookFailed": "Install failed:",
-
     "display": "Display",
     "mascotPosition": "Mascot Position",
     "mascotPositionDesc": "Which side of the notch the mascot is on",
@@ -205,7 +200,6 @@
     "bubbleActiveOthers": "+{{count}} others",
     "bubbleJumpToTerminal": "Click to jump to terminal",
     "bubbleExpandPanel": "Click to expand panel",
-
     "sound": "Sound",
     "petSfx": "Character Voice",
     "petSfxDesc": "Play character sounds during interactions",
@@ -255,12 +249,10 @@
     "autoCloseCompletionDesc": "Automatically close the completion popup after 5 seconds",
     "autoExpandOnTask": "Auto Popup",
     "autoExpandOnTaskDesc": "Automatically expand panel when a task completes or needs input",
-
     "system": "System",
     "autostart": "Launch on Login",
     "autostartDesc": "Start oc-claw automatically when you log in",
     "autostartFailed": "Failed to update autostart:",
-
     "about": "About",
     "currentVersion": "Current Version",
     "latest": "Latest",
@@ -277,13 +269,11 @@
     "checking": "Checking...",
     "checkUpdate": "Check for Updates",
     "exitApp": "Exit Application",
-
     "appMode": "Mode",
     "codingMode": "Coding Mode",
     "codingModeDesc": "Multi-agent monitoring, token stats & task alerts",
     "petMode": "Pet Mode",
     "petModeDesc": "Rich animations, nurture system & interactive play",
-
     "language": "Language",
     "languageDesc": "Select the display language",
     "langZh": "中文",
@@ -291,9 +281,17 @@
     "langJa": "日本語",
     "langKo": "한국어",
     "langEs": "Español",
-    "langFr": "Français"
+    "langFr": "Français",
+    "debug": "Debug",
+    "debugInjectTitle": "Test message inject",
+    "debugInjectDesc": "Inject fake coding sessions into memory only. No network, no real agent, no history. Use bubble style above for compact/detailed.",
+    "debugInjectActive": "{{count}} debug session(s) active",
+    "debugInjectClear": "Clear debug inject",
+    "debugInjectProcessingGeneric": "Inject processing (generic)",
+    "debugInjectProcessingCommand": "Inject processing (command)",
+    "debugInjectWaitingApproval": "Inject waiting (approval)",
+    "debugInjectWaitingUserInput": "Inject waiting (user input)"
   },
-
   "onboarding": {
     "chooseModeTitle": "Choose Your Mode",
     "chooseModeSubtitle": "You can switch between modes at any time in Settings.",
@@ -301,7 +299,6 @@
     "petModeLongDesc": "Raise your desktop pet! Feed, play, and build affection with rich animations.",
     "recommended": "Recommended"
   },
-
   "pet": {
     "dailyGift": "Daily Gift",
     "claimed": "Claimed",
@@ -321,7 +318,6 @@
     "min": "min",
     "go": "GO"
   },
-
   "petPicker": {
     "mascots": "Mascots",
     "selectedMascot": "Selected {{name}}",
@@ -339,7 +335,6 @@
     "demoModePickHint": "Click a pet to place another mascot on screen",
     "addMascot": "Add Mascot"
   },
-
   "updateModal": {
     "title": "Update Available",
     "availableSubtitle": "A new version of OC-CLAW is ready to install.",
@@ -359,7 +354,6 @@
       "ready_to_restart": "Update ready to restart"
     }
   },
-
   "character": {
     "trackAgent": "Track Agent",
     "trackAgentDesc": "Desktop pet status and chat will be bound to this agent",
@@ -389,7 +383,6 @@
     "charNameExists": "Character name already exists. Pet animation will be appended.",
     "saveFailed": "Save failed:"
   },
-
   "createChar": {
     "title": "Create New Character",
     "step1Title": "Go to Gemini to generate character sprite",
@@ -410,7 +403,6 @@
     "nameExists": "Character name already exists. Please choose another name.",
     "cantReadFile": "Cannot read the dropped file"
   },
-
   "gifMaker": {
     "geminiApiKey": "Gemini API Key",
     "baseUrl": "Base URL",
@@ -438,7 +430,6 @@
     "statusReady": "Ready",
     "statusError": "Error"
   },
-
   "agentDetail": {
     "working": "Working",
     "idleStatus": "Idle",
@@ -467,7 +458,6 @@
     "times": "",
     "callsUnit": "Count"
   },
-
   "claudeStats": {
     "title": "Claude Code Stats",
     "titleCodex": "Codex Stats",

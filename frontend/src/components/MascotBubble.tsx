@@ -821,6 +821,65 @@ function MeasureSessionBubbleRow({
  *   6. When closing, Mini emits `mascot-bubble-close`. MascotBubble expands back to motion mode, springs to (-150, -95)
  *      with concurrent opacity fade-out, and on animation completion emits `mascot-bubble-exit-complete`.
  */
+
+function isBubbleDebugPreview(): boolean {
+  if (typeof window === 'undefined') return false
+  return /[?&]debug=1\b/.test(window.location.hash)
+}
+
+function buildDebugBubblePayload(
+  kind: 'processing-generic' | 'processing-command' | 'waiting-approval' | 'waiting-user-input',
+  style: 'compact' | 'detailed',
+): MascotBubblePayload {
+  const sessionId = `debug-inject-${kind}`
+  if (kind === 'processing-generic') {
+    const s: BubbleSessionDetail = {
+      sessionId,
+      title: 'Debug Inject',
+      source: 'cc',
+      status: 'processing',
+      activity: { kind: 'generic', summary: 'Thinking through the next step…', status: 'running', source: 'fallback' },
+    }
+    return { style, running: 1, waiting: 0, activeSession: s, activeSessions: [s] }
+  }
+  if (kind === 'processing-command') {
+    const s: BubbleSessionDetail = {
+      sessionId,
+      title: 'Debug Inject',
+      source: 'cc',
+      status: 'tool_running',
+      tool: 'Bash',
+      activity: { kind: 'command', summary: 'Running command', toolName: 'Bash', status: 'running', source: 'fallback' },
+    }
+    return { style, running: 1, waiting: 0, activeSession: s, activeSessions: [s] }
+  }
+  if (kind === 'waiting-approval') {
+    const s: BubbleSessionDetail = {
+      sessionId,
+      title: 'Debug Inject',
+      source: 'cc',
+      status: 'waiting',
+      pendingInteraction: {
+        kind: 'approval',
+        interactionType: 'command',
+        summary: 'Allow running: echo debug-inject',
+        tool: 'Bash',
+        approvalActions: { canDeny: true, canAllowTurn: true, canAllowSession: true },
+      },
+    }
+    return { style, running: 0, waiting: 1, activeSession: s, activeSessions: [s] }
+  }
+  const s: BubbleSessionDetail = {
+    sessionId,
+    title: 'Debug Inject',
+    source: 'cc',
+    status: 'waiting',
+    questionText: 'Which approach should we take?',
+    pendingInteraction: { kind: 'user_input', summary: 'Which approach should we take?' },
+  }
+  return { style, running: 0, waiting: 1, activeSession: s, activeSessions: [s] }
+}
+
 export default function MascotBubble() {
   const { t } = useTranslation()
   const prefersReducedMotion = useReducedMotion()
@@ -1661,6 +1720,59 @@ export default function MascotBubble() {
           )}
         </div>
       </motion.div>
+
+
+      {isBubbleDebugPreview() && (
+        <div
+          style={{
+            position: 'fixed',
+            left: 8,
+            top: 8,
+            zIndex: 9999,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 4,
+            pointerEvents: 'auto',
+            maxWidth: 220,
+          }}
+        >
+          {([
+            'processing-generic',
+            'processing-command',
+            'waiting-approval',
+            'waiting-user-input',
+          ] as const).map((kind) => (
+            <button
+              key={kind}
+              type="button"
+              style={{ fontSize: 11, padding: '4px 6px', borderRadius: 6, background: 'rgba(0,0,0,0.7)', color: '#fff', border: '1px solid rgba(255,255,255,0.2)' }}
+              onClick={() => {
+                const style = (displaySummary?.style === 'detailed' ? 'detailed' : 'compact') as 'compact' | 'detailed'
+                const payload = buildDebugBubblePayload(kind, style)
+                lastValidSummaryRef.current = payload
+                setSummary(payload)
+                activeMotionTokensRef.current.clear()
+                setPhase('visible')
+                phaseRef.current = 'visible'
+              }}
+            >
+              {kind}
+            </button>
+          ))}
+          <button
+            type="button"
+            style={{ fontSize: 11, padding: '4px 6px', borderRadius: 6, background: 'rgba(80,0,0,0.7)', color: '#f88', border: '1px solid rgba(255,100,100,0.3)' }}
+            onClick={() => {
+              setSummary(null)
+              lastValidSummaryRef.current = null
+              setPhase('hidden')
+              phaseRef.current = 'hidden'
+            }}
+          >
+            clear
+          </button>
+        </div>
+      )}
 
       {/* Off-screen intrinsic measurement stack for detailed bubble */}
       {isDetailed && (

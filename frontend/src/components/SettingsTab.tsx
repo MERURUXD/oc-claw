@@ -11,6 +11,7 @@ import { AnimatePresence, motion } from 'motion/react'
 import { useTranslation } from 'react-i18next'
 import { getStore, loadOcConnections, saveOcConnections } from '../lib/store'
 import type { BubbleStyle, OcConnection } from '../lib/types'
+import { DEBUG_INJECT_PRESETS, type DebugInjectPreset } from '../lib/debugInject'
 
 type UpdateProgressPayload = {
   stage: string
@@ -680,7 +681,7 @@ function HermesSection({ hermesHookStatus, t }: {
   )
 }
 
-export function SettingsTab({ bubbleStyle, onChangeBubbleStyle, notifySound, onChangeNotifySound, waitingSound, onToggleWaitingSound, soundEnabled, onToggleSoundEnabled, codexSoundEnabled, onToggleCodexSoundEnabled, cursorSoundEnabled, onToggleCursorSoundEnabled, geminiSoundEnabled, onToggleGeminiSoundEnabled, opencodeSoundEnabled, onToggleOpencodeSoundEnabled, hermesSoundEnabled, onToggleHermesSoundEnabled, antigravitySoundEnabled, onToggleAntigravitySoundEnabled, autoCloseCompletion, onToggleAutoCloseCompletion, autoExpandOnTask, onToggleAutoExpandOnTask, islandBg, onChangeIslandBg, bgPos, onChangeBgPos, panelMaxHeight, onChangePanelMaxHeight, hoverDelay, onChangeHoverDelay, largeMascotScale, onChangeLargeMascotScale, appMode, onChangeAppMode, petSfxEnabled, onTogglePetSfxEnabled, petIdleIntervalMin, onChangePetIdleIntervalMin }: { bubbleStyle?: BubbleStyle; onChangeBubbleStyle?: (v: BubbleStyle) => void; notifySound: 'default' | 'manbo'; onChangeNotifySound: (v: 'default' | 'manbo') => void; waitingSound: boolean; onToggleWaitingSound: (v: boolean) => void; soundEnabled: boolean; onToggleSoundEnabled: (v: boolean) => void; codexSoundEnabled: boolean; onToggleCodexSoundEnabled: (v: boolean) => void; cursorSoundEnabled: boolean; onToggleCursorSoundEnabled: (v: boolean) => void; geminiSoundEnabled: boolean; onToggleGeminiSoundEnabled: (v: boolean) => void; opencodeSoundEnabled: boolean; onToggleOpencodeSoundEnabled: (v: boolean) => void; hermesSoundEnabled: boolean; onToggleHermesSoundEnabled: (v: boolean) => void; antigravitySoundEnabled?: boolean; onToggleAntigravitySoundEnabled?: (v: boolean) => void; autoCloseCompletion: boolean; onToggleAutoCloseCompletion: (v: boolean) => void; autoExpandOnTask: boolean; onToggleAutoExpandOnTask: (v: boolean) => void; islandBg: string; onChangeIslandBg: (v: string) => void; bgPos: { x: number; y: number }; onChangeBgPos: (v: { x: number; y: number }) => void; panelMaxHeight: number; onChangePanelMaxHeight: (v: number) => void; hoverDelay: number; onChangeHoverDelay: (v: number) => void; largeMascotScale: number; onChangeLargeMascotScale: (v: number) => void; appMode?: 'coding' | 'pet' | null; onChangeAppMode?: (v: 'coding' | 'pet') => void; petSfxEnabled?: boolean; onTogglePetSfxEnabled?: (v: boolean) => void; petIdleIntervalMin?: number; onChangePetIdleIntervalMin?: (v: number) => void }) {
+export function SettingsTab({ bubbleStyle, onChangeBubbleStyle, onDebugInjectPreset, onClearDebugInject, debugInjectCount = 0, notifySound, onChangeNotifySound, waitingSound, onToggleWaitingSound, soundEnabled, onToggleSoundEnabled, codexSoundEnabled, onToggleCodexSoundEnabled, cursorSoundEnabled, onToggleCursorSoundEnabled, geminiSoundEnabled, onToggleGeminiSoundEnabled, opencodeSoundEnabled, onToggleOpencodeSoundEnabled, hermesSoundEnabled, onToggleHermesSoundEnabled, antigravitySoundEnabled, onToggleAntigravitySoundEnabled, autoCloseCompletion, onToggleAutoCloseCompletion, autoExpandOnTask, onToggleAutoExpandOnTask, islandBg, onChangeIslandBg, bgPos, onChangeBgPos, panelMaxHeight, onChangePanelMaxHeight, hoverDelay, onChangeHoverDelay, largeMascotScale, onChangeLargeMascotScale, appMode, onChangeAppMode, petSfxEnabled, onTogglePetSfxEnabled, petIdleIntervalMin, onChangePetIdleIntervalMin }: { bubbleStyle?: BubbleStyle; onChangeBubbleStyle?: (v: BubbleStyle) => void; onDebugInjectPreset?: (preset: DebugInjectPreset) => void; onClearDebugInject?: () => void; debugInjectCount?: number; notifySound: 'default' | 'manbo'; onChangeNotifySound: (v: 'default' | 'manbo') => void; waitingSound: boolean; onToggleWaitingSound: (v: boolean) => void; soundEnabled: boolean; onToggleSoundEnabled: (v: boolean) => void; codexSoundEnabled: boolean; onToggleCodexSoundEnabled: (v: boolean) => void; cursorSoundEnabled: boolean; onToggleCursorSoundEnabled: (v: boolean) => void; geminiSoundEnabled: boolean; onToggleGeminiSoundEnabled: (v: boolean) => void; opencodeSoundEnabled: boolean; onToggleOpencodeSoundEnabled: (v: boolean) => void; hermesSoundEnabled: boolean; onToggleHermesSoundEnabled: (v: boolean) => void; antigravitySoundEnabled?: boolean; onToggleAntigravitySoundEnabled?: (v: boolean) => void; autoCloseCompletion: boolean; onToggleAutoCloseCompletion: (v: boolean) => void; autoExpandOnTask: boolean; onToggleAutoExpandOnTask: (v: boolean) => void; islandBg: string; onChangeIslandBg: (v: string) => void; bgPos: { x: number; y: number }; onChangeBgPos: (v: { x: number; y: number }) => void; panelMaxHeight: number; onChangePanelMaxHeight: (v: number) => void; hoverDelay: number; onChangeHoverDelay: (v: number) => void; largeMascotScale: number; onChangeLargeMascotScale: (v: number) => void; appMode?: 'coding' | 'pet' | null; onChangeAppMode?: (v: 'coding' | 'pet') => void; petSfxEnabled?: boolean; onTogglePetSfxEnabled?: (v: boolean) => void; petIdleIntervalMin?: number; onChangePetIdleIntervalMin?: (v: number) => void }) {
   const { t, i18n } = useTranslation()
   const [connections, setConnections] = useState<OcConnection[]>([])
   const [enableClaudeCode, setEnableClaudeCode] = useState(true)
@@ -1557,6 +1558,42 @@ export function SettingsTab({ bubbleStyle, onChangeBubbleStyle, notifySound, onC
       </section>
 
       </>}
+
+      {/* Debug settings — always available in release builds */}
+      <section className="flex flex-col gap-4">
+        <h2 className="text-lg font-medium text-white">{t("settings.debug", "Debug")}</h2>
+        <div className="bg-[#0f0f0f] border border-white/5 rounded-2xl overflow-hidden p-4 flex flex-col gap-3">
+          <div className="flex flex-col gap-1">
+            <span className="text-sm font-medium text-white/90">{t("settings.debugInjectTitle", "Test message inject")}</span>
+            <span className="text-xs text-white/40">{t("settings.debugInjectDesc", "Inject fake coding sessions into memory only. No network, no real agent, no history. Use bubble style above for compact/detailed.")}</span>
+            {debugInjectCount > 0 && (
+              <span className="text-xs text-amber-400">{t("settings.debugInjectActive", "{{count}} debug session(s) active", { count: debugInjectCount })}</span>
+            )}
+          </div>
+          <div className="flex flex-col gap-2">
+            {DEBUG_INJECT_PRESETS.map((p) => (
+              <button
+                key={p.id}
+                type="button"
+                onClick={() => onDebugInjectPreset?.(p.id)}
+                disabled={!onDebugInjectPreset}
+                className="w-full text-left px-3 py-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-sm text-white/80 transition-colors disabled:opacity-40"
+              >
+                {t(p.labelKey, p.fallback)}
+              </button>
+            ))}
+          </div>
+          <button
+            type="button"
+            onClick={() => onClearDebugInject?.()}
+            disabled={!onClearDebugInject || debugInjectCount === 0}
+            className="w-full py-2 bg-red-500/10 hover:bg-red-500/20 border border-red-500/20 text-red-400 rounded-lg text-sm font-medium transition-colors disabled:opacity-40"
+          >
+            {t("settings.debugInjectClear", "Clear debug inject")}
+          </button>
+        </div>
+      </section>
+
       {/* 系统 */}
       <section className="flex flex-col gap-4">
         <h2 className="text-lg font-medium text-white">{t('settings.system', 'System')}</h2>

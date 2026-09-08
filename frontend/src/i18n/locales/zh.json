@@ -35,7 +35,6 @@
     "show": "显示",
     "hide": "隐藏"
   },
-
   "mini": {
     "geminiDone": "Gemini 已完成工作，点击查看。",
     "opencodeDone": "opencode 已完成工作，点击查看。",
@@ -126,7 +125,6 @@
     "ipGenshin": "原神",
     "ipUmaMusume": "赛马娘"
   },
-
   "charNames": {
     "派蒙": "派蒙",
     "温迪": "温迪",
@@ -145,7 +143,6 @@
     "香企鹅": "香企鹅",
     "诗歌剧": "诗歌剧"
   },
-
   "settings": {
     "ocConnections": "OpenClaw 连接",
     "noConnections": "暂无连接，点击「添加」来连接 OpenClaw 实例",
@@ -165,7 +162,6 @@
     "step2": "2. 将公钥复制到远程服务器",
     "step3": "3. 验证免密登录",
     "step4": "4. 填入用户名和服务器地址，点击「测试」",
-
     "claudeCode": "Claude Code",
     "enableClaudeCode": "启用 Claude Code",
     "enableClaudeCodeDesc": "通过 Hook 监听本地 Claude Code 会话",
@@ -178,7 +174,6 @@
     "enableCodexDesc": "通过 Hook 监听本地 Codex 会话",
     "hookInstalled": "Hook 已安装",
     "hookFailed": "安装失败:",
-
     "display": "显示",
     "mascotPosition": "看板娘位置",
     "mascotPositionDesc": "看板娘在刘海的哪一侧",
@@ -205,7 +200,6 @@
     "bubbleActiveOthers": "+{{count}} 个其他任务",
     "bubbleJumpToTerminal": "点击跳转至终端",
     "bubbleExpandPanel": "点击展开面板",
-
     "sound": "提示音",
     "petSfx": "角色叫声",
     "petSfxDesc": "互动时播放角色的声音",
@@ -255,12 +249,10 @@
     "autoCloseCompletionDesc": "完成弹窗出现后 5 秒自动关闭",
     "autoExpandOnTask": "主动弹窗",
     "autoExpandOnTaskDesc": "任务完成或需要输入时自动弹出面板",
-
     "system": "系统",
     "autostart": "开机启动",
     "autostartDesc": "登录系统后自动启动 oc-claw",
     "autostartFailed": "设置失败：",
-
     "about": "关于",
     "currentVersion": "当前版本",
     "latest": "Latest",
@@ -277,13 +269,11 @@
     "checking": "检查中...",
     "checkUpdate": "检查更新",
     "exitApp": "退出应用",
-
     "appMode": "模式",
     "codingMode": "编程模式",
     "codingModeDesc": "监控多 Agent 会话、Token 统计与任务提醒",
     "petMode": "桌宠模式",
     "petModeDesc": "丰富动作、养成系统与互动玩法",
-
     "language": "语言",
     "languageDesc": "选择界面显示语言",
     "langZh": "中文",
@@ -291,9 +281,17 @@
     "langJa": "日本語",
     "langKo": "한국어",
     "langEs": "Español",
-    "langFr": "Français"
+    "langFr": "Français",
+    "debug": "调试设置",
+    "debugInjectTitle": "测试消息注入",
+    "debugInjectDesc": "仅写入内存的假会话：不发网络、不调真实 agent、不污染历史。气泡样式用上方 compact/detailed。",
+    "debugInjectActive": "{{count}} 个调试会话生效中",
+    "debugInjectClear": "一键清除调试注入",
+    "debugInjectProcessingGeneric": "注入 processing（generic）",
+    "debugInjectProcessingCommand": "注入 processing（command）",
+    "debugInjectWaitingApproval": "注入 waiting（approval）",
+    "debugInjectWaitingUserInput": "注入 waiting（user_input）"
   },
-
   "onboarding": {
     "chooseModeTitle": "选择你的模式",
     "chooseModeSubtitle": "你可以随时在设置中切换模式。",
@@ -301,7 +299,6 @@
     "petModeLongDesc": "养成你的桌面宠物！喂食、互动，并通过丰富动画提升好感。",
     "recommended": "推荐"
   },
-
   "pet": {
     "dailyGift": "每日礼物",
     "claimed": "已领取",
@@ -321,7 +318,6 @@
     "min": "分钟",
     "go": "开始"
   },
-
   "petPicker": {
     "mascots": "看板娘",
     "selectedMascot": "已选择 {{name}}",
@@ -339,7 +335,6 @@
     "demoModePickHint": "点击宠物在屏幕上多挂一个",
     "addMascot": "添加看板娘"
   },
-
   "updateModal": {
     "title": "发现更新",
     "availableSubtitle": "OC-CLAW 新版本已可安装。",
@@ -359,7 +354,6 @@
       "ready_to_restart": "更新已准备完成"
     }
   },
-
   "character": {
     "trackAgent": "追踪 Agent",
     "trackAgentDesc": "桌宠状态和聊天将绑定此 Agent",
@@ -389,7 +383,6 @@
     "charNameExists": "角色名已存在，桌宠动画将追加到该角色",
     "saveFailed": "保存失败:"
   },
-
   "createChar": {
     "title": "创建新角色",
     "step1Title": "前往 Gemini 生成角色精灵图",
@@ -410,7 +403,6 @@
     "nameExists": "角色名已存在，请换一个名字",
     "cantReadFile": "无法读取拖拽的文件"
   },
-
   "gifMaker": {
     "geminiApiKey": "Gemini API Key",
     "baseUrl": "Base URL",
@@ -438,7 +430,6 @@
     "statusReady": "Ready",
     "statusError": "Error"
   },
-
   "agentDetail": {
     "working": "工作中",
     "idleStatus": "空闲",
@@ -467,7 +458,6 @@
     "times": "次",
     "callsUnit": "次数"
   },
-
   "claudeStats": {
     "title": "Claude Code 统计",
     "titleCodex": "Codex 统计",
