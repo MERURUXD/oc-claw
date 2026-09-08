@@ -1,0 +1,138 @@
+name: Dev Release
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dev-release
+  cancel-in-progress: true
+
+jobs:
+  release-dev:
+    name: Publish rolling Dev Build
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Check latest main
+        id: freshness
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          $mainSha = gh api "repos/$env:GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha'
+          if ($mainSha -ne $env:CANDIDATE_SHA) {
+            Write-Host "Skipping stale CI result: candidate=$env:CANDIDATE_SHA current-main=$mainSha"
+            "publish=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            exit 0
+          }
+
+          Write-Host "Publishing current main: $env:CANDIDATE_SHA"
+          "publish=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Checkout tested commit
+        if: steps.freshness.outputs.publish == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        if: steps.freshness.outputs.publish == 'true'
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.1
+          run_install: false
+
+      - name: Setup Node.js
+        if: steps.freshness.outputs.publish == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Setup Rust
+        if: steps.freshness.outputs.publish == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        if: steps.freshness.outputs.publish == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: frontend/src-tauri -> target
+
+      - name: Install dependencies
+        if: steps.freshness.outputs.publish == 'true'
+        run: pnpm install --frozen-lockfile
+
+      - name: Build NSIS installer
+        if: steps.freshness.outputs.publish == 'true'
+        run: pnpm exec tauri build --bundles nsis
+
+      - name: Prepare rolling installer
+        if: steps.freshness.outputs.publish == 'true'
+        id: asset
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem "src-tauri/target/release/bundle/nsis/*-setup.exe")
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one NSIS installer, found $($installers.Count)"
+          }
+
+          $devInstaller = "src-tauri/target/release/bundle/nsis/oc-claw-dev-setup.exe"
+          Copy-Item $installers[0].FullName $devInstaller -Force
+          "path=$devInstaller" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Move dev tag
+        if: steps.freshness.outputs.publish == 'true'
+        shell: pwsh
+        env:
+          CANDIDATE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f dev $env:CANDIDATE_SHA
+          git push origin refs/tags/dev --force
+
+      - name: Create or update Dev Build release
+        if: steps.freshness.outputs.publish == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ github.event.workflow_run.head_sha }}
+          ASSET_PATH: ${{ steps.asset.outputs.path }}
+        run: |
+          $shortSha = $env:CANDIDATE_SHA.Substring(0, 7)
+          $builtAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm 'UTC'")
+          $notesPath = Join-Path $env:RUNNER_TEMP "dev-release-notes.md"
+
+          @"
+          Automated development build from the latest `main` commit whose CI passed.
+
+          - Commit: [$shortSha](https://github.com/$env:GITHUB_REPOSITORY/commit/$env:CANDIDATE_SHA)
+          - Built: $builtAt
+          - Asset: `oc-claw-dev-setup.exe`
+
+          > Development build: this rolling release is replaced whenever a newer `main` commit passes CI. Versioned `vX.Y.Z` releases remain manual, permanent snapshots.
+          "@ | Set-Content -Path $notesPath -Encoding utf8
+
+          if (gh release view dev *> $null) {
+            gh release edit dev --title "Dev Build" --prerelease --notes-file $notesPath
+          } else {
+            gh release create dev --title "Dev Build" --prerelease --notes-file $notesPath
+          }
+
+          gh release upload dev $env:ASSET_PATH --clobber
