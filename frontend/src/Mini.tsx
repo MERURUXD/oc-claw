@@ -18,9 +18,9 @@ import type { AgentMetrics, BubbleSessionDetail, BubbleStyle, BubbleTransitionEv
 import { deriveSessionActivity, isSameBubblePayload } from './lib/sessionActivity'
 import {
   type BubbleLifecycleState,
-  handleFullscreenSuppressionChange,
+  handlePresentationSuppressionChange,
   handleBubbleReadyWhileSuppressed,
-  handleNativeShowResult,
+  commitBubbleNativeShow,
   handleBubbleVisible,
 } from './lib/bubbleSuppression'
 import { OnboardingModal } from './components/OnboardingModal'
@@ -585,7 +585,9 @@ export default function Mini() {
   const bubbleDesiredVisibleRef = useRef(false)
   const bubbleTransitionIdRef = useRef(0)
   const bubblePhaseRef = useRef<'hidden' | 'prepared' | 'entering' | 'visible' | 'exiting'>('hidden')
-  const bubbleFullscreenSuppressedRef = useRef(false)
+  const bubblePresentationSuppressedRef = useRef(false)
+  const bubbleReadyTransitionRef = useRef<number | null>(null)
+  const bubbleSuppressionRevisionRef = useRef(0)
 
   // Settings mode: native window grows, then a separate settings card animates in.
   const [settingsMode, setSettingsMode] = useState(false)
@@ -2203,7 +2205,6 @@ export default function Mini() {
       bubbleTransitionIdRef.current++
       bubblePhaseRef.current = 'hidden'
       bubbleNativeVisibleRef.current = false
-      bubbleFullscreenSuppressedRef.current = false
       invoke('set_mascot_bubble_visible', { visible: false }).catch(() => {})
       return
     }
@@ -2213,7 +2214,6 @@ export default function Mini() {
       bubbleTransitionIdRef.current++
       bubblePhaseRef.current = 'hidden'
       bubbleNativeVisibleRef.current = false
-      bubbleFullscreenSuppressedRef.current = false
       invoke('set_mascot_bubble_visible', { visible: false }).catch(() => {})
       return
     }
@@ -3178,32 +3178,37 @@ export default function Mini() {
       phase: bubblePhaseRef.current,
       nativeVisible: bubbleNativeVisibleRef.current,
       transitionId: bubbleTransitionIdRef.current,
-      fullscreenSuppressed: bubbleFullscreenSuppressedRef.current,
+      presentationSuppressed: bubblePresentationSuppressedRef.current,
     })
+
+    // Check current refs after IPC, never the snapshot from before the await.
+    const showCurrentBubble = async () => {
+      const state = getBubbleState()
+      const transitionId = state.transitionId
+      const revision = bubbleSuppressionRevisionRef.current
+      if (state.presentationSuppressed || !state.desiredVisible ||
+          (state.phase !== 'prepared' && state.phase !== 'entering' && state.phase !== 'visible')) return
+      if (state.phase === 'prepared' && bubbleReadyTransitionRef.current !== transitionId) return
+      const res = await invoke<string>('set_mascot_bubble_visible', { visible: true }).catch(() => 'error')
+      if (transitionId !== bubbleTransitionIdRef.current || revision !== bubbleSuppressionRevisionRef.current) return
+      const current = getBubbleState()
+      const result = commitBubbleNativeShow(current, transitionId, res)
+      bubbleNativeVisibleRef.current = current.nativeVisible
+      if (result.shouldEmitEnter) {
+        // Claim entry synchronously: concurrent ready/restore callbacks cannot replay it.
+        bubblePhaseRef.current = 'entering'
+        emit('mascot-bubble-enter', { transitionId }).catch(() => {})
+      }
+    }
 
     const unlistenBubbleReady = listen<BubbleTransitionEvent>('mascot-bubble-ready', async (e) => {
       const transitionId = e.payload?.transitionId
       if (transitionId == null) return
       const state = getBubbleState()
-      const { canShowNative, reason } = handleBubbleReadyWhileSuppressed(state, transitionId)
-      if (!canShowNative) {
-        if (reason === 'suppressed') {
-          bubbleNativeVisibleRef.current = false
-        }
-        return
-      }
-
-      const res = await invoke<string>('set_mascot_bubble_visible', { visible: true }).catch(() => 'error')
-      const shown = handleNativeShowResult(state, res)
-      bubbleNativeVisibleRef.current = shown
-      if (
-        shown &&
-        transitionId === bubbleTransitionIdRef.current &&
-        bubbleDesiredVisibleRef.current
-      ) {
-        bubblePhaseRef.current = 'entering'
-        emit('mascot-bubble-enter', { transitionId }).catch(() => {})
-      }
+      if (transitionId !== state.transitionId || !state.desiredVisible) return
+      bubbleReadyTransitionRef.current = transitionId
+      const { canShowNative } = handleBubbleReadyWhileSuppressed(state, transitionId)
+      if (canShowNative) await showCurrentBubble()
     })
 
     const unlistenBubbleVisible = listen<BubbleTransitionEvent>('mascot-bubble-visible', (e) => {
@@ -3215,34 +3220,27 @@ export default function Mini() {
       }
     })
 
-    const unlistenFullscreenSuppression = listen<{ suppressed: boolean }>(
-      'mascot-fullscreen-suppression',
-      async (e) => {
-        const suppressed = !!e.payload?.suppressed
-        const state = getBubbleState()
-        const result = handleFullscreenSuppressionChange(state, suppressed)
-        bubbleFullscreenSuppressedRef.current = state.fullscreenSuppressed
-        bubbleNativeVisibleRef.current = state.nativeVisible
-        console.log(result.logMessage)
-
-        if (result.shouldShowNative) {
-          const transitionId = bubbleTransitionIdRef.current
-          const res = await invoke<string>('set_mascot_bubble_visible', { visible: true }).catch(() => 'error')
-          const shown = handleNativeShowResult(state, res)
-          bubbleNativeVisibleRef.current = shown
-
-          if (shown && result.shouldEmitEnter) {
-            if (
-              bubbleDesiredVisibleRef.current &&
-              bubbleTransitionIdRef.current === transitionId
-            ) {
-              bubblePhaseRef.current = 'entering'
-              emit('mascot-bubble-enter', { transitionId }).catch(() => {})
-            }
-          }
-        }
-      }
+    const reconcilePresentation = async (suppressed: boolean) => {
+      bubbleSuppressionRevisionRef.current++
+      const state = getBubbleState()
+      const result = handlePresentationSuppressionChange(state, suppressed)
+      bubblePresentationSuppressedRef.current = state.presentationSuppressed
+      bubbleNativeVisibleRef.current = state.nativeVisible
+      console.log(result.logMessage)
+      if (result.shouldShowNative) await showCurrentBubble()
+    }
+    const unlistenPresentationSuppression = listen<{ suppressed: boolean }>(
+      'mascot-presentation-suppression', (e) => reconcilePresentation(!!e.payload?.suppressed)
     )
+    // Subscribe before querying, and discard a snapshot overtaken by an event.
+    let presentationDisposed = false
+    unlistenPresentationSuppression.then(async () => {
+      const revision = bubbleSuppressionRevisionRef.current
+      const suppressed = await invoke<boolean>('get_mascot_presentation_suppressed').catch(() => null)
+      if (!presentationDisposed && suppressed !== null && revision === bubbleSuppressionRevisionRef.current) {
+        await reconcilePresentation(suppressed)
+      }
+    })
 
     const unlistenBubbleExit = listen<BubbleTransitionEvent>('mascot-bubble-exit-complete', async (e) => {
       const transitionId = e.payload?.transitionId
@@ -3262,7 +3260,8 @@ export default function Mini() {
       unlistenBubbleSession.then((fn) => fn())
       unlistenBubbleReady.then((fn) => fn())
       unlistenBubbleVisible.then((fn) => fn())
-      unlistenFullscreenSuppression.then((fn) => fn())
+      presentationDisposed = true
+      unlistenPresentationSuppression.then((fn) => fn())
       unlistenBubbleExit.then((fn) => fn())
     }
   }, [])

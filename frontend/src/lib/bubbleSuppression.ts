@@ -5,13 +5,13 @@ export interface BubbleLifecycleState {
   phase: BubblePhase
   nativeVisible: boolean
   transitionId: number
-  fullscreenSuppressed: boolean
+  presentationSuppressed: boolean
 }
 
-export type FullscreenReconcileAction = 'restore' | 'stay_hidden'
+export type PresentationReconcileAction = 'restore' | 'stay_hidden'
 
-export interface FullscreenSuppressionReconcileResult {
-  action: 'suppressed' | FullscreenReconcileAction
+export interface PresentationSuppressionReconcileResult {
+  action: 'suppressed' | PresentationReconcileAction
   shouldShowNative: boolean
   shouldEmitEnter: boolean
   newPhase?: BubblePhase
@@ -19,9 +19,9 @@ export interface FullscreenSuppressionReconcileResult {
 }
 
 /**
- * Reconciles native presentation suppression when entering or leaving fullscreen.
+ * Reconciles the aggregate native presentation state (fullscreen or tray Hide).
  *
- * Fullscreen suppression is an independent native presentation state:
+ * Presentation suppression is an independent native presentation state:
  * - suppressed = true:
  *   Native window is hidden by OS/Rust watcher.
  *   Logical lifecycle (desiredVisible, phase, transitionId, payload) is preserved.
@@ -30,19 +30,19 @@ export interface FullscreenSuppressionReconcileResult {
  *   If the bubble logically still desires to be visible and is in an active phase
  *   ('visible', 'entering', or 'prepared'):
  *     -> action = 'restore', native presentation is re-asserted.
- *     -> if phase was 'prepared', transition to 'entering' and emit enter.
+ *     -> if phase was 'prepared', request entry after ready and native show succeed.
  *     -> if phase was 'visible' or 'entering', restore directly without replaying animations.
  *   If the session ended, panel expanded, or desiredVisible became false while suppressed:
  *     -> action = 'stay_hidden', native window remains hidden.
  */
-export function handleFullscreenSuppressionChange(
+export function handlePresentationSuppressionChange(
   state: BubbleLifecycleState,
   suppressed: boolean
-): FullscreenSuppressionReconcileResult {
+): PresentationSuppressionReconcileResult {
   if (suppressed) {
-    state.fullscreenSuppressed = true
+    state.presentationSuppressed = true
     state.nativeVisible = false
-    const logMessage = `[bubble-native] fullscreen suppressed=true phase=${state.phase} desired=${state.desiredVisible} native=false`
+    const logMessage = `[bubble-native] presentation suppressed=true phase=${state.phase} desired=${state.desiredVisible} native=false`
     return {
       action: 'suppressed',
       shouldShowNative: false,
@@ -51,17 +51,16 @@ export function handleFullscreenSuppressionChange(
     }
   }
 
-  state.fullscreenSuppressed = false
+  state.presentationSuppressed = false
   const shouldRestore =
     state.desiredVisible &&
     (state.phase === 'visible' || state.phase === 'entering' || state.phase === 'prepared')
 
-  const action: FullscreenReconcileAction = shouldRestore ? 'restore' : 'stay_hidden'
-  const logMessage = `[bubble-native] fullscreen suppressed=false phase=${state.phase} desired=${state.desiredVisible} action=${action}`
+  const action: PresentationReconcileAction = shouldRestore ? 'restore' : 'stay_hidden'
+  const logMessage = `[bubble-native] presentation suppressed=false phase=${state.phase} desired=${state.desiredVisible} action=${action}`
 
   if (shouldRestore) {
     if (state.phase === 'prepared') {
-      state.phase = 'entering'
       return {
         action: 'restore',
         shouldShowNative: true,
@@ -88,7 +87,7 @@ export function handleFullscreenSuppressionChange(
 
 /**
  * Handles `mascot-bubble-ready` handshake event.
- * If currently fullscreen-suppressed, prevents setting nativeVisible or showing window.
+ * If currently presentation-suppressed, prevents setting nativeVisible or showing window.
  */
 export function handleBubbleReadyWhileSuppressed(
   state: BubbleLifecycleState,
@@ -97,11 +96,24 @@ export function handleBubbleReadyWhileSuppressed(
   if (readyTransitionId !== state.transitionId || !state.desiredVisible) {
     return { canShowNative: false, reason: 'mismatch' }
   }
-  if (state.fullscreenSuppressed) {
+  if (state.presentationSuppressed) {
     state.nativeVisible = false
     return { canShowNative: false, reason: 'suppressed' }
   }
   return { canShowNative: true, reason: 'ok' }
+}
+
+/** Re-read live state after IPC, then claim entry at most once for this transition. */
+export function commitBubbleNativeShow(
+  state: BubbleLifecycleState,
+  transitionId: number,
+  result: string,
+): { applied: boolean; shouldEmitEnter: boolean } {
+  if (transitionId !== state.transitionId) return { applied: false, shouldEmitEnter: false }
+  const shown = handleNativeShowResult(state, result)
+  const shouldEmitEnter = shown && state.phase === 'prepared'
+  if (shouldEmitEnter) state.phase = 'entering'
+  return { applied: true, shouldEmitEnter }
 }
 
 /**
@@ -111,7 +123,8 @@ export function handleNativeShowResult(
   state: BubbleLifecycleState,
   result: 'shown' | 'suppressed' | 'hidden' | 'error' | string
 ): boolean {
-  if (result === 'shown') {
+  if (result === 'shown' && !state.presentationSuppressed && state.desiredVisible &&
+      (state.phase === 'prepared' || state.phase === 'entering' || state.phase === 'visible')) {
     state.nativeVisible = true
     return true
   }
