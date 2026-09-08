@@ -817,7 +817,7 @@ function MeasureSessionBubbleRow({
  *      with motion reserve, and emits `mascot-bubble-ready`.
  *   3. Mini shows the native window and emits `mascot-bubble-enter`.
  *   4. MascotBubble awaits double requestAnimationFrame and springs to visible state (0, 0).
- *   5. When animation settles in visible state, native geometry shrinks from motion mode to stable mode (0 reserve).
+ *   5. When animation settles in visible state, native geometry shrinks from motion mode to stable mode (0 reserve) after a double-rAF so the resting frame paints first.
  *   6. When closing, Mini emits `mascot-bubble-close`. MascotBubble expands back to motion mode, springs to (-150, -95)
  *      with concurrent opacity fade-out, and on animation completion emits `mascot-bubble-exit-complete`.
  */
@@ -947,6 +947,28 @@ export default function MascotBubble() {
     }).catch(() => {})
   }, [])
 
+
+  // Defer motion→stable shrink until after the resting frame paints (avoids 1-frame settle flicker
+  // when the native window drops the flight envelope right as enter animation completes).
+  const stableSyncRafRef = useRef<number | null>(null)
+  const cancelScheduledStableGeometrySync = useCallback(() => {
+    if (stableSyncRafRef.current != null) {
+      cancelAnimationFrame(stableSyncRafRef.current)
+      stableSyncRafRef.current = null
+    }
+  }, [])
+  const scheduleStableGeometrySync = useCallback(() => {
+    cancelScheduledStableGeometrySync()
+    stableSyncRafRef.current = requestAnimationFrame(() => {
+      stableSyncRafRef.current = requestAnimationFrame(() => {
+        stableSyncRafRef.current = null
+        if (phaseRef.current !== 'visible') return
+        if (activeMotionTokensRef.current.size > 0) return
+        syncBubbleGeometry('stable', { preserveAnchor: true })
+      })
+    })
+  }, [cancelScheduledStableGeometrySync, syncBubbleGeometry])
+
   // Measure geometry and notify Mini that the bubble is ready to be natively shown
   const syncGeometryAndNotifyReady = useCallback((tid: number) => {
     const el = contentRef.current
@@ -993,6 +1015,7 @@ export default function MascotBubble() {
       transitionIdRef.current = tid
       readySentForTransitionRef.current = -1
       logBubbleDev(`[bubble ${tid}] prepare`)
+      cancelScheduledStableGeometrySync()
 
       enteringCompletedSessionIdsRef.current.clear()
       exitingCompletedSessionIdsRef.current.clear()
@@ -1180,6 +1203,7 @@ export default function MascotBubble() {
         transitionIdRef.current = tid
       }
       logBubbleDev(`[bubble ${transitionIdRef.current}] close`)
+      cancelScheduledStableGeometrySync()
       if (phaseRef.current === 'hidden') return
       exitingCompletedSessionIdsRef.current.clear()
       activeMotionTokensRef.current.add('global-exit')
@@ -1211,8 +1235,9 @@ export default function MascotBubble() {
       unlistenSummary?.()
       unlistenClose?.()
       if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current)
+      cancelScheduledStableGeometrySync()
     }
-  }, [syncBubbleGeometry])
+  }, [syncBubbleGeometry, cancelScheduledStableGeometrySync])
 
   // The active payload to render (retain last valid summary during exiting so DOM does not collapse early)
   const displaySummary = summary || (phase === 'exiting' ? lastValidSummaryRef.current : null)
@@ -1383,10 +1408,10 @@ export default function MascotBubble() {
       setPhase('visible')
       phaseRef.current = 'visible'
       logBubbleDev(`[bubble ${currentId}] visible (reduced-motion)`)
-      syncBubbleGeometry('stable', { preserveAnchor: true })
+      scheduleStableGeometrySync()
       emit('mascot-bubble-visible', { transitionId: currentId }).catch(() => {})
     }
-  }, [prefersReducedMotion, phase, syncBubbleGeometry])
+  }, [prefersReducedMotion, phase, scheduleStableGeometrySync])
 
   const handleAnimationComplete = useCallback(() => {
     // If multi-session, row animations control phase completion
@@ -1401,7 +1426,7 @@ export default function MascotBubble() {
       phaseRef.current = 'visible'
       logBubbleDev(`[bubble ${currentId}] visible`)
       if (activeMotionTokensRef.current.size === 0) {
-        syncBubbleGeometry('stable', { preserveAnchor: true })
+        scheduleStableGeometrySync()
       }
       emit('mascot-bubble-visible', { transitionId: currentId }).catch(() => {})
     } else if (currentPhase === 'exiting') {
@@ -1416,7 +1441,7 @@ export default function MascotBubble() {
       logBubbleDev(`[bubble ${currentId}] exit complete`)
       emit('mascot-bubble-exit-complete', { transitionId: currentId }).catch(() => {})
     }
-  }, [syncBubbleGeometry])
+  }, [scheduleStableGeometrySync])
 
   const handleRowAnimationComplete = useCallback(
     (sessionId: string) => {
@@ -1432,7 +1457,7 @@ export default function MascotBubble() {
           return rest
         })
         if (activeMotionTokensRef.current.size === 0 && phaseRef.current === 'visible') {
-          syncBubbleGeometry('stable', { preserveAnchor: true })
+          scheduleStableGeometrySync()
         }
       }
 
@@ -1450,7 +1475,7 @@ export default function MascotBubble() {
           phaseRef.current = 'visible'
           logBubbleDev(`[bubble ${currentId}] multi-row visible`)
           if (activeMotionTokensRef.current.size === 0) {
-            syncBubbleGeometry('stable', { preserveAnchor: true })
+            scheduleStableGeometrySync()
           }
           emit('mascot-bubble-visible', { transitionId: currentId }).catch(() => {})
         }
@@ -1476,7 +1501,7 @@ export default function MascotBubble() {
         }
       }
     },
-    [syncBubbleGeometry]
+    [scheduleStableGeometrySync]
   )
 
   if (!displaySummary || phase === 'hidden') {
