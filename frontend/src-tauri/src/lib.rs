@@ -11732,6 +11732,17 @@ const BUBBLE_RESERVE_Y: f64 = 115.0;
 const BUBBLE_PAD_RIGHT: f64 = 16.0;
 const BUBBLE_PAD_BOTTOM: f64 = 16.0;
 
+/// Resting card edges implied by an applied bubble window frame (logical px).
+/// Used by preserve shrink + anchor write-back so card edges stay continuous.
+fn resting_card_edges_from_frame(win_x: f64, win_y: f64, win_w: f64, win_h: f64) -> (f64, f64) {
+    let card_right = win_x + win_w - BUBBLE_PAD_RIGHT;
+    #[cfg(target_os = "macos")]
+    let card_bottom = win_y + BUBBLE_PAD_BOTTOM;
+    #[cfg(not(target_os = "macos"))]
+    let card_bottom = win_y + win_h - BUBBLE_PAD_BOTTOM;
+    (card_right, card_bottom)
+}
+
 /// Position the mascot status bubble next to the primary mascot window.
 /// `width`/`height` are the bubble's logical content size in logical pixels, measured
 /// by the frontend via ResizeObserver.
@@ -11818,9 +11829,60 @@ async fn sync_mascot_bubble(
 
     let existing_anchor = BUBBLE_GEOMETRY.lock().unwrap().anchor;
 
+    // Live bubble window frame (logical px) for preserve shrink. Stored anchor
+    // card edges can be stale after motion/DPI round-trips that never wrote
+    // the anchor back — using live edges keeps the resting card continuous.
+    let live_bubble: Option<(f64, f64, f64, f64)> = {
+        #[cfg(target_os = "windows")]
+        {
+            (|| -> Result<(f64, f64, f64, f64), String> {
+                let scale = win.scale_factor().unwrap_or(1.0);
+                let pos = win.outer_position().map_err(|e| e.to_string())?;
+                let size = win.outer_size().map_err(|e| e.to_string())?;
+                Ok((
+                    pos.x as f64 / scale,
+                    pos.y as f64 / scale,
+                    size.width as f64 / scale,
+                    size.height as f64 / scale,
+                ))
+            })()
+            .ok()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let win_clone = win.clone();
+            let app_clone = app.clone();
+            let _ = app_clone.run_on_main_thread(move || {
+                use objc2::msg_send;
+                use objc2::runtime::AnyObject;
+                use objc2_foundation::NSRect;
+                if let Ok(ns_win) = win_clone.ns_window() {
+                    let obj = unsafe { &*(ns_win as *mut AnyObject) };
+                    let frame: NSRect = unsafe { msg_send![obj, frame] };
+                    let _ = tx.send((
+                        frame.origin.x,
+                        frame.origin.y,
+                        frame.size.width,
+                        frame.size.height,
+                    ));
+                }
+            });
+            rx.recv_timeout(std::time::Duration::from_millis(200)).ok()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            None
+        }
+    };
+
     let (final_win_x, final_win_y) = if should_preserve && existing_anchor.is_some() {
         let anchor = existing_anchor.unwrap();
-        let mut preserved_card_right = anchor.card_right;
+        let (mut preserved_card_right, mut preserved_card_bottom) = if let Some((lx, ly, lw, lh)) = live_bubble {
+            resting_card_edges_from_frame(lx, ly, lw, lh)
+        } else {
+            (anchor.card_right, anchor.card_bottom)
+        };
         if preserved_card_right - bubble_w < anchor.mon_x + margin {
             preserved_card_right = anchor.mon_x + margin + bubble_w;
         }
@@ -11832,7 +11894,6 @@ async fn sync_mascot_bubble(
 
         #[cfg(target_os = "macos")]
         let y = {
-            let mut preserved_card_bottom = anchor.card_bottom;
             if preserved_card_bottom + bubble_h > anchor.mon_y + anchor.mon_h - margin {
                 preserved_card_bottom = (anchor.mon_y + anchor.mon_h - margin - bubble_h).max(anchor.mon_y + margin);
             }
@@ -11844,7 +11905,6 @@ async fn sync_mascot_bubble(
 
         #[cfg(not(target_os = "macos"))]
         let y = {
-            let mut preserved_card_bottom = anchor.card_bottom;
             if preserved_card_bottom - bubble_h < anchor.mon_y + margin {
                 preserved_card_bottom = (anchor.mon_y + margin + bubble_h).min(anchor.mon_y + anchor.mon_h - margin);
             }
@@ -12032,6 +12092,18 @@ async fn sync_mascot_bubble(
     {
         let _ = win.set_size(tauri::LogicalSize::new(win_w, win_h));
         let _ = win.set_position(tauri::LogicalPosition::new(final_win_x, final_win_y));
+    }
+
+    // Write resting card edges implied by the applied frame back into the
+    // preserve anchor so the next shrink/preserve pass does not jump from
+    // stale card_right/card_bottom (Windows land displacement).
+    {
+        let mut geom = BUBBLE_GEOMETRY.lock().unwrap();
+        if let Some(a) = geom.anchor.as_mut() {
+            let (cr, cb) = resting_card_edges_from_frame(final_win_x, final_win_y, win_w, win_h);
+            a.card_right = cr;
+            a.card_bottom = cb;
+        }
     }
 
     // Don't re-assert always-on-top while the Windows fullscreen watcher has
@@ -22581,6 +22653,98 @@ mod fullscreen_bubble_suppression_tests {
             let mut geom = BUBBLE_GEOMETRY.lock().unwrap();
             geom.anchor = None;
         }
+    }
+
+    #[test]
+    fn test_preserve_shrink_uses_live_edges_not_stale_anchor() {
+        // Stale anchor from a prior expand/motion pass (card edges drifted).
+        let stale = BubbleAnchor {
+            card_right: 900.0,
+            card_bottom: 500.0,
+            mon_x: 0.0,
+            mon_y: 0.0,
+            mon_w: 1920.0,
+            mon_h: 1080.0,
+        };
+        {
+            let mut geom = BUBBLE_GEOMETRY.lock().unwrap();
+            geom.anchor = Some(stale);
+        }
+
+        // Live bubble window frame currently on screen (logical px).
+        let (lx, ly, lw, lh) = (700.0, 200.0, 220.0, 160.0);
+        let (live_right, live_bottom) = resting_card_edges_from_frame(lx, ly, lw, lh);
+        assert_ne!(live_right, stale.card_right);
+        assert_ne!(live_bottom, stale.card_bottom);
+
+        // Preserve shrink must use live edges, not the stale anchor.
+        let bubble_w = 80.0;
+        let bubble_h = 40.0;
+        let res_x = 0.0;
+        let res_y = 0.0;
+        let win_w = (bubble_w + res_x + BUBBLE_PAD_RIGHT).max(8.0);
+        let win_h = (bubble_h + res_y + BUBBLE_PAD_BOTTOM).max(8.0);
+        let margin = 8.0;
+
+        let mut preserved_card_right = live_right;
+        let mut preserved_card_bottom = live_bottom;
+        if preserved_card_right - bubble_w < stale.mon_x + margin {
+            preserved_card_right = stale.mon_x + margin + bubble_w;
+        }
+        if preserved_card_right > stale.mon_x + stale.mon_w - margin {
+            preserved_card_right = stale.mon_x + stale.mon_w - margin;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            if preserved_card_bottom - bubble_h < stale.mon_y + margin {
+                preserved_card_bottom =
+                    (stale.mon_y + margin + bubble_h).min(stale.mon_y + stale.mon_h - margin);
+            }
+            if preserved_card_bottom > stale.mon_y + stale.mon_h - margin {
+                preserved_card_bottom = stale.mon_y + stale.mon_h - margin;
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if preserved_card_bottom + bubble_h > stale.mon_y + stale.mon_h - margin {
+                preserved_card_bottom =
+                    (stale.mon_y + stale.mon_h - margin - bubble_h).max(stale.mon_y + margin);
+            }
+            if preserved_card_bottom < stale.mon_y + margin {
+                preserved_card_bottom = stale.mon_y + margin;
+            }
+        }
+
+        let final_win_x = preserved_card_right - (win_w - BUBBLE_PAD_RIGHT);
+        #[cfg(target_os = "macos")]
+        let final_win_y = preserved_card_bottom - BUBBLE_PAD_BOTTOM;
+        #[cfg(not(target_os = "macos"))]
+        let final_win_y = preserved_card_bottom - (win_h - BUBBLE_PAD_BOTTOM);
+
+        let (cr_after, cb_after) =
+            resting_card_edges_from_frame(final_win_x, final_win_y, win_w, win_h);
+        // Card edges stay continuous through preserve shrink.
+        assert!((cr_after - preserved_card_right).abs() < 1e-9);
+        assert!((cb_after - preserved_card_bottom).abs() < 1e-9);
+
+        // Write-back replaces stale edges with the applied frame's edges.
+        {
+            let mut geom = BUBBLE_GEOMETRY.lock().unwrap();
+            if let Some(a) = geom.anchor.as_mut() {
+                a.card_right = cr_after;
+                a.card_bottom = cb_after;
+            }
+        }
+        {
+            let geom = BUBBLE_GEOMETRY.lock().unwrap();
+            let a = geom.anchor.unwrap();
+            assert_eq!(a.card_right, cr_after);
+            assert_eq!(a.card_bottom, cb_after);
+            assert_ne!(a.card_right, stale.card_right);
+            assert_ne!(a.card_bottom, stale.card_bottom);
+        }
+
+        BUBBLE_GEOMETRY.lock().unwrap().anchor = None;
     }
 
     #[test]
