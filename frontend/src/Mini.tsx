@@ -4571,17 +4571,15 @@ export default function Mini() {
         fetchAgents()
         if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
         try {
-          // Prefer set_mini_expanded(false) over set_mini_size(restore) so
-          // MINI_IS_EXPANDED is cleared. Leaving it true forces bubble sync onto
-          // the preserve path after settings, so the bubble stops following the mascot.
-          await invoke('set_mini_expanded', {
-            expanded: false,
+          // Use set_mini_size(restore) so default placement returns when
+          // customPosRef is null. Rust restore now clears MINI_IS_EXPANDED +
+          // bubble anchor so follow works without keepPosition.
+          await invoke('set_mini_size', {
+            restore: true,
             position: mascotPositionRef.current,
-            efficiency: viewModeRef.current === 'efficiency',
             mascotScale: mascotScaleRef.current,
             largeMascot: true,
             largeMascotScale: largeMascotScaleRef.current,
-            keepPosition: true,
           })
           if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
           await restoreCollapsedMascotPosition()
