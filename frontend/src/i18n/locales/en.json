@@ -256,6 +256,9 @@
     "autoExpandOnTask": "Auto Popup",
     "autoExpandOnTaskDesc": "Automatically expand panel when a task completes or needs input",
 
+    "developer": "Developer",
+    "developerMode": "Developer Mode",
+    "developerModeDesc": "Show debug settings such as test session inject",
     "system": "System",
     "autostart": "Launch on Login",
     "autostartDesc": "Start oc-claw automatically when you log in",
