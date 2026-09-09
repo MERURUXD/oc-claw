@@ -17,6 +17,13 @@ import { getStore, DEFAULT_CHAR, DEFAULT_CHAR_NAME, loadCharacters, loadOcConnec
 import type { AgentMetrics, BubbleSessionDetail, BubbleStyle, BubbleTransitionEvent, MascotBubblePayload, OcConnection, SubagentDetail } from './lib/types'
 import { deriveSessionActivity, isSameBubblePayload } from './lib/sessionActivity'
 import {
+  buildDebugSession,
+  isDebugInjectSession,
+  isInteractiveSession,
+  mergeSessionsWithDebugInject,
+  type DebugInjectPreset,
+} from './lib/debugInject'
+import {
   type BubbleLifecycleState,
   handlePresentationSuppressionChange,
   handleBubbleReadyWhileSuppressed,
@@ -390,6 +397,25 @@ export default function Mini() {
   const [claudeSessions, setClaudeSessions] = useState<any[]>([])
   const claudeSessionsRef = useRef<any[]>([])
   claudeSessionsRef.current = claudeSessions
+  // In-memory debug inject sessions (never persisted / never sent to network)
+  const [debugInjectSessions, setDebugInjectSessions] = useState<any[]>([])
+  const debugInjectSessionsRef = useRef<any[]>([])
+  debugInjectSessionsRef.current = debugInjectSessions
+  const applyDebugInjectPreset = useCallback((preset: DebugInjectPreset) => {
+    // v1: single-session only — replace the entire inject table
+    const next = buildDebugSession(preset)
+    const inject = [next]
+    // Sync ref immediately so an in-flight poll cannot merge with a stale inject table.
+    debugInjectSessionsRef.current = inject
+    setDebugInjectSessions(inject)
+    setClaudeSessions((cur) => mergeSessionsWithDebugInject(cur, inject))
+  }, [])
+  const clearDebugInjectSessions = useCallback(() => {
+    debugInjectSessionsRef.current = []
+    setDebugInjectSessions([])
+    setClaudeSessions((prev) => prev.filter((s) => !isDebugInjectSession(s)))
+  }, [])
+
 
   // Transient mascot reactions (waving / failed)
   const [mascotReaction, setMascotReaction] = useState<MascotReaction | null>(null)
@@ -2199,6 +2225,8 @@ export default function Mini() {
   useEffect(() => {
     if (appMode !== 'coding') {
       setClaudeSessions([])
+      debugInjectSessionsRef.current = []
+      setDebugInjectSessions([])
       // The status bubble only exists in coding mode — make sure it is
       // hidden when leaving it (pet mode etc.).
       bubbleDesiredVisibleRef.current = false
@@ -2210,6 +2238,8 @@ export default function Mini() {
     }
     if (!(enableClaudeCode || enableClaudeDesktop || enableCodex || enableCursor || enableGemini || enableOpencode || enableHermes || enableAntigravity)) {
       setClaudeSessions([])
+      debugInjectSessionsRef.current = []
+      setDebugInjectSessions([])
       bubbleDesiredVisibleRef.current = false
       bubbleTransitionIdRef.current++
       bubblePhaseRef.current = 'hidden'
@@ -2400,7 +2430,7 @@ export default function Mini() {
         }
         // Decide whether to pop the completion popup, but DO NOT commit
         // setCompletionSessionId yet. We need to batch it with
-        // setClaudeSessions(sessions) below so the panel's first frame
+        // setClaudeSessions(...) below so the panel's first frame
         // already has both the new session list and the new filter state.
         // Otherwise React renders once with new completionSessionId + stale
         // claudeSessions (lastResponse not yet present) → user sees the
@@ -2465,14 +2495,15 @@ export default function Mini() {
         // Commit sessions + completion popup state in the same sync block so
         // React batches them: the panel's first render after expand already
         // has the filtered single-session view, no full-list flash.
-        setClaudeSessions(sessions)
+        const sessionsForUi = mergeSessionsWithDebugInject(sessions, debugInjectSessionsRef.current)
+        setClaudeSessions(sessionsForUi)
         // Mascot status bubble: derive a summary and active session detail from
         // the merged session list. Show it only while the panel is collapsed
         // and at least one session is active.
         let bubbleRunning = 0
         let bubbleWaiting = 0
         const activeSessionsMap = new Map<string, any>()
-        for (const s of sessions) {
+        for (const s of sessionsForUi) {
           const st = s.status
           if (st === 'processing' || st === 'tool_running' || st === 'compacting') {
             bubbleRunning++
@@ -2484,17 +2515,17 @@ export default function Mini() {
         }
 
         // Retain tracked sessions that still exist in the current sessions list
-        const allKnownSessionIds = new Set(sessions.map((s: any) => String(s.sessionId || '')))
+        const allKnownSessionIds = new Set(sessionsForUi.map((s: any) => String(s.sessionId || '')))
         bubbleActiveSessionOrderRef.current = bubbleActiveSessionOrderRef.current.filter((id) => allKnownSessionIds.has(id))
 
         // Collect new sessions not yet assigned a slot in bubbleActiveSessionOrderRef
-        const unassignedSessionIds = sessions
+        const unassignedSessionIds = sessionsForUi
           .map((s: any) => String(s.sessionId || ''))
           .filter((id: string) => id && !bubbleActiveSessionOrderRef.current.includes(id))
 
         if (unassignedSessionIds.length > 0) {
           const getSessionSortTime = (sid: string) => {
-            const s = sessions.find((item: any) => String(item.sessionId) === sid)
+            const s = sessionsForUi.find((item: any) => String(item.sessionId) === sid)
             if (!s) return 0
             if (s.createdAt) {
               const t = typeof s.createdAt === 'string' ? new Date(s.createdAt).getTime() : Number(s.createdAt)
@@ -3138,6 +3169,12 @@ export default function Mini() {
         ? claudeSessionsRef.current.find((s: any) => s.sessionId === sid) || lastActiveSessionRef.current
         : lastActiveSessionRef.current
       if (bubbleStyleRef.current === 'detailed' && targetSession && targetSession.status === 'waiting') {
+        // Debug inject is visual-only — never jump / activate real apps with a fake sessionId.
+        if (!isInteractiveSession(targetSession)) {
+          if (expandedRef.current || expandingRef.current) return
+          void expandFnRef.current?.()
+          return
+        }
         const src = targetSession.source
         if (src === 'antigravity') {
           invoke('activate_app', { appName: 'Antigravity' }).catch(() => {})
@@ -5964,9 +6001,9 @@ export default function Mini() {
                                       }
                                       if (!isWaiting || isGeminiSource || isOpencodeSource) {
                                         if (cs.source === 'cursor') {
-                                          invoke('focus_cursor_terminal', { sessionId: cs.sessionId }).catch((err: unknown) => console.warn('focus cursor failed:', err))
+                                          isInteractiveSession(cs) && invoke('focus_cursor_terminal', { sessionId: cs.sessionId }).catch((err: unknown) => console.warn('focus cursor failed:', err))
                                         } else {
-                                          invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch((err: unknown) => console.warn('jump failed:', err))
+                                          isInteractiveSession(cs) && invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch((err: unknown) => console.warn('jump failed:', err))
                                         }
                                       }
                                     }}
@@ -6280,6 +6317,7 @@ export default function Mini() {
                                             // the permission popup closes without waiting for
                                             // the next 2s poll cycle.
                                             const resolvePermission = (decision: string) => {
+                                              if (!isInteractiveSession(cs)) return
                                               if (cs.source === 'codex') return
                                               invoke('resolve_claude_permission', { sessionId: cs.sessionId, decision }).catch(() => {})
                                               // Clear waiting state locally so popup disappears instantly
@@ -6300,7 +6338,7 @@ export default function Mini() {
 
                                                 const handleResolveCodex = async (decision: 'allow' | 'deny' | 'fallback') => {
                                                   if (!cs.pendingInteraction?.requestId || !cs.pendingInteraction?.turnId) {
-                                                    invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
+                                                    isInteractiveSession(cs) && invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
                                                     hoverExpandedRef.current = false
                                                     collapse()
                                                     return
@@ -6312,6 +6350,7 @@ export default function Mini() {
                                                     return next
                                                   })
                                                   try {
+                                                    if (!isInteractiveSession(cs)) return
                                                     await invoke('resolve_codex_permission', {
                                                       sessionId: cs.sessionId,
                                                       turnId: cs.pendingInteraction.turnId,
@@ -6319,7 +6358,7 @@ export default function Mini() {
                                                       decision,
                                                     })
                                                     if (decision === 'fallback') {
-                                                      invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
+                                                      isInteractiveSession(cs) && invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
                                                     }
                                                     hoverExpandedRef.current = false
                                                     collapse()
@@ -6441,7 +6480,7 @@ export default function Mini() {
                                                         data-no-drag
                                                         onClick={(e) => {
                                                           e.stopPropagation()
-                                                          invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
+                                                          isInteractiveSession(cs) && invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
                                                           hoverExpandedRef.current = false
                                                           collapse()
                                                         }}
@@ -6519,10 +6558,10 @@ export default function Mini() {
                                                         if (appName) {
                                                           invoke('activate_app', { appName }).catch(() => {})
                                                         } else {
-                                                          invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
+                                                          isInteractiveSession(cs) && invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
                                                         }
                                                       } else {
-                                                        invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
+                                                        isInteractiveSession(cs) && invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
                                                       }
                                                       hoverExpandedRef.current = false
                                                       collapse()
@@ -6620,12 +6659,12 @@ export default function Mini() {
                                             if (cs.source === 'antigravity') {
                                               invoke('activate_app', { appName: 'Antigravity' }).catch(() => {})
                                             } else if (cs.source === 'cursor') {
-                                              invoke('focus_cursor_terminal', { sessionId: cs.sessionId }).catch((err: unknown) => console.warn('focus cursor failed:', err))
+                                              isInteractiveSession(cs) && invoke('focus_cursor_terminal', { sessionId: cs.sessionId }).catch((err: unknown) => console.warn('focus cursor failed:', err))
                                             } else if (!(isWindowsPlatform && cs.source === 'gemini')) {
                                               // Gemini on Windows runs in a terminal whose window can't be
                                               // reliably targeted from the detached process tree, so don't
                                               // attempt to jump — just dismiss the popup.
-                                              invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
+                                              isInteractiveSession(cs) && invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
                                             }
                                             collapseFnRef.current?.()
                                           }}
@@ -7401,6 +7440,9 @@ export default function Mini() {
                     <div className="h-full overflow-y-auto bg-[#151515] scrollbar-hidden">
                       <SettingsTab
                         bubbleStyle={bubbleStyle}
+                        onDebugInjectPreset={applyDebugInjectPreset}
+                        onClearDebugInject={clearDebugInjectSessions}
+                        debugInjectCount={debugInjectSessions.length}
                         onChangeBubbleStyle={async (v) => {
                           setBubbleStyle(v)
                           bubbleStyleRef.current = v
