@@ -4486,6 +4486,11 @@ export default function Mini() {
     if (!expanded || pinned || settingsMode || settingsTransitioning || updateModalOpen) return
     const onClick = (e: MouseEvent) => {
       if (isCreateModalOpenRef.current) return
+      // enterSettings sets the ref before React re-renders / effect cleanup.
+      if (settingsTransitioningRef.current) {
+        debugToTerminal('outside', 'window mousedown ignored: settingsTransitioning=true')
+        return
+      }
       if (isSettingsPickerBlockingClose()) {
         debugToTerminal('outside', 'window mousedown ignored: settings picker active')
         return
@@ -4511,7 +4516,7 @@ export default function Mini() {
     }
     invoke('set_outside_click_watch', { active: true }).catch(() => {})
     const unlisten = listen('mini-outside-click', () => {
-      if (pinnedRef.current || settingsModeRef.current) return
+      if (pinnedRef.current || settingsModeRef.current || settingsTransitioningRef.current) return
       if (isCreateModalOpenRef.current) return
       if (filePickerOpenRef.current) return
       if (isSettingsPickerBlockingClose()) return
