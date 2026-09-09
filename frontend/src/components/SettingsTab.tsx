@@ -702,6 +702,7 @@ export function SettingsTab({ bubbleStyle, onChangeBubbleStyle, notifySound, onC
   const [enableAutostart, setEnableAutostart] = useState(false)
   const [autostartStatus, setAutostartStatus] = useState('')
   const [updateInfo, setUpdateInfo] = useState<{ current: string; latest: string; hasUpdate: boolean; url: string } | null>(null)
+  const [buildInfo, setBuildInfo] = useState<{ version: string; gitSha: string; gitShaShort: string } | null>(null)
   const [updateChecking, setUpdateChecking] = useState(false)
   const [updateCheckResult, setUpdateCheckResult] = useState<'success' | 'error' | null>(null)
   const [updateCheckMsg, setUpdateCheckMsg] = useState('')
@@ -781,6 +782,14 @@ export function SettingsTab({ bubbleStyle, onChangeBubbleStyle, notifySound, onC
       }
     })()
     void checkForUpdate()
+    void (async () => {
+      try {
+        const info = await invoke('get_build_info') as { version: string; gitSha: string; gitShaShort: string }
+        setBuildInfo(info)
+      } catch {
+        // ignore — About still shows semver from update check
+      }
+    })()
     if (showIslandBackgroundSettings) {
       invoke('list_backgrounds').then((list: any) => setBackgrounds(list as string[])).catch(() => {})
     }
@@ -1580,12 +1589,17 @@ export function SettingsTab({ bubbleStyle, onChangeBubbleStyle, notifySound, onC
             <div className="flex flex-col gap-1">
               <span className="text-sm font-medium text-white/90">{t('settings.currentVersion')}</span>
               <span className="text-xs text-white/40">
-                {updateInfo ? `v${updateInfo.current}` : '...'}
+                {updateInfo ? `v${updateInfo.current}` : (buildInfo ? `v${buildInfo.version}` : '...')}
                 {updateInfo && !updateInfo.hasUpdate && ` (${t('settings.latest')})`}
                 {updateInfo?.hasUpdate && (
                   <span className="ml-2 text-emerald-400">v{updateInfo.latest} {t('settings.available')}</span>
                 )}
               </span>
+              {buildInfo?.gitShaShort && buildInfo.gitShaShort !== 'unknown' && (
+                <span className="text-xs text-white/40 font-mono" title={buildInfo.gitSha}>
+                  {t('settings.buildCommit', 'Commit')} {buildInfo.gitShaShort}
+                </span>
+              )}
               {updateCheckResult === 'success' && updateCheckMsg && (
                 <span className="text-xs text-emerald-400">{updateCheckMsg}</span>
               )}

@@ -262,6 +262,7 @@
     "autostartFailed": "Failed to update autostart:",
 
     "about": "About",
+    "buildCommit": "Commit",
     "currentVersion": "Current Version",
     "latest": "Latest",
     "available": "available",
