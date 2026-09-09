@@ -95,6 +95,10 @@ static BUBBLE_GEOMETRY: Mutex<BubbleGeometryState> = Mutex::new(BubbleGeometrySt
 });
 /// Tracks whether the mini window is currently expanded into the message/settings panel.
 static MINI_IS_EXPANDED: AtomicBool = AtomicBool::new(false);
+/// Last `set_always_on_top` value applied to the mascot-bubble window.
+/// Re-asserting always-on-top on every geometry sync can 1-frame flash on Windows.
+static BUBBLE_ALWAYS_ON_TOP: AtomicBool = AtomicBool::new(true);
+static BUBBLE_ALWAYS_ON_TOP_KNOWN: AtomicBool = AtomicBool::new(false);
 
 
 /// Coalesces drag-apply tasks so we never queue more than one
@@ -11699,6 +11703,9 @@ fn spawn_mascot_bubble(app: tauri::AppHandle) -> Result<(), String> {
     .build()
     .map_err(|e| e.to_string())?;
 
+    BUBBLE_ALWAYS_ON_TOP.store(true, Ordering::SeqCst);
+    BUBBLE_ALWAYS_ON_TOP_KNOWN.store(true, Ordering::SeqCst);
+
     // macOS: float at level 27 like the mini, but with only the
     // CanJoinAllSpaces | Stationary | FullScreenAuxiliary collection
     // behavior bits (no over-fullscreen bits) so the bubble hides together
@@ -12036,11 +12043,19 @@ async fn sync_mascot_bubble(
 
     // Don't re-assert always-on-top while the Windows fullscreen watcher has
     // the mini hidden — the bubble must stay off the fullscreen app too.
+    // Also skip when the desired topmost state is unchanged: re-applying
+    // always-on-top after every motion→stable shrink can 1-frame flash.
     #[cfg(target_os = "windows")]
     let want_top = !PRESENTATION.active();
     #[cfg(not(target_os = "windows"))]
     let want_top = true;
-    let _ = win.set_always_on_top(want_top);
+    let known = BUBBLE_ALWAYS_ON_TOP_KNOWN.load(Ordering::SeqCst);
+    let last = BUBBLE_ALWAYS_ON_TOP.load(Ordering::SeqCst);
+    if !known || last != want_top {
+        let _ = win.set_always_on_top(want_top);
+        BUBBLE_ALWAYS_ON_TOP.store(want_top, Ordering::SeqCst);
+        BUBBLE_ALWAYS_ON_TOP_KNOWN.store(true, Ordering::SeqCst);
+    }
     Ok(())
 }
 
