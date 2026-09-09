@@ -14096,8 +14096,6 @@ fn pick_localized_notes(notes_i18n: &serde_json::Value, lang: Option<&str>) -> O
     None
 }
 
-#[tauri::command]
-
 /// Build identity for Settings → About: package version + embedded git SHA.
 #[tauri::command]
 fn get_build_info(app: tauri::AppHandle) -> serde_json::Value {
@@ -14111,6 +14109,7 @@ fn get_build_info(app: tauri::AppHandle) -> serde_json::Value {
     })
 }
 
+#[tauri::command]
 async fn check_for_update(app: tauri::AppHandle, lang: Option<String>) -> Result<serde_json::Value, String> {
     let current = app.config().version.clone().unwrap_or_default();
 
