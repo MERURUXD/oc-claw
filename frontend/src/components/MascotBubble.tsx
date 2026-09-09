@@ -17,6 +17,15 @@ import {
   BUBBLE_WIDTH_MOTION,
   resolveBubbleWidthTarget,
 } from '../lib/bubbleWidth'
+import {
+  applyDeferredStable,
+  beginGeometryMotion,
+  createGeometryLifecycle,
+  resolveObservedGeometryMode,
+  scheduleDeferredStable,
+  type DeferredStableTicket,
+  type GeometryLifecycleSnapshot,
+} from '../lib/bubbleGeometryLifecycle'
 import { QuotaMiniBadge } from './QuotaCapsule'
 
 export { BUBBLE_WIDTH, BUBBLE_WIDTH_MOTION }
@@ -817,7 +826,7 @@ function MeasureSessionBubbleRow({
  *      with motion reserve, and emits `mascot-bubble-ready`.
  *   3. Mini shows the native window and emits `mascot-bubble-enter`.
  *   4. MascotBubble awaits double requestAnimationFrame and springs to visible state (0, 0).
- *   5. When animation settles in visible state, native geometry shrinks from motion mode to stable mode (0 reserve) after a double-rAF so the resting frame paints first.
+ *   5. When animation settles in visible state, the geometry lifecycle opens `stableGeometryAllowed` after a generation-guarded double-rAF, then the sole authority path shrinks native geometry to stable mode.
  *   6. When closing, Mini emits `mascot-bubble-close`. MascotBubble expands back to motion mode, springs to (-150, -95)
  *      with concurrent opacity fade-out, and on animation completion emits `mascot-bubble-exit-complete`.
  */
@@ -948,23 +957,56 @@ export default function MascotBubble() {
   }, [])
 
 
-  // Defer motion→stable shrink until after the resting frame paints (avoids 1-frame settle flicker
-  // when the native window drops the flight envelope right as enter animation completes).
+  // Unified geometry lifecycle: gate + generation-guarded deferred stable (sole shrink authority).
+  const geometryLifecycleRef = useRef<GeometryLifecycleSnapshot>(createGeometryLifecycle())
   const stableSyncRafRef = useRef<number | null>(null)
+  const pendingStableTicketRef = useRef<DeferredStableTicket | null>(null)
+
   const cancelScheduledStableGeometrySync = useCallback(() => {
     if (stableSyncRafRef.current != null) {
       cancelAnimationFrame(stableSyncRafRef.current)
       stableSyncRafRef.current = null
     }
+    pendingStableTicketRef.current = null
+    const cur = geometryLifecycleRef.current
+    geometryLifecycleRef.current = {
+      ...cur,
+      pendingGeneration: null,
+      pendingTransitionId: null,
+    }
   }, [])
+
+  const beginStableGeometryMotion = useCallback((nextTransitionId?: number) => {
+    cancelScheduledStableGeometrySync()
+    geometryLifecycleRef.current = beginGeometryMotion(
+      geometryLifecycleRef.current,
+      nextTransitionId,
+    )
+  }, [cancelScheduledStableGeometrySync])
+
+  /** Completion callbacks only update lifecycle; this is the sole path that may shrink to stable. */
   const scheduleStableGeometrySync = useCallback(() => {
     cancelScheduledStableGeometrySync()
+    const scheduled = scheduleDeferredStable(geometryLifecycleRef.current)
+    geometryLifecycleRef.current = scheduled.state
+    const ticket = scheduled.ticket
+    pendingStableTicketRef.current = ticket
     stableSyncRafRef.current = requestAnimationFrame(() => {
       stableSyncRafRef.current = requestAnimationFrame(() => {
         stableSyncRafRef.current = null
-        if (phaseRef.current !== 'visible') return
-        if (activeMotionTokensRef.current.size > 0) return
-        syncBubbleGeometry('stable', { preserveAnchor: true })
+        const pending = pendingStableTicketRef.current
+        if (!pending || pending.generation !== ticket.generation || pending.transitionId !== ticket.transitionId) {
+          return
+        }
+        const applied = applyDeferredStable(geometryLifecycleRef.current, ticket, {
+          phase: phaseRef.current,
+          hasActiveMotion: activeMotionTokensRef.current.size > 0,
+        })
+        geometryLifecycleRef.current = applied.state
+        pendingStableTicketRef.current = null
+        if (applied.shouldShrinkToStable) {
+          syncBubbleGeometry('stable', { preserveAnchor: true })
+        }
       })
     })
   }, [cancelScheduledStableGeometrySync, syncBubbleGeometry])
@@ -1015,7 +1057,7 @@ export default function MascotBubble() {
       transitionIdRef.current = tid
       readySentForTransitionRef.current = -1
       logBubbleDev(`[bubble ${tid}] prepare`)
-      cancelScheduledStableGeometrySync()
+      beginStableGeometryMotion(tid)
 
       enteringCompletedSessionIdsRef.current.clear()
       exitingCompletedSessionIdsRef.current.clear()
@@ -1116,6 +1158,7 @@ export default function MascotBubble() {
             newIncrementalIds.forEach((id) => {
               activeMotionTokensRef.current.add(`incremental:${id}`)
             })
+            beginStableGeometryMotion()
 
             const startIncrementalEntry = () => {
               if (disposed) return
@@ -1163,6 +1206,7 @@ export default function MascotBubble() {
           enteringCompletedSessionIdsRef.current.clear()
           activeMotionTokensRef.current.clear()
           activeMotionTokensRef.current.add('global-entry')
+          beginStableGeometryMotion()
           if (currentGeometryModeRef.current !== 'motion') {
             syncBubbleGeometry('motion', { preserveAnchor: true })
           }
@@ -1173,6 +1217,7 @@ export default function MascotBubble() {
         if (phaseRef.current !== 'hidden' && phaseRef.current !== 'exiting') {
           exitingCompletedSessionIdsRef.current.clear()
           activeMotionTokensRef.current.add('global-exit')
+          beginStableGeometryMotion()
 
           const startExit = () => {
             if (disposed) return
@@ -1203,7 +1248,7 @@ export default function MascotBubble() {
         transitionIdRef.current = tid
       }
       logBubbleDev(`[bubble ${transitionIdRef.current}] close`)
-      cancelScheduledStableGeometrySync()
+      beginStableGeometryMotion(transitionIdRef.current)
       if (phaseRef.current === 'hidden') return
       exitingCompletedSessionIdsRef.current.clear()
       activeMotionTokensRef.current.add('global-exit')
@@ -1237,7 +1282,7 @@ export default function MascotBubble() {
       if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current)
       cancelScheduledStableGeometrySync()
     }
-  }, [syncBubbleGeometry, cancelScheduledStableGeometrySync])
+  }, [syncBubbleGeometry, beginStableGeometryMotion])
 
   // The active payload to render (retain last valid summary during exiting so DOM does not collapse early)
   const displaySummary = summary || (phase === 'exiting' ? lastValidSummaryRef.current : null)
@@ -1341,8 +1386,12 @@ export default function MascotBubble() {
       const height = Math.ceil(target.offsetHeight)
       if (width <= 0 || height <= 0) return
 
-      const isMotionActive = activeMotionTokensRef.current.size > 0 || phaseRef.current !== 'visible'
-      const targetMode: BubbleGeometryMode = isMotionActive ? 'motion' : 'stable'
+      const isMotionActive = activeMotionTokensRef.current.size > 0
+      const targetMode: BubbleGeometryMode = resolveObservedGeometryMode({
+        stableGeometryAllowed: geometryLifecycleRef.current.stableGeometryAllowed,
+        hasActiveMotion: isMotionActive,
+        phase: phaseRef.current,
+      })
       const preserveAnchor = phaseRef.current !== 'prepared'
 
       if (phaseRef.current === 'prepared') {
