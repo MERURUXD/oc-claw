@@ -609,6 +609,10 @@ export default function Mini() {
   const bubbleActiveSessionOrderRef = useRef<string[]>([])
   const bubbleNativeVisibleRef = useRef(false)
   const bubbleDesiredVisibleRef = useRef(false)
+  /** Wanted show while collapse was still settling — flush when collapsingRef clears. */
+  const bubbleShowDeferredRef = useRef(false)
+  /** Latest bubble visibility applicator from the session poll effect (collapse/expand flush). */
+  const syncBubbleVisibilityRef = useRef<() => void>(() => {})
   const bubbleTransitionIdRef = useRef(0)
   const bubblePhaseRef = useRef<'hidden' | 'prepared' | 'entering' | 'visible' | 'exiting'>('hidden')
   const bubblePresentationSuppressedRef = useRef(false)
@@ -2699,11 +2703,6 @@ export default function Mini() {
         lastActiveSessionRef.current = topSession
 
         const bubbleActive = totalActive > 0
-        const bubbleShouldShow =
-          !expandedRef.current &&
-          !collapsingRef.current &&
-          !expandingRef.current &&
-          bubbleActive
         const bubblePayload: MascotBubblePayload = {
           style: bubbleStyleRef.current,
           running: bubbleRunning,
@@ -2714,25 +2713,43 @@ export default function Mini() {
         const isDuplicatePayload = isSameBubblePayload(lastBubblePayloadRef.current, bubblePayload)
         lastBubblePayloadRef.current = bubblePayload
 
-        if (bubbleShouldShow) {
-          bubbleDesiredVisibleRef.current = true
-          const currentPhase = bubblePhaseRef.current
-          if (currentPhase === 'visible' || currentPhase === 'entering' || currentPhase === 'prepared') {
-            if (!isDuplicatePayload) {
-              emit('mascot-bubble-summary', bubblePayload).catch(() => {})
-            }
-          } else {
-            const transitionId = ++bubbleTransitionIdRef.current
-            bubblePhaseRef.current = 'prepared'
-            invoke('ensure_mascot_bubble')
-              .then(() => {
-                emit('mascot-bubble-prepare', { transitionId, payload: bubblePayload }).catch(() => {})
-              })
-              .catch(() => {
-                emit('mascot-bubble-prepare', { transitionId, payload: bubblePayload }).catch(() => {})
-              })
+        const applyBubbleVisibility = (
+          active: boolean,
+          payload: MascotBubblePayload,
+          opts?: { forcePrepare?: boolean },
+        ) => {
+          const wantShow = !expandedRef.current && active
+          const canPrepare = !collapsingRef.current && !expandingRef.current
+
+          // Collapse in progress: defer show — do not hide/close (avoids up-to-2s poll wait).
+          if (wantShow && collapsingRef.current) {
+            bubbleShowDeferredRef.current = true
+            return
           }
-        } else {
+
+          if (wantShow && canPrepare) {
+            bubbleShowDeferredRef.current = false
+            bubbleDesiredVisibleRef.current = true
+            const currentPhase = bubblePhaseRef.current
+            if (currentPhase === 'visible' || currentPhase === 'entering' || currentPhase === 'prepared') {
+              if (opts?.forcePrepare || !isDuplicatePayload) {
+                emit('mascot-bubble-summary', payload).catch(() => {})
+              }
+            } else {
+              const transitionId = ++bubbleTransitionIdRef.current
+              bubblePhaseRef.current = 'prepared'
+              invoke('ensure_mascot_bubble')
+                .then(() => {
+                  emit('mascot-bubble-prepare', { transitionId, payload }).catch(() => {})
+                })
+                .catch(() => {
+                  emit('mascot-bubble-prepare', { transitionId, payload }).catch(() => {})
+                })
+            }
+            return
+          }
+
+          bubbleShowDeferredRef.current = false
           bubbleDesiredVisibleRef.current = false
           const currentPhase = bubblePhaseRef.current
           if (currentPhase !== 'hidden' && currentPhase !== 'exiting') {
@@ -2740,6 +2757,15 @@ export default function Mini() {
             bubblePhaseRef.current = 'exiting'
             emit('mascot-bubble-close', { transitionId }).catch(() => {})
           }
+        }
+
+        applyBubbleVisibility(bubbleActive, bubblePayload)
+
+        syncBubbleVisibilityRef.current = () => {
+          const payload = lastBubblePayloadRef.current
+          const active = payload.running + payload.waiting > 0
+          // Recompute duplicate against itself after collapse: always allow prepare/summary.
+          applyBubbleVisibility(active, payload, { forcePrepare: true })
         }
         if (completionCandidate) {
           shownCompletionsRef.current.add(completionCandidate.sessionId)
@@ -3152,6 +3178,7 @@ export default function Mini() {
     } finally {
       setHiding(false)
       expandingRef.current = false
+      syncBubbleVisibilityRef.current()
     }
   }, [syncExpandedWindowLayout])
   expandFnRef.current = expand
@@ -4219,6 +4246,9 @@ export default function Mini() {
       setTimeout(() => {
         collapsingRef.current = false
         settingsTransitioningRef.current = false
+        if (bubbleShowDeferredRef.current || (!expandedRef.current && (lastBubblePayloadRef.current.running + lastBubblePayloadRef.current.waiting > 0))) {
+          syncBubbleVisibilityRef.current()
+        }
       }, 300)
     }, delay)
   }, [fetchAgents, restoreCollapsedMascotPosition, debugToTerminal, isSettingsPickerBlockingClose])
