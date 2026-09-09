@@ -2699,7 +2699,11 @@ export default function Mini() {
         lastActiveSessionRef.current = topSession
 
         const bubbleActive = totalActive > 0
-        const bubbleShouldShow = !expandedRef.current && bubbleActive
+        const bubbleShouldShow =
+          !expandedRef.current &&
+          !collapsingRef.current &&
+          !expandingRef.current &&
+          bubbleActive
         const bubblePayload: MascotBubblePayload = {
           style: bubbleStyleRef.current,
           running: bubbleRunning,
