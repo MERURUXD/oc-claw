@@ -256,6 +256,9 @@
     "autoExpandOnTask": "主动弹窗",
     "autoExpandOnTaskDesc": "任务完成或需要输入时自动弹出面板",
 
+    "developer": "开发者",
+    "developerMode": "开发者模式",
+    "developerModeDesc": "开启后显示调试设置（如测试消息注入）",
     "system": "系统",
     "autostart": "开机启动",
     "autostartDesc": "登录系统后自动启动 oc-claw",
