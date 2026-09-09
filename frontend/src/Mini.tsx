@@ -19,6 +19,7 @@ import { deriveSessionActivity, isSameBubblePayload } from './lib/sessionActivit
 import {
   buildDebugSession,
   isDebugInjectSession,
+  isInteractiveSession,
   mergeSessionsWithDebugInject,
   type DebugInjectPreset,
 } from './lib/debugInject'
@@ -404,10 +405,13 @@ export default function Mini() {
     // v1: single-session only — replace the entire inject table
     const next = buildDebugSession(preset)
     const inject = [next]
+    // Sync ref immediately so an in-flight poll cannot merge with a stale inject table.
+    debugInjectSessionsRef.current = inject
     setDebugInjectSessions(inject)
     setClaudeSessions((cur) => mergeSessionsWithDebugInject(cur, inject))
   }, [])
   const clearDebugInjectSessions = useCallback(() => {
+    debugInjectSessionsRef.current = []
     setDebugInjectSessions([])
     setClaudeSessions((prev) => prev.filter((s) => !isDebugInjectSession(s)))
   }, [])
@@ -2221,6 +2225,7 @@ export default function Mini() {
   useEffect(() => {
     if (appMode !== 'coding') {
       setClaudeSessions([])
+      debugInjectSessionsRef.current = []
       setDebugInjectSessions([])
       // The status bubble only exists in coding mode — make sure it is
       // hidden when leaving it (pet mode etc.).
@@ -2233,6 +2238,7 @@ export default function Mini() {
     }
     if (!(enableClaudeCode || enableClaudeDesktop || enableCodex || enableCursor || enableGemini || enableOpencode || enableHermes || enableAntigravity)) {
       setClaudeSessions([])
+      debugInjectSessionsRef.current = []
       setDebugInjectSessions([])
       bubbleDesiredVisibleRef.current = false
       bubbleTransitionIdRef.current++
@@ -3163,6 +3169,12 @@ export default function Mini() {
         ? claudeSessionsRef.current.find((s: any) => s.sessionId === sid) || lastActiveSessionRef.current
         : lastActiveSessionRef.current
       if (bubbleStyleRef.current === 'detailed' && targetSession && targetSession.status === 'waiting') {
+        // Debug inject is visual-only — never jump / activate real apps with a fake sessionId.
+        if (!isInteractiveSession(targetSession)) {
+          if (expandedRef.current || expandingRef.current) return
+          void expandFnRef.current?.()
+          return
+        }
         const src = targetSession.source
         if (src === 'antigravity') {
           invoke('activate_app', { appName: 'Antigravity' }).catch(() => {})
@@ -5989,9 +6001,9 @@ export default function Mini() {
                                       }
                                       if (!isWaiting || isGeminiSource || isOpencodeSource) {
                                         if (cs.source === 'cursor') {
-                                          invoke('focus_cursor_terminal', { sessionId: cs.sessionId }).catch((err: unknown) => console.warn('focus cursor failed:', err))
+                                          isInteractiveSession(cs) && invoke('focus_cursor_terminal', { sessionId: cs.sessionId }).catch((err: unknown) => console.warn('focus cursor failed:', err))
                                         } else {
-                                          invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch((err: unknown) => console.warn('jump failed:', err))
+                                          isInteractiveSession(cs) && invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch((err: unknown) => console.warn('jump failed:', err))
                                         }
                                       }
                                     }}
@@ -6305,6 +6317,7 @@ export default function Mini() {
                                             // the permission popup closes without waiting for
                                             // the next 2s poll cycle.
                                             const resolvePermission = (decision: string) => {
+                                              if (!isInteractiveSession(cs)) return
                                               if (cs.source === 'codex') return
                                               invoke('resolve_claude_permission', { sessionId: cs.sessionId, decision }).catch(() => {})
                                               // Clear waiting state locally so popup disappears instantly
@@ -6325,7 +6338,7 @@ export default function Mini() {
 
                                                 const handleResolveCodex = async (decision: 'allow' | 'deny' | 'fallback') => {
                                                   if (!cs.pendingInteraction?.requestId || !cs.pendingInteraction?.turnId) {
-                                                    invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
+                                                    isInteractiveSession(cs) && invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
                                                     hoverExpandedRef.current = false
                                                     collapse()
                                                     return
@@ -6337,6 +6350,7 @@ export default function Mini() {
                                                     return next
                                                   })
                                                   try {
+                                                    if (!isInteractiveSession(cs)) return
                                                     await invoke('resolve_codex_permission', {
                                                       sessionId: cs.sessionId,
                                                       turnId: cs.pendingInteraction.turnId,
@@ -6344,7 +6358,7 @@ export default function Mini() {
                                                       decision,
                                                     })
                                                     if (decision === 'fallback') {
-                                                      invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
+                                                      isInteractiveSession(cs) && invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
                                                     }
                                                     hoverExpandedRef.current = false
                                                     collapse()
@@ -6466,7 +6480,7 @@ export default function Mini() {
                                                         data-no-drag
                                                         onClick={(e) => {
                                                           e.stopPropagation()
-                                                          invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
+                                                          isInteractiveSession(cs) && invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
                                                           hoverExpandedRef.current = false
                                                           collapse()
                                                         }}
@@ -6544,10 +6558,10 @@ export default function Mini() {
                                                         if (appName) {
                                                           invoke('activate_app', { appName }).catch(() => {})
                                                         } else {
-                                                          invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
+                                                          isInteractiveSession(cs) && invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
                                                         }
                                                       } else {
-                                                        invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
+                                                        isInteractiveSession(cs) && invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
                                                       }
                                                       hoverExpandedRef.current = false
                                                       collapse()
@@ -6645,12 +6659,12 @@ export default function Mini() {
                                             if (cs.source === 'antigravity') {
                                               invoke('activate_app', { appName: 'Antigravity' }).catch(() => {})
                                             } else if (cs.source === 'cursor') {
-                                              invoke('focus_cursor_terminal', { sessionId: cs.sessionId }).catch((err: unknown) => console.warn('focus cursor failed:', err))
+                                              isInteractiveSession(cs) && invoke('focus_cursor_terminal', { sessionId: cs.sessionId }).catch((err: unknown) => console.warn('focus cursor failed:', err))
                                             } else if (!(isWindowsPlatform && cs.source === 'gemini')) {
                                               // Gemini on Windows runs in a terminal whose window can't be
                                               // reliably targeted from the detached process tree, so don't
                                               // attempt to jump — just dismiss the popup.
-                                              invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
+                                              isInteractiveSession(cs) && invoke('jump_to_claude_terminal', { sessionId: cs.sessionId }).catch(() => {})
                                             }
                                             collapseFnRef.current?.()
                                           }}

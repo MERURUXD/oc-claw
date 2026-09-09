@@ -12,6 +12,11 @@ export function isDebugInjectSession(session: { sessionId?: string } | null | un
   return Boolean(session?.sessionId?.startsWith(DEBUG_SESSION_PREFIX))
 }
 
+/** Real sessions may trigger backend / OS focus side effects; debug inject must not. */
+export function isInteractiveSession(session: { sessionId?: string } | null | undefined): boolean {
+  return Boolean(session?.sessionId) && !isDebugInjectSession(session)
+}
+
 export function mergeSessionsWithDebugInject<T extends { sessionId?: string }>(
   polled: T[],
   inject: T[],
