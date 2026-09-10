@@ -8,7 +8,9 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "test": "node --experimental-strip-types --test src/**/*.test.ts"
+    "test": "node --experimental-strip-types --test src/**/*.test.ts",
+    "tauri:dev:local": "tauri dev --config src-tauri/tauri.local.conf.json",
+    "tauri:build:local": "tauri build --debug --no-bundle --config src-tauri/tauri.local.conf.json"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.2.2",
