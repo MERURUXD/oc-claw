@@ -17,6 +17,15 @@ import { getStore, DEFAULT_CHAR, DEFAULT_CHAR_NAME, loadCharacters, loadOcConnec
 import type { AgentMetrics, BubbleSessionDetail, BubbleStyle, BubbleTransitionEvent, MascotBubblePayload, OcConnection, SubagentDetail } from './lib/types'
 import { deriveSessionActivity, isSameBubblePayload } from './lib/sessionActivity'
 import {
+  beginPanelUiTransition,
+  capturePanelUiGeneration,
+  createPanelUiTransition,
+  isPanelUiGenerationCurrent,
+  resolvePanelDismissAction,
+  type PanelDismissSnapshot,
+  type PanelUiTransitionState,
+} from './lib/panelUiTransition'
+import {
   buildDebugSession,
   isDebugInjectSession,
   isInteractiveSession,
@@ -657,6 +666,7 @@ export default function Mini() {
       Date.now() < settingsPickerCloseGraceUntilRef.current,
     [],
   )
+
   useEffect(() => {
     debugToTerminal('state', `settingsMode=${settingsMode}`)
   }, [settingsMode, debugToTerminal])
@@ -763,6 +773,8 @@ export default function Mini() {
   const expandedWindowModeRef = useRef<'island' | 'efficiency' | null>(null)
   // showIdleSessions removed — all sessions visible, important ones sorted to top
   const collapsingRef = useRef(false)
+  /** Shared ownership token for collapse / enterSettings / exitSettings. */
+  const panelUiTransitionRef = useRef<PanelUiTransitionState>(createPanelUiTransition())
   const customPosRef = useRef<{ x: number; y: number } | null>(null)
   const [moveMode, _setMoveMode] = useState(false)
   const moveModeRef = useRef(false)
@@ -797,6 +809,17 @@ export default function Mini() {
   const { t, i18n } = useTranslation()
   const [updateModalOpen, setUpdateModalOpen] = useState(false)
   const updateModalOpenRef = useRef(false)
+
+  const readPanelDismissSnapshot = useCallback((): PanelDismissSnapshot => ({
+    pinned: pinnedRef.current,
+    settingsMode: settingsModeRef.current,
+    settingsTransitioning: settingsTransitioningRef.current,
+    collapsing: collapsingRef.current,
+    updateModalOpen: updateModalOpenRef.current,
+    createModalOpen: isCreateModalOpenRef.current,
+    filePickerOpen: filePickerOpenRef.current,
+    settingsPickerBlocking: isSettingsPickerBlockingClose(),
+  }), [isSettingsPickerBlockingClose])
   const pendingUpdateInfoRef = useRef<UpdateModalInfo | null>(null)
   const updateModalRunOwnedRef = useRef(false)
   const [updateModalPhase, setUpdateModalPhase] = useState<UpdateModalPhase>('available')
@@ -4093,6 +4116,10 @@ export default function Mini() {
     // down before it appears.
     if (settingsTransitioningRef.current) return
     debugToTerminal('close', 'collapse proceed')
+    // Take panel-UI ownership so a later enterSettings/exitSettings can
+    // invalidate this collapse's delayed timeout/await tail.
+    panelUiTransitionRef.current = beginPanelUiTransition(panelUiTransitionRef.current, 'collapse')
+    const myGen = capturePanelUiGeneration(panelUiTransitionRef.current)
     collapsingRef.current = true
     hoverExpandedRef.current = false
     // Intentionally DO NOT clear completionSessionId / effListCollapsed here.
@@ -4120,7 +4147,13 @@ export default function Mini() {
     }
     const delay = isWindowsPlatform ? 150 : wasSettings ? 280 : 480
     setTimeout(async () => {
-      debugToTerminal('close', `collapse timeout fired (wasSettings=${wasSettings})`)
+      if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) {
+        debugToTerminal('close', `collapse timeout aborted: stale gen=${myGen} current=${panelUiTransitionRef.current.generation}`)
+        // Do not clear settings/expanded, do not rewrite native geometry,
+        // do not clear hiding — ownership belongs to the newer transition.
+        return
+      }
+      debugToTerminal('close', `collapse timeout fired (wasSettings=${wasSettings}) gen=${myGen}`)
       settingsPickerOpenRef.current = false
       settingsModeRef.current = false
       setSettingsMode(false)
@@ -4131,6 +4164,7 @@ export default function Mini() {
         // re-sync feature toggles from store immediately.
         try {
           const store = await load('settings.json', { defaults: {}, autoSave: true })
+          if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
           const cc = await store.get('enable_claudecode')
           setEnableClaudeCode(cc !== false)
           const ccDesktop = await store.get('enable_claude_desktop')
@@ -4149,8 +4183,10 @@ export default function Mini() {
           if (hcn) setHermesConns(hcn)
         } catch {}
         // Trigger immediate refresh so config changes are reflected right away.
+        if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
         fetchAgents()
       }
+      if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
       setHiding(true)
       // Unmount the expanded React tree before shrinking/repositioning the
       // native Tauri window. Otherwise the last frames of the expanded panel
@@ -4170,12 +4206,21 @@ export default function Mini() {
       // mask, both Windows DWM and macOS WindowServer keep compositing
       // the in-flight frame, which the user sees as the mascot flashing
       // at the notch position before snapping to its real spot.
+      // Only mask when we still own the transition — otherwise a newer
+      // enterSettings would inherit opacity 0 with no owner to clear it.
+      if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
       document.documentElement.style.opacity = '0'
       try {
         await new Promise<void>((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())))
+        if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) {
+          // Newer transition won during rAF; leave opacity/hiding to it.
+          return
+        }
         if (wasSettings && appModeRef.current === 'pet' && largeMascotRef.current) {
           await invoke('set_mini_expanded', { expanded: false, position: mascotPositionRef.current, efficiency: true, mascotScale: mascotScaleRef.current, largeMascot: true, largeMascotScale: largeMascotScaleRef.current }).catch(() => {})
+          if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
           await invoke('set_pet_mode_window', { active: true, mascotScale: mascotScaleRef.current, largeMascotScale: largeMascotScaleRef.current }).catch(() => {})
+          if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
           if (petOriginBeforeSettingsRef.current) {
             const [x, y] = petOriginBeforeSettingsRef.current
             await invoke('set_mini_origin', { x, y }).catch(() => {})
@@ -4183,6 +4228,7 @@ export default function Mini() {
           }
         } else if (wasSettings) {
           await invoke('set_mini_size', { restore: true, position: mascotPositionRef.current, mascotScale: mascotScaleRef.current, largeMascot: true, largeMascotScale: largeMascotScaleRef.current })
+          if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
           await restoreCollapsedMascotPosition()
         } else {
           await invoke('set_mini_expanded', {
@@ -4193,11 +4239,13 @@ export default function Mini() {
             largeMascot: true,
             largeMascotScale: largeMascotScaleRef.current,
           })
+          if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
           await restoreCollapsedMascotPosition()
         }
       } catch {
-        /* ensure hiding is always cleared */
+        /* ensure hiding is always cleared when we still own the transition */
       }
+      if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
       // Even if the native resize invoke fails, always clear the hiding shell so
       // the mascot becomes visible again instead of getting stuck transparent.
       setHiding(false)
@@ -4208,11 +4256,13 @@ export default function Mini() {
       // the empty webview through the transparent window.
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
+          if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
           document.documentElement.style.opacity = '1'
         })
       })
       // Brief cooldown to prevent focus event from immediately re-expanding
       setTimeout(() => {
+        if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
         collapsingRef.current = false
         settingsTransitioningRef.current = false
       }, 300)
@@ -4332,6 +4382,11 @@ export default function Mini() {
           hoverCloseTimerRef.current = setTimeout(() => {
             hoverExpandedRef.current = false
             hoverCloseTimerRef.current = null
+            const action = resolvePanelDismissAction(readPanelDismissSnapshot())
+            if (action !== 'collapse') {
+              debugToTerminal('close', `hover-close ignored: dismiss=${action}`)
+              return
+            }
             collapse()
           }, 300)
         }
@@ -4344,12 +4399,43 @@ export default function Mini() {
         hoverOpenTimerRef.current = null
       }
     }
-  }, [viewMode, collapse, appMode])
+  }, [viewMode, collapse, appMode, readPanelDismissSnapshot, debugToTerminal])
 
   const petOriginBeforeSettingsRef = useRef<[number, number] | null>(null)
 
   const enterSettings = useCallback(async () => {
     if (settingsModeRef.current || settingsTransitioningRef.current) return
+    // Cancel pending hover-close / delayed close so they cannot collapse
+    // underneath the settings transition.
+    if (hoverCloseTimerRef.current) {
+      clearTimeout(hoverCloseTimerRef.current)
+      hoverCloseTimerRef.current = null
+    }
+    if (hoverOpenTimerRef.current) {
+      clearTimeout(hoverOpenTimerRef.current)
+      hoverOpenTimerRef.current = null
+    }
+    if (autoCloseTimerRef.current) {
+      clearTimeout(autoCloseTimerRef.current)
+      autoCloseTimerRef.current = null
+    }
+    // If a collapse is already in flight, bump generation so its delayed
+    // timeout/await tail cannot clear settings or rewrite native geometry
+    // after we take ownership, then reclaim local collapse ownership.
+    if (collapsingRef.current) {
+      panelUiTransitionRef.current = beginPanelUiTransition(panelUiTransitionRef.current, 'enterSettings')
+      collapsingRef.current = false
+      // Collapse may have masked the document or set hiding; restore so
+      // settings UI is not stuck invisible under a stale collapse.
+      document.documentElement.style.opacity = '1'
+      setHiding(false)
+      setSettingsTransitioning(false)
+      settingsTransitioningRef.current = false
+      debugToTerminal('close', 'enterSettings reclaimed from in-flight collapse')
+    } else {
+      panelUiTransitionRef.current = beginPanelUiTransition(panelUiTransitionRef.current, 'enterSettings')
+    }
+    const myGen = capturePanelUiGeneration(panelUiTransitionRef.current)
     settingsPickerOpenRef.current = false
     hoverExpandedRef.current = false
     settingsTransitioningRef.current = true
@@ -4362,25 +4448,32 @@ export default function Mini() {
     if (appModeRef.current === 'pet') {
       try {
         const pos = await invoke('get_mini_origin') as [number, number]
+        if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
         petOriginBeforeSettingsRef.current = pos
       } catch {}
     }
+    if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
     setShowSettingsOverlay(false)
     setSettingsTransitioning(true)
     // Stop pet passthrough poll before resizing to settings mode
     if (appModeRef.current === 'pet') {
       await invoke('set_pet_mode_window', { active: false, mascotScale: mascotScaleRef.current, largeMascotScale: largeMascotScaleRef.current }).catch(() => {})
+      if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
     }
     await new Promise<void>((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())))
+    if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
     try {
-      await invoke('set_mini_size', { restore: false, position: mascotPositionRef.current, mascotScale: mascotScaleRef.current })
+      // Windows set_mini_size(restore=false) demotes always_on_top by default;
+      // keep floating during settings transition so React and native converge.
+      await invoke('set_mini_size', { restore: false, position: mascotPositionRef.current, mascotScale: mascotScaleRef.current, keepOnTop: true })
     } catch {}
+    if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
     settingsModeRef.current = true
     setSettingsMode(true)
     setShowSettingsOverlay(true)
     setSettingsTransitioning(false)
     settingsTransitioningRef.current = false
-  }, [])
+  }, [debugToTerminal])
 
   // `force` is set when the close path is a trusted, in-app user action
   // (e.g. clicking the ✕ button). Untrusted paths (blur / backdrop click)
@@ -4404,11 +4497,24 @@ export default function Mini() {
       }
     }
     debugToTerminal('close', `exitSettings proceed force=${force}`)
+    // Cancel pending dismiss timers; ownership moves to exitSettings.
+    if (hoverCloseTimerRef.current) {
+      clearTimeout(hoverCloseTimerRef.current)
+      hoverCloseTimerRef.current = null
+    }
+    panelUiTransitionRef.current = beginPanelUiTransition(panelUiTransitionRef.current, 'exitSettings')
+    const myGen = capturePanelUiGeneration(panelUiTransitionRef.current)
+    // Invalidate any in-flight collapse ownership (same as enterSettings).
+    if (collapsingRef.current) {
+      collapsingRef.current = false
+      document.documentElement.style.opacity = '1'
+    }
     setIsCreateModalOpen(false)
     settingsTransitioningRef.current = true
     setShowSettingsOverlay(false)
     try {
       await new Promise<void>((r) => setTimeout(r, 220))
+      if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
       setSettingsTransitioning(true)
       settingsModeRef.current = false
       setSettingsMode(false)
@@ -4427,7 +4533,9 @@ export default function Mini() {
       if (appModeRef.current === 'pet' && largeMascotRef.current) {
         // Pet mode: restore pet-sized window directly, skip syncExpandedWindowLayout
         await invoke('set_mini_expanded', { expanded: false, position: mascotPositionRef.current, efficiency: true, mascotScale: mascotScaleRef.current, largeMascot: true, largeMascotScale: largeMascotScaleRef.current }).catch(() => {})
+        if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
         await invoke('set_pet_mode_window', { active: true, mascotScale: mascotScaleRef.current, largeMascotScale: largeMascotScaleRef.current }).catch(() => {})
+        if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
         // Restore exact window position saved before entering settings
         if (petOriginBeforeSettingsRef.current) {
           const [x, y] = petOriginBeforeSettingsRef.current
@@ -4443,6 +4551,7 @@ export default function Mini() {
         // top of that big window — visually the mascot teleported under
         // the notch on macOS.
         const store = await load('settings.json', { defaults: {}, autoSave: true })
+        if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
         const cc = await store.get('enable_claudecode')
         setEnableClaudeCode(cc !== false)
         const ccDesktop = await store.get('enable_claude_desktop')
@@ -4460,7 +4569,11 @@ export default function Mini() {
         const hcn2 = await store.get('hermes_connections') as { id: string; type: 'local' | 'remote'; host?: string; user?: string }[] | null
         if (hcn2) setHermesConns(hcn2)
         fetchAgents()
+        if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
         try {
+          // Use set_mini_size(restore) so default placement returns when
+          // customPosRef is null. Rust restore now clears MINI_IS_EXPANDED +
+          // bubble anchor so follow works without keepPosition.
           await invoke('set_mini_size', {
             restore: true,
             position: mascotPositionRef.current,
@@ -4468,16 +4581,22 @@ export default function Mini() {
             largeMascot: true,
             largeMascotScale: largeMascotScaleRef.current,
           })
+          if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
           await restoreCollapsedMascotPosition()
         } catch {}
       }
     } finally {
-      // Always clear transition/hiding guards so mascot can't get stuck invisible.
-      settingsPickerOpenRef.current = false
-      setSettingsTransitioning(false)
-      settingsTransitioningRef.current = false
-      setHiding(false)
-      debugToTerminal('close', 'exitSettings finished')
+      // Only clear transition/hiding guards if we still own the transition;
+      // a newer owner (e.g. re-enter settings) must keep its own flags.
+      if (isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) {
+        settingsPickerOpenRef.current = false
+        setSettingsTransitioning(false)
+        settingsTransitioningRef.current = false
+        setHiding(false)
+        debugToTerminal('close', 'exitSettings finished')
+      } else {
+        debugToTerminal('close', `exitSettings aborted in finally: stale gen=${myGen}`)
+      }
     }
   }, [fetchAgents, restoreCollapsedMascotPosition, debugToTerminal, isSettingsPickerBlockingClose, setNativeDialogActive])
 
@@ -4485,9 +4604,9 @@ export default function Mini() {
   useEffect(() => {
     if (!expanded || pinned || settingsMode || settingsTransitioning || updateModalOpen) return
     const onClick = (e: MouseEvent) => {
-      if (isCreateModalOpenRef.current) return
-      if (isSettingsPickerBlockingClose()) {
-        debugToTerminal('outside', 'window mousedown ignored: settings picker active')
+      const action = resolvePanelDismissAction(readPanelDismissSnapshot())
+      if (action !== 'collapse') {
+        debugToTerminal('outside', `window mousedown ignored: dismiss=${action}`)
         return
       }
       if (!(e.target as HTMLElement).closest('#mini-panel')) {
@@ -4497,7 +4616,7 @@ export default function Mini() {
     }
     window.addEventListener('mousedown', onClick)
     return () => window.removeEventListener('mousedown', onClick)
-  }, [expanded, pinned, settingsMode, settingsTransitioning, updateModalOpen, collapse, debugToTerminal, isSettingsPickerBlockingClose])
+  }, [expanded, pinned, settingsMode, settingsTransitioning, updateModalOpen, collapse, debugToTerminal, readPanelDismissSnapshot])
 
   // Windows: an auto-expanded completion popup never takes OS focus, so the
   // window-blur close path never fires and clicking another app won't close
@@ -4511,10 +4630,11 @@ export default function Mini() {
     }
     invoke('set_outside_click_watch', { active: true }).catch(() => {})
     const unlisten = listen('mini-outside-click', () => {
-      if (pinnedRef.current || settingsModeRef.current) return
-      if (isCreateModalOpenRef.current) return
-      if (filePickerOpenRef.current) return
-      if (isSettingsPickerBlockingClose()) return
+      const action = resolvePanelDismissAction(readPanelDismissSnapshot())
+      if (action !== 'collapse') {
+        debugToTerminal('outside', `mini-outside-click ignored: dismiss=${action}`)
+        return
+      }
       debugToTerminal('outside', 'mini-outside-click -> collapse')
       collapse()
     })
@@ -4522,7 +4642,7 @@ export default function Mini() {
       invoke('set_outside_click_watch', { active: false }).catch(() => {})
       unlisten.then((fn) => fn())
     }
-  }, [expanded, pinned, settingsMode, settingsTransitioning, updateModalOpen, collapse, debugToTerminal, isSettingsPickerBlockingClose])
+  }, [expanded, pinned, settingsMode, settingsTransitioning, updateModalOpen, collapse, debugToTerminal, readPanelDismissSnapshot])
 
   // Window blur: collapse when user clicks outside the app (when not pinned, or in settings mode)
   // Skip blur when a file picker dialog is open
@@ -4555,34 +4675,19 @@ export default function Mini() {
       }
     }
     const onBlur = () => {
-      if (filePickerOpenRef.current) {
-        debugToTerminal('blur', 'ignore blur: filePickerOpen=true')
-        return
-      }
-      if (isSettingsPickerBlockingClose()) {
+      const snap = readPanelDismissSnapshot()
+      // Re-assert floating while a native dialog is open even if we ignore dismiss.
+      if (snap.settingsPickerBlocking) {
         debugToTerminal('blur', 'ignore blur: settings picker active')
-        // Re-assert always-on-top whenever we lose focus while a native
-        // dialog is open. Both Windows and macOS will demote our floating
-        // mini window back to a normal level when another app (or the
-        // dialog itself) becomes active, which makes the settings panel +
-        // picker visually disappear behind other windows. Pinging Rust
-        // here pulls the window back up to status level immediately.
         invoke('reassert_floating').catch(() => {})
         return
       }
-      // Resizing the native window via `set_mini_size` during the
-      // enter/exit-settings transition can momentarily steal focus from
-      // the webview. Without this guard, the resulting blur tears the
-      // half-built settings UI back down via `collapse()`, leaving the
-      // user staring at an empty mascot ("设置页出不来"). Skip blur while
-      // either transition is in flight.
-      if (settingsTransitioningRef.current) {
-        debugToTerminal('blur', 'ignore blur: settingsTransitioning=true')
+      const action = resolvePanelDismissAction(snap, { allowExitSettings: true })
+      if (action === 'ignore') {
+        debugToTerminal('blur', 'ignore blur: shared dismiss admission')
         return
       }
-      // When settings is open, use the dedicated close path so pet mode
-      // restores window geometry/state consistently.
-      if (settingsModeRef.current) {
+      if (action === 'exitSettings') {
         debugToTerminal('blur', 'blur -> exitSettings')
         exitSettings()
         return
@@ -4598,7 +4703,7 @@ export default function Mini() {
       window.removeEventListener('blur', onBlur)
       window.removeEventListener('focus', onFocus)
     }
-  }, [expanded, pinned, settingsMode, updateModalOpen, collapse, exitSettings, debugToTerminal, isSettingsPickerBlockingClose])
+  }, [expanded, pinned, settingsMode, updateModalOpen, collapse, exitSettings, debugToTerminal, readPanelDismissSnapshot, isSettingsPickerBlockingClose])
 
   useEffect(() => {
     if (expanded || moveMode || updateModalOpen) return

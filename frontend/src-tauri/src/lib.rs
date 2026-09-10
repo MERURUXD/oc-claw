@@ -5831,6 +5831,10 @@ async fn set_mini_size(
     large_mascot: Option<bool>,
     large_mascot_scale: Option<f64>,
 ) -> Result<(), String> {
+    if restore {
+        MINI_IS_EXPANDED.store(false, Ordering::SeqCst);
+        BUBBLE_GEOMETRY.lock().unwrap().anchor = None;
+    }
     let win = app.get_webview_window("mini").ok_or("mini window not found")?;
     let pos = position.unwrap_or_else(|| "right".to_string());
     let want_top = keep_on_top.unwrap_or(restore);
