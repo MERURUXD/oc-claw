@@ -1,134 +1,173 @@
 # Agent Guidelines & Project Conventions
 
-This document specifies the architecture, lifecycle hooks, tool execution rules, subagent tracking, and development workflows for AI coding assistants (Google Antigravity, Claude Code, Cursor, Codex, OpenCode, Gemini CLI, and Hermes Agent) in `oc-claw`.
+This file contains stable, repository-level rules for coding agents working on `oc-claw`. Keep it focused on behavior, validation, and collaboration conventions. Fast-changing architecture details, protocol payloads, endpoint values, UI measurements/colors, and machine-specific setup belong in code, tests, or `docs/`, not here.
 
 ---
 
-## 1. Google Antigravity Integration & Architecture
+## 1. Scope & Sources of Truth
 
-### Socket Server & IPC
-- **Windows TCP Server**: `127.0.0.1:19288`
-- **Unix Domain Socket**: `/tmp/ooclaw-antigravity.sock`
-- **Hook Scripts**:
-  - Windows: `~/.gemini/hooks/ooclaw-antigravity-hook.ps1`
-  - Unix: `~/.gemini/hooks/ooclaw-antigravity-hook.sh`
-  - Plugin config: `~/.gemini/config/plugins/occlaw/plugin.json` and `hooks.json`
-- **Hook Output**: Hook scripts must write `{"decision":"allow"}` (for `PreToolUse`) or `{}` to stdout to avoid blocking Antigravity.
-
-### Status Transitions & Tool Execution
-- **`PreInvocation`** $\rightarrow$ maps to `UserPromptSubmit` (`status = "processing"`).
-- **`PreToolUse`**:
-  - **Interactive Questions Only**: Only `ask_question`, `AskUserQuestion`, `AskQuestion` tools enter `status = "waiting"` to display user prompts/jump buttons.
-  - **Regular Tools**: `run_command`, `write_to_file`, `replace_file_content`, etc. **must set `status = "tool_running"`**.
-  - **Turbo Mode Rule**: Never set `status = "waiting"` for non-question tools, so Turbo Mode and auto-approved commands run smoothly without reminder popup spam.
-- **`PostToolUse`** $\rightarrow$ maps to `PostToolUse` (`status = "processing"`).
-- **`Stop` & Multi-turn Execution**:
-  - Antigravity emits a `Stop` hook after each model generation turn.
-  - **Intermediate Step Check**: When `Stop` arrives, inspect `~/.gemini/antigravity/brain/<session_id>/.system_generated/logs/transcript.jsonl`.
-  - If the latest model turn contains pending `tool_calls` or if subagents are running (`pending_agents > 0`):
-    - Keep `status = "processing"` or `"tool_running"`.
-    - **Suppress completion sound and completion popup**.
-  - Only when the model produces a final text response (no `tool_calls`) and all subagents are finished (`pending_agents == 0`):
-    - Set `status = "stopped"`.
-    - Emit `claude-task-complete` and play the single completion sound effect.
-
-### Subagent Tracking & UI Distinction
-- **Subagent Counter**:
-  - `PreToolUse` with `tool == "invoke_subagent"` $\rightarrow$ increment `session.pending_agents += 1`.
-  - `PostToolUse` with `tool == "invoke_subagent"` / `SubagentStop` $\rightarrow$ decrement `session.pending_agents -= 1`.
-- **Role & Title Formatting**:
-  - Subagent roles (e.g. `Backend Rust Engineer`, `UI and i18n Engineer`) are extracted from `transcript.jsonl` (e.g. `You are the <Role> for oc-claw...`).
-  - In the session list, subagent titles are formatted as `[Role] projectName` to prevent identical repetitive titles.
-- **Preview & Rich Text**:
-  - User prompts are cleaned of `<USER_REQUEST>`, `<ADDITIONAL_METADATA>`, and XML metadata tags.
-  - Assistant responses are rendered with Markdown in the session card and completion reminder popup.
+- Work only inside the `oc-claw` repository unless the user explicitly asks otherwise.
+- Before changing behavior, inspect the current implementation, nearby tests, and relevant workflows. Prefer current code/tests over stale prose descriptions.
+- Keep changes scoped to the requested task. Do not mix unrelated cleanup, formatting churn, or speculative refactors into the same change.
+- Do not add machine-specific absolute paths, local proxy ports, credentials, tokens, or tool-install locations to repository guidance.
+- Preserve cross-platform behavior. A Windows fix must not casually remove or bypass macOS/Linux logic, and vice versa.
 
 ---
 
-## 2. Development & Bug Fixing Conventions
+## 2. Core Behavioral Invariants
 
-When modifying the codebase:
-1. **Target Confirmation**:
-   - Always confirm you are working inside `oc-claw/` (the project root). Do not touch parent or sibling directories.
-2. **Type & Compilation Checks**:
-   - **Rust backend**: Run `cargo check` in `frontend/src-tauri` after any Rust modification.
-   - **TypeScript frontend**: Run `npx tsc --noEmit` in `frontend/` after any TypeScript/React modification.
-   - **Release binary test**: Run `npx tauri build --no-bundle` in `frontend/` to verify release compilation (`frontend/src-tauri/target/release/oc_claw.exe`).
-3. **Behavioral Integrity**:
-   - Do not invent fixes for unmentioned edge cases. Implement what is requested first.
-   - Preserve all existing comments, docstrings, and cross-platform logic (macOS/Windows).
+These are project-level invariants. Implementation details may change, but fixes should preserve them unless the task explicitly changes the design.
 
----
+### Session, Turn & Subagent Lifecycle
 
-## 3. GitHub & Proxy Environment (Windows)
+- Treat explicit harness/lifecycle events as the authority for whether work is active or complete. Metadata is descriptive and must not terminate a live turn.
+- Silence, elapsed wall-clock time, or a newer database/message timestamp is not sufficient evidence that a turn completed.
+- A root session remains logically active while descendant/subagent work required by that turn is still active.
+- Nested subagents must preserve lineage and identity; do not collapse distinct descendants into one generic entry merely because display names collide or metadata is incomplete.
+- Scope asynchronous and delayed events to the session/turn/agent that produced them. Stale events from an older turn must not mutate a newer active turn.
 
-- **GitHub MCP Tools (Recommended)**:
-  - You can use the `github` MCP server directly via `call_mcp_tool`:
-    - Create PR: `ToolName: "create_pull_request"`, Arguments: `{"owner": "MERURUXD", "repo": "oc-claw", "title": "...", "head": "branch_name", "base": "main", "body": "..."}`
-    - Merge PR: `ToolName: "merge_pull_request"`, Arguments: `{"owner": "MERURUXD", "repo": "oc-claw", "pull_number": <N>, "merge_method": "squash"}`
-    - Issue & PR query: `list_pull_requests`, `get_pull_request`, `list_issues`, `create_issue`, etc.
-- **GitHub CLI Path (Fallback)**: `C:\Program Files\GitHub CLI\gh.exe`
-- **Proxy Configuration**:
-  Network calls on Windows (such as `gh pr create` / `gh pr merge` / `git push`) require local proxy environment variables:
-  ```powershell
-  $env:HTTP_PROXY='http://127.0.0.1:63106'; $env:HTTPS_PROXY='http://127.0.0.1:63106'
-  ```
-- **Commit & PR Strategy**:
-  - **Small Fixes & Quick Tweaks**: Commit directly and push to `main` (no PR required).
-  - **Major Features & Large Work**: Create branch $\rightarrow$ Commit $\rightarrow$ Push to `origin <branch>` $\rightarrow$ Create PR (via GitHub MCP or `gh`) $\rightarrow$ Squash merge $\rightarrow$ `git fetch origin main`.
+### Approval & Tool Interaction
+
+- Preserve each harness's native approval flow by default. Observation/relay hooks must not silently auto-approve, auto-deny, or block native interaction unless that behavior is an explicit requirement.
+- Interactive-question/waiting state must be distinguished from ordinary tool execution; normal tool activity should not be presented as waiting for the user.
+
+### Presentation State
+
+- Temporary presentation suppression (for example fullscreen/tray hide) must not destroy the underlying logical session or bubble lifecycle.
+- Animation state, native-window geometry, and visual transitions are presentation concerns; they must not become accidental sources of truth for session completion or ownership.
+- Prefer explicit lifecycle/acknowledgement state over arbitrary delays when fixing races.
 
 ---
 
-## 4. AI Harness Usage Limits & Quota Tracking
+## 3. Implementation & Regression-Fix Rules
 
-### Architecture & Endpoints
-- **Rust Backend**: [`frontend/src-tauri/src/harness_quota.rs`](file:///C:/Users/Mei_LuLuXD/.gemini/antigravity/worktrees/oc-claw/track_harness_usage_limits/frontend/src-tauri/src/harness_quota.rs)
-  - Exposed Tauri command: `get_harness_quota(harness: String, force_refresh: Option<bool>) -> Result<Option<HarnessQuotaSummary>, String>`.
-  - **OpenAI Codex**:
-    - Credentials: read `$HOME/.codex/auth.json` (`tokens.access_token`, `tokens.account_id`, `tokens.refresh_token`).
-    - Endpoint: `GET https://chatgpt.com/backend-api/wham/usage`.
-    - Auto-refresh: on HTTP 401, exchange `refresh_token` via `POST https://auth.openai.com/oauth/token` (client_id `app_EMoamEEZ73f0CkXaXp7hrann`), update `auth.json`, and retry once.
-  - **Google Antigravity**:
-    - Process discovery: scans for `language_server_windows_x64.exe` / `language_server.exe` / `language_server` (Windows: `Get-CimInstance Win32_Process` + `Get-NetTCPConnection`; macOS: `ps -ax` + `lsof`).
-    - Extracts `--csrf_token` and `--extension_server_port`.
-    - Endpoint: `POST https://127.0.0.1:<port>/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary` (Connect-RPC Protocol v1, with relaxed TLS for self-signed loopback certificate).
-    - Decodes model buckets (Gemini 5h rolling limit, Gemini weekly, Claude/GPT limits).
-  - **Cache & Throttling**:
-    - In-memory cache: 5 minutes TTL per harness.
-    - 429 protection: parses `Retry-After` header and enforces dynamic backoff.
-
-### Frontend Components & Codeburn 1:1 Design
-- **Core Component**: [`frontend/src/components/QuotaCapsule.tsx`](file:///C:/Users/Mei_LuLuXD/.gemini/antigravity/worktrees/oc-claw/track_harness_usage_limits/frontend/src/components/QuotaCapsule.tsx)
-- **Remaining Quota Rule (剩余量准则)**:
-  - All metrics are normalized and presented as **Remaining Quota (剩余量)**: `remaining = 100 - used_percent`.
-  - Health ladder:
-    - $\ge 30\%$: Emerald green (`#10b981`, Healthy).
-    - $15\% \sim 30\%$: Amber yellow (`#f59e0b`, Warning).
-    - $< 15\%$: Rose red (`#f43f5e` + pulse, Critical).
-- **Side Dock (`QuotaSideRail`)**:
-  - Mounted inside the right edge of `#mini-panel` in `Mini.tsx`.
-  - Theme: unified `#141414` background for seamless surface continuity.
-  - Squircle buttons: `44px` `rounded-[14px]` with pure white vector icons (`AntigravityIcon`, `CodexIcon`).
-  - Inlaid progress arc: SVG `rect` with `strokeDasharray` rotated `-90deg` from top center, creating a recessed gauge look directly on the dock.
-  - Clean remaining percentage displayed below each button.
-- **Popover Card (`QuotaCard`)**:
-  - Compact Codeburn layout (~180px height), pure `#141414` background.
-  - Scrollbar hidden: `[scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden`.
-  - Wheel isolation: `onWheel={(e) => e.stopPropagation()}` to prevent scrolling the underlying session list.
-  - Embedded in `ClaudeStatsView` as a natural stat card (`bg-white/[0.03] border border-white/5`).
-- **Mascot Bubble (`QuotaMiniBadge`)**:
-  - Mini pill badge (`[⚡ 76%]`) rendered in `MascotBubble.tsx` beside active session title with hover reset countdown tooltip.
+- Reproduce or identify the failing state transition before changing code when practical.
+- For regressions, add or update the smallest test that captures the broken invariant whenever the behavior is testable.
+- Prefer fixing ownership/state-transition mistakes at their source instead of layering timers or duplicate state flags around the symptom.
+- Preserve useful existing comments/docstrings; update or remove them only when the behavior they describe changed.
+- Do not broaden the task merely because adjacent cleanup looks attractive. Mention follow-up work separately when useful.
 
 ---
 
-## 5. Obsidian Project Note Conventions (D:\OBSI-NEW)
+## 4. Validation
 
-- **Main Note**: `D:\OBSI-NEW\03-项目\occlaw\oc-claw.md`
-- **Daily Note**: `D:\OBSI-NEW\04-日记\YYYY-MM-DD.md`
-- **Specification**: Must strictly follow `D:\OBSI-NEW\00-规范\笔记格式规范.md`.
-- **Curation Workflow (Beyond Raw Git Commits)**:
-  - When completing features, refactors, or when requested to organize notes:
-  - Inspect `git log` and `git diff` to understand architectural intent.
-  - Synthesize cohesive technical summaries under `## 进度与决策` (motivation, key decisions, protocol/IPC changes).
-  - Update `## 任务清单` status (`[x]` and `[ ]`), wikilinks, and `updated` frontmatter.
-  - Sync completed items to today's daily note with `[[oc-claw]]` link.
+Use the repository's checked-in toolchain and lockfiles. `frontend/package.json` is pnpm-based; do not substitute npm/npx commands in project guidance when an equivalent pnpm command exists.
+
+### Frontend / TypeScript / React changes
+
+From `frontend/`:
+
+```bash
+pnpm test
+pnpm build
+pnpm lint
+```
+
+- `pnpm build` includes the TypeScript build/type check.
+- Lint currently has a known repository baseline and is advisory in CI. Do not introduce new lint findings in touched code; report pre-existing findings instead of hiding them with unrelated cleanup.
+
+### Rust changes
+
+From `frontend/src-tauri/`:
+
+```bash
+cargo fmt --check
+cargo check --locked
+cargo test --locked
+```
+
+- `cargo fmt --check` currently has a known repository baseline and is advisory in CI. Avoid introducing new formatting drift in touched code.
+
+### Cross-layer / native-window / build-system changes
+
+In addition to the relevant checks above, run from `frontend/` when the change can affect Tauri integration or release compilation:
+
+```bash
+pnpm exec tauri build --no-bundle
+```
+
+### Documentation-only changes
+
+- No local compile is required for pure prose-only edits unless the documentation change also modifies executable examples, workflow/config files, or generated content.
+- PR CI is still expected to run normally.
+
+Always report what was actually run. Never claim a test or manual scenario passed if it was not executed.
+
+---
+
+## 5. Git & Pull Request Rules
+
+### Branching
+
+- Default workflow: **branch -> commit(s) -> push -> pull request -> review/validation -> squash merge**.
+- Do not push directly to `main` unless the user explicitly requests that exception.
+- Branch from the latest practical `main` state and keep one logical goal per branch/PR.
+- Prefer short descriptive branch names such as:
+  - `feat/<topic>`
+  - `fix/<topic>`
+  - `refactor/<topic>`
+  - `docs/<topic>`
+  - `test/<topic>`
+  - `ci/<topic>`
+  - `chore/<topic>`
+- Do not silently include another open PR's changes. If a task depends on an unmerged PR, state that dependency clearly and avoid accidental stacking.
+
+### PR title
+
+Use a concise Conventional Commit-style title whenever practical:
+
+```text
+feat(scope): add ...
+fix(scope): prevent ...
+refactor(scope): simplify ...
+docs: clarify ...
+ci: add ...
+```
+
+The title should describe the user-visible or architectural outcome, not the implementation process.
+
+### PR body
+
+A normal PR should include:
+
+1. **Summary** — what problem or goal the PR addresses.
+2. **Changes** — the important implementation changes, kept concise.
+3. **Validation** — automated commands actually run plus manual scenarios still required.
+4. **Risks / Follow-up** — only when relevant; call out known limitations, unverified GUI behavior, migrations, or dependent PRs.
+
+For bug fixes, explain the failure mode/root cause when known. For race/state-machine fixes, name the state transition or stale-event path being guarded.
+
+### PR scope & follow-up edits
+
+- Keep unrelated refactors and formatting changes out of the PR.
+- If review finds follow-up issues within the same logical task, update the same branch/PR, rerun the relevant checks, and review the full resulting diff again.
+- If `main` changes underneath the PR, re-check assumptions and conflicts before merge, especially for lifecycle/state-machine work that overlaps nearby changes.
+
+### Merge rules
+
+- Passing CI is necessary for normal code changes but is not permission to merge by itself.
+- **Never merge a PR merely because it looks clean or CI is green. Require explicit user approval to merge.**
+- Default merge method is **squash** unless the user explicitly requests another strategy.
+- Before merging, verify that the intended diff is still the PR's complete scope, required checks are green (aside from documented advisory baseline jobs), and any required manual/user validation has been acknowledged.
+- Do not manually move the rolling `dev` tag, publish a release, or create a version tag unless the user explicitly asks. Release workflows are the source of truth for publishing behavior.
+
+---
+
+## 6. What Belongs in `AGENTS.md`
+
+Keep this file limited to durable instructions that materially change how coding agents should work in the repository.
+
+Appropriate here:
+- repository scope and safety boundaries;
+- durable lifecycle/behavioral invariants;
+- validation expectations;
+- branch, PR, review, and merge conventions.
+
+Prefer `docs/`, code comments, tests, or the implementation itself for:
+- exact hook payloads, socket addresses, endpoints, plugin versions, or protocol internals;
+- component-specific dimensions, colors, layout details, and product screenshots;
+- temporary debugging procedures or one-off migration notes;
+- personal Obsidian/vault workflows;
+- local GitHub CLI paths, proxy configuration, or other machine-specific environment setup.
+
+When one of those details becomes important to a future task, inspect the current implementation instead of copying a historical snapshot back into this file.

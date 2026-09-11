@@ -5831,6 +5831,10 @@ async fn set_mini_size(
     large_mascot: Option<bool>,
     large_mascot_scale: Option<f64>,
 ) -> Result<(), String> {
+    if restore {
+        MINI_IS_EXPANDED.store(false, Ordering::SeqCst);
+        BUBBLE_GEOMETRY.lock().unwrap().anchor = None;
+    }
     let win = app.get_webview_window("mini").ok_or("mini window not found")?;
     let pos = position.unwrap_or_else(|| "right".to_string());
     let want_top = keep_on_top.unwrap_or(restore);
@@ -11571,9 +11575,15 @@ fn spawn_mascot_window(app: tauri::AppHandle, label: String, url: String, n: u64
     let _ = over_fullscreen;
     let presentation_win = win.clone();
     let is_extra = label.starts_with("extra-mascot-");
+    let extra_label = label.clone();
     app.run_on_main_thread(move || {
-        if !is_extra || (!PRESENTATION.active() && !EXTRA_MASCOTS_HIDDEN.load(Ordering::SeqCst)) {
-            show_mascot_without_activation(&presentation_win);
+        // Demo mascots are not presentation-owned (they must stay visible over
+        // fullscreen for screen recording); extra mascots follow the same masked
+        // reconciliation as the primary mini. The mask is read here, at
+        // execution time, so a suppression that landed in between wins.
+        let extra_suppressed = PRESENTATION.active() || EXTRA_MASCOTS_HIDDEN.load(Ordering::SeqCst);
+        if !is_extra || !extra_suppressed {
+            set_presentation_native_visibility(&presentation_win, &extra_label, true);
         }
     }).map_err(|e| e.to_string())?;
     Ok(label)
@@ -11661,12 +11671,9 @@ async fn set_extra_mascots_hidden(app: tauri::AppHandle, hidden: bool) -> Result
     let presentation_app = app.clone();
     app.run_on_main_thread(move || {
         EXTRA_MASCOTS_HIDDEN.store(hidden, Ordering::SeqCst);
-        for (label, win) in presentation_app.webview_windows() {
-            if label.starts_with("extra-mascot-") {
-                if hidden || PRESENTATION.active() { let _ = win.hide(); }
-                else { show_mascot_without_activation(&win); }
-            }
-        }
+        // Extra mascots are presentation-owned windows: visibility comes from
+        // the same masked reconciliation (and native-first hide) as the mini.
+        reconcile_presentation_windows(&presentation_app);
     }).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -11731,6 +11738,17 @@ const BUBBLE_RESERVE_X: f64 = 170.0;
 const BUBBLE_RESERVE_Y: f64 = 115.0;
 const BUBBLE_PAD_RIGHT: f64 = 16.0;
 const BUBBLE_PAD_BOTTOM: f64 = 16.0;
+
+/// Resting card edges implied by an applied bubble window frame (logical px).
+/// Used by preserve shrink + anchor write-back so card edges stay continuous.
+fn resting_card_edges_from_frame(win_x: f64, win_y: f64, win_w: f64, win_h: f64) -> (f64, f64) {
+    let card_right = win_x + win_w - BUBBLE_PAD_RIGHT;
+    #[cfg(target_os = "macos")]
+    let card_bottom = win_y + BUBBLE_PAD_BOTTOM;
+    #[cfg(not(target_os = "macos"))]
+    let card_bottom = win_y + win_h - BUBBLE_PAD_BOTTOM;
+    (card_right, card_bottom)
+}
 
 /// Position the mascot status bubble next to the primary mascot window.
 /// `width`/`height` are the bubble's logical content size in logical pixels, measured
@@ -11818,9 +11836,60 @@ async fn sync_mascot_bubble(
 
     let existing_anchor = BUBBLE_GEOMETRY.lock().unwrap().anchor;
 
+    // Live bubble window frame (logical px) for preserve shrink. Stored anchor
+    // card edges can be stale after motion/DPI round-trips that never wrote
+    // the anchor back — using live edges keeps the resting card continuous.
+    let live_bubble: Option<(f64, f64, f64, f64)> = {
+        #[cfg(target_os = "windows")]
+        {
+            (|| -> Result<(f64, f64, f64, f64), String> {
+                let scale = win.scale_factor().unwrap_or(1.0);
+                let pos = win.outer_position().map_err(|e| e.to_string())?;
+                let size = win.outer_size().map_err(|e| e.to_string())?;
+                Ok((
+                    pos.x as f64 / scale,
+                    pos.y as f64 / scale,
+                    size.width as f64 / scale,
+                    size.height as f64 / scale,
+                ))
+            })()
+            .ok()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let win_clone = win.clone();
+            let app_clone = app.clone();
+            let _ = app_clone.run_on_main_thread(move || {
+                use objc2::msg_send;
+                use objc2::runtime::AnyObject;
+                use objc2_foundation::NSRect;
+                if let Ok(ns_win) = win_clone.ns_window() {
+                    let obj = unsafe { &*(ns_win as *mut AnyObject) };
+                    let frame: NSRect = unsafe { msg_send![obj, frame] };
+                    let _ = tx.send((
+                        frame.origin.x,
+                        frame.origin.y,
+                        frame.size.width,
+                        frame.size.height,
+                    ));
+                }
+            });
+            rx.recv_timeout(std::time::Duration::from_millis(200)).ok()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            None
+        }
+    };
+
     let (final_win_x, final_win_y) = if should_preserve && existing_anchor.is_some() {
         let anchor = existing_anchor.unwrap();
-        let mut preserved_card_right = anchor.card_right;
+        let (mut preserved_card_right, mut preserved_card_bottom) = if let Some((lx, ly, lw, lh)) = live_bubble {
+            resting_card_edges_from_frame(lx, ly, lw, lh)
+        } else {
+            (anchor.card_right, anchor.card_bottom)
+        };
         if preserved_card_right - bubble_w < anchor.mon_x + margin {
             preserved_card_right = anchor.mon_x + margin + bubble_w;
         }
@@ -11832,7 +11901,6 @@ async fn sync_mascot_bubble(
 
         #[cfg(target_os = "macos")]
         let y = {
-            let mut preserved_card_bottom = anchor.card_bottom;
             if preserved_card_bottom + bubble_h > anchor.mon_y + anchor.mon_h - margin {
                 preserved_card_bottom = (anchor.mon_y + anchor.mon_h - margin - bubble_h).max(anchor.mon_y + margin);
             }
@@ -11844,7 +11912,6 @@ async fn sync_mascot_bubble(
 
         #[cfg(not(target_os = "macos"))]
         let y = {
-            let mut preserved_card_bottom = anchor.card_bottom;
             if preserved_card_bottom - bubble_h < anchor.mon_y + margin {
                 preserved_card_bottom = (anchor.mon_y + margin + bubble_h).min(anchor.mon_y + anchor.mon_h - margin);
             }
@@ -12034,6 +12101,18 @@ async fn sync_mascot_bubble(
         let _ = win.set_position(tauri::LogicalPosition::new(final_win_x, final_win_y));
     }
 
+    // Write resting card edges implied by the applied frame back into the
+    // preserve anchor so the next shrink/preserve pass does not jump from
+    // stale card_right/card_bottom (Windows land displacement).
+    {
+        let mut geom = BUBBLE_GEOMETRY.lock().unwrap();
+        if let Some(a) = geom.anchor.as_mut() {
+            let (cr, cb) = resting_card_edges_from_frame(final_win_x, final_win_y, win_w, win_h);
+            a.card_right = cr;
+            a.card_bottom = cb;
+        }
+    }
+
     // Don't re-assert always-on-top while the Windows fullscreen watcher has
     // the mini hidden — the bubble must stay off the fullscreen app too.
     #[cfg(target_os = "windows")]
@@ -12058,41 +12137,160 @@ async fn ensure_mascot_bubble(app: tauri::AppHandle) -> Result<(), String> {
 /// All presentation mutations run on the UI thread, including bubble show, so
 /// a pending show cannot overtake a tray/fullscreen hide after checking the mask.
 fn set_presentation_suppressed(app: &tauri::AppHandle, reason: u8, hidden: bool) {
+    let mask_before = PRESENTATION.mask();
     PRESENTATION.set(reason, hidden);
     let suppressed = PRESENTATION.active();
-    for (label, win) in app.webview_windows() {
-        match presentation::window_action(&label, suppressed, EXTRA_MASCOTS_HIDDEN.load(Ordering::SeqCst)) {
-            presentation::WindowAction::Hide => {
-                let _ = win.hide();
-            }
-            presentation::WindowAction::Show => {
-                show_mascot_without_activation(&win);
-            }
-            presentation::WindowAction::ReconcileBubble | presentation::WindowAction::Ignore => {}
-        }
-    }
+    log::info!(
+        "[presentation] reason={} hidden={} mask_before={:#04b}({}) mask_after={:#04b}({}) suppressed={}",
+        presentation::reason_label(reason),
+        hidden,
+        mask_before,
+        presentation::reasons_label(mask_before),
+        PRESENTATION.mask(),
+        presentation::reasons_label(PRESENTATION.mask()),
+        suppressed
+    );
+    reconcile_presentation_windows(app);
     // Bubble restoration is owned by its current frontend lifecycle, even if
     // polling has produced no new payload during the entire hidden interval.
     let _ = app.emit("mascot-presentation-suppression", serde_json::json!({ "suppressed": suppressed }));
 }
 
-fn show_mascot_without_activation(win: &tauri::WebviewWindow) {
+/// Single native-visibility reconciliation point for every presentation-owned
+/// window (mini, mascot-bubble, extra-mascot-*). Must run on the UI thread.
+///
+/// `PRESENTATION` suppression mask -> this function -> native window state is
+/// the only direction that may drive `mini` visibility. Nothing else may show or
+/// hide a presentation-owned window: see `set_presentation_native_visibility`
+/// for why a stray native show is effectively irreversible on Windows.
+fn reconcile_presentation_windows(app: &tauri::AppHandle) {
+    let suppressed = PRESENTATION.active();
+    let extras_hidden = EXTRA_MASCOTS_HIDDEN.load(Ordering::SeqCst);
+    log::info!(
+        "[presentation] reconcile mask={:#04b}({}) extras_hidden={}",
+        PRESENTATION.mask(),
+        presentation::reasons_label(PRESENTATION.mask()),
+        extras_hidden
+    );
+    for (label, win) in app.webview_windows() {
+        match presentation::window_action(&label, suppressed, extras_hidden) {
+            presentation::WindowAction::Hide => set_presentation_native_visibility(&win, &label, false),
+            presentation::WindowAction::Show => {
+                if presentation::show_is_allowed(suppressed) {
+                    set_presentation_native_visibility(&win, &label, true);
+                }
+            }
+            presentation::WindowAction::ReconcileBubble | presentation::WindowAction::Ignore => {}
+        }
+    }
+}
+
+/// Windows: read the native truth for a window (`IsWindowVisible` follows the
+/// HWND, not our logical state). Used by the presentation diagnostics and by
+/// `set_presentation_native_visibility` to prove the hide actually landed.
+#[cfg(target_os = "windows")]
+fn native_window_visible(win: &tauri::WebviewWindow) -> Option<bool> {
+    use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+    let hwnd = win.hwnd().ok()?;
+    Some(unsafe { IsWindowVisible(windows::Win32::Foundation::HWND(hwnd.0)).as_bool() })
+}
+
+/// Apply visibility to a presentation-owned window, with Windows native truth as
+/// the authority and the suppression mask as the only caller-visible policy.
+///
+/// Why this cannot just be `WebviewWindow::show()/hide()`:
+///
+/// * tao (0.34.8) keeps its own `WindowFlags::VISIBLE` bookkeeping and
+///   `WindowState::set_window_flags` -> `WindowFlags::apply_diff` **early-returns
+///   when the stored flags do not change**
+///   (`platform_impl/windows/window_state.rs`: `if diff == WindowFlags::empty()
+///   { return; }` before the `if !new.contains(VISIBLE) { ShowWindow(SW_HIDE) }`
+///   branch). So `hide()` only issues `SW_HIDE` while tao *believes* the window
+///   is visible.
+/// * The no-activation restore path deliberately bypasses tao
+///   (`ShowWindow(SW_SHOWNOACTIVATE)`) so restoring never steals focus from the
+///   user's foreground app. tao therefore keeps `VISIBLE = false` while the HWND
+///   is on screen, and every later `hide()` is diff-gated into a silent no-op:
+///   the mascot stays visible while the bubble (which uses tao in both
+///   directions, so its flags stay truthful) hides correctly.
+///
+/// Hence on Windows the hide path is native-first: always issue `SW_HIDE`, then
+/// call `hide()` so tao's bookkeeping converges back to the real state. Show
+/// stays native-only (`SW_SHOWNOACTIVATE`) — it is always effective regardless
+/// of stale bookkeeping, and `hide()` no longer depends on that flag.
+fn set_presentation_native_visibility(win: &tauri::WebviewWindow, label: &str, visible: bool) {
     #[cfg(target_os = "windows")]
-    if let Ok(hwnd) = win.hwnd() {
-        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE};
-        unsafe { let _ = ShowWindow(windows::Win32::Foundation::HWND(hwnd.0), SW_SHOWNOACTIVATE); }
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOWNOACTIVATE};
+        let action = if visible { "Show" } else { "Hide" };
+        let visible_before = native_window_visible(win);
+        match win.hwnd() {
+            Ok(hwnd) => {
+                let raw = windows::Win32::Foundation::HWND(hwnd.0);
+                let show_cmd = if visible { SW_SHOWNOACTIVATE } else { SW_HIDE };
+                let showwindow = unsafe { ShowWindow(raw, show_cmd) };
+                // Repair tao's bookkeeping on hide: when its flag still says
+                // visible this performs the normal apply_diff (styles + SW_HIDE),
+                // and when it is already false it is a no-op — either way the
+                // native window is hidden because of the call above.
+                let tao_hide = if visible { None } else { Some(win.hide()) };
+                let visible_after = native_window_visible(win);
+                log::info!(
+                    "[presentation] label={} action={} visible_before={:?} showwindow={:?} tao_hide={:?} visible_after={:?} hwnd={:#x}",
+                    label,
+                    action,
+                    visible_before,
+                    showwindow.as_bool(),
+                    tao_hide.as_ref().map(|r| r.is_ok()),
+                    visible_after,
+                    hwnd.0 as usize
+                );
+                if visible_after != Some(visible) {
+                    // Native truth disagrees with what presentation asked for.
+                    // For a hide this is the historical regression signature
+                    // (`hide()` diff-gated into a no-op); for a show it means
+                    // something else hid the window in the same instant.
+                    log::warn!(
+                        "[presentation] label={} action={} native_state_mismatch visible_before={:?} visible_after={:?} mask={:#04b}({})",
+                        label,
+                        action,
+                        visible_before,
+                        visible_after,
+                        PRESENTATION.mask(),
+                        presentation::reasons_label(PRESENTATION.mask())
+                    );
+                }
+            }
+            Err(e) => {
+                // No HWND (should not happen on Windows): fall back to tao.
+                log::warn!("[presentation] label={} hwnd unavailable ({e}); falling back to tao", label);
+                let _ = if visible { win.show() } else { win.hide() };
+            }
+        }
         return;
     }
-    let _ = win.show();
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = label;
+        let _ = if visible { win.show() } else { win.hide() };
+    }
 }
 
 #[cfg(target_os = "windows")]
 fn show_primary_mascot_if_allowed(app: &tauri::AppHandle, win: tauri::WebviewWindow, focus: bool) -> Result<(), String> {
     app.run_on_main_thread(move || {
-        if !PRESENTATION.active() {
+        // Gate is evaluated at execution time (inside the main-thread closure),
+        // never when the command was queued.
+        if presentation::show_is_allowed(PRESENTATION.active()) {
             let _ = win.set_always_on_top(true);
-            show_mascot_without_activation(&win);
+            set_presentation_native_visibility(&win, "mini", true);
             if focus { let _ = win.set_focus(); }
+        } else {
+            log::info!(
+                "[presentation] label=mini action=ShowSkipped mask={:#04b}({})",
+                PRESENTATION.mask(),
+                presentation::reasons_label(PRESENTATION.mask())
+            );
         }
     }).map_err(|e| e.to_string())
 }
@@ -22107,8 +22305,61 @@ fn build_asset_response(
     }
 }
 
+/// Windows-only diagnostic breadcrumb written BEFORE any plugin or window exists.
+///
+/// A second launch that the single-instance plugin terminates exits inside
+/// `Builder::build()` -> plugin setup, i.e. before our `setup()` installs the
+/// log plugin — so that process can never write an oc-claw log line, and a
+/// duplicate launch is invisible in `logs/run-*.log`. This appends one line per
+/// process start to a fixed path shared by every flavor/identifier so
+/// "did a second process start, and from where" stays verifiable:
+///
+///   `%LOCALAPPDATA%\oc-claw-diagnostics\startup.log`
+#[cfg(target_os = "windows")]
+fn write_startup_breadcrumb() {
+    const MAX_BYTES: u64 = 512 * 1024;
+    let Some(dir) = dirs::data_local_dir() else { return };
+    let dir = dir.join("oc-claw-diagnostics");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("startup.log");
+    if std::fs::metadata(&path)
+        .map(|m| m.len() > MAX_BYTES)
+        .unwrap_or(false)
+    {
+        let _ = std::fs::rename(&path, dir.join("startup.log.1"));
+    }
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let line = format!(
+        "[{}] pid={} exe={} cwd={} argv={:?}\n",
+        chrono::Local::now().format("%Y-%m-%d_%H-%M-%S%.3f"),
+        std::process::id(),
+        exe,
+        cwd,
+        std::env::args().collect::<Vec<_>>()
+    );
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Windows: leave a breadcrumb before any plugin can terminate this process.
+    #[cfg(target_os = "windows")]
+    write_startup_breadcrumb();
+
     #[cfg(target_os = "windows")]
     {
         // WebView2 hardware video decode can drop VP9 alpha; force software decode.
@@ -22125,22 +22376,31 @@ pub fn run() {
     // Single-instance MUST be registered first so a second Start Menu /
     // Desktop / exe launch exits instead of stacking another oc_claw.exe
     // (which leaves the old windows visible and looks like hide/fullscreen
-    // failure). If presentation is already suppressed (tray Hide /
-    // fullscreen), keep it suppressed — do not force-show.
+    // failure).
+    //
+    // The callback is deliberately presentation-neutral: the plugin's only job
+    // is "the second process exits". It must not show/hide/focus the mini nor
+    // touch the suppression mask — a native show from here runs outside the
+    // masked reconciliation (and, on Windows, it desynced tao's visibility
+    // bookkeeping, which then silently skipped later `hide()` calls). Log the
+    // secondary's argv/cwd instead: argv[0] is the secondary's exe path, which
+    // is the only cross-instance evidence the dying process can leave behind
+    // (it exits before the log plugin exists).
     let mut builder = tauri::Builder::default();
     #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
     {
-        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            if PRESENTATION.active() {
-                log::info!(
-                    "[single-instance] secondary launch while presentation suppressed; keeping hidden"
-                );
-                return;
+        builder = builder.plugin(tauri_plugin_single_instance::init(|_app, argv, cwd| {
+            match presentation::secondary_launch_action() {
+                presentation::SecondaryLaunchAction::Ignore => {}
             }
-            if let Some(win) = app.get_webview_window("mini") {
-                let _ = win.set_always_on_top(true);
-                show_mascot_without_activation(&win);
-            }
+            log::info!(
+                "[single-instance] secondary launch detected; terminating secondary without touching presentation (primary_pid={} mask={:#04b}({}) secondary_cwd={} secondary_argv={:?})",
+                std::process::id(),
+                PRESENTATION.mask(),
+                presentation::reasons_label(PRESENTATION.mask()),
+                cwd,
+                argv
+            );
         }));
     }
     builder
@@ -22241,6 +22501,27 @@ pub fn run() {
                     .build(),
             )?;
 
+            // Startup identity breadcrumb. Which exe/PID/identifier is this
+            // process, in which app-data/log dir, with which argv? Needed
+            // because (a) a second launch can be terminated by the
+            // single-instance plugin before it can log anything of its own
+            // (see `write_startup_breadcrumb`), and (b) the Local flavor
+            // deliberately carries a different identifier, which moves app
+            // data, logs and the single-instance mutex at the same time.
+            log::info!(
+                "[startup] pid={} exe={} identifier={} product_name={} version={} cwd={} argv={:?} app_data_dir={:?} log_dir={:?} app_local_data_dir={:?}",
+                std::process::id(),
+                std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
+                app.config().identifier,
+                app.package_info().name,
+                app.package_info().version,
+                std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default(),
+                std::env::args().collect::<Vec<_>>(),
+                app.path().app_data_dir().map(|p| p.display().to_string()),
+                app.path().app_log_dir().map(|p| p.display().to_string()),
+                app.path().app_local_data_dir().map(|p| p.display().to_string()),
+            );
+
             // Run the WKWebView swizzle AFTER the log plugin is initialized so
             // its [first-mouse] / IME log lines are actually visible in the
             // tauri-plugin-log stream. Order vs window creation is fine —
@@ -22336,7 +22617,19 @@ pub fn run() {
                     let x = sw / 2.0 + 40.0;
                     let _ = win.set_position(tauri::LogicalPosition::new(x, MASCOT_TOP_INSET));
                 }
-                let _ = win.show();
+                // Initial show only while presentation is free. `win.show()` (not
+                // the native-first helper) is intentional here: it is the one
+                // place where taking focus is expected (app launch), and it
+                // leaves tao's bookkeeping truthful for the first Hide.
+                if presentation::show_is_allowed(PRESENTATION.active()) {
+                    let _ = win.show();
+                } else {
+                    log::info!(
+                        "[presentation] startup mini show skipped mask={:#04b}({})",
+                        PRESENTATION.mask(),
+                        presentation::reasons_label(PRESENTATION.mask())
+                    );
+                }
             }
 
             // Windows: suppress presentation when a fullscreen app is on the SAME
@@ -22581,6 +22874,98 @@ mod fullscreen_bubble_suppression_tests {
             let mut geom = BUBBLE_GEOMETRY.lock().unwrap();
             geom.anchor = None;
         }
+    }
+
+    #[test]
+    fn test_preserve_shrink_uses_live_edges_not_stale_anchor() {
+        // Stale anchor from a prior expand/motion pass (card edges drifted).
+        let stale = BubbleAnchor {
+            card_right: 900.0,
+            card_bottom: 500.0,
+            mon_x: 0.0,
+            mon_y: 0.0,
+            mon_w: 1920.0,
+            mon_h: 1080.0,
+        };
+        {
+            let mut geom = BUBBLE_GEOMETRY.lock().unwrap();
+            geom.anchor = Some(stale);
+        }
+
+        // Live bubble window frame currently on screen (logical px).
+        let (lx, ly, lw, lh) = (700.0, 200.0, 220.0, 160.0);
+        let (live_right, live_bottom) = resting_card_edges_from_frame(lx, ly, lw, lh);
+        assert_ne!(live_right, stale.card_right);
+        assert_ne!(live_bottom, stale.card_bottom);
+
+        // Preserve shrink must use live edges, not the stale anchor.
+        let bubble_w = 80.0;
+        let bubble_h = 40.0;
+        let res_x = 0.0;
+        let res_y = 0.0;
+        let win_w = (bubble_w + res_x + BUBBLE_PAD_RIGHT).max(8.0);
+        let win_h = (bubble_h + res_y + BUBBLE_PAD_BOTTOM).max(8.0);
+        let margin = 8.0;
+
+        let mut preserved_card_right = live_right;
+        let mut preserved_card_bottom = live_bottom;
+        if preserved_card_right - bubble_w < stale.mon_x + margin {
+            preserved_card_right = stale.mon_x + margin + bubble_w;
+        }
+        if preserved_card_right > stale.mon_x + stale.mon_w - margin {
+            preserved_card_right = stale.mon_x + stale.mon_w - margin;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            if preserved_card_bottom - bubble_h < stale.mon_y + margin {
+                preserved_card_bottom =
+                    (stale.mon_y + margin + bubble_h).min(stale.mon_y + stale.mon_h - margin);
+            }
+            if preserved_card_bottom > stale.mon_y + stale.mon_h - margin {
+                preserved_card_bottom = stale.mon_y + stale.mon_h - margin;
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if preserved_card_bottom + bubble_h > stale.mon_y + stale.mon_h - margin {
+                preserved_card_bottom =
+                    (stale.mon_y + stale.mon_h - margin - bubble_h).max(stale.mon_y + margin);
+            }
+            if preserved_card_bottom < stale.mon_y + margin {
+                preserved_card_bottom = stale.mon_y + margin;
+            }
+        }
+
+        let final_win_x = preserved_card_right - (win_w - BUBBLE_PAD_RIGHT);
+        #[cfg(target_os = "macos")]
+        let final_win_y = preserved_card_bottom - BUBBLE_PAD_BOTTOM;
+        #[cfg(not(target_os = "macos"))]
+        let final_win_y = preserved_card_bottom - (win_h - BUBBLE_PAD_BOTTOM);
+
+        let (cr_after, cb_after) =
+            resting_card_edges_from_frame(final_win_x, final_win_y, win_w, win_h);
+        // Card edges stay continuous through preserve shrink.
+        assert!((cr_after - preserved_card_right).abs() < 1e-9);
+        assert!((cb_after - preserved_card_bottom).abs() < 1e-9);
+
+        // Write-back replaces stale edges with the applied frame's edges.
+        {
+            let mut geom = BUBBLE_GEOMETRY.lock().unwrap();
+            if let Some(a) = geom.anchor.as_mut() {
+                a.card_right = cr_after;
+                a.card_bottom = cb_after;
+            }
+        }
+        {
+            let geom = BUBBLE_GEOMETRY.lock().unwrap();
+            let a = geom.anchor.unwrap();
+            assert_eq!(a.card_right, cr_after);
+            assert_eq!(a.card_bottom, cb_after);
+            assert_ne!(a.card_right, stale.card_right);
+            assert_ne!(a.card_bottom, stale.card_bottom);
+        }
+
+        BUBBLE_GEOMETRY.lock().unwrap().anchor = None;
     }
 
     #[test]
