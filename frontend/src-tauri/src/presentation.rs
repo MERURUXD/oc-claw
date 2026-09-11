@@ -29,6 +29,22 @@ pub fn window_action(label: &str, suppressed: bool, extras_hidden: bool) -> Wind
     WindowAction::Ignore
 }
 
+/// Dedicated policy for extra (multi-pet) mascots when panel expands/collapses.
+///
+/// Toggling `EXTRA_MASCOTS_HIDDEN` must only mutate `extra-mascot-*` windows;
+/// it must NEVER request Show or Hide on `mini` or `mascot-bubble`.
+pub fn extra_mascot_action(label: &str, suppressed: bool, extras_hidden: bool) -> WindowAction {
+    if label.starts_with("extra-mascot-") {
+        if suppressed || extras_hidden {
+            WindowAction::Hide
+        } else {
+            WindowAction::Show
+        }
+    } else {
+        WindowAction::Ignore
+    }
+}
+
 /// Independent reasons suppress presentation, never the bubble lifecycle.
 #[derive(Default)]
 pub struct Suppression(AtomicU8);
@@ -231,5 +247,41 @@ mod tests {
             !show_is_allowed(state.active()),
             "fullscreen suppression landed before the queued show ran"
         );
+    }
+
+    /// Toggling extra_hidden (panel expand/collapse) must only mutate extra-mascot
+    /// visibility and must NEVER request mini Show/Hide or bubble Show/Hide.
+    #[test]
+    fn extra_hidden_state_change_only_mutates_extras_never_mini_or_bubble() {
+        for suppressed in [false, true] {
+            for extras_hidden in [false, true] {
+                // Must not touch mini, bubble, or other windows
+                assert_eq!(
+                    extra_mascot_action("mini", suppressed, extras_hidden),
+                    WindowAction::Ignore,
+                    "extra-hidden changes must never request mini Show or Hide"
+                );
+                assert_eq!(
+                    extra_mascot_action("mascot-bubble", suppressed, extras_hidden),
+                    WindowAction::Ignore,
+                    "extra-hidden changes must never request bubble Show or Hide"
+                );
+                assert_eq!(
+                    extra_mascot_action("detail", suppressed, extras_hidden),
+                    WindowAction::Ignore
+                );
+
+                // Extras only show when both presentation is unsuppressed AND extras_hidden is false
+                let expected_extra = if suppressed || extras_hidden {
+                    WindowAction::Hide
+                } else {
+                    WindowAction::Show
+                };
+                assert_eq!(
+                    extra_mascot_action("extra-mascot-1", suppressed, extras_hidden),
+                    expected_extra
+                );
+            }
+        }
     }
 }
