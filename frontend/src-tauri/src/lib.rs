@@ -11668,12 +11668,14 @@ async fn close_extra_mascots(app: tauri::AppHandle) -> Result<u32, String> {
 /// collapses).
 #[tauri::command]
 async fn set_extra_mascots_hidden(app: tauri::AppHandle, hidden: bool) -> Result<(), String> {
+    log::info!("[panel-extra] hidden={hidden}");
     let presentation_app = app.clone();
     app.run_on_main_thread(move || {
         EXTRA_MASCOTS_HIDDEN.store(hidden, Ordering::SeqCst);
         // Extra mascots are presentation-owned windows: visibility comes from
-        // the same masked reconciliation (and native-first hide) as the mini.
-        reconcile_presentation_windows(&presentation_app);
+        // the same masked reconciliation (and native-first hide) as the mini,
+        // but toggling extras-hidden must only affect extra-mascot-* windows.
+        reconcile_extra_mascot_windows(&presentation_app);
     }).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -12174,6 +12176,34 @@ fn reconcile_presentation_windows(app: &tauri::AppHandle) {
     );
     for (label, win) in app.webview_windows() {
         match presentation::window_action(&label, suppressed, extras_hidden) {
+            presentation::WindowAction::Hide => set_presentation_native_visibility(&win, &label, false),
+            presentation::WindowAction::Show => {
+                if presentation::show_is_allowed(suppressed) {
+                    set_presentation_native_visibility(&win, &label, true);
+                }
+            }
+            presentation::WindowAction::ReconcileBubble | presentation::WindowAction::Ignore => {}
+        }
+    }
+}
+
+/// Native-visibility reconciliation point scoped exclusively to extra (multi-pet)
+/// mascot windows when the session panel expands or collapses.
+///
+/// Unlike `reconcile_presentation_windows`, this does NOT touch `mini` or
+/// `mascot-bubble`, preventing spurious native `ShowWindow` calls on the primary
+/// mascot during panel transition and bubble fly-back settle.
+fn reconcile_extra_mascot_windows(app: &tauri::AppHandle) {
+    let suppressed = PRESENTATION.active();
+    let extras_hidden = EXTRA_MASCOTS_HIDDEN.load(Ordering::SeqCst);
+    log::info!(
+        "[presentation] reconcile extras-only mask={:#04b}({}) extras_hidden={}",
+        PRESENTATION.mask(),
+        presentation::reasons_label(PRESENTATION.mask()),
+        extras_hidden
+    );
+    for (label, win) in app.webview_windows() {
+        match presentation::extra_mascot_action(&label, suppressed, extras_hidden) {
             presentation::WindowAction::Hide => set_presentation_native_visibility(&win, &label, false),
             presentation::WindowAction::Show => {
                 if presentation::show_is_allowed(suppressed) {
