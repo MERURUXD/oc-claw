@@ -22856,8 +22856,11 @@ pub fn run() {
 mod fullscreen_bubble_suppression_tests {
     use super::*;
 
+    static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_anchor_preserved_under_fullscreen_suppression() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         // Set an existing anchor in BUBBLE_GEOMETRY
         let sample_anchor = BubbleAnchor {
             card_right: 850.0,
@@ -22908,6 +22911,7 @@ mod fullscreen_bubble_suppression_tests {
 
     #[test]
     fn test_preserve_shrink_uses_live_edges_not_stale_anchor() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         // Stale anchor from a prior expand/motion pass (card edges drifted).
         let stale = BubbleAnchor {
             card_right: 900.0,
