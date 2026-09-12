@@ -1,4 +1,6 @@
+import { useEffect, useState } from 'react'
 import { DEBUG_INJECT_PRESETS, type DebugInjectPreset } from '../lib/debugInject'
+import { getBubbleRuntimeTrace, setBubbleRuntimeTrace } from '../lib/bubbleTrace'
 
 export function DebugSettingsSection({
   onDebugInjectPreset,
@@ -10,6 +12,11 @@ export function DebugSettingsSection({
   debugInjectCount?: number
 }) {
   const isZh = typeof navigator !== 'undefined' && navigator.language.toLowerCase().startsWith('zh')
+  const [bubbleTraceEnabled, setBubbleTraceEnabled] = useState(false)
+
+  useEffect(() => {
+    getBubbleRuntimeTrace().then(setBubbleTraceEnabled)
+  }, [])
 
   const presetLabel = (preset: DebugInjectPreset) => {
     if (!isZh) {
@@ -28,7 +35,35 @@ export function DebugSettingsSection({
     <section className="flex flex-col gap-4">
       <h2 className="text-lg font-medium text-white">{isZh ? '调试' : 'Debug'}</h2>
       <div className="bg-[#0f0f0f] border border-white/5 rounded-2xl overflow-hidden p-4 flex flex-col gap-3">
-        <div className="flex flex-col gap-1">
+        <div className="flex items-center justify-between pb-1">
+          <div className="flex flex-col gap-1">
+            <span className="text-sm font-medium text-white/90">
+              {isZh ? '气泡运行追踪 (Bubble Trace)' : 'Bubble Runtime Trace'}
+            </span>
+            <span className="text-xs text-white/40">
+              {isZh
+                ? '记录气泡生命周期与 Win32 原生窗口事件到 run-*.log (OC_BUBBLE_TRACE=1)'
+                : 'Log bubble lifecycle & Win32 native window mutations to run-*.log (OC_BUBBLE_TRACE=1)'}
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={async () => {
+              const next = !bubbleTraceEnabled
+              const actual = await setBubbleRuntimeTrace(next)
+              setBubbleTraceEnabled(actual)
+            }}
+            className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${bubbleTraceEnabled ? 'bg-blue-500' : 'bg-white/10'}`}
+            role="switch"
+            aria-checked={bubbleTraceEnabled}
+          >
+            <span
+              className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${bubbleTraceEnabled ? 'translate-x-5' : 'translate-x-0'}`}
+            />
+          </button>
+        </div>
+
+        <div className="border-t border-white/5 pt-3 flex flex-col gap-1">
           <span className="text-sm font-medium text-white/90">{isZh ? '测试消息注入' : 'Test message inject'}</span>
           <span className="text-xs text-white/40">
             {isZh

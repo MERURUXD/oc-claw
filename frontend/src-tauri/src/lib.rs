@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 mod presentation;
+mod bubble_trace;
 static PRESENTATION: presentation::Suppression = presentation::Suppression::new();
 static EXTRA_MASCOTS_HIDDEN: AtomicBool = AtomicBool::new(false);
 use percent_encoding::percent_decode_str;
@@ -3152,7 +3153,7 @@ async fn open_mini(app: tauri::AppHandle) -> Result<(), String> {
                     let geom = *BUBBLE_GEOMETRY.lock().unwrap();
                     let app = app_for_events.clone();
                     tauri::async_runtime::spawn(async move {
-                        let _ = sync_mascot_bubble(app, geom.width, geom.height, Some(geom.reserve_x), Some(geom.reserve_y), Some(false)).await;
+                        let _ = sync_mascot_bubble(app, geom.width, geom.height, Some(geom.reserve_x), Some(geom.reserve_y), Some(false), None, Some("internal-window-move".into())).await;
                     });
                 }
             }
@@ -3477,7 +3478,7 @@ async fn move_mini_by(app: tauri::AppHandle, dx: f64, dy: f64) -> Result<(), Str
         }
     }
     let geom = *BUBBLE_GEOMETRY.lock().unwrap();
-    let _ = sync_mascot_bubble(app.clone(), geom.width, geom.height, Some(geom.reserve_x), Some(geom.reserve_y), Some(false)).await;
+    let _ = sync_mascot_bubble(app.clone(), geom.width, geom.height, Some(geom.reserve_x), Some(geom.reserve_y), Some(false), None, Some("internal-move-by".into())).await;
     Ok(())
 }
 
@@ -3507,7 +3508,6 @@ async fn get_mini_origin(app: tauri::AppHandle) -> Result<(f64, f64), String> {
     }
     #[cfg(target_os = "windows")]
     {
-        // outer_position() returns PhysicalPosition; convert to logical for consistency.
         if let Ok(pos) = win.outer_position() {
             let scale = win.scale_factor().unwrap_or(1.0);
             return Ok((pos.x as f64 / scale, pos.y as f64 / scale));
@@ -3667,7 +3667,7 @@ async fn set_mini_origin(
             );
             let _ = win.set_position(tauri::LogicalPosition::new(x, y));
             let geom = *BUBBLE_GEOMETRY.lock().unwrap();
-            let _ = sync_mascot_bubble(app.clone(), geom.width, geom.height, Some(geom.reserve_x), Some(geom.reserve_y), Some(false)).await;
+            let _ = sync_mascot_bubble(app.clone(), geom.width, geom.height, Some(geom.reserve_x), Some(geom.reserve_y), Some(false), None, Some("internal-origin-unconfined".into())).await;
             return Ok(());
         }
         if let Ok(Some(monitor)) = win.current_monitor() {
@@ -3702,7 +3702,7 @@ async fn set_mini_origin(
         }
     }
     let geom = *BUBBLE_GEOMETRY.lock().unwrap();
-    let _ = sync_mascot_bubble(app.clone(), geom.width, geom.height, Some(geom.reserve_x), Some(geom.reserve_y), Some(false)).await;
+    let _ = sync_mascot_bubble(app.clone(), geom.width, geom.height, Some(geom.reserve_x), Some(geom.reserve_y), Some(false), None, Some("internal-origin-clamped".into())).await;
     Ok(())
 }
 
@@ -11765,6 +11765,8 @@ fn set_bubble_frame_atomic(
     y: f64,
     width: f64,
     height: f64,
+    transition_id: Option<i64>,
+    caller: &str,
 ) -> Result<(), String> {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -11780,6 +11782,30 @@ fn set_bubble_frame_atomic(
     let px_w = (width * scale).round() as i32;
     let px_h = (height * scale).round() as i32;
 
+    let before_rect = bubble_trace::win32::get_rect(hwnd);
+    let visible_before = bubble_trace::win32::is_visible(hwnd);
+    let flags = SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER;
+
+    let flags_str = format!("{:#06x}", flags.0);
+    let hwnd_str = format!("{:#x}", hwnd_raw as usize);
+    let before_str = format!("{:?}", before_rect);
+    let target_str = format!("[{}, {}, {}, {}]", px_x, px_y, px_w, px_h);
+    let vis_before_str = visible_before.to_string();
+
+    bubble_trace::trace(
+        "win32",
+        "SetWindowPos-before",
+        transition_id,
+        &[
+            ("hwnd", &hwnd_str),
+            ("caller", caller),
+            ("flags", &flags_str),
+            ("target_rect", &target_str),
+            ("before_rect", &before_str),
+            ("visible_before", &vis_before_str),
+        ],
+    );
+
     unsafe {
         let _ = SetWindowPos(
             hwnd,
@@ -11788,9 +11814,27 @@ fn set_bubble_frame_atomic(
             px_y,
             px_w,
             px_h,
-            SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
+            flags,
         );
     }
+
+    let after_rect = bubble_trace::win32::get_rect(hwnd);
+    let visible_after = bubble_trace::win32::is_visible(hwnd);
+    let after_str = format!("{:?}", after_rect);
+    let vis_after_str = visible_after.to_string();
+
+    bubble_trace::trace(
+        "win32",
+        "SetWindowPos-after",
+        transition_id,
+        &[
+            ("hwnd", &hwnd_str),
+            ("caller", caller),
+            ("after_rect", &after_str),
+            ("visible_after", &vis_after_str),
+        ],
+    );
+
     Ok(())
 }
 
@@ -11810,6 +11854,8 @@ async fn sync_mascot_bubble(
     entry_offset_x: Option<f64>,
     entry_offset_y: Option<f64>,
     preserve_anchor: Option<bool>,
+    transition_id: Option<i64>,
+    reason: Option<String>,
 ) -> Result<(), String> {
     let res_x = entry_offset_x.unwrap_or(BUBBLE_RESERVE_X);
     let res_y = entry_offset_y.unwrap_or(BUBBLE_RESERVE_Y);
@@ -11837,6 +11883,46 @@ async fn sync_mascot_bubble(
     };
 
     let existing_anchor = BUBBLE_GEOMETRY.lock().unwrap().anchor;
+
+    let reason_val = reason.as_deref().unwrap_or("unknown");
+    let w_str = width.to_string();
+    let h_str = height.to_string();
+    let res_x_str = res_x.to_string();
+    let res_y_str = res_y.to_string();
+    let preserve_req_str = preserve_anchor.map(|b| b.to_string()).unwrap_or_else(|| "none".to_string());
+    let is_exp_str = is_expanded.to_string();
+    let mask_str = format!("{:#04b}", PRESENTATION.mask());
+
+    #[cfg(target_os = "windows")]
+    let (hwnd_str, before_rect_str, vis_before_str) = {
+        if let Ok(hwnd_raw) = win.hwnd() {
+            let hwnd = windows::Win32::Foundation::HWND(hwnd_raw.0 as _);
+            let r = bubble_trace::win32::get_rect(hwnd);
+            let v = bubble_trace::win32::is_visible(hwnd);
+            (format!("{:#x}", hwnd_raw.0 as usize), format!("{:?}", r), v.to_string())
+        } else {
+            ("none".to_string(), "none".to_string(), "unknown".to_string())
+        }
+    };
+
+    let mut begin_details = vec![
+        ("reason", reason_val),
+        ("requested_width", &w_str),
+        ("requested_height", &h_str),
+        ("reserve_x", &res_x_str),
+        ("reserve_y", &res_y_str),
+        ("preserve_anchor_param", &preserve_req_str),
+        ("should_preserve", if should_preserve { "true" } else { "false" }),
+        ("mini_is_expanded", &is_exp_str),
+        ("presentation_mask", &mask_str),
+    ];
+    #[cfg(target_os = "windows")]
+    {
+        begin_details.push(("hwnd", &hwnd_str));
+        begin_details.push(("frame_before", &before_rect_str));
+        begin_details.push(("native_visible_before", &vis_before_str));
+    }
+    bubble_trace::trace("rust", "sync-begin", transition_id, &begin_details);
 
     // Live bubble window frame (logical px) for preserve shrink. Stored anchor
     // card edges can be stale after motion/DPI round-trips that never wrote
@@ -11885,11 +11971,16 @@ async fn sync_mascot_bubble(
         }
     };
 
+    let anchor_before_str = format!("{:?}", existing_anchor.map(|a| (a.card_right, a.card_bottom)));
+    let mut anchor_source = "new";
+
     let (final_win_x, final_win_y) = if should_preserve && existing_anchor.is_some() {
         let anchor = existing_anchor.unwrap();
         let (mut preserved_card_right, mut preserved_card_bottom) = if let Some((lx, ly, lw, lh)) = live_bubble {
+            anchor_source = "live";
             resting_card_edges_from_frame(lx, ly, lw, lh)
         } else {
+            anchor_source = "stored";
             (anchor.card_right, anchor.card_bottom)
         };
         if preserved_card_right - bubble_w < anchor.mon_x + margin {
@@ -12064,6 +12155,16 @@ async fn sync_mascot_bubble(
         (win_x, win_y)
     };
 
+    bubble_trace::trace(
+        "rust",
+        "anchor-resolved",
+        transition_id,
+        &[
+            ("source", anchor_source),
+            ("anchor_before", &anchor_before_str),
+        ],
+    );
+
     {
         let mut geom = BUBBLE_GEOMETRY.lock().unwrap();
         geom.width = bubble_w;
@@ -12074,7 +12175,7 @@ async fn sync_mascot_bubble(
 
     #[cfg(target_os = "windows")]
     {
-        set_bubble_frame_atomic(&win, final_win_x, final_win_y, win_w, win_h)?;
+        set_bubble_frame_atomic(&win, final_win_x, final_win_y, win_w, win_h, transition_id, "bubble-geometry")?;
     }
 
     #[cfg(target_os = "macos")]
@@ -12115,12 +12216,52 @@ async fn sync_mascot_bubble(
         }
     }
 
+    let anchor_after_str = format!("{:?}", BUBBLE_GEOMETRY.lock().unwrap().anchor.map(|a| (a.card_right, a.card_bottom)));
+    let final_frame_str = format!("[{:.1}, {:.1}, {:.1}, {:.1}]", final_win_x, final_win_y, win_w, win_h);
+    let mut end_details = vec![
+        ("reason", reason_val),
+        ("final_frame", &final_frame_str),
+        ("anchor_after", &anchor_after_str),
+    ];
+    #[cfg(target_os = "windows")]
+    let (after_rect_str, vis_after_str) = {
+        if let Ok(hwnd_raw) = win.hwnd() {
+            let hwnd = windows::Win32::Foundation::HWND(hwnd_raw.0 as _);
+            let r = bubble_trace::win32::get_rect(hwnd);
+            let v = bubble_trace::win32::is_visible(hwnd);
+            (format!("{:?}", r), v.to_string())
+        } else {
+            ("none".to_string(), "unknown".to_string())
+        }
+    };
+    #[cfg(target_os = "windows")]
+    {
+        end_details.push(("frame_after", &after_rect_str));
+        end_details.push(("native_visible_after", &vis_after_str));
+    }
+    bubble_trace::trace("rust", "sync-end", transition_id, &end_details);
+
     // Don't re-assert always-on-top while the Windows fullscreen watcher has
     // the mini hidden — the bubble must stay off the fullscreen app too.
     #[cfg(target_os = "windows")]
     let want_top = !PRESENTATION.active();
     #[cfg(not(target_os = "windows"))]
     let want_top = true;
+
+    #[cfg(target_os = "windows")]
+    let is_top_before = win.hwnd().ok().map(|h| bubble_trace::win32::is_topmost(windows::Win32::Foundation::HWND(h.0 as _)));
+
+    let want_top_str = want_top.to_string();
+    let mut top_details = vec![
+        ("caller", "sync_mascot_bubble"),
+        ("value", &want_top_str),
+    ];
+    #[cfg(target_os = "windows")]
+    let top_before_str = is_top_before.map(|b| b.to_string()).unwrap_or_else(|| "unknown".to_string());
+    #[cfg(target_os = "windows")]
+    top_details.push(("topmost_before", &top_before_str));
+
+    bubble_trace::trace("rust", "topmost-request", transition_id, &top_details);
     let _ = win.set_always_on_top(want_top);
     Ok(())
 }
@@ -12142,14 +12283,27 @@ fn set_presentation_suppressed(app: &tauri::AppHandle, reason: u8, hidden: bool)
     let mask_before = PRESENTATION.mask();
     PRESENTATION.set(reason, hidden);
     let suppressed = PRESENTATION.active();
+    let mask_after = PRESENTATION.mask();
+    let trigger = format!("{}({})", presentation::reason_label(reason), hidden);
+    let mask_str = format!("{:#04b}({})", mask_after, presentation::reasons_label(mask_after));
+    bubble_trace::trace(
+        "rust",
+        "suppression-changed",
+        None,
+        &[
+            ("trigger", &trigger),
+            ("mask", &mask_str),
+            ("suppressed", if suppressed { "true" } else { "false" }),
+        ],
+    );
     log::info!(
         "[presentation] reason={} hidden={} mask_before={:#04b}({}) mask_after={:#04b}({}) suppressed={}",
         presentation::reason_label(reason),
         hidden,
         mask_before,
         presentation::reasons_label(mask_before),
-        PRESENTATION.mask(),
-        presentation::reasons_label(PRESENTATION.mask()),
+        mask_after,
+        presentation::reasons_label(mask_after),
         suppressed
     );
     reconcile_presentation_windows(app);
@@ -12168,14 +12322,31 @@ fn set_presentation_suppressed(app: &tauri::AppHandle, reason: u8, hidden: bool)
 fn reconcile_presentation_windows(app: &tauri::AppHandle) {
     let suppressed = PRESENTATION.active();
     let extras_hidden = EXTRA_MASCOTS_HIDDEN.load(Ordering::SeqCst);
+    let mask = PRESENTATION.mask();
+    let mask_str = format!("{:#04b}({})", mask, presentation::reasons_label(mask));
+    let extras_hidden_str = extras_hidden.to_string();
     log::info!(
         "[presentation] reconcile mask={:#04b}({}) extras_hidden={}",
-        PRESENTATION.mask(),
-        presentation::reasons_label(PRESENTATION.mask()),
+        mask,
+        presentation::reasons_label(mask),
         extras_hidden
     );
     for (label, win) in app.webview_windows() {
-        match presentation::window_action(&label, suppressed, extras_hidden) {
+        let action = presentation::window_action(&label, suppressed, extras_hidden);
+        let action_str = format!("{:?}", action);
+        bubble_trace::trace(
+            "rust",
+            "presentation-reconcile",
+            None,
+            &[
+                ("trigger", "reconcile_presentation_windows"),
+                ("mask", &mask_str),
+                ("extras_hidden", &extras_hidden_str),
+                ("label", &label),
+                ("resolved_action", &action_str),
+            ],
+        );
+        match action {
             presentation::WindowAction::Hide => set_presentation_native_visibility(&win, &label, false),
             presentation::WindowAction::Show => {
                 if presentation::show_is_allowed(suppressed) {
@@ -12196,14 +12367,31 @@ fn reconcile_presentation_windows(app: &tauri::AppHandle) {
 fn reconcile_extra_mascot_windows(app: &tauri::AppHandle) {
     let suppressed = PRESENTATION.active();
     let extras_hidden = EXTRA_MASCOTS_HIDDEN.load(Ordering::SeqCst);
+    let mask = PRESENTATION.mask();
+    let mask_str = format!("{:#04b}({})", mask, presentation::reasons_label(mask));
+    let extras_hidden_str = extras_hidden.to_string();
     log::info!(
         "[presentation] reconcile extras-only mask={:#04b}({}) extras_hidden={}",
-        PRESENTATION.mask(),
-        presentation::reasons_label(PRESENTATION.mask()),
+        mask,
+        presentation::reasons_label(mask),
         extras_hidden
     );
     for (label, win) in app.webview_windows() {
-        match presentation::extra_mascot_action(&label, suppressed, extras_hidden) {
+        let action = presentation::extra_mascot_action(&label, suppressed, extras_hidden);
+        let action_str = format!("{:?}", action);
+        bubble_trace::trace(
+            "rust",
+            "presentation-reconcile",
+            None,
+            &[
+                ("trigger", "reconcile_extra_mascot_windows"),
+                ("mask", &mask_str),
+                ("extras_hidden", &extras_hidden_str),
+                ("label", &label),
+                ("resolved_action", &action_str),
+            ],
+        );
+        match action {
             presentation::WindowAction::Hide => set_presentation_native_visibility(&win, &label, false),
             presentation::WindowAction::Show => {
                 if presentation::show_is_allowed(suppressed) {
@@ -12258,6 +12446,7 @@ fn set_presentation_native_visibility(win: &tauri::WebviewWindow, label: &str, v
             Ok(hwnd) => {
                 let raw = windows::Win32::Foundation::HWND(hwnd.0);
                 let show_cmd = if visible { SW_SHOWNOACTIVATE } else { SW_HIDE };
+                let show_cmd_str = if visible { "SW_SHOWNOACTIVATE" } else { "SW_HIDE" };
                 let showwindow = unsafe { ShowWindow(raw, show_cmd) };
                 // Repair tao's bookkeeping on hide: when its flag still says
                 // visible this performs the normal apply_diff (styles + SW_HIDE),
@@ -12265,6 +12454,24 @@ fn set_presentation_native_visibility(win: &tauri::WebviewWindow, label: &str, v
                 // native window is hidden because of the call above.
                 let tao_hide = if visible { None } else { Some(win.hide()) };
                 let visible_after = native_window_visible(win);
+                let hwnd_str = format!("{:#x}", hwnd.0 as usize);
+                let vis_before_str = format!("{:?}", visible_before);
+                let vis_after_str = format!("{:?}", visible_after);
+
+                bubble_trace::trace(
+                    "win32",
+                    "ShowWindow",
+                    None,
+                    &[
+                        ("hwnd", &hwnd_str),
+                        ("caller", "presentation"),
+                        ("label", label),
+                        ("action", action),
+                        ("cmd", show_cmd_str),
+                        ("visible_before", &vis_before_str),
+                        ("visible_after", &vis_after_str),
+                    ],
+                );
                 log::info!(
                     "[presentation] label={} action={} visible_before={:?} showwindow={:?} tao_hide={:?} visible_after={:?} hwnd={:#x}",
                     label,
@@ -12330,6 +12537,30 @@ fn get_mascot_presentation_suppressed() -> bool {
     PRESENTATION.active()
 }
 
+#[tauri::command]
+fn trace_bubble_event(
+    event: String,
+    transition_id: Option<i64>,
+    details: Option<HashMap<String, String>>,
+) {
+    let pairs: Vec<(&str, &str)> = details
+        .as_ref()
+        .map(|m| m.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect())
+        .unwrap_or_default();
+    bubble_trace::trace("frontend", &event, transition_id, &pairs);
+}
+
+#[tauri::command]
+fn set_bubble_runtime_trace(enabled: bool) {
+    bubble_trace::set_enabled(enabled);
+    log::info!("[bubble-trace] runtime trace enabled={}", enabled);
+}
+
+#[tauri::command]
+fn get_bubble_runtime_trace() -> bool {
+    bubble_trace::is_enabled()
+}
+
 /// Show or hide the mascot status bubble. `visible=true` spawns the window on
 /// first use, refuses to show while any presentation suppression reason is
 /// active (returning "suppressed"),
@@ -12344,9 +12575,35 @@ async fn set_mascot_bubble_visible(app: tauri::AppHandle, visible: bool) -> Resu
     let (tx, rx) = tokio::sync::oneshot::channel();
     let presentation_app = app.clone();
     app.run_on_main_thread(move || {
+        let win_opt = presentation_app.get_webview_window("mascot-bubble");
+        let win_exists = win_opt.is_some();
+        let mask = PRESENTATION.mask();
+        let mask_str = format!("{:#04b}({})", mask, presentation::reasons_label(mask));
+
+        #[cfg(target_os = "windows")]
+        let vis_before = win_opt.as_ref().and_then(native_window_visible);
+        #[cfg(not(target_os = "windows"))]
+        let vis_before: Option<bool> = None;
+
+        let vis_before_str = format!("{:?}", vis_before);
+        let win_exists_str = win_exists.to_string();
+        let req_vis_str = visible.to_string();
+
+        bubble_trace::trace(
+            "rust",
+            "set-bubble-visible-request",
+            None,
+            &[
+                ("request_visible", &req_vis_str),
+                ("presentation_mask", &mask_str),
+                ("window_exists", &win_exists_str),
+                ("visible_before", &vis_before_str),
+            ],
+        );
+
         let result = if visible && PRESENTATION.active() {
             Ok("suppressed".to_string())
-        } else if let Some(win) = presentation_app.get_webview_window("mascot-bubble") {
+        } else if let Some(win) = win_opt {
             if visible {
                 win.show().map(|_| {
                     reassert_mini_floating(&presentation_app);
@@ -12359,6 +12616,28 @@ async fn set_mascot_bubble_visible(app: tauri::AppHandle, visible: bool) -> Resu
                 }).map_err(|e| e.to_string())
             }
         } else { Ok("hidden".to_string()) };
+
+        let result_str = match &result {
+            Ok(s) => s.as_str(),
+            Err(e) => e.as_str(),
+        };
+
+        #[cfg(target_os = "windows")]
+        let vis_after = presentation_app.get_webview_window("mascot-bubble").as_ref().and_then(native_window_visible);
+        #[cfg(not(target_os = "windows"))]
+        let vis_after: Option<bool> = None;
+        let vis_after_str = format!("{:?}", vis_after);
+
+        bubble_trace::trace(
+            "rust",
+            "set-bubble-visible-result",
+            None,
+            &[
+                ("result", result_str),
+                ("visible_after", &vis_after_str),
+            ],
+        );
+
         let _ = tx.send(result);
     }).map_err(|e| e.to_string())?;
     rx.await.map_err(|e| e.to_string())?
@@ -12379,6 +12658,7 @@ async fn set_mascot_bubble_visible(app: tauri::AppHandle, visible: bool) -> Resu
 // main-thread assertions and aborts the app with SIGTERM.
 fn reassert_mini_floating(app: &tauri::AppHandle) {
     use tauri::Manager;
+    bubble_trace::trace("rust", "reassert_mini_floating-begin", None, &[]);
     // Reassert the main mini window plus every extra (multi-pet) mascot so they
     // all sit at the exact same window level. macOS (and Tauri's own
     // always-on-top bookkeeping) can silently demote floating windows after a
@@ -12421,9 +12701,26 @@ fn reassert_mini_floating(app: &tauri::AppHandle) {
             }
             #[cfg(not(target_os = "macos"))]
             let _ = over_fullscreen;
-            let _ = win_clone.set_always_on_top(!PRESENTATION.active());
+            let label = win_clone.label().to_string();
+            let want_top = !PRESENTATION.active();
+            let want_top_str = want_top.to_string();
+            #[cfg(target_os = "windows")]
+            let is_top_before = win_clone.hwnd().ok().map(|h| bubble_trace::win32::is_topmost(windows::Win32::Foundation::HWND(h.0 as _)));
+            let mut top_details = vec![
+                ("caller", "reassert_mini_floating"),
+                ("label", &label),
+                ("value", &want_top_str),
+            ];
+            #[cfg(target_os = "windows")]
+            let top_before_str = is_top_before.map(|b| b.to_string()).unwrap_or_else(|| "unknown".to_string());
+            #[cfg(target_os = "windows")]
+            top_details.push(("topmost_before", &top_before_str));
+
+            bubble_trace::trace("rust", "topmost-request", None, &top_details);
+            let _ = win_clone.set_always_on_top(want_top);
         });
     }
+    bubble_trace::trace("rust", "reassert_mini_floating-end", None, &[]);
 }
 
 #[tauri::command]
@@ -22386,6 +22683,7 @@ fn write_startup_breadcrumb() {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    bubble_trace::init();
     // Windows: leave a breadcrumb before any plugin can terminate this process.
     #[cfg(target_os = "windows")]
     write_startup_breadcrumb();
@@ -22840,7 +23138,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_antigravity_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, resolve_codex_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, get_build_info, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, sync_mascot_bubble, ensure_mascot_bubble, set_mascot_bubble_visible, get_mascot_presentation_suppressed, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs, fetch_petdex_manifest, download_codex_pet, delete_custom_codex_pet, get_hermes_remote_conversation, get_harness_quota])
+        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_antigravity_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, resolve_codex_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, get_build_info, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, sync_mascot_bubble, ensure_mascot_bubble, set_mascot_bubble_visible, get_mascot_presentation_suppressed, trace_bubble_event, set_bubble_runtime_trace, get_bubble_runtime_trace, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs, fetch_petdex_manifest, download_codex_pet, delete_custom_codex_pet, get_hermes_remote_conversation, get_harness_quota])
         .manage(ActiveAgentPid { pid: Mutex::new(None) })
         .manage(ClaudeState {
             sessions: Arc::new(Mutex::new(HashMap::new())),

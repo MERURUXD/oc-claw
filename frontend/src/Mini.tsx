@@ -39,6 +39,7 @@ import {
   commitBubbleNativeShow,
   handleBubbleVisible,
 } from './lib/bubbleSuppression'
+import { traceBubbleEvent } from './lib/bubbleTrace'
 import { OnboardingModal } from './components/OnboardingModal'
 import { PetContextMenu, PomodoroOverlay } from './components/PetContextMenu'
 import {
@@ -2252,6 +2253,12 @@ export default function Mini() {
       setDebugInjectSessions([])
       // The status bubble only exists in coding mode — make sure it is
       // hidden when leaving it (pet mode etc.).
+      if (bubbleDesiredVisibleRef.current) {
+        traceBubbleEvent('bubble-desired-visible-false', {
+          transitionId: bubbleTransitionIdRef.current,
+          details: { reason: 'app-mode-not-coding' },
+        })
+      }
       bubbleDesiredVisibleRef.current = false
       bubbleTransitionIdRef.current++
       bubblePhaseRef.current = 'hidden'
@@ -2263,6 +2270,12 @@ export default function Mini() {
       setClaudeSessions([])
       debugInjectSessionsRef.current = []
       setDebugInjectSessions([])
+      if (bubbleDesiredVisibleRef.current) {
+        traceBubbleEvent('bubble-desired-visible-false', {
+          transitionId: bubbleTransitionIdRef.current,
+          details: { reason: 'no-harness-enabled' },
+        })
+      }
       bubbleDesiredVisibleRef.current = false
       bubbleTransitionIdRef.current++
       bubblePhaseRef.current = 'hidden'
@@ -2734,6 +2747,12 @@ export default function Mini() {
         lastBubblePayloadRef.current = bubblePayload
 
         if (bubbleShouldShow) {
+          if (!bubbleDesiredVisibleRef.current) {
+            traceBubbleEvent('bubble-desired-visible-true', {
+              transitionId: bubbleTransitionIdRef.current,
+              details: { reason: 'session-poll', phase: bubblePhaseRef.current },
+            })
+          }
           bubbleDesiredVisibleRef.current = true
           const currentPhase = bubblePhaseRef.current
           if (currentPhase === 'visible' || currentPhase === 'entering' || currentPhase === 'prepared') {
@@ -2752,6 +2771,12 @@ export default function Mini() {
               })
           }
         } else {
+          if (bubbleDesiredVisibleRef.current) {
+            traceBubbleEvent('bubble-desired-visible-false', {
+              transitionId: bubbleTransitionIdRef.current,
+              details: { reason: 'session-poll', phase: bubblePhaseRef.current },
+            })
+          }
           bubbleDesiredVisibleRef.current = false
           const currentPhase = bubblePhaseRef.current
           if (currentPhase !== 'hidden' && currentPhase !== 'exiting') {
@@ -3356,11 +3381,18 @@ export default function Mini() {
   // must hide too — and reappear when it collapses. Pet mode has none.
   useEffect(() => {
     if (appMode !== 'coding') return
+    traceBubbleEvent('extra-mascots-hidden-request', { details: { hidden: expanded } })
     invoke('set_extra_mascots_hidden', { hidden: expanded }).catch(() => {})
     // The status bubble closes with a fast fly-out when the panel expands (the panel
     // already shows the full status); the session poll re-shows it on the
     // next tick once collapsed.
     if (expanded) {
+      if (bubbleDesiredVisibleRef.current) {
+        traceBubbleEvent('bubble-desired-visible-false', {
+          transitionId: bubbleTransitionIdRef.current,
+          details: { reason: 'panel-expanded', phase: bubblePhaseRef.current },
+        })
+      }
       bubbleDesiredVisibleRef.current = false
       const currentPhase = bubblePhaseRef.current
       if (currentPhase !== 'hidden' && currentPhase !== 'exiting') {
@@ -3390,11 +3422,29 @@ export default function Mini() {
 
   const restoreCollapsedMascotPosition = useCallback(async () => {
     const pos = customPosRef.current
-    if (!pos) return
+    traceBubbleEvent('mini-position-restore-begin', {
+      transitionId: bubbleTransitionIdRef.current,
+      details: { pos: pos ? `${pos.x},${pos.y}` : 'none' },
+    })
+    if (!pos) {
+      traceBubbleEvent('mini-position-restore-done', {
+        transitionId: bubbleTransitionIdRef.current,
+        details: { skipped: 'no-custom-pos' },
+      })
+      return
+    }
     try {
       await invoke('set_mini_origin', { x: pos.x, y: pos.y })
+      traceBubbleEvent('mini-position-restore-done', {
+        transitionId: bubbleTransitionIdRef.current,
+        details: { x: pos.x, y: pos.y },
+      })
     } catch (e) {
       console.warn('[mini] restore custom mascot position failed:', e)
+      traceBubbleEvent('mini-position-restore-done', {
+        transitionId: bubbleTransitionIdRef.current,
+        details: { error: String(e) },
+      })
     }
   }, [])
 
@@ -4122,6 +4172,10 @@ export default function Mini() {
     const myGen = capturePanelUiGeneration(panelUiTransitionRef.current)
     collapsingRef.current = true
     hoverExpandedRef.current = false
+    traceBubbleEvent('panel-collapse-begin', {
+      transitionId: bubbleTransitionIdRef.current,
+      details: { gen: myGen, wasSettings: settingsModeRef.current },
+    })
     // Intentionally DO NOT clear completionSessionId / effListCollapsed here.
     // While the panel fades out (opacity 1 → 0 over panelChromeTransition),
     // the content is still mounted. Clearing the popup state mid-fade would
@@ -4188,6 +4242,10 @@ export default function Mini() {
       }
       if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
       setHiding(true)
+      traceBubbleEvent('panel-expanded-false', {
+        transitionId: bubbleTransitionIdRef.current,
+        details: { gen: myGen },
+      })
       // Unmount the expanded React tree before shrinking/repositioning the
       // native Tauri window. Otherwise the last frames of the expanded panel
       // can render inside the collapsed window geometry and look like a flicker.
@@ -4217,7 +4275,15 @@ export default function Mini() {
           return
         }
         if (wasSettings && appModeRef.current === 'pet' && largeMascotRef.current) {
+          traceBubbleEvent('mini-native-collapse-request', {
+            transitionId: bubbleTransitionIdRef.current,
+            details: { gen: myGen, mode: 'pet' },
+          })
           await invoke('set_mini_expanded', { expanded: false, position: mascotPositionRef.current, efficiency: true, mascotScale: mascotScaleRef.current, largeMascot: true, largeMascotScale: largeMascotScaleRef.current }).catch(() => {})
+          traceBubbleEvent('mini-native-collapse-done', {
+            transitionId: bubbleTransitionIdRef.current,
+            details: { gen: myGen, mode: 'pet' },
+          })
           if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
           await invoke('set_pet_mode_window', { active: true, mascotScale: mascotScaleRef.current, largeMascotScale: largeMascotScaleRef.current }).catch(() => {})
           if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
@@ -4227,10 +4293,22 @@ export default function Mini() {
             petOriginBeforeSettingsRef.current = null
           }
         } else if (wasSettings) {
+          traceBubbleEvent('mini-native-collapse-request', {
+            transitionId: bubbleTransitionIdRef.current,
+            details: { gen: myGen, wasSettings: true },
+          })
           await invoke('set_mini_size', { restore: true, position: mascotPositionRef.current, mascotScale: mascotScaleRef.current, largeMascot: true, largeMascotScale: largeMascotScaleRef.current })
+          traceBubbleEvent('mini-native-collapse-done', {
+            transitionId: bubbleTransitionIdRef.current,
+            details: { gen: myGen, wasSettings: true },
+          })
           if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
           await restoreCollapsedMascotPosition()
         } else {
+          traceBubbleEvent('mini-native-collapse-request', {
+            transitionId: bubbleTransitionIdRef.current,
+            details: { gen: myGen, pos: mascotPositionRef.current },
+          })
           await invoke('set_mini_expanded', {
             expanded: false,
             position: mascotPositionRef.current,
@@ -4238,6 +4316,10 @@ export default function Mini() {
             mascotScale: mascotScaleRef.current,
             largeMascot: true,
             largeMascotScale: largeMascotScaleRef.current,
+          })
+          traceBubbleEvent('mini-native-collapse-done', {
+            transitionId: bubbleTransitionIdRef.current,
+            details: { gen: myGen },
           })
           if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
           await restoreCollapsedMascotPosition()
@@ -4265,6 +4347,10 @@ export default function Mini() {
         if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
         collapsingRef.current = false
         settingsTransitioningRef.current = false
+        traceBubbleEvent('collapsing-false', {
+          transitionId: bubbleTransitionIdRef.current,
+          details: { gen: myGen, reason: 'collapse-timer' },
+        })
       }, 300)
     }, delay)
   }, [fetchAgents, restoreCollapsedMascotPosition, debugToTerminal, isSettingsPickerBlockingClose])
@@ -4425,6 +4511,10 @@ export default function Mini() {
     if (collapsingRef.current) {
       panelUiTransitionRef.current = beginPanelUiTransition(panelUiTransitionRef.current, 'enterSettings')
       collapsingRef.current = false
+      traceBubbleEvent('collapsing-false', {
+        transitionId: bubbleTransitionIdRef.current,
+        details: { reason: 'enterSettings' },
+      })
       // Collapse may have masked the document or set hiding; restore so
       // settings UI is not stuck invisible under a stale collapse.
       document.documentElement.style.opacity = '1'
@@ -4507,6 +4597,10 @@ export default function Mini() {
     // Invalidate any in-flight collapse ownership (same as enterSettings).
     if (collapsingRef.current) {
       collapsingRef.current = false
+      traceBubbleEvent('collapsing-false', {
+        transitionId: bubbleTransitionIdRef.current,
+        details: { reason: 'exitSettings' },
+      })
       document.documentElement.style.opacity = '1'
     }
     setIsCreateModalOpen(false)

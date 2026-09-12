@@ -26,6 +26,7 @@ import {
   type DeferredStableTicket,
   type GeometryLifecycleSnapshot,
 } from '../lib/bubbleGeometryLifecycle'
+import { traceBubbleEvent } from '../lib/bubbleTrace'
 import { QuotaMiniBadge } from './QuotaCapsule'
 
 export { BUBBLE_WIDTH, BUBBLE_WIDTH_MOTION }
@@ -911,8 +912,14 @@ export default function MascotBubble() {
 
     const entryOffsetX = pending.mode === 'motion' ? BUBBLE_MOTION.reserveX : 0
     const entryOffsetY = pending.mode === 'motion' ? BUBBLE_MOTION.reserveY : 0
+    const tid = transitionIdRef.current
+    const reason = 'resize-observer'
 
     logBubbleDev(`[bubble ro-coalesced] sync ${pending.width}x${pending.height} mode=${pending.mode} preserve=${pending.preserveAnchor}`)
+    traceBubbleEvent('resize-observer-sync', {
+      transitionId: tid,
+      details: { width: pending.width, height: pending.height, mode: pending.mode },
+    })
 
     isSyncInFlightRef.current = true
     invoke('sync_mascot_bubble', {
@@ -921,6 +928,8 @@ export default function MascotBubble() {
       entryOffsetX,
       entryOffsetY,
       preserveAnchor: pending.preserveAnchor,
+      transitionId: tid,
+      reason,
     })
       .finally(() => {
         isSyncInFlightRef.current = false
@@ -931,7 +940,7 @@ export default function MascotBubble() {
   }, [])
 
   // Unified geometry synchronization helper
-  const syncBubbleGeometry = useCallback((mode: BubbleGeometryMode, options?: { preserveAnchor?: boolean }) => {
+  const syncBubbleGeometry = useCallback((mode: BubbleGeometryMode, options?: { preserveAnchor?: boolean; reason?: string }) => {
     const el = contentRef.current
     if (!el) return Promise.resolve()
     const width = Math.ceil(el.offsetWidth)
@@ -945,6 +954,8 @@ export default function MascotBubble() {
     const entryOffsetX = mode === 'motion' ? BUBBLE_MOTION.reserveX : 0
     const entryOffsetY = mode === 'motion' ? BUBBLE_MOTION.reserveY : 0
     const preserveAnchor = options?.preserveAnchor ?? (mode === 'stable' || phaseRef.current === 'exiting' || phaseRef.current === 'visible')
+    const tid = transitionIdRef.current
+    const reason = options?.reason ?? (mode === 'stable' ? 'stable' : 'motion')
 
     logBubbleDev(`[bubble] syncBubbleGeometry mode=${mode} size=${width}x${height} offset=${entryOffsetX}x${entryOffsetY} preserve=${preserveAnchor}`)
     return invoke('sync_mascot_bubble', {
@@ -953,6 +964,8 @@ export default function MascotBubble() {
       entryOffsetX,
       entryOffsetY,
       preserveAnchor,
+      transitionId: tid,
+      reason,
     }).catch(() => {})
   }, [])
 
@@ -991,8 +1004,20 @@ export default function MascotBubble() {
     geometryLifecycleRef.current = scheduled.state
     const ticket = scheduled.ticket
     pendingStableTicketRef.current = ticket
+    traceBubbleEvent('stable-sync-scheduled', {
+      transitionId: ticket.transitionId,
+      details: { gen: ticket.generation },
+    })
     stableSyncRafRef.current = requestAnimationFrame(() => {
+      traceBubbleEvent('stable-sync-raf1', {
+        transitionId: ticket.transitionId,
+        details: { gen: ticket.generation },
+      })
       stableSyncRafRef.current = requestAnimationFrame(() => {
+        traceBubbleEvent('stable-sync-raf2', {
+          transitionId: ticket.transitionId,
+          details: { gen: ticket.generation },
+        })
         stableSyncRafRef.current = null
         const pending = pendingStableTicketRef.current
         if (!pending || pending.generation !== ticket.generation || pending.transitionId !== ticket.transitionId) {
@@ -1005,7 +1030,11 @@ export default function MascotBubble() {
         geometryLifecycleRef.current = applied.state
         pendingStableTicketRef.current = null
         if (applied.shouldShrinkToStable) {
-          syncBubbleGeometry('stable', { preserveAnchor: true })
+          traceBubbleEvent('stable-sync-request', {
+            transitionId: ticket.transitionId,
+            details: { gen: ticket.generation },
+          })
+          syncBubbleGeometry('stable', { preserveAnchor: true, reason: 'stable-deferred' })
         }
       })
     })
@@ -1024,6 +1053,10 @@ export default function MascotBubble() {
     lastSyncedGeometryRef.current = { width, height, mode: 'motion' }
 
     logBubbleDev(`[bubble ${tid}] geometry ${width}x${height} (motion mode, fresh anchor)`)
+    traceBubbleEvent('motion-sync-request', {
+      transitionId: tid,
+      details: { width, height, reason: 'prepare' },
+    })
 
     invoke('sync_mascot_bubble', {
       width,
@@ -1031,11 +1064,14 @@ export default function MascotBubble() {
       entryOffsetX: BUBBLE_MOTION.reserveX,
       entryOffsetY: BUBBLE_MOTION.reserveY,
       preserveAnchor: false,
+      transitionId: tid,
+      reason: 'prepare',
     })
       .then(() => {
         if (readySentForTransitionRef.current !== tid && transitionIdRef.current === tid) {
           readySentForTransitionRef.current = tid
           logBubbleDev(`[bubble ${tid}] ready`)
+          traceBubbleEvent('ready', { transitionId: tid })
           emit('mascot-bubble-ready', { transitionId: tid }).catch(() => {})
         }
       })
@@ -1057,6 +1093,10 @@ export default function MascotBubble() {
       transitionIdRef.current = tid
       readySentForTransitionRef.current = -1
       logBubbleDev(`[bubble ${tid}] prepare`)
+      traceBubbleEvent('prepare', {
+        transitionId: tid,
+        details: { hasPayload: !!newPayload },
+      })
       beginStableGeometryMotion(tid)
 
       enteringCompletedSessionIdsRef.current.clear()
@@ -1092,6 +1132,7 @@ export default function MascotBubble() {
       const tid = e.payload?.transitionId ?? 0
       if (tid !== transitionIdRef.current) return
       logBubbleDev(`[bubble ${tid}] enter`)
+      traceBubbleEvent('enter-received', { transitionId: tid })
 
       if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current)
       rafIdRef.current = requestAnimationFrame(() => {
@@ -1248,6 +1289,7 @@ export default function MascotBubble() {
         transitionIdRef.current = tid
       }
       logBubbleDev(`[bubble ${transitionIdRef.current}] close`)
+      traceBubbleEvent('close', { transitionId: transitionIdRef.current })
       beginStableGeometryMotion(transitionIdRef.current)
       if (phaseRef.current === 'hidden') return
       exitingCompletedSessionIdsRef.current.clear()
@@ -1400,12 +1442,19 @@ export default function MascotBubble() {
           lastSizeRef.current = { width, height }
           lastSyncedGeometryRef.current = { width, height, mode: 'motion' }
           currentGeometryModeRef.current = 'motion'
+          const tid = transitionIdRef.current
+          traceBubbleEvent('resize-observer-sync', {
+            transitionId: tid,
+            details: { width, height, mode: 'motion', phase: 'prepared' },
+          })
           invoke('sync_mascot_bubble', {
             width,
             height,
             entryOffsetX: BUBBLE_MOTION.reserveX,
             entryOffsetY: BUBBLE_MOTION.reserveY,
             preserveAnchor: false,
+            transitionId: tid,
+            reason: 'resize-observer-prepared',
           }).catch(() => {})
         }
         const tid = transitionIdRef.current
@@ -1450,6 +1499,7 @@ export default function MascotBubble() {
       phaseRef.current = 'hidden'
       setSummary(null)
       logBubbleDev(`[bubble ${currentId}] exit complete (reduced-motion)`)
+      traceBubbleEvent('exit-complete', { transitionId: currentId, details: { mode: 'reduced-motion' } })
       emit('mascot-bubble-exit-complete', { transitionId: currentId }).catch(() => {})
     } else if (prefersReducedMotion && phase === 'entering') {
       const currentId = transitionIdRef.current
@@ -1457,6 +1507,7 @@ export default function MascotBubble() {
       setPhase('visible')
       phaseRef.current = 'visible'
       logBubbleDev(`[bubble ${currentId}] visible (reduced-motion)`)
+      traceBubbleEvent('visible', { transitionId: currentId, details: { mode: 'reduced-motion' } })
       scheduleStableGeometrySync()
       emit('mascot-bubble-visible', { transitionId: currentId }).catch(() => {})
     }
@@ -1468,12 +1519,17 @@ export default function MascotBubble() {
 
     const currentPhase = phaseRef.current
     const currentId = transitionIdRef.current
+    traceBubbleEvent('animation-complete', {
+      transitionId: currentId,
+      details: { phase: currentPhase },
+    })
 
     if (currentPhase === 'entering') {
       activeMotionTokensRef.current.delete('global-entry')
       setPhase('visible')
       phaseRef.current = 'visible'
       logBubbleDev(`[bubble ${currentId}] visible`)
+      traceBubbleEvent('visible', { transitionId: currentId })
       if (activeMotionTokensRef.current.size === 0) {
         scheduleStableGeometrySync()
       }
@@ -1488,6 +1544,7 @@ export default function MascotBubble() {
       setShouldAnimateWidth(false)
       isWidthAnimatingRef.current = false
       logBubbleDev(`[bubble ${currentId}] exit complete`)
+      traceBubbleEvent('exit-complete', { transitionId: currentId })
       emit('mascot-bubble-exit-complete', { transitionId: currentId }).catch(() => {})
     }
   }, [scheduleStableGeometrySync])
@@ -1496,6 +1553,10 @@ export default function MascotBubble() {
     (sessionId: string) => {
       const currentPhase = phaseRef.current
       const currentId = transitionIdRef.current
+      traceBubbleEvent('animation-complete', {
+        transitionId: currentId,
+        details: { phase: currentPhase, sessionId },
+      })
 
       // If this was an incremental entry row
       if (incrementalEntriesRef.current[sessionId]) {
@@ -1523,6 +1584,7 @@ export default function MascotBubble() {
           setPhase('visible')
           phaseRef.current = 'visible'
           logBubbleDev(`[bubble ${currentId}] multi-row visible`)
+          traceBubbleEvent('visible', { transitionId: currentId })
           if (activeMotionTokensRef.current.size === 0) {
             scheduleStableGeometrySync()
           }
@@ -1546,6 +1608,7 @@ export default function MascotBubble() {
           knownSessionIdsRef.current.clear()
           seenTurnKeysRef.current.clear()
           logBubbleDev(`[bubble ${currentId}] multi-row exit complete`)
+          traceBubbleEvent('exit-complete', { transitionId: currentId })
           emit('mascot-bubble-exit-complete', { transitionId: currentId }).catch(() => {})
         }
       }
