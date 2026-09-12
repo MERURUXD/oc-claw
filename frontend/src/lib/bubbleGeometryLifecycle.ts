@@ -122,6 +122,7 @@ export function resolveObservedGeometryMode(_opts?: {
   hasActiveMotion?: boolean
   phase?: BubblePhaseLite
 }): BubbleGeometryModeLite {
+  void _opts
   return 'motion'
 }
 
@@ -176,4 +177,18 @@ export function canSettleToStable(opts: {
 export function estimateDetailedBubbleHeight(sessionsCount: number): number {
   if (sessionsCount <= 0) return 60
   return 60 * sessionsCount + 8 * (sessionsCount - 1)
+}
+
+/**
+ * Determines whether the native motion envelope needs upfront expansion
+ * for incremental session rows before their entry animation begins.
+ * Expansion is required if the native window has not yet been sized
+ * or if either the expected width or expected height exceeds the currently synced dimensions.
+ */
+export function shouldExpandIncrementalEnvelope(
+  currentSynced: { width: number; height: number } | null,
+  expected: { width: number; height: number }
+): boolean {
+  if (!currentSynced) return true
+  return expected.width > currentSynced.width || expected.height > currentSynced.height
 }

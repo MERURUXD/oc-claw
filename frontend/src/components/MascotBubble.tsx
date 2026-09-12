@@ -25,6 +25,7 @@ import {
   estimateDetailedBubbleHeight,
   isIncrementalMotionActive,
   resolveObservedGeometryMode,
+  shouldExpandIncrementalEnvelope,
   shouldGateIncrementalResizeObserver,
   type GeometryLifecycleSnapshot,
 } from '../lib/bubbleGeometryLifecycle'
@@ -1255,8 +1256,14 @@ export default function MascotBubble() {
             }
 
             // Calculate final required motion envelope once upfront
-            const currentW = Math.ceil(contentRef.current?.offsetWidth ?? BUBBLE_WIDTH.min)
-            const currentH = Math.ceil(contentRef.current?.offsetHeight ?? 60)
+            const currentW = Math.max(
+              Math.ceil(contentRef.current?.offsetWidth ?? BUBBLE_WIDTH.min),
+              lastSyncedGeometryRef.current?.width ?? 0
+            )
+            const currentH = Math.max(
+              Math.ceil(contentRef.current?.offsetHeight ?? 60),
+              lastSyncedGeometryRef.current?.height ?? 0
+            )
             const { width: expectedW, height: expectedH } = measureExpectedStackDimensions(
               currentSessions,
               currentW,
@@ -1265,14 +1272,21 @@ export default function MascotBubble() {
 
             incrementalEnvelopePreparedRef.current = true
 
-            // Expand to motion geometry before row begins flight to guarantee envelope
-            if (currentGeometryModeRef.current !== 'motion') {
+            // Expand native motion envelope before row begins flight if required
+            const needsExpansion =
+              currentGeometryModeRef.current !== 'motion' ||
+              shouldExpandIncrementalEnvelope(lastSyncedGeometryRef.current, {
+                width: expectedW,
+                height: expectedH,
+              })
+
+            if (needsExpansion) {
               syncBubbleGeometry('motion', {
                 preserveAnchor: true,
                 reason: 'incremental-motion-envelope',
                 width: expectedW,
                 height: expectedH,
-              }).then(() => {
+              }).finally(() => {
                 requestAnimationFrame(() => {
                   requestAnimationFrame(() => {
                     startIncrementalEntry()
