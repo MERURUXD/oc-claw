@@ -96,6 +96,9 @@ static BUBBLE_GEOMETRY: Mutex<BubbleGeometryState> = Mutex::new(BubbleGeometrySt
 });
 /// Tracks whether the mini window is currently expanded into the message/settings panel.
 static MINI_IS_EXPANDED: AtomicBool = AtomicBool::new(false);
+/// Controls the cursor hit-test passthrough thread for the mascot status bubble window.
+static BUBBLE_PASSTHROUGH_ACTIVE: AtomicBool = AtomicBool::new(false);
+static BUBBLE_PASSTHROUGH_THREAD_ALIVE: AtomicBool = AtomicBool::new(false);
 
 
 /// Coalesces drag-apply tasks so we never queue more than one
@@ -12262,7 +12265,16 @@ async fn sync_mascot_bubble(
     top_details.push(("topmost_before", &top_before_str));
 
     bubble_trace::trace("rust", "topmost-request", transition_id, &top_details);
-    let _ = win.set_always_on_top(want_top);
+    #[cfg(target_os = "windows")]
+    {
+        if is_top_before != Some(want_top) {
+            let _ = win.set_always_on_top(want_top);
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = win.set_always_on_top(want_top);
+    }
     Ok(())
 }
 
@@ -12561,6 +12573,110 @@ fn get_bubble_runtime_trace() -> bool {
     bubble_trace::is_enabled()
 }
 
+/// Pure helper to hit-test whether screen cursor coordinates fall within the resting card bounds.
+fn is_cursor_over_bubble_card(
+    cursor_x: f64,
+    cursor_y: f64,
+    card_right: f64,
+    card_bottom: f64,
+    width: f64,
+    height: f64,
+    scale: f64,
+) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = scale;
+        let left = card_right - width;
+        let right = card_right;
+        let bottom = card_bottom;
+        let top = card_bottom + height;
+        cursor_x >= left && cursor_x <= right && cursor_y >= bottom && cursor_y <= top
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let left = (card_right - width) * scale;
+        let right = card_right * scale;
+        let top = (card_bottom - height) * scale;
+        let bottom = card_bottom * scale;
+        cursor_x >= left && cursor_x <= right && cursor_y >= top && cursor_y <= bottom
+    }
+}
+
+/// Polls the cursor position and toggles `set_ignore_cursor_events` on the mascot bubble window.
+/// While the bubble window holds a persistent motion envelope, clicks outside the resting card
+/// pass directly through to whatever window or desktop surface is underneath, while clicks within
+/// the resting card reach the webview (allowing interaction/details expansion).
+fn bubble_passthrough_poll(app: tauri::AppHandle) {
+    use std::time::Duration;
+
+    BUBBLE_PASSTHROUGH_THREAD_ALIVE.store(true, Ordering::SeqCst);
+    let mut last_interactive: Option<bool> = None;
+
+    while BUBBLE_PASSTHROUGH_ACTIVE.load(Ordering::SeqCst) {
+        let Some(win) = app.get_webview_window("mascot-bubble") else {
+            break;
+        };
+
+        let is_visible = win.is_visible().unwrap_or(false);
+        if !is_visible {
+            std::thread::sleep(Duration::from_millis(40));
+            continue;
+        }
+
+        let geom_opt = {
+            let geom = BUBBLE_GEOMETRY.lock().unwrap();
+            geom.anchor.map(|a| (a.card_right, a.card_bottom, geom.width, geom.height))
+        };
+
+        if let Some((card_right, card_bottom, width, height)) = geom_opt {
+            let scale = win.scale_factor().unwrap_or(1.0);
+
+            #[cfg(target_os = "windows")]
+            let cursor_opt = {
+                use windows::Win32::Foundation::POINT;
+                use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+                let mut pt = POINT::default();
+                if unsafe { GetCursorPos(&mut pt).is_ok() } {
+                    Some((pt.x as f64, pt.y as f64))
+                } else {
+                    None
+                }
+            };
+
+            #[cfg(target_os = "macos")]
+            let cursor_opt = Some(macos_cursor_position());
+
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+            let cursor_opt: Option<(f64, f64)> = None;
+
+            let is_over_card = match cursor_opt {
+                Some((cx, cy)) => is_cursor_over_bubble_card(cx, cy, card_right, card_bottom, width, height, scale),
+                None => true,
+            };
+
+            if last_interactive != Some(is_over_card) {
+                bubble_trace::trace(
+                    "rust",
+                    "bubble-passthrough-toggle",
+                    None,
+                    &[
+                        ("interactive", if is_over_card { "true" } else { "false" }),
+                    ],
+                );
+                let _ = win.set_ignore_cursor_events(!is_over_card);
+                last_interactive = Some(is_over_card);
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    if let Some(win) = app.get_webview_window("mascot-bubble") {
+        let _ = win.set_ignore_cursor_events(false);
+    }
+    BUBBLE_PASSTHROUGH_THREAD_ALIVE.store(false, Ordering::SeqCst);
+}
+
 /// Show or hide the mascot status bubble. `visible=true` spawns the window on
 /// first use, refuses to show while any presentation suppression reason is
 /// active (returning "suppressed"),
@@ -12602,20 +12718,30 @@ async fn set_mascot_bubble_visible(app: tauri::AppHandle, visible: bool) -> Resu
         );
 
         let result = if visible && PRESENTATION.active() {
+            BUBBLE_PASSTHROUGH_ACTIVE.store(false, Ordering::SeqCst);
             Ok("suppressed".to_string())
         } else if let Some(win) = win_opt {
             if visible {
                 win.show().map(|_| {
                     reassert_mini_floating(&presentation_app);
+                    BUBBLE_PASSTHROUGH_ACTIVE.store(true, Ordering::SeqCst);
+                    if !BUBBLE_PASSTHROUGH_THREAD_ALIVE.load(Ordering::SeqCst) {
+                        let app_poll = presentation_app.clone();
+                        std::thread::spawn(move || bubble_passthrough_poll(app_poll));
+                    }
                     "shown".to_string()
                 }).map_err(|e| e.to_string())
             } else {
                 win.hide().map(|_| {
+                    BUBBLE_PASSTHROUGH_ACTIVE.store(false, Ordering::SeqCst);
                     BUBBLE_GEOMETRY.lock().unwrap().anchor = None;
                     "hidden".to_string()
                 }).map_err(|e| e.to_string())
             }
-        } else { Ok("hidden".to_string()) };
+        } else {
+            BUBBLE_PASSTHROUGH_ACTIVE.store(false, Ordering::SeqCst);
+            Ok("hidden".to_string())
+        };
 
         let result_str = match &result {
             Ok(s) => s.as_str(),
@@ -23326,5 +23452,40 @@ mod fullscreen_bubble_suppression_tests {
             (Some(fs), Some(mini)) if fs == mini
         );
         assert!(!none_monitor, "Missing monitor must NOT trigger suppression");
+    }
+
+    #[test]
+    fn test_is_cursor_over_bubble_card_hit_testing() {
+        let card_right = 800.0;
+        let card_bottom = 600.0;
+        let width = 200.0;
+        let height = 80.0;
+        let scale = 1.5;
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Inside card: center
+            assert!(is_cursor_over_bubble_card(1050.0, 840.0, card_right, card_bottom, width, height, scale));
+            // Inside card: corners
+            assert!(is_cursor_over_bubble_card(900.0, 780.0, card_right, card_bottom, width, height, scale));
+            assert!(is_cursor_over_bubble_card(1200.0, 900.0, card_right, card_bottom, width, height, scale));
+
+            // Outside card: left (in transparent reserve area)
+            assert!(!is_cursor_over_bubble_card(800.0, 840.0, card_right, card_bottom, width, height, scale));
+            // Outside card: top (in transparent reserve area)
+            assert!(!is_cursor_over_bubble_card(1050.0, 700.0, card_right, card_bottom, width, height, scale));
+            // Outside card: right
+            assert!(!is_cursor_over_bubble_card(1250.0, 840.0, card_right, card_bottom, width, height, scale));
+            // Outside card: bottom
+            assert!(!is_cursor_over_bubble_card(1050.0, 950.0, card_right, card_bottom, width, height, scale));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            // Inside card (logical coordinates, bottom-left origin: card_bottom..card_bottom+height)
+            assert!(is_cursor_over_bubble_card(700.0, 640.0, card_right, card_bottom, width, height, scale));
+            // Outside card
+            assert!(!is_cursor_over_bubble_card(500.0, 640.0, card_right, card_bottom, width, height, scale));
+        }
     }
 }

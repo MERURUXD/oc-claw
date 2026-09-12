@@ -108,21 +108,21 @@ export function applyDeferredStable(
       pendingGeneration: null,
       pendingTransitionId: null,
     },
-    shouldShrinkToStable: true,
+    // Under persistent envelope architecture, native window never shrinks to stable
+    shouldShrinkToStable: false,
   }
 }
 
-/** ResizeObserver / coalesced sync must obey the gate. */
-export function resolveObservedGeometryMode(opts: {
-  stableGeometryAllowed: boolean
-  hasActiveMotion: boolean
-  phase: BubblePhaseLite
+/**
+ * Under persistent envelope architecture, observed geometry mode remains 'motion'
+ * so the window always preserves its motion envelope without shrinking.
+ */
+export function resolveObservedGeometryMode(_opts?: {
+  stableGeometryAllowed?: boolean
+  hasActiveMotion?: boolean
+  phase?: BubblePhaseLite
 }): BubbleGeometryModeLite {
-  if (opts.phase === 'prepared' || opts.phase === 'hidden') return 'motion'
-  if (!opts.stableGeometryAllowed) return 'motion'
-  if (opts.hasActiveMotion) return 'motion'
-  if (opts.phase !== 'visible') return 'motion'
-  return 'stable'
+  return 'motion'
 }
 
 /** Whether any incremental entry row motion is currently in flight. */

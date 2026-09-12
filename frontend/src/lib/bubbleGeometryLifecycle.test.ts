@@ -13,7 +13,7 @@ import {
   shouldGateIncrementalResizeObserver,
 } from './bubbleGeometryLifecycle.ts'
 
-test('1. Normal settle: motion → schedule → double-rAF apply opens gate and shrinks', () => {
+test('1. Normal settle: motion → schedule → double-rAF apply marks settled without native shrink', () => {
   let s = createGeometryLifecycle(1)
   s = beginGeometryMotion(s, 1)
   assert.equal(s.stableGeometryAllowed, false)
@@ -21,7 +21,6 @@ test('1. Normal settle: motion → schedule → double-rAF apply opens gate and 
 
   const { state: scheduled, ticket } = scheduleDeferredStable(s)
   s = scheduled
-  // Before apply, RO must stay on motion envelope even if phase looks visible and tokens empty
   assert.equal(
     resolveObservedGeometryMode({
       stableGeometryAllowed: s.stableGeometryAllowed,
@@ -33,7 +32,8 @@ test('1. Normal settle: motion → schedule → double-rAF apply opens gate and 
 
   const applied = applyDeferredStable(s, ticket, { phase: 'visible', hasActiveMotion: false })
   s = applied.state
-  assert.equal(applied.shouldShrinkToStable, true)
+  // Under persistent envelope architecture, native window never shrinks to stable
+  assert.equal(applied.shouldShrinkToStable, false)
   assert.equal(s.stableGeometryAllowed, true)
   assert.equal(
     resolveObservedGeometryMode({
@@ -41,7 +41,7 @@ test('1. Normal settle: motion → schedule → double-rAF apply opens gate and 
       hasActiveMotion: false,
       phase: 'visible',
     }),
-    'stable',
+    'motion',
   )
 })
 
@@ -66,7 +66,7 @@ test('3. Fast re-enter: old deferred rAF is dirty against new generation/transit
 
   const second = scheduleDeferredStable(s)
   const ok = applyDeferredStable(second.state, second.ticket, { phase: 'visible', hasActiveMotion: false })
-  assert.equal(ok.shouldShrinkToStable, true)
+  assert.equal(ok.shouldShrinkToStable, false)
   assert.equal(ok.state.stableGeometryAllowed, true)
 })
 
@@ -75,7 +75,7 @@ test('4. Width retarget while settling: RO stays motion until deferred apply', (
   s = beginGeometryMotion(s, 3)
   const { state: scheduled } = scheduleDeferredStable(s)
   s = scheduled
-  // Simulate width retarget RO while gate still closed
+  // Under persistent envelope, RO always maintains motion envelope
   assert.equal(
     resolveObservedGeometryMode({
       stableGeometryAllowed: s.stableGeometryAllowed,
@@ -102,7 +102,8 @@ test('5. Multi-session: only final settle (no active motion) may open gate', () 
     phase: 'visible',
     hasActiveMotion: false,
   })
-  assert.equal(done.shouldShrinkToStable, true)
+  assert.equal(done.shouldShrinkToStable, false)
+  assert.equal(done.state.stableGeometryAllowed, true)
 })
 
 test('6. Dirty rAF after cancelDeferredStable / generation bump', () => {

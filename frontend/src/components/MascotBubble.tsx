@@ -19,16 +19,13 @@ import {
   resolveBubbleWidthTarget,
 } from '../lib/bubbleWidth'
 import {
-  applyDeferredStable,
   beginGeometryMotion,
   canSettleToStable,
   createGeometryLifecycle,
   estimateDetailedBubbleHeight,
   isIncrementalMotionActive,
   resolveObservedGeometryMode,
-  scheduleDeferredStable,
   shouldGateIncrementalResizeObserver,
-  type DeferredStableTicket,
   type GeometryLifecycleSnapshot,
 } from '../lib/bubbleGeometryLifecycle'
 import { traceBubbleEvent } from '../lib/bubbleTrace'
@@ -1037,17 +1034,10 @@ export default function MascotBubble() {
   }, [])
 
 
-  // Unified geometry lifecycle: gate + generation-guarded deferred stable (sole shrink authority).
+  // Unified geometry lifecycle
   const geometryLifecycleRef = useRef<GeometryLifecycleSnapshot>(createGeometryLifecycle())
-  const stableSyncRafRef = useRef<number | null>(null)
-  const pendingStableTicketRef = useRef<DeferredStableTicket | null>(null)
 
   const cancelScheduledStableGeometrySync = useCallback(() => {
-    if (stableSyncRafRef.current != null) {
-      cancelAnimationFrame(stableSyncRafRef.current)
-      stableSyncRafRef.current = null
-    }
-    pendingStableTicketRef.current = null
     const cur = geometryLifecycleRef.current
     geometryLifecycleRef.current = {
       ...cur,
@@ -1064,50 +1054,8 @@ export default function MascotBubble() {
     )
   }, [cancelScheduledStableGeometrySync])
 
-  /** Completion callbacks only update lifecycle; this is the sole path that may shrink to stable. */
-  const scheduleStableGeometrySync = useCallback(() => {
-    cancelScheduledStableGeometrySync()
-    const scheduled = scheduleDeferredStable(geometryLifecycleRef.current)
-    geometryLifecycleRef.current = scheduled.state
-    const ticket = scheduled.ticket
-    pendingStableTicketRef.current = ticket
-    traceBubbleEvent('stable-sync-scheduled', {
-      transitionId: ticket.transitionId,
-      details: { gen: ticket.generation },
-    })
-    stableSyncRafRef.current = requestAnimationFrame(() => {
-      traceBubbleEvent('stable-sync-raf1', {
-        transitionId: ticket.transitionId,
-        details: { gen: ticket.generation },
-      })
-      stableSyncRafRef.current = requestAnimationFrame(() => {
-        traceBubbleEvent('stable-sync-raf2', {
-          transitionId: ticket.transitionId,
-          details: { gen: ticket.generation },
-        })
-        stableSyncRafRef.current = null
-        const pending = pendingStableTicketRef.current
-        if (!pending || pending.generation !== ticket.generation || pending.transitionId !== ticket.transitionId) {
-          return
-        }
-        const applied = applyDeferredStable(geometryLifecycleRef.current, ticket, {
-          phase: phaseRef.current,
-          hasActiveMotion: activeMotionTokensRef.current.size > 0,
-        })
-        geometryLifecycleRef.current = applied.state
-        pendingStableTicketRef.current = null
-        if (applied.shouldShrinkToStable) {
-          traceBubbleEvent('stable-sync-request', {
-            transitionId: ticket.transitionId,
-            details: { gen: ticket.generation },
-          })
-          syncBubbleGeometry('stable', { preserveAnchor: true, reason: 'stable-deferred' })
-        }
-      })
-    })
-  }, [cancelScheduledStableGeometrySync, syncBubbleGeometry])
-
-  // Centralized controller: verifies all preconditions before permitting stable shrink
+  // Centralized controller: verifies all preconditions when settling in visible state.
+  // Under persistent envelope architecture, the window remains in motion envelope without shrinking.
   const maybeScheduleStableSettle = useCallback(() => {
     const canSettle = canSettleToStable({
       phase: phaseRef.current,
@@ -1118,8 +1066,12 @@ export default function MascotBubble() {
     if (!canSettle) return
 
     incrementalEnvelopePreparedRef.current = false
-    scheduleStableGeometrySync()
-  }, [scheduleStableGeometrySync])
+    cancelScheduledStableGeometrySync()
+    traceBubbleEvent('settled', {
+      transitionId: transitionIdRef.current,
+      details: { mode: 'persistent-envelope' },
+    })
+  }, [cancelScheduledStableGeometrySync])
 
   // Measure geometry and notify Mini that the bubble is ready to be natively shown
   const syncGeometryAndNotifyReady = useCallback((tid: number) => {
@@ -1369,15 +1321,7 @@ export default function MascotBubble() {
             phaseRef.current = 'exiting'
           }
 
-          if (currentGeometryModeRef.current === 'stable') {
-            syncBubbleGeometry('motion', { preserveAnchor: true }).then(() => {
-              requestAnimationFrame(() => {
-                startExit()
-              })
-            })
-          } else {
-            startExit()
-          }
+          startExit()
         }
       }
     }).then((fn) => {
@@ -1405,15 +1349,7 @@ export default function MascotBubble() {
         phaseRef.current = 'exiting'
       }
 
-      if (currentGeometryModeRef.current === 'stable') {
-        syncBubbleGeometry('motion', { preserveAnchor: true }).then(() => {
-          requestAnimationFrame(() => {
-            startExit()
-          })
-        })
-      } else {
-        startExit()
-      }
+      startExit()
     }).then((fn) => {
       if (disposed) fn()
       else unlistenClose = fn
@@ -1429,7 +1365,7 @@ export default function MascotBubble() {
       cancelScheduledStableGeometrySync()
       incrementalEnvelopePreparedRef.current = false
     }
-  }, [syncBubbleGeometry, beginStableGeometryMotion])
+  }, [syncBubbleGeometry, beginStableGeometryMotion, cancelScheduledStableGeometrySync])
 
   // The active payload to render (retain last valid summary during exiting so DOM does not collapse early)
   const displaySummary = summary || (phase === 'exiting' ? lastValidSummaryRef.current : null)
@@ -1680,8 +1616,9 @@ export default function MascotBubble() {
         delete incrementalEntriesRef.current[sessionId]
         setIncrementalEntries((prev) => {
           if (!prev[sessionId]) return prev
-          const { [sessionId]: _, ...rest } = prev
-          return rest
+          const next = { ...prev }
+          delete next[sessionId]
+          return next
         })
         maybeScheduleStableSettle()
       }
