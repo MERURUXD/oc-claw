@@ -4,9 +4,13 @@ import {
   applyDeferredStable,
   beginGeometryMotion,
   cancelDeferredStable,
+  canSettleToStable,
   createGeometryLifecycle,
+  estimateDetailedBubbleHeight,
+  isIncrementalMotionActive,
   resolveObservedGeometryMode,
   scheduleDeferredStable,
+  shouldGateIncrementalResizeObserver,
 } from './bubbleGeometryLifecycle.ts'
 
 test('1. Normal settle: motion → schedule → double-rAF apply opens gate and shrinks', () => {
@@ -108,4 +112,114 @@ test('6. Dirty rAF after cancelDeferredStable / generation bump', () => {
   s = cancelDeferredStable(scheduled)
   const applied = applyDeferredStable(s, ticket, { phase: 'visible', hasActiveMotion: false })
   assert.equal(applied.shouldShrinkToStable, false)
+})
+
+test('7. Incremental motion detection: recognizes incremental tokens', () => {
+  assert.equal(isIncrementalMotionActive(new Set(['global-entry'])), false)
+  assert.equal(isIncrementalMotionActive(new Set(['global-exit'])), false)
+  assert.equal(isIncrementalMotionActive(new Set()), false)
+  assert.equal(isIncrementalMotionActive(new Set(['incremental:session-1'])), true)
+  assert.equal(isIncrementalMotionActive(new Set(['global-entry', 'incremental:session-2'])), true)
+})
+
+test('8. ResizeObserver gating during incremental motion', () => {
+  // Gated ONLY when both incremental motion is active AND envelope is prepared
+  assert.equal(
+    shouldGateIncrementalResizeObserver({
+      hasIncrementalMotion: true,
+      incrementalEnvelopePrepared: true,
+    }),
+    true
+  )
+  // Not gated if envelope has not been prepared yet
+  assert.equal(
+    shouldGateIncrementalResizeObserver({
+      hasIncrementalMotion: true,
+      incrementalEnvelopePrepared: false,
+    }),
+    false
+  )
+  // Not gated if incremental motion has completed
+  assert.equal(
+    shouldGateIncrementalResizeObserver({
+      hasIncrementalMotion: false,
+      incrementalEnvelopePrepared: true,
+    }),
+    false
+  )
+  assert.equal(
+    shouldGateIncrementalResizeObserver({
+      hasIncrementalMotion: false,
+      incrementalEnvelopePrepared: false,
+    }),
+    false
+  )
+})
+
+test('9. Stable settle gating: decouples row completion from window settle', () => {
+  // Disallowed if phase is not visible
+  assert.equal(
+    canSettleToStable({
+      phase: 'entering',
+      activeMotionTokensCount: 0,
+      pendingIncrementalCount: 0,
+      isWidthAnimating: false,
+    }),
+    false
+  )
+
+  // Disallowed if active motion tokens still exist (e.g. other incremental rows)
+  assert.equal(
+    canSettleToStable({
+      phase: 'visible',
+      activeMotionTokensCount: 1,
+      pendingIncrementalCount: 0,
+      isWidthAnimating: false,
+    }),
+    false
+  )
+
+  // Disallowed if pending incremental row entries exist
+  assert.equal(
+    canSettleToStable({
+      phase: 'visible',
+      activeMotionTokensCount: 0,
+      pendingIncrementalCount: 1,
+      isWidthAnimating: false,
+    }),
+    false
+  )
+
+  // Disallowed while width spring is still animating
+  assert.equal(
+    canSettleToStable({
+      phase: 'visible',
+      activeMotionTokensCount: 0,
+      pendingIncrementalCount: 0,
+      isWidthAnimating: true,
+    }),
+    false
+  )
+
+  // Allowed only when all conditions are satisfied
+  assert.equal(
+    canSettleToStable({
+      phase: 'visible',
+      activeMotionTokensCount: 0,
+      pendingIncrementalCount: 0,
+      isWidthAnimating: false,
+    }),
+    true
+  )
+})
+
+test('10. Detailed bubble height estimation', () => {
+  assert.equal(estimateDetailedBubbleHeight(0), 60)
+  assert.equal(estimateDetailedBubbleHeight(1), 60)
+  // 2 rows: 60 + 8 + 60 = 128px
+  assert.equal(estimateDetailedBubbleHeight(2), 128)
+  // 3 rows: 60 + 8 + 60 + 8 + 60 = 196px
+  assert.equal(estimateDetailedBubbleHeight(3), 196)
+  // 4 rows: 60*4 + 8*3 = 264px
+  assert.equal(estimateDetailedBubbleHeight(4), 264)
 })

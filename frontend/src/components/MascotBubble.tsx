@@ -15,14 +15,19 @@ import { isSameBubblePayload } from '../lib/sessionActivity'
 import {
   BUBBLE_WIDTH,
   BUBBLE_WIDTH_MOTION,
+  clampBubbleWidth,
   resolveBubbleWidthTarget,
 } from '../lib/bubbleWidth'
 import {
   applyDeferredStable,
   beginGeometryMotion,
+  canSettleToStable,
   createGeometryLifecycle,
+  estimateDetailedBubbleHeight,
+  isIncrementalMotionActive,
   resolveObservedGeometryMode,
   scheduleDeferredStable,
+  shouldGateIncrementalResizeObserver,
   type DeferredStableTicket,
   type GeometryLifecycleSnapshot,
 } from '../lib/bubbleGeometryLifecycle'
@@ -831,6 +836,63 @@ function MeasureSessionBubbleRow({
  *   6. When closing, Mini emits `mascot-bubble-close`. MascotBubble expands back to motion mode, springs to (-150, -95)
  *      with concurrent opacity fade-out, and on animation completion emits `mascot-bubble-exit-complete`.
  */
+function measureExpectedStackDimensions(
+  sessions: BubbleSessionDetail[],
+  currentWidth: number,
+  currentHeight: number
+): { width: number; height: number } {
+  const expectedH = estimateDetailedBubbleHeight(sessions.length)
+  const height = Math.max(currentHeight, expectedH)
+
+  // In browser environment, measure unconstrained width via offscreen container
+  let measuredW = currentWidth
+  if (typeof document !== 'undefined') {
+    let container = document.getElementById('mascot-bubble-measure-scratch')
+    if (!container) {
+      container = document.createElement('div')
+      container.id = 'mascot-bubble-measure-scratch'
+      container.className = 'mascot-bubble-stack'
+      container.style.position = 'fixed'
+      container.style.top = '-9999px'
+      container.style.left = '-9999px'
+      container.style.visibility = 'hidden'
+      container.style.pointerEvents = 'none'
+      container.style.width = 'max-content'
+      document.body.appendChild(container)
+    }
+
+    let html = ''
+    for (const s of sessions) {
+      const escapedTitle = (s.title || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+      html += `
+        <div class="mascot-bubble-row-motion">
+          <div class="mascot-bubble-detailed">
+            <div class="mascot-bubble-content">
+              <div class="mascot-bubble-title-line">
+                <div class="mascot-bubble-title-wrapper">
+                  <span class="mascot-bubble-main-title" style="white-space: nowrap;">${escapedTitle}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      `
+    }
+    container.innerHTML = html
+    const measured = Math.ceil(container.offsetWidth)
+    if (measured > 0) {
+      measuredW = clampBubbleWidth(measured)
+    }
+  }
+
+  const width = Math.max(currentWidth, measuredW)
+  return { width, height }
+}
+
 export default function MascotBubble() {
   const { t } = useTranslation()
   const prefersReducedMotion = useReducedMotion()
@@ -857,6 +919,7 @@ export default function MascotBubble() {
   // Active motion tracking and transient envelope mode
   const activeMotionTokensRef = useRef<Set<string>>(new Set())
   const currentGeometryModeRef = useRef<BubbleGeometryMode>('motion')
+  const incrementalEnvelopePreparedRef = useRef<boolean>(false)
 
   // Multi-row completion tracking
   const enteringCompletedSessionIdsRef = useRef<Set<string>>(new Set())
@@ -940,11 +1003,15 @@ export default function MascotBubble() {
   }, [])
 
   // Unified geometry synchronization helper
-  const syncBubbleGeometry = useCallback((mode: BubbleGeometryMode, options?: { preserveAnchor?: boolean; reason?: string }) => {
+  const syncBubbleGeometry = useCallback((mode: BubbleGeometryMode, options?: {
+    preserveAnchor?: boolean
+    reason?: string
+    width?: number
+    height?: number
+  }) => {
     const el = contentRef.current
-    if (!el) return Promise.resolve()
-    const width = Math.ceil(el.offsetWidth)
-    const height = Math.ceil(el.offsetHeight)
+    const width = options?.width ?? (el ? Math.ceil(el.offsetWidth) : 0)
+    const height = options?.height ?? (el ? Math.ceil(el.offsetHeight) : 0)
     if (width <= 0 || height <= 0) return Promise.resolve()
 
     currentGeometryModeRef.current = mode
@@ -957,7 +1024,7 @@ export default function MascotBubble() {
     const tid = transitionIdRef.current
     const reason = options?.reason ?? (mode === 'stable' ? 'stable' : 'motion')
 
-    logBubbleDev(`[bubble] syncBubbleGeometry mode=${mode} size=${width}x${height} offset=${entryOffsetX}x${entryOffsetY} preserve=${preserveAnchor}`)
+    logBubbleDev(`[bubble] syncBubbleGeometry mode=${mode} size=${width}x${height} offset=${entryOffsetX}x${entryOffsetY} preserve=${preserveAnchor} reason=${reason}`)
     return invoke('sync_mascot_bubble', {
       width,
       height,
@@ -1040,6 +1107,20 @@ export default function MascotBubble() {
     })
   }, [cancelScheduledStableGeometrySync, syncBubbleGeometry])
 
+  // Centralized controller: verifies all preconditions before permitting stable shrink
+  const maybeScheduleStableSettle = useCallback(() => {
+    const canSettle = canSettleToStable({
+      phase: phaseRef.current,
+      activeMotionTokensCount: activeMotionTokensRef.current.size,
+      pendingIncrementalCount: Object.keys(incrementalEntriesRef.current).length,
+      isWidthAnimating: isWidthAnimatingRef.current,
+    })
+    if (!canSettle) return
+
+    incrementalEnvelopePreparedRef.current = false
+    scheduleStableGeometrySync()
+  }, [scheduleStableGeometrySync])
+
   // Measure geometry and notify Mini that the bubble is ready to be natively shown
   const syncGeometryAndNotifyReady = useCallback((tid: number) => {
     const el = contentRef.current
@@ -1104,6 +1185,7 @@ export default function MascotBubble() {
       activeMotionTokensRef.current.clear()
       activeMotionTokensRef.current.add('global-entry')
       currentGeometryModeRef.current = 'motion'
+      incrementalEnvelopePreparedRef.current = false
       setIncrementalEntries({})
       incrementalEntriesRef.current = {}
 
@@ -1203,6 +1285,11 @@ export default function MascotBubble() {
 
             const startIncrementalEntry = () => {
               if (disposed) return
+              newIncrementalIds.forEach((id, newIdx) => {
+                incrementalEntriesRef.current[id] = {
+                  delay: Math.min(newIdx, 3) * BUBBLE_MOTION.staggerDelay,
+                }
+              })
               setIncrementalEntries((prev) => {
                 const next = { ...prev }
                 newIncrementalIds.forEach((id, newIdx) => {
@@ -1215,9 +1302,25 @@ export default function MascotBubble() {
               setSummary(p)
             }
 
+            // Calculate final required motion envelope once upfront
+            const currentW = Math.ceil(contentRef.current?.offsetWidth ?? BUBBLE_WIDTH.min)
+            const currentH = Math.ceil(contentRef.current?.offsetHeight ?? 60)
+            const { width: expectedW, height: expectedH } = measureExpectedStackDimensions(
+              currentSessions,
+              currentW,
+              currentH
+            )
+
+            incrementalEnvelopePreparedRef.current = true
+
             // Expand to motion geometry before row begins flight to guarantee envelope
             if (currentGeometryModeRef.current !== 'motion') {
-              syncBubbleGeometry('motion', { preserveAnchor: true }).then(() => {
+              syncBubbleGeometry('motion', {
+                preserveAnchor: true,
+                reason: 'incremental-motion-envelope',
+                width: expectedW,
+                height: expectedH,
+              }).then(() => {
                 requestAnimationFrame(() => {
                   requestAnimationFrame(() => {
                     startIncrementalEntry()
@@ -1291,6 +1394,7 @@ export default function MascotBubble() {
       logBubbleDev(`[bubble ${transitionIdRef.current}] close`)
       traceBubbleEvent('close', { transitionId: transitionIdRef.current })
       beginStableGeometryMotion(transitionIdRef.current)
+      incrementalEnvelopePreparedRef.current = false
       if (phaseRef.current === 'hidden') return
       exitingCompletedSessionIdsRef.current.clear()
       activeMotionTokensRef.current.add('global-exit')
@@ -1323,6 +1427,7 @@ export default function MascotBubble() {
       unlistenClose?.()
       if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current)
       cancelScheduledStableGeometrySync()
+      incrementalEnvelopePreparedRef.current = false
     }
   }, [syncBubbleGeometry, beginStableGeometryMotion])
 
@@ -1428,6 +1533,19 @@ export default function MascotBubble() {
       const height = Math.ceil(target.offsetHeight)
       if (width <= 0 || height <= 0) return
 
+      // Gate native sync during incremental motion: envelope was prepared once upfront,
+      // so domestic spring animations must not flood SetWindowPos.
+      const hasIncrementalMotion = isIncrementalMotionActive(activeMotionTokensRef.current)
+      if (
+        shouldGateIncrementalResizeObserver({
+          hasIncrementalMotion,
+          incrementalEnvelopePrepared: incrementalEnvelopePreparedRef.current,
+        })
+      ) {
+        lastSizeRef.current = { width, height }
+        return
+      }
+
       const isMotionActive = activeMotionTokensRef.current.size > 0
       const targetMode: BubbleGeometryMode = resolveObservedGeometryMode({
         stableGeometryAllowed: geometryLifecycleRef.current.stableGeometryAllowed,
@@ -1508,10 +1626,10 @@ export default function MascotBubble() {
       phaseRef.current = 'visible'
       logBubbleDev(`[bubble ${currentId}] visible (reduced-motion)`)
       traceBubbleEvent('visible', { transitionId: currentId, details: { mode: 'reduced-motion' } })
-      scheduleStableGeometrySync()
+      maybeScheduleStableSettle()
       emit('mascot-bubble-visible', { transitionId: currentId }).catch(() => {})
     }
-  }, [prefersReducedMotion, phase, scheduleStableGeometrySync])
+  }, [prefersReducedMotion, phase, maybeScheduleStableSettle])
 
   const handleAnimationComplete = useCallback(() => {
     // If multi-session, row animations control phase completion
@@ -1530,9 +1648,7 @@ export default function MascotBubble() {
       phaseRef.current = 'visible'
       logBubbleDev(`[bubble ${currentId}] visible`)
       traceBubbleEvent('visible', { transitionId: currentId })
-      if (activeMotionTokensRef.current.size === 0) {
-        scheduleStableGeometrySync()
-      }
+      maybeScheduleStableSettle()
       emit('mascot-bubble-visible', { transitionId: currentId }).catch(() => {})
     } else if (currentPhase === 'exiting') {
       activeMotionTokensRef.current.delete('global-exit')
@@ -1547,7 +1663,7 @@ export default function MascotBubble() {
       traceBubbleEvent('exit-complete', { transitionId: currentId })
       emit('mascot-bubble-exit-complete', { transitionId: currentId }).catch(() => {})
     }
-  }, [scheduleStableGeometrySync])
+  }, [maybeScheduleStableSettle])
 
   const handleRowAnimationComplete = useCallback(
     (sessionId: string) => {
@@ -1561,14 +1677,13 @@ export default function MascotBubble() {
       // If this was an incremental entry row
       if (incrementalEntriesRef.current[sessionId]) {
         activeMotionTokensRef.current.delete(`incremental:${sessionId}`)
+        delete incrementalEntriesRef.current[sessionId]
         setIncrementalEntries((prev) => {
           if (!prev[sessionId]) return prev
           const { [sessionId]: _, ...rest } = prev
           return rest
         })
-        if (activeMotionTokensRef.current.size === 0 && phaseRef.current === 'visible') {
-          scheduleStableGeometrySync()
-        }
+        maybeScheduleStableSettle()
       }
 
       if (!isMultiSessionRef.current) return
@@ -1585,9 +1700,7 @@ export default function MascotBubble() {
           phaseRef.current = 'visible'
           logBubbleDev(`[bubble ${currentId}] multi-row visible`)
           traceBubbleEvent('visible', { transitionId: currentId })
-          if (activeMotionTokensRef.current.size === 0) {
-            scheduleStableGeometrySync()
-          }
+          maybeScheduleStableSettle()
           emit('mascot-bubble-visible', { transitionId: currentId }).catch(() => {})
         }
       } else if (currentPhase === 'exiting') {
@@ -1613,7 +1726,7 @@ export default function MascotBubble() {
         }
       }
     },
-    [scheduleStableGeometrySync]
+    [maybeScheduleStableSettle]
   )
 
   if (!displaySummary || phase === 'hidden') {
@@ -1741,6 +1854,7 @@ export default function MascotBubble() {
               onAnimationComplete={() => {
                 isWidthAnimatingRef.current = false
                 setShouldAnimateWidth(false)
+                maybeScheduleStableSettle()
               }}
             >
               {sessionsToRender.map((session, idx) => {
