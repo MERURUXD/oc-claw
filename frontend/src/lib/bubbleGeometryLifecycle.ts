@@ -108,19 +108,87 @@ export function applyDeferredStable(
       pendingGeneration: null,
       pendingTransitionId: null,
     },
-    shouldShrinkToStable: true,
+    // Under persistent envelope architecture, native window never shrinks to stable
+    shouldShrinkToStable: false,
   }
 }
 
-/** ResizeObserver / coalesced sync must obey the gate. */
-export function resolveObservedGeometryMode(opts: {
-  stableGeometryAllowed: boolean
-  hasActiveMotion: boolean
-  phase: BubblePhaseLite
+/**
+ * Under persistent envelope architecture, observed geometry mode remains 'motion'
+ * so the window always preserves its motion envelope without shrinking.
+ */
+export function resolveObservedGeometryMode(_opts?: {
+  stableGeometryAllowed?: boolean
+  hasActiveMotion?: boolean
+  phase?: BubblePhaseLite
 }): BubbleGeometryModeLite {
-  if (opts.phase === 'prepared' || opts.phase === 'hidden') return 'motion'
-  if (!opts.stableGeometryAllowed) return 'motion'
-  if (opts.hasActiveMotion) return 'motion'
-  if (opts.phase !== 'visible') return 'motion'
-  return 'stable'
+  void _opts
+  return 'motion'
+}
+
+/** Whether any incremental entry row motion is currently in flight. */
+export function isIncrementalMotionActive(
+  activeMotionTokens: Set<string> | Iterable<string>
+): boolean {
+  for (const token of activeMotionTokens) {
+    if (token.startsWith('incremental:')) return true
+  }
+  return false
+}
+
+/**
+ * Gate native ResizeObserver IPC during incremental entry motion once the
+ * envelope has already been expanded upfront, preventing SetWindowPos storms.
+ */
+export function shouldGateIncrementalResizeObserver(opts: {
+  hasIncrementalMotion: boolean
+  incrementalEnvelopePrepared: boolean
+}): boolean {
+  return opts.hasIncrementalMotion && opts.incrementalEnvelopePrepared
+}
+
+/**
+ * Decouples row-level animation completion from window-level settle.
+ * Stable settle is permitted ONLY when:
+ * 1. Bubble phase is visible
+ * 2. No active motion tokens remain
+ * 3. No pending incremental entries exist
+ * 4. Width spring layout has settled
+ */
+export function canSettleToStable(opts: {
+  phase: BubblePhaseLite
+  activeMotionTokensCount: number
+  pendingIncrementalCount: number
+  isWidthAnimating: boolean
+}): boolean {
+  if (opts.phase !== 'visible') return false
+  if (opts.activeMotionTokensCount > 0) return false
+  if (opts.pendingIncrementalCount > 0) return false
+  if (opts.isWidthAnimating) return false
+  return true
+}
+
+/**
+ * Deterministic height estimation for stacked detailed session rows:
+ * - Single row base: 60px (22px padding/border + 38px title & action)
+ * - Inter-row gap: 8px (.mascot-bubble-stack gap)
+ * - N rows: 60 * N + 8 * (N - 1)
+ */
+export function estimateDetailedBubbleHeight(sessionsCount: number): number {
+  if (sessionsCount <= 0) return 60
+  return 60 * sessionsCount + 8 * (sessionsCount - 1)
+}
+
+/**
+ * Determines whether the native motion envelope needs upfront expansion
+ * for incremental session rows before their entry animation begins.
+ * Expansion is required if the native window has not yet been sized
+ * or if either the expected width or expected height exceeds the currently synced dimensions.
+ */
+export function shouldExpandIncrementalEnvelope(
+  currentSynced: { width: number; height: number } | null,
+  expected: { width: number; height: number }
+): boolean {
+  if (!currentSynced) return true
+  return expected.width > currentSynced.width || expected.height > currentSynced.height
 }

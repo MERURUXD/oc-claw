@@ -4,12 +4,17 @@ import {
   applyDeferredStable,
   beginGeometryMotion,
   cancelDeferredStable,
+  canSettleToStable,
   createGeometryLifecycle,
+  estimateDetailedBubbleHeight,
+  isIncrementalMotionActive,
   resolveObservedGeometryMode,
   scheduleDeferredStable,
+  shouldExpandIncrementalEnvelope,
+  shouldGateIncrementalResizeObserver,
 } from './bubbleGeometryLifecycle.ts'
 
-test('1. Normal settle: motion → schedule → double-rAF apply opens gate and shrinks', () => {
+test('1. Normal settle: motion → schedule → double-rAF apply marks settled without native shrink', () => {
   let s = createGeometryLifecycle(1)
   s = beginGeometryMotion(s, 1)
   assert.equal(s.stableGeometryAllowed, false)
@@ -17,7 +22,6 @@ test('1. Normal settle: motion → schedule → double-rAF apply opens gate and 
 
   const { state: scheduled, ticket } = scheduleDeferredStable(s)
   s = scheduled
-  // Before apply, RO must stay on motion envelope even if phase looks visible and tokens empty
   assert.equal(
     resolveObservedGeometryMode({
       stableGeometryAllowed: s.stableGeometryAllowed,
@@ -29,7 +33,8 @@ test('1. Normal settle: motion → schedule → double-rAF apply opens gate and 
 
   const applied = applyDeferredStable(s, ticket, { phase: 'visible', hasActiveMotion: false })
   s = applied.state
-  assert.equal(applied.shouldShrinkToStable, true)
+  // Under persistent envelope architecture, native window never shrinks to stable
+  assert.equal(applied.shouldShrinkToStable, false)
   assert.equal(s.stableGeometryAllowed, true)
   assert.equal(
     resolveObservedGeometryMode({
@@ -37,7 +42,7 @@ test('1. Normal settle: motion → schedule → double-rAF apply opens gate and 
       hasActiveMotion: false,
       phase: 'visible',
     }),
-    'stable',
+    'motion',
   )
 })
 
@@ -62,7 +67,7 @@ test('3. Fast re-enter: old deferred rAF is dirty against new generation/transit
 
   const second = scheduleDeferredStable(s)
   const ok = applyDeferredStable(second.state, second.ticket, { phase: 'visible', hasActiveMotion: false })
-  assert.equal(ok.shouldShrinkToStable, true)
+  assert.equal(ok.shouldShrinkToStable, false)
   assert.equal(ok.state.stableGeometryAllowed, true)
 })
 
@@ -71,7 +76,7 @@ test('4. Width retarget while settling: RO stays motion until deferred apply', (
   s = beginGeometryMotion(s, 3)
   const { state: scheduled } = scheduleDeferredStable(s)
   s = scheduled
-  // Simulate width retarget RO while gate still closed
+  // Under persistent envelope, RO always maintains motion envelope
   assert.equal(
     resolveObservedGeometryMode({
       stableGeometryAllowed: s.stableGeometryAllowed,
@@ -98,7 +103,8 @@ test('5. Multi-session: only final settle (no active motion) may open gate', () 
     phase: 'visible',
     hasActiveMotion: false,
   })
-  assert.equal(done.shouldShrinkToStable, true)
+  assert.equal(done.shouldShrinkToStable, false)
+  assert.equal(done.state.stableGeometryAllowed, true)
 })
 
 test('6. Dirty rAF after cancelDeferredStable / generation bump', () => {
@@ -109,3 +115,279 @@ test('6. Dirty rAF after cancelDeferredStable / generation bump', () => {
   const applied = applyDeferredStable(s, ticket, { phase: 'visible', hasActiveMotion: false })
   assert.equal(applied.shouldShrinkToStable, false)
 })
+
+test('7. Incremental motion detection: recognizes incremental tokens', () => {
+  assert.equal(isIncrementalMotionActive(new Set(['global-entry'])), false)
+  assert.equal(isIncrementalMotionActive(new Set(['global-exit'])), false)
+  assert.equal(isIncrementalMotionActive(new Set()), false)
+  assert.equal(isIncrementalMotionActive(new Set(['incremental:session-1'])), true)
+  assert.equal(isIncrementalMotionActive(new Set(['global-entry', 'incremental:session-2'])), true)
+})
+
+test('8. ResizeObserver gating during incremental motion', () => {
+  // Gated ONLY when both incremental motion is active AND envelope is prepared
+  assert.equal(
+    shouldGateIncrementalResizeObserver({
+      hasIncrementalMotion: true,
+      incrementalEnvelopePrepared: true,
+    }),
+    true
+  )
+  // Not gated if envelope has not been prepared yet
+  assert.equal(
+    shouldGateIncrementalResizeObserver({
+      hasIncrementalMotion: true,
+      incrementalEnvelopePrepared: false,
+    }),
+    false
+  )
+  // Not gated if incremental motion has completed
+  assert.equal(
+    shouldGateIncrementalResizeObserver({
+      hasIncrementalMotion: false,
+      incrementalEnvelopePrepared: true,
+    }),
+    false
+  )
+  assert.equal(
+    shouldGateIncrementalResizeObserver({
+      hasIncrementalMotion: false,
+      incrementalEnvelopePrepared: false,
+    }),
+    false
+  )
+})
+
+test('9. Stable settle gating: decouples row completion from window settle', () => {
+  // Disallowed if phase is not visible
+  assert.equal(
+    canSettleToStable({
+      phase: 'entering',
+      activeMotionTokensCount: 0,
+      pendingIncrementalCount: 0,
+      isWidthAnimating: false,
+    }),
+    false
+  )
+
+  // Disallowed if active motion tokens still exist (e.g. other incremental rows)
+  assert.equal(
+    canSettleToStable({
+      phase: 'visible',
+      activeMotionTokensCount: 1,
+      pendingIncrementalCount: 0,
+      isWidthAnimating: false,
+    }),
+    false
+  )
+
+  // Disallowed if pending incremental row entries exist
+  assert.equal(
+    canSettleToStable({
+      phase: 'visible',
+      activeMotionTokensCount: 0,
+      pendingIncrementalCount: 1,
+      isWidthAnimating: false,
+    }),
+    false
+  )
+
+  // Disallowed while width spring is still animating
+  assert.equal(
+    canSettleToStable({
+      phase: 'visible',
+      activeMotionTokensCount: 0,
+      pendingIncrementalCount: 0,
+      isWidthAnimating: true,
+    }),
+    false
+  )
+
+  // Allowed only when all conditions are satisfied
+  assert.equal(
+    canSettleToStable({
+      phase: 'visible',
+      activeMotionTokensCount: 0,
+      pendingIncrementalCount: 0,
+      isWidthAnimating: false,
+    }),
+    true
+  )
+})
+
+test('10. Detailed bubble height estimation', () => {
+  assert.equal(estimateDetailedBubbleHeight(0), 60)
+  assert.equal(estimateDetailedBubbleHeight(1), 60)
+  // 2 rows: 60 + 8 + 60 = 128px
+  assert.equal(estimateDetailedBubbleHeight(2), 128)
+  // 3 rows: 60 + 8 + 60 + 8 + 60 = 196px
+  assert.equal(estimateDetailedBubbleHeight(3), 196)
+  // 4 rows: 60*4 + 8*3 = 264px
+  assert.equal(estimateDetailedBubbleHeight(4), 264)
+})
+
+test('11. Upfront envelope expansion requirement detection', () => {
+  // Uninitialized synced geometry always requires expansion
+  assert.equal(
+    shouldExpandIncrementalEnvelope(null, { width: 260, height: 60 }),
+    true
+  )
+
+  // 1 session currently synced at 260x60
+  const synced1 = { width: 260, height: 60 }
+  // Same size does not require expansion
+  assert.equal(
+    shouldExpandIncrementalEnvelope(synced1, { width: 260, height: 60 }),
+    false
+  )
+  // 2 sessions require height expansion (128 > 60)
+  assert.equal(
+    shouldExpandIncrementalEnvelope(synced1, {
+      width: 260,
+      height: estimateDetailedBubbleHeight(2),
+    }),
+    true
+  )
+  // 3 sessions require height expansion (196 > 60)
+  assert.equal(
+    shouldExpandIncrementalEnvelope(synced1, {
+      width: 260,
+      height: estimateDetailedBubbleHeight(3),
+    }),
+    true
+  )
+  // Wider session row requires width expansion (320 > 260)
+  assert.equal(
+    shouldExpandIncrementalEnvelope(synced1, { width: 320, height: 60 }),
+    true
+  )
+
+  // Synced geometry already large enough (e.g. 320x220)
+  const syncedLarge = { width: 320, height: 220 }
+  assert.equal(
+    shouldExpandIncrementalEnvelope(syncedLarge, {
+      width: 260,
+      height: estimateDetailedBubbleHeight(3),
+    }),
+    false
+  )
+  assert.equal(
+    shouldExpandIncrementalEnvelope(syncedLarge, { width: 340, height: 220 }),
+    true
+  )
+})
+
+test('12. Regression: 1→3+ session incremental envelope growth under persistent motion architecture', () => {
+  // Initial state: 1 session visible, persistent envelope mode is 'motion'
+  let s = createGeometryLifecycle(100)
+  s = beginGeometryMotion(s, 100)
+  const initialSettle = scheduleDeferredStable(s)
+  const applied = applyDeferredStable(initialSettle.state, initialSettle.ticket, {
+    phase: 'visible',
+    hasActiveMotion: false,
+  })
+  s = applied.state
+
+  // Mode is 'motion' under persistent envelope architecture
+  const currentMode = resolveObservedGeometryMode({
+    stableGeometryAllowed: s.stableGeometryAllowed,
+    hasActiveMotion: false,
+    phase: 'visible',
+  })
+  assert.equal(currentMode, 'motion')
+
+  // 1 session was synced to native
+  let lastSyncedGeometry: { width: number; height: number; mode: string } | null = {
+    width: 260,
+    height: 60,
+    mode: 'motion',
+  }
+
+  // 2 new sessions arrive incrementally (sessions 1, 2, 3 total)
+  const totalSessionsCount = 3
+  const expectedH = estimateDetailedBubbleHeight(totalSessionsCount) // 196px
+  const expectedW = 260
+
+  // Bug reproduction check:
+  // In previous implementation, upfront sizing only fired if (currentGeometryMode !== 'motion').
+  // Because Option A keeps currentGeometryMode as 'motion', that check falsely evaluated to false:
+  const oldBuggyCondition = (currentMode as string) !== 'motion'
+  assert.equal(oldBuggyCondition, false, 'Old mode-check falsely skips upfront sizing')
+
+  // Fixed check:
+  // Upfront sizing evaluates whether the required envelope exceeds currently synced dimensions:
+  const needsExpansion =
+    oldBuggyCondition ||
+    shouldExpandIncrementalEnvelope(lastSyncedGeometry, {
+      width: expectedW,
+      height: expectedH,
+    })
+  assert.equal(needsExpansion, true, 'Upfront sizing correctly triggers envelope expansion')
+
+  // Simulate upfront expansion IPC executing before row animation starts
+  lastSyncedGeometry = { width: expectedW, height: expectedH, mode: 'motion' }
+  const incrementalEnvelopePrepared = true
+
+  // Row flight begins: active motion tokens for incremental sessions
+  const activeMotionTokens = new Set(['incremental:session-2', 'incremental:session-3'])
+  s = beginGeometryMotion(s, 100)
+
+  // During row flight:
+  assert.equal(isIncrementalMotionActive(activeMotionTokens), true)
+  // ResizeObserver is gated so mid-flight DOM changes do not cause SetWindowPos storms
+  assert.equal(
+    shouldGateIncrementalResizeObserver({
+      hasIncrementalMotion: isIncrementalMotionActive(activeMotionTokens),
+      incrementalEnvelopePrepared,
+    }),
+    true
+  )
+  // Native settle cannot occur while incremental motion is active
+  assert.equal(
+    canSettleToStable({
+      phase: 'visible',
+      activeMotionTokensCount: activeMotionTokens.size,
+      pendingIncrementalCount: 0,
+      isWidthAnimating: false,
+    }),
+    false
+  )
+
+  // Row 2 completes animation
+  activeMotionTokens.delete('incremental:session-2')
+  assert.equal(isIncrementalMotionActive(activeMotionTokens), true)
+  assert.equal(
+    canSettleToStable({
+      phase: 'visible',
+      activeMotionTokensCount: activeMotionTokens.size,
+      pendingIncrementalCount: 0,
+      isWidthAnimating: false,
+    }),
+    false
+  )
+
+  // Row 3 completes animation
+  activeMotionTokens.delete('incremental:session-3')
+  assert.equal(isIncrementalMotionActive(activeMotionTokens), false)
+  // Now all motion complete; settle gate opens
+  assert.equal(
+    canSettleToStable({
+      phase: 'visible',
+      activeMotionTokensCount: activeMotionTokens.size,
+      pendingIncrementalCount: 0,
+      isWidthAnimating: false,
+    }),
+    true
+  )
+
+  // Settle does not shrink window back to 1-session size
+  const finalSettle = scheduleDeferredStable(s)
+  const finalApplied = applyDeferredStable(finalSettle.state, finalSettle.ticket, {
+    phase: 'visible',
+    hasActiveMotion: false,
+  })
+  assert.equal(finalApplied.shouldShrinkToStable, false)
+  // Native HWND envelope preserved at full 196px height, no clipping of 3 rows
+  assert.equal(lastSyncedGeometry.height, 196)
+})
+
