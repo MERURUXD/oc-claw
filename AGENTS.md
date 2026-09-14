@@ -7,7 +7,9 @@ This file contains stable, repository-level rules for coding agents working on `
 ## 1. Scope & Sources of Truth
 
 - Work only inside the `oc-claw` repository unless the user explicitly asks otherwise.
-- Before changing behavior, inspect the current implementation, nearby tests, and relevant workflows. Prefer current code/tests over stale prose descriptions.
+- Before changing behavior, inspect the affected implementation and nearby tests; read workflows only when CI, build, or release behavior matters. Prefer current code/tests over historical notes.
+- Locate UI targets from code and available screenshots. Ask only when multiple plausible targets would materially change the implementation.
+- Within the authorized scope, continue through implementation, focused validation, and fixes for failures introduced by the change. Deliver when acceptance conditions and relevant checks are satisfied; broaden validation only for a concrete remaining risk or required gate. Report environment blockers and continue work that is not blocked.
 - Keep changes scoped to the requested task. Do not mix unrelated cleanup, formatting churn, or speculative refactors into the same change.
 - Do not add machine-specific absolute paths, local proxy ports, credentials, tokens, or tool-install locations to repository guidance.
 - Preserve cross-platform behavior. A Windows fix must not casually remove or bypass macOS/Linux logic, and vice versa.
@@ -42,7 +44,8 @@ These are project-level invariants. Implementation details may change, but fixes
 ## 3. Implementation & Regression-Fix Rules
 
 - Reproduce or identify the failing state transition before changing code when practical.
-- For regressions, add or update the smallest test that captures the broken invariant whenever the behavior is testable.
+- For regressions, add or update the smallest test that captures the broken invariant when existing coverage does not already capture it. Cover necessary edge cases of the same root cause; report unrelated issues separately.
+- Review the final diff and affected call paths rather than mechanically rereading every changed file in full.
 - Prefer fixing ownership/state-transition mistakes at their source instead of layering timers or duplicate state flags around the symptom.
 - Preserve useful existing comments/docstrings; update or remove them only when the behavior they describe changed.
 - Do not broaden the task merely because adjacent cleanup looks attractive. Mention follow-up work separately when useful.
@@ -52,6 +55,8 @@ These are project-level invariants. Implementation details may change, but fixes
 ## 4. Validation
 
 Use the repository's checked-in toolchain and lockfiles. `frontend/package.json` is pnpm-based; do not substitute npm/npx commands in project guidance when an equivalent pnpm command exists.
+
+The commands below are validation entry points, not a mandatory local checklist for every edit. Choose local checks for the affected behavior and layer. Existing CI evidence may cover a check when its commit, configuration, and scope match; rerun after relevant changes or to resolve a concrete risk. Keep all required CI gates. Once sufficient evidence exists, stop optional checking.
 
 ### Frontend / TypeScript / React changes
 
@@ -80,7 +85,7 @@ cargo test --locked
 
 ### Cross-layer / native-window / build-system changes
 
-In addition to the relevant checks above, run from `frontend/` when the change can affect Tauri integration or release compilation:
+Use this check from `frontend/` when Tauri integration or release compilation is an affected risk; matching CI may provide that evidence:
 
 ```bash
 pnpm exec tauri build --no-bundle
@@ -99,7 +104,8 @@ Always report what was actually run. Never claim a test or manual scenario passe
 
 ### Branching
 
-- Default workflow: **branch -> commit(s) -> push -> pull request -> review/validation -> squash merge**.
+- Default workflow: **branch -> commit(s) -> push -> pull request -> review/validation -> authorized squash merge**.
+- A request to open a PR authorizes the necessary scoped branch, commits, push, and same-scope revisions. Do not ask again at each step; a request for advice or review alone does not authorize implementation.
 - Do not push directly to `main` unless the user explicitly requests that exception.
 - Branch from the latest practical `main` state and keep one logical goal per branch/PR.
 - Prefer short descriptive branch names such as:
@@ -146,10 +152,10 @@ For bug fixes, explain the failure mode/root cause when known. For race/state-ma
 ### Merge rules
 
 - Passing CI is necessary for normal code changes but is not permission to merge by itself.
-- **Never merge a PR merely because it looks clean or CI is green. Require explicit user approval to merge.**
+- Require user authorization to merge. A conditional request such as "review and merge if clean" is merge authorization once its conditions are met; do not ask again solely because review is complete.
 - Default merge method is **squash** unless the user explicitly requests another strategy.
 - Before merging, verify that the intended diff is still the PR's complete scope, required checks are green (aside from documented advisory baseline jobs), and any required manual/user validation has been acknowledged.
-- Do not manually move the rolling `dev` tag, publish a release, or create a version tag unless the user explicitly asks. Release workflows are the source of truth for publishing behavior.
+- An authorized merge includes the existing automatic dev-release workflow it normally triggers. Manual release/tag operations or changes to publishing policy require authorization for those actions. Release workflows remain the source of truth for publishing behavior.
 
 ---
 
