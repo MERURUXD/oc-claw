@@ -1,0 +1,72 @@
+/* Running-state polish layered after index.css.
+ * Keep animation compositor-only while making the loader read more like a
+ * compact Fluent ProgressRing: quiet track + short cyan arc.
+ */
+
+.mascot-bubble-detailed.status-running {
+  background: linear-gradient(
+      0deg,
+      rgba(56, 189, 248, 0.024),
+      rgba(56, 189, 248, 0.024)
+    ),
+    var(--bubble-surface);
+  border-color: rgba(56, 189, 248, 0.11);
+}
+
+.mascot-bubble-detailed.status-running:hover {
+  background: linear-gradient(
+      0deg,
+      rgba(56, 189, 248, 0.04),
+      rgba(56, 189, 248, 0.04)
+    ),
+    rgba(38, 38, 38, 0.92);
+  border-color: rgba(56, 189, 248, 0.19);
+}
+
+.status-running .mascot-bubble-status-badge {
+  color: rgba(56, 189, 248, 0.88);
+}
+
+.status-running .mascot-bubble-status-icon {
+  position: relative;
+  width: 14px;
+  height: 14px;
+}
+
+/* Static low-contrast track behind the rotating arc. */
+.status-running .mascot-bubble-status-icon::before {
+  content: '';
+  position: absolute;
+  inset: 1px;
+  box-sizing: border-box;
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+  opacity: 0.16;
+  pointer-events: none;
+}
+
+/* Loader2 becomes the short foreground arc rather than a near-complete ring. */
+.status-running .mascot-status-icon-svg {
+  position: relative;
+  z-index: 1;
+  width: 14px;
+  height: 14px;
+  opacity: 0.92;
+  stroke-linecap: round;
+}
+
+.status-running .mascot-status-icon-svg path {
+  stroke-dasharray: 12 48;
+}
+
+.status-running .mascot-status-icon--spin {
+  animation-duration: 1.25s;
+  animation-timing-function: linear;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .status-running .mascot-status-icon--spin {
+    animation: none !important;
+    transform: rotate(-35deg);
+  }
+}
