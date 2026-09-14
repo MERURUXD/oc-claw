@@ -6,6 +6,7 @@ import ja from './locales/ja.json'
 import ko from './locales/ko.json'
 import es from './locales/es.json'
 import fr from './locales/fr.json'
+import { BUBBLE_STATUS_TRANSLATIONS } from './bubbleStatusTranslations'
 
 const supportedLngs = ['zh', 'en', 'ja', 'ko', 'es', 'fr'] as const
 type SupportedLng = typeof supportedLngs[number]
@@ -25,12 +26,12 @@ function detectLanguage(): SupportedLng {
 
 i18n.use(initReactI18next).init({
   resources: {
-    zh: { translation: zh },
-    en: { translation: en },
-    ja: { translation: ja },
-    ko: { translation: ko },
-    es: { translation: es },
-    fr: { translation: fr },
+    zh: { translation: { ...zh, mini: { ...zh.mini, ...BUBBLE_STATUS_TRANSLATIONS.zh } } },
+    en: { translation: { ...en, mini: { ...en.mini, ...BUBBLE_STATUS_TRANSLATIONS.en } } },
+    ja: { translation: { ...ja, mini: { ...ja.mini, ...BUBBLE_STATUS_TRANSLATIONS.ja } } },
+    ko: { translation: { ...ko, mini: { ...ko.mini, ...BUBBLE_STATUS_TRANSLATIONS.ko } } },
+    es: { translation: { ...es, mini: { ...es.mini, ...BUBBLE_STATUS_TRANSLATIONS.es } } },
+    fr: { translation: { ...fr, mini: { ...fr.mini, ...BUBBLE_STATUS_TRANSLATIONS.fr } } },
   },
   lng: detectLanguage(),
   fallbackLng: 'en',
