@@ -1,0 +1,58 @@
+export const BUBBLE_STATUS_TRANSLATIONS = {
+  zh: {
+    statusNeedsAnswer: '需要回答',
+    waitingApproval: '等待批准',
+    waitingFileApproval: '等待确认修改',
+    statusRunning: '正在运行',
+    statusWorking: '工作中',
+    statusWaitingSubagents: '等待子代理',
+    processingFallback: '处理中…',
+  },
+  en: {
+    statusNeedsAnswer: 'Needs answer',
+    waitingApproval: 'Awaiting approval',
+    waitingFileApproval: 'Confirm changes',
+    statusRunning: 'Running',
+    statusWorking: 'Working',
+    statusWaitingSubagents: 'Waiting for subagents',
+    processingFallback: 'Processing…',
+  },
+  ja: {
+    statusNeedsAnswer: '回答が必要',
+    waitingApproval: '承認待ち',
+    waitingFileApproval: '変更確認待ち',
+    statusRunning: '実行中',
+    statusWorking: '作業中',
+    statusWaitingSubagents: 'サブエージェント待ち',
+    processingFallback: '処理中…',
+  },
+  ko: {
+    statusNeedsAnswer: '응답 필요',
+    waitingApproval: '승인 대기',
+    waitingFileApproval: '변경 확인 대기',
+    statusRunning: '실행 중',
+    statusWorking: '작업 중',
+    statusWaitingSubagents: '하위 에이전트 대기',
+    processingFallback: '처리 중…',
+  },
+  es: {
+    statusNeedsAnswer: 'Necesita respuesta',
+    waitingApproval: 'Esperando aprobación',
+    waitingFileApproval: 'Confirmar cambios',
+    statusRunning: 'Ejecutando',
+    statusWorking: 'Trabajando',
+    statusWaitingSubagents: 'Esperando subagentes',
+    processingFallback: 'Procesando…',
+  },
+  fr: {
+    statusNeedsAnswer: 'Réponse requise',
+    waitingApproval: 'En attente d’approbation',
+    waitingFileApproval: 'Confirmer les modifications',
+    statusRunning: 'Exécution',
+    statusWorking: 'En cours',
+    statusWaitingSubagents: 'En attente des sous-agents',
+    processingFallback: 'Traitement…',
+  },
+} as const
+
+export type BubbleStatusLocale = keyof typeof BUBBLE_STATUS_TRANSLATIONS
