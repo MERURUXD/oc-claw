@@ -4,14 +4,15 @@ import { emit, listen } from '@tauri-apps/api/event'
 import { useTranslation } from 'react-i18next'
 import type { TFunction } from 'i18next'
 import { motion, useReducedMotion } from 'motion/react'
+import { CircleHelp, ShieldAlert, Loader2 } from 'lucide-react'
 import type {
   BubbleSessionDetail,
   BubbleTransitionEvent,
   MascotBubblePayload,
   SubagentDetail,
 } from '../lib/types'
-import { formatActivity } from '../lib/activityFormat'
 import { isSameBubblePayload } from '../lib/sessionActivity'
+import { resolveBubbleStatus, type BubbleStatusKind } from '../lib/bubbleStatus'
 import {
   BUBBLE_WIDTH,
   BUBBLE_WIDTH_MOTION,
@@ -155,197 +156,41 @@ function hashSessionId(id: string): number {
   return Math.abs(hash)
 }
 
-function extractToolParam(toolInput: unknown): string | null {
-  if (!toolInput) return null
-  try {
-    const inp = typeof toolInput === 'string' ? JSON.parse(toolInput) : toolInput
-    if (typeof inp === 'object' && inp !== null) {
-      let rawVal = ''
-      if (Array.isArray(inp.questions) && inp.questions.length > 0) {
-        const firstQ = inp.questions[0]
-        if (typeof firstQ === 'object' && firstQ !== null && typeof firstQ.question === 'string' && firstQ.question.trim()) {
-          rawVal = firstQ.question.trim()
-        } else if (typeof firstQ === 'string' && firstQ.trim()) {
-          rawVal = firstQ.trim()
-        }
-      } else if (typeof inp.question === 'string' && inp.question.trim()) {
-        rawVal = inp.question.trim()
-      } else if (typeof inp.justification === 'string' && inp.justification.trim()) {
-        rawVal = inp.justification.trim()
-      } else {
-        rawVal =
-          inp.command ||
-          inp.CommandLine ||
-          inp.toolAction ||
-          inp.toolSummary ||
-          inp.Query ||
-          inp.query ||
-          inp.Pattern ||
-          inp.pattern ||
-          inp.file_path ||
-          inp.TargetFile ||
-          inp.AbsolutePath ||
-          inp.DirectoryPath ||
-          inp.SearchPath ||
-          inp.SearchDirectory ||
-          inp.description ||
-          inp.Description ||
-          inp.prompt ||
-          inp.Prompt ||
-          (typeof inp === 'string' ? inp : '')
-      }
-      if (typeof rawVal === 'string' && rawVal.trim()) {
-        let cleanVal = rawVal.trim()
-        if (cleanVal.includes('/') || cleanVal.includes('\\')) {
-          const parts = cleanVal.split(/[/\\]/)
-          if (parts.length > 1 && !cleanVal.includes(' ')) {
-            cleanVal = parts[parts.length - 1] || cleanVal
-          }
-        }
-        return cleanVal
-      }
-    } else if (typeof inp === 'string') {
-      return inp
-    }
-  } catch {
-    return typeof toolInput === 'string' ? toolInput : null
-  }
-  return null
-}
-
-function getSessionLine2(
-  session: BubbleSessionDetail,
-  t: TFunction,
-  fallbackThinkingText?: string
-): { actionPrefix: string | null; actionContent: string; isWaiting: boolean; isProcessing: boolean } {
-  const isWaiting = session.status === 'waiting'
-  const isRunning = session.status === 'processing' || session.status === 'tool_running'
-  const isProcessing = session.status === 'processing'
-
-  // 1. Waiting for user interaction / question / approval
-  if (isWaiting) {
-    if (session.pendingInteraction?.kind === 'approval') {
-      const isFileChange = session.pendingInteraction.interactionType === 'file_change'
-      const icon = isFileChange ? '✏️' : '🔐'
-      const label = isFileChange
-        ? t('mini.waitingFileApproval', '等待确认修改')
-        : t('mini.waitingApproval', '等待批准')
-      const target =
-        session.pendingInteraction.summary ||
-        session.pendingInteraction.tool ||
-        session.pendingInteraction.detail ||
-        session.questionText ||
-        session.userPrompt ||
-        t('settings.bubbleJumpToTerminal', 'Waiting for input...')
-      const firstLine = target.split('\n')[0].trim()
-      const displayTarget = firstLine.length > 80 ? firstLine.slice(0, 80) + '...' : firstLine
-      return {
-        actionPrefix: null,
-        actionContent: `${icon} ${label} · ${displayTarget}`,
-        isWaiting: true,
-        isProcessing: false,
-      }
-    }
-
-    if (session.pendingInteraction?.kind === 'user_input') {
-      const icon = '❓'
-      const label = t('mini.waitingYourAnswer', '等你回答')
-      const target =
-        session.pendingInteraction.summary ||
-        session.pendingInteraction.detail ||
-        session.questionText ||
-        session.userPrompt ||
-        t('settings.bubbleJumpToTerminal', 'Waiting for input...')
-      const firstLine = target.split('\n')[0].trim()
-      const displayTarget = firstLine.length > 80 ? firstLine.slice(0, 80) + '...' : firstLine
-      return {
-        actionPrefix: null,
-        actionContent: `${icon} ${label} · ${displayTarget}`,
-        isWaiting: true,
-        isProcessing: false,
-      }
-    }
-
-    return {
-      actionPrefix: null,
-      actionContent: session.questionText || session.userPrompt || t('settings.bubbleJumpToTerminal', 'Waiting for input...'),
-      isWaiting: true,
-      isProcessing: false,
-    }
-  }
-
-  // 2. Active subagents
-  if (session.activeSubagents && session.activeSubagents.length > 0) {
-    const roles = session.activeSubagents.map((s) => s.role).filter(Boolean)
-    if (roles.length > 0) {
-      return {
-        actionPrefix: null,
-        actionContent: `[${roles.join(', ')}]`,
-        isWaiting: false,
-        isProcessing,
-      }
-    }
-  }
-
-  // 3. Normalized Session Activity (reasoning summary, tool call, command, search, read, edit, etc.)
-  if (isRunning && session.activity) {
-    const formatted = formatActivity(session.activity, t)
-    if (formatted) {
-      return {
-        actionPrefix: null,
-        actionContent: formatted,
-        isWaiting: false,
-        isProcessing: session.status === 'processing',
-      }
-    }
-  }
-
-  // 4. Compacting
-  if (session.status === 'compacting') {
-    return {
-      actionPrefix: null,
-      actionContent: t('mini.compacting', 'compacting...'),
-      isWaiting: false,
-      isProcessing: false,
-    }
-  }
-
-  // 5. Legacy tool running fallback (if activity not present)
-  if (session.status === 'tool_running' && session.tool) {
-    const toolLower = session.tool.toLowerCase()
-    if (toolLower.includes('command') || toolLower.includes('bash') || toolLower.includes('shell')) {
-      return {
-        actionPrefix: null,
-        actionContent: t('mini.activityRunningCommand', 'Running command'),
-        isWaiting: false,
-        isProcessing: false,
-      }
-    }
-    const param = extractToolParam(session.toolInput)
-    return {
-      actionPrefix: session.tool,
-      actionContent: param || session.actionText || '',
-      isWaiting: false,
-      isProcessing: false,
-    }
-  }
-
-  // 6. Processing thinking pool fallback
-  if (isProcessing) {
-    return {
-      actionPrefix: null,
-      actionContent: fallbackThinkingText || t('mini.thinking', '思考中...'),
-      isWaiting: false,
-      isProcessing: true,
-    }
-  }
-
-  // 7. General fallback
-  return {
-    actionPrefix: null,
-    actionContent: session.actionText || session.subtitle || session.userPrompt || t('mini.working', 'working...'),
-    isWaiting: false,
-    isProcessing: false,
+function StatusIcon({ kind, isMeasure }: { kind: BubbleStatusKind; isMeasure?: boolean }) {
+  switch (kind) {
+    case 'answer':
+      return (
+        <CircleHelp
+          className={`mascot-status-icon-svg ${isMeasure ? '' : 'mascot-status-icon--attention'}`}
+          size={14}
+          strokeWidth={2}
+        />
+      )
+    case 'approval':
+      return (
+        <ShieldAlert
+          className={`mascot-status-icon-svg ${isMeasure ? '' : 'mascot-status-icon--attention'}`}
+          size={14}
+          strokeWidth={2}
+        />
+      )
+    case 'running':
+      return (
+        <Loader2
+          className={`mascot-status-icon-svg ${isMeasure ? '' : 'mascot-status-icon--spin'}`}
+          size={14}
+          strokeWidth={2}
+        />
+      )
+    case 'working':
+    default:
+      return (
+        <span className="mascot-status-dots" aria-hidden="true">
+          <span className="mascot-status-dot" />
+          <span className="mascot-status-dot" />
+          <span className="mascot-status-dot" />
+        </span>
+      )
   }
 }
 
@@ -590,7 +435,8 @@ function SessionBubbleRow({
   remainingOthers,
 }: SessionBubbleRowProps) {
   const fallback = fallbackThinkingText || thinkingText
-  const { actionPrefix, actionContent, isWaiting, isProcessing } = getSessionLine2(session, t, fallback)
+  const status = resolveBubbleStatus(session, t, fallback)
+  const isWaiting = status.kind === 'answer' || status.kind === 'approval'
 
   const mode = getRowMotionMode({
     phase,
@@ -699,7 +545,7 @@ function SessionBubbleRow({
       onAnimationComplete={() => onAnimationComplete(session.sessionId)}
     >
       <div
-        className="mascot-bubble-detailed"
+        className={`mascot-bubble-detailed ${status.className}`}
         onClick={() => onClick(session.sessionId)}
         onKeyDown={(e) => {
           if (e.key === 'Enter' || e.key === ' ') {
@@ -740,10 +586,16 @@ function SessionBubbleRow({
           {session.activeSubagents && session.activeSubagents.length > 0 ? (
             <SubagentsRow subagents={session.activeSubagents} />
           ) : (
-            <div className={`mascot-bubble-action-line ${isWaiting ? 'is-waiting' : ''} ${isProcessing ? 'is-processing' : ''}`}>
-              {actionPrefix && <span className="mascot-bubble-tool-prefix">{actionPrefix}:</span>}
+            <div className={`mascot-bubble-action-line ${status.className}`}>
+              <span className={`mascot-bubble-status-badge ${status.className}`}>
+                <span className="mascot-bubble-status-icon" key={status.kind} aria-hidden="true">
+                  <StatusIcon kind={status.kind} />
+                </span>
+                <span className="mascot-bubble-status-label">{status.statusLabel}</span>
+              </span>
+              <span className="mascot-bubble-status-sep" aria-hidden="true">·</span>
               <span className="mascot-bubble-action-text truncate">
-                {actionContent || (actionPrefix ? '' : t('mini.working', 'working...'))}
+                {status.content}
               </span>
             </div>
           )}
@@ -768,11 +620,11 @@ function MeasureSessionBubbleRow({
   showBadge,
   remainingOthers,
 }: MeasureSessionBubbleRowProps) {
-  const { actionPrefix, actionContent, isWaiting, isProcessing } = getSessionLine2(session, t, fallbackThinkingText)
+  const status = resolveBubbleStatus(session, t, fallbackThinkingText)
 
   return (
     <div className="mascot-bubble-row-motion">
-      <div className="mascot-bubble-detailed">
+      <div className={`mascot-bubble-detailed ${status.className}`}>
         <div className="mascot-bubble-content">
           {/* Line 1: Session Title + Metadata */}
           <div className="mascot-bubble-title-line">
@@ -806,10 +658,18 @@ function MeasureSessionBubbleRow({
               })}
             </div>
           ) : (
-            <div className={`mascot-bubble-action-line ${isWaiting ? 'is-waiting' : ''} ${isProcessing ? 'is-processing' : ''}`}>
-              {actionPrefix && <span className="mascot-bubble-tool-prefix">{actionPrefix}:</span>}
+            <div className={`mascot-bubble-action-line ${status.className}`}>
+              <span className={`mascot-bubble-status-badge ${status.className}`}>
+                <span className="mascot-bubble-status-icon" aria-hidden="true">
+                  <StatusIcon kind={status.kind} isMeasure />
+                </span>
+                <span className="mascot-bubble-status-label" style={{ whiteSpace: 'nowrap' }}>
+                  {status.statusLabel}
+                </span>
+              </span>
+              <span className="mascot-bubble-status-sep" aria-hidden="true">·</span>
               <span className="mascot-bubble-action-text" style={{ whiteSpace: 'nowrap' }}>
-                {actionContent || (actionPrefix ? '' : t('mini.working', 'working...'))}
+                {status.content}
               </span>
             </div>
           )}

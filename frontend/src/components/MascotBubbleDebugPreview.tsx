@@ -30,7 +30,8 @@ function buildDebugBubblePayload(kind: DebugKind, style: DebugStyle): MascotBubb
       source: 'cc',
       status: 'tool_running',
       tool: 'Bash',
-      activity: { kind: 'command', summary: 'Running command', toolName: 'Bash', status: 'running', source: 'fallback' },
+      toolInput: JSON.stringify({ command: 'echo debug-inject' }),
+      activity: { kind: 'command', summary: 'echo debug-inject', toolName: 'Bash', status: 'running', source: 'fallback' },
     }
     return { style, running: 1, waiting: 0, activeSession: s, activeSessions: [s] }
   }
