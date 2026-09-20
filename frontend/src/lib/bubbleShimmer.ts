@@ -6,15 +6,15 @@ import type { BubbleStatusKind } from './bubbleStatus'
  * - activeMs: duration of the sweep animation across the text
  * - intervalMs: cycle interval between successive sweeps
  *
- * Tuned parameters for tighter cadence and wider presence:
- * - 300ms initial delay
- * - 1200ms sweep duration
- * - 2700ms cadence interval (1.2s active sweep + 1.5s quiet resting pause)
+ * Tuned parameters for a calmer, narrower title shimmer:
+ * - 600ms initial delay
+ * - 1800ms sweep duration
+ * - 4200ms cadence interval (1.8s active sweep + 2.4s quiet resting pause)
  */
 export const SHIMMER_TIMING = {
-  initialDelayMs: 300,
-  activeMs: 1200,
-  intervalMs: 2700,
+  initialDelayMs: 600,
+  activeMs: 1800,
+  intervalMs: 4200,
 } as const
 
 /**
