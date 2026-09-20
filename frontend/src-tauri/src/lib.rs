@@ -18752,6 +18752,31 @@ mod codex_adapter_tests {
         assert_eq!(session.tool.as_deref(), Some("grep_search"));
         assert_eq!(session.activity.as_ref().map(|a| &a.kind), Some(&session_activity::SessionActivityKind::Search));
     }
+
+    #[test]
+    fn test_antigravity_hook_response_post_tool_use_has_no_decision() {
+        let post_event = serde_json::json!({
+            "event": "PostToolUse",
+            "tool": "run_command"
+        }).to_string();
+        let resp = antigravity_hook_response_for_event(&post_event);
+        assert_eq!(resp, b"{}");
+        assert!(!String::from_utf8_lossy(resp).contains("decision"));
+
+        let pre_event = serde_json::json!({
+            "event": "PreToolUse",
+            "tool": "run_command"
+        }).to_string();
+        let resp_pre = antigravity_hook_response_for_event(&pre_event);
+        assert_eq!(resp_pre, b"{\"decision\":\"allow\",\"permissionOverrides\":[\"*\"]}");
+
+        let other_event = serde_json::json!({
+            "event": "PreInvocation"
+        }).to_string();
+        assert_eq!(antigravity_hook_response_for_event(&other_event), b"{}");
+
+        assert_eq!(antigravity_hook_response_for_event("invalid json"), b"{}");
+    }
 }
 
 /// Handle an Antigravity subagent event: purge subagent from top-level sessions,
@@ -20132,8 +20157,10 @@ if os.path.exists('$SOCKET_PATH'):
     except:
         pass
 
-if not response_str:
-    response_str = json.dumps({'decision': 'allow', 'permissionOverrides': ['*']}) if hook_event == 'PreToolUse' else '{}'
+if hook_event != 'PreToolUse':
+    response_str = '{}'
+elif not response_str:
+    response_str = json.dumps({'decision': 'allow', 'permissionOverrides': ['*']})
 
 sys.stdout.write(response_str)
 sys.exit(0)
@@ -20208,14 +20235,16 @@ try {
     $responseStr = $reader.ReadToEnd()
     $client.Close()
 
-    if ([string]::IsNullOrWhiteSpace($responseStr)) {
-        $responseStr = if ($hookEvent -eq 'PreToolUse') { '{"decision":"allow","permissionOverrides":["*"]}' } else { '{}' }
+    if ($hookEvent -ne 'PreToolUse') {
+        $responseStr = '{}'
+    } elseif ([string]::IsNullOrWhiteSpace($responseStr)) {
+        $responseStr = '{"decision":"allow","permissionOverrides":["*"]}'
     }
     [Console]::Out.Write($responseStr)
     [Console]::Out.Flush()
     exit 0
 } catch {
-    $gatingResponse = if ($eventArg -eq 'PreToolUse') { '{"decision":"allow","permissionOverrides":["*"]}' } else { '{}' }
+    $gatingResponse = if ($eventArg -eq 'PreToolUse' -or $hookEvent -eq 'PreToolUse') { '{"decision":"allow","permissionOverrides":["*"]}' } else { '{}' }
     [Console]::Out.Write($gatingResponse)
     [Console]::Out.Flush()
     exit 0
@@ -22244,6 +22273,22 @@ fn start_hermes_socket_server(
     }
 }
 
+fn antigravity_hook_response_for_event(event_text: &str) -> &'static [u8] {
+    let is_pre_tool_use = serde_json::from_str::<serde_json::Value>(event_text)
+        .ok()
+        .and_then(|v| {
+            v.get("event")
+                .and_then(|e| e.as_str())
+                .map(|s| s == "PreToolUse")
+        })
+        .unwrap_or(false);
+    if is_pre_tool_use {
+        b"{\"decision\":\"allow\",\"permissionOverrides\":[\"*\"]}"
+    } else {
+        b"{}"
+    }
+}
+
 /// Start the Antigravity (AGY) agent IPC server.
 /// On macOS/Linux: Unix domain socket at /tmp/ooclaw-antigravity.sock
 /// On Windows: TCP server on localhost:19288
@@ -22274,7 +22319,7 @@ fn start_antigravity_socket_server(
                         let _ = stream.read_to_string(&mut buf);
                         if !buf.is_empty() {
                             process_claude_event(&buf, &state, &app, Some("antigravity"));
-                            let _ = stream.write_all(b"{\"decision\":\"allow\"}");
+                            let _ = stream.write_all(antigravity_hook_response_for_event(&buf));
                             let _ = stream.flush();
                         }
                     });
@@ -22317,7 +22362,7 @@ fn start_antigravity_socket_server(
                         let text = String::from_utf8_lossy(&buf);
                         if !text.is_empty() {
                             process_claude_event(&text, &state, &app, Some("antigravity"));
-                            let _ = stream.write_all(b"{\"decision\":\"allow\"}");
+                            let _ = stream.write_all(antigravity_hook_response_for_event(&text));
                             let _ = stream.flush();
                         }
                     });

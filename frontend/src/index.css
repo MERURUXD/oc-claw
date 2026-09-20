@@ -459,8 +459,6 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
   margin-top: 2px;
   color: var(--bubble-text-secondary);
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
   display: flex;
   align-items: center;
   min-width: 0;
