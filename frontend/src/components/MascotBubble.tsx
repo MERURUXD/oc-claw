@@ -32,8 +32,9 @@ import {
 } from '../lib/bubbleGeometryLifecycle'
 import { traceBubbleEvent } from '../lib/bubbleTrace'
 import { QuotaMiniBadge } from './QuotaCapsule'
+import { SHIMMER_TIMING, isShimmerActive } from '../lib/bubbleShimmer'
 
-export { BUBBLE_WIDTH, BUBBLE_WIDTH_MOTION }
+export { BUBBLE_WIDTH, BUBBLE_WIDTH_MOTION, SHIMMER_TIMING, isShimmerActive }
 
 /**
  * Centralized motion and geometry constants for the mascot status bubble.
@@ -80,6 +81,74 @@ export function getBubbleEntryOffset(placement: BubblePlacement = 'top-left') {
     default:
       return { x: -BUBBLE_MOTION.offsetX, y: -BUBBLE_MOTION.offsetY }
   }
+}
+
+/**
+ * Codex-style Cadenced Shimmer for session title:
+ * - 300ms initial delay after active
+ * - 1200ms active sweep (mask/sweep translated opposite to highlight layer)
+ * - 2700ms cadence interval (1.2s sweep, 1.5s quiet)
+ * - steps(60, end) timing
+ * - Stops immediately when inactive (e.g. waiting / stopped)
+ * - Completely disabled under prefers-reduced-motion
+ * - Isolated against QuotaMiniBadge 1-second ticker rerenders
+ */
+export function CadencedShimmerText({
+  children,
+  active,
+  reducedMotion = false,
+  className = '',
+}: {
+  children: React.ReactNode
+  active: boolean
+  reducedMotion?: boolean
+  className?: string
+}) {
+  const [isShimmering, setIsShimmering] = useState(false)
+
+  useEffect(() => {
+    if (!active || reducedMotion) {
+      setIsShimmering(false)
+      return
+    }
+
+    let activeTimer: ReturnType<typeof setTimeout> | null = null
+    let intervalTimer: ReturnType<typeof setInterval> | null = null
+    let initialTimer: ReturnType<typeof setTimeout> | null = null
+
+    const triggerSweep = () => {
+      setIsShimmering(true)
+      if (activeTimer) clearTimeout(activeTimer)
+      activeTimer = setTimeout(() => {
+        setIsShimmering(false)
+      }, SHIMMER_TIMING.activeMs)
+    }
+
+    initialTimer = setTimeout(() => {
+      triggerSweep()
+      intervalTimer = setInterval(() => {
+        triggerSweep()
+      }, SHIMMER_TIMING.intervalMs)
+    }, SHIMMER_TIMING.initialDelayMs)
+
+    return () => {
+      if (initialTimer) clearTimeout(initialTimer)
+      if (intervalTimer) clearInterval(intervalTimer)
+      if (activeTimer) clearTimeout(activeTimer)
+      setIsShimmering(false)
+    }
+  }, [active, reducedMotion])
+
+  return (
+    <div className={`mascot-bubble-title-wrapper ${className}`}>
+      <span className="mascot-bubble-main-title truncate">{children}</span>
+      {isShimmering && !reducedMotion && (
+        <span className="mascot-bubble-shimmer-sweep" aria-hidden="true">
+          <span className="mascot-bubble-shimmer-highlight truncate">{children}</span>
+        </span>
+      )}
+    </div>
+  )
 }
 
 export type BubblePhase =
@@ -451,9 +520,12 @@ function SessionBubbleRow({
         <div className="mascot-bubble-content">
           {/* Line 1: Session Title / Topic + Metadata */}
           <div className="mascot-bubble-title-line">
-            <div className="mascot-bubble-title-wrapper">
-              <span className="mascot-bubble-main-title truncate">{session.title}</span>
-            </div>
+            <CadencedShimmerText
+              active={isShimmerActive(session.status, status.kind)}
+              reducedMotion={Boolean(prefersReducedMotion)}
+            >
+              {session.title}
+            </CadencedShimmerText>
 
             <div className="mascot-bubble-metadata-group">
               {showBadge && (

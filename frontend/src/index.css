@@ -379,6 +379,72 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
   max-width: 100%;
 }
 
+/* Codex ThinkingShimmer mask/sweep (tuned for wider beam and tighter cadence) */
+.mascot-bubble-shimmer-sweep {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    black 15% 45%,
+    transparent 65% 100%
+  );
+  mask-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    black 15% 45%,
+    transparent 65% 100%
+  );
+  animation: codex-shimmer-sweep 1.2s steps(60, end) 1 forwards;
+  will-change: transform;
+}
+
+.mascot-bubble-shimmer-highlight {
+  display: block;
+  font-size: 13px;
+  line-height: 17px;
+  font-weight: 500;
+  letter-spacing: normal;
+  color: #ffffff;
+  text-shadow: 0 0 6px rgba(255, 255, 255, 0.7);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+  animation: codex-shimmer-highlight 1.2s steps(60, end) 1 forwards;
+  will-change: transform;
+}
+
+@keyframes codex-shimmer-sweep {
+  0% {
+    transform: translateX(-70%);
+  }
+  100% {
+    transform: translateX(110%);
+  }
+}
+
+@keyframes codex-shimmer-highlight {
+  0% {
+    transform: translateX(70%);
+  }
+  100% {
+    transform: translateX(-110%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mascot-bubble-shimmer-sweep {
+    display: none !important;
+    animation: none !important;
+  }
+}
+
 .mascot-bubble-metadata-group {
   display: flex;
   align-items: center;
