@@ -379,7 +379,7 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
   max-width: 100%;
 }
 
-/* Codex ThinkingShimmer mask/sweep (tuned for wider beam and tighter cadence) */
+/* Codex ThinkingShimmer mask/sweep (narrow beam, calm cadence) */
 .mascot-bubble-shimmer-sweep {
   position: absolute;
   top: 0;
@@ -391,16 +391,22 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
   -webkit-mask-image: linear-gradient(
     90deg,
     transparent 0%,
-    black 15% 45%,
-    transparent 65% 100%
+    rgba(0, 0, 0, 0.25) 30%,
+    black 44%,
+    black 56%,
+    rgba(0, 0, 0, 0.25) 70%,
+    transparent 100%
   );
   mask-image: linear-gradient(
     90deg,
     transparent 0%,
-    black 15% 45%,
-    transparent 65% 100%
+    rgba(0, 0, 0, 0.25) 30%,
+    black 44%,
+    black 56%,
+    rgba(0, 0, 0, 0.25) 70%,
+    transparent 100%
   );
-  animation: codex-shimmer-sweep 1.2s steps(60, end) 1 forwards;
+  animation: codex-shimmer-sweep 1.8s linear 1 forwards;
   will-change: transform;
 }
 
@@ -416,25 +422,25 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 100%;
-  animation: codex-shimmer-highlight 1.2s steps(60, end) 1 forwards;
+  animation: codex-shimmer-highlight 1.8s linear 1 forwards;
   will-change: transform;
 }
 
 @keyframes codex-shimmer-sweep {
   0% {
-    transform: translateX(-70%);
+    transform: translateX(-100%);
   }
   100% {
-    transform: translateX(110%);
+    transform: translateX(100%);
   }
 }
 
 @keyframes codex-shimmer-highlight {
   0% {
-    transform: translateX(70%);
+    transform: translateX(100%);
   }
   100% {
-    transform: translateX(-110%);
+    transform: translateX(-100%);
   }
 }
 
