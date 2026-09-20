@@ -4,7 +4,7 @@ import { emit, listen } from '@tauri-apps/api/event'
 import { useTranslation } from 'react-i18next'
 import type { TFunction } from 'i18next'
 import { motion, useReducedMotion } from 'motion/react'
-import { BubbleDotMatrix, type BubbleDotMatrixState } from './BubbleDotMatrix'
+import { BubbleDotMatrix, toDotMatrixState } from './BubbleDotMatrix'
 import type {
   BubbleSessionDetail,
   BubbleTransitionEvent,
@@ -148,20 +148,6 @@ function hashSessionId(id: string): number {
     hash |= 0
   }
   return Math.abs(hash)
-}
-
-function toDotMatrixState(kind: BubbleStatusKind): BubbleDotMatrixState {
-  switch (kind) {
-    case 'running':
-      return 'loading'
-    case 'answer':
-      return 'waiting'
-    case 'approval':
-      return 'warning'
-    case 'working':
-    default:
-      return 'thinking'
-  }
 }
 
 function StatusIcon({ kind, isMeasure }: { kind: BubbleStatusKind; isMeasure?: boolean }) {

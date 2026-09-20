@@ -51,7 +51,7 @@
 }
 
 .bubble-dot-matrix-dot {
-  opacity: var(--dot-matrix-hi, 1);
+  opacity: var(--dot-matrix-resting, var(--dot-matrix-hi, 1));
   animation-name: dot-matrix-blink;
   animation-timing-function: ease-in-out;
   animation-iteration-count: infinite;
@@ -66,11 +66,13 @@
 .bubble-dot-matrix--measure .bubble-dot-matrix-dot {
   animation: none !important;
   transition: none !important;
+  opacity: var(--dot-matrix-resting, 1) !important;
 }
 
 /* Accessible reduced motion: halt continuous blinking, preserve resting pattern glyph */
 @media (prefers-reduced-motion: reduce) {
   .bubble-dot-matrix-dot {
     animation: none !important;
+    opacity: var(--dot-matrix-resting, 1) !important;
   }
 }

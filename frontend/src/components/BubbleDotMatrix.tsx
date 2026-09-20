@@ -1,12 +1,14 @@
 import type { CSSProperties } from 'react'
 import {
   DOT_INDEXES,
-  GRID_SIZE,
-  MATRIX_STATE_CONFIGS,
+  MATRIX_DIMENSIONS,
+  getDotParameters,
+  toDotMatrixState,
   type BubbleDotMatrixSize,
   type BubbleDotMatrixState,
 } from '../lib/bubbleDotMatrix'
 
+export { toDotMatrixState }
 export type { BubbleDotMatrixSize, BubbleDotMatrixState }
 
 export interface BubbleDotMatrixProps {
@@ -14,6 +16,7 @@ export interface BubbleDotMatrixProps {
   size?: BubbleDotMatrixSize
   isMeasure?: boolean
   className?: string
+  style?: CSSProperties
   'aria-label'?: string
 }
 
@@ -25,16 +28,22 @@ export interface BubbleDotMatrixProps {
  * - Single persistent DOM structure; status transitions cross-fade via CSS property transitions
  * - Fill: `currentColor`
  * - Deterministic CSS animations (no JS timers or Math.random)
- * - Full prefers-reduced-motion support (stops animation while preserving static resting pattern)
+ * - Full prefers-reduced-motion support:
+ *   - Stops continuous blinking
+ *   - thinking: shows resting diagonal stripe
+ *   - loading: shows resting scattered constellation
+ *   - waiting: shows resting ellipsis
+ *   - warning: shows resting exclamation mark
  */
 export function BubbleDotMatrix({
   state = 'thinking',
   size = 'detailed',
   isMeasure = false,
   className = '',
+  style: propStyle,
   'aria-label': ariaLabel,
 }: BubbleDotMatrixProps) {
-  const config = MATRIX_STATE_CONFIGS[state] ?? MATRIX_STATE_CONFIGS.thinking
+  const dimensions = MATRIX_DIMENSIONS[size] ?? MATRIX_DIMENSIONS.detailed
 
   return (
     <span
@@ -43,6 +52,11 @@ export function BubbleDotMatrix({
       role="img"
       aria-hidden={isMeasure || !ariaLabel}
       aria-label={ariaLabel}
+      style={{
+        width: dimensions.width,
+        height: dimensions.height,
+        ...propStyle,
+      }}
     >
       <svg
         viewBox="0 0 20 20"
@@ -51,29 +65,26 @@ export function BubbleDotMatrix({
         aria-hidden="true"
       >
         {DOT_INDEXES.map((i) => {
-          const row = Math.floor(i / GRID_SIZE)
-          const col = i % GRID_SIZE
-          const on = !config.glyph || config.glyph.has(i)
-          const hi = on ? config.base : (config.dim ?? 0.15)
-          const blink = on ? config.blink?.(i, row, col) : undefined
+          const dot = getDotParameters(state, i)
 
           const dotStyle: CSSProperties = {
-            opacity: hi,
-            ['--dot-matrix-hi' as string]: hi,
-            ['--dot-matrix-lo' as string]: blink?.lo ?? hi,
+            opacity: dot.resting,
+            ['--dot-matrix-hi' as string]: dot.hi,
+            ['--dot-matrix-lo' as string]: dot.lo,
+            ['--dot-matrix-resting' as string]: dot.resting,
           }
 
-          if (!isMeasure && blink) {
-            dotStyle.animationDuration = `${blink.duration}s`
-            dotStyle.animationDelay = `${blink.delay}s`
+          if (!isMeasure && dot.duration !== undefined) {
+            dotStyle.animationDuration = `${dot.duration}s`
+            dotStyle.animationDelay = `${dot.delay ?? 0}s`
           }
 
           return (
             <circle
               key={i}
               className="bubble-dot-matrix-dot"
-              cx={2 + col * 4}
-              cy={2 + row * 4}
+              cx={2 + dot.col * 4}
+              cy={2 + dot.row * 4}
               r={1.3}
               style={dotStyle}
             />

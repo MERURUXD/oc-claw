@@ -10,6 +10,8 @@ import {
   getDotParameters,
   ELLIPSIS_GLYPH,
   WARNING_GLYPH,
+  THINKING_RESTING_GLYPH,
+  LOADING_RESTING_GLYPH,
 } from './bubbleDotMatrix.ts'
 
 test('bubbleDotMatrix: grid and dimension invariant verification', () => {
@@ -44,7 +46,7 @@ test('bubbleDotMatrix: hashDotMatrix is purely deterministic without random/time
   assert.notEqual(val0, val5, 'Adjacent vertical dots must not correlate')
 })
 
-test('bubbleDotMatrix: thinking state has diagonal wave across all 25 dots', () => {
+test('bubbleDotMatrix: thinking state has diagonal wave in normal mode', () => {
   for (let i = 0; i < TOTAL_DOTS; i++) {
     const dot = getDotParameters('thinking', i)
     assert.equal(dot.isOn, true, `All dots must be active in thinking, dot ${i} failed`)
@@ -89,11 +91,13 @@ test('bubbleDotMatrix: waiting state activates exactly 3 horizontal ellipsis dot
       assert.equal(dot.hi, 1, `On dot ${i} must have hi = 1`)
       assert.equal(dot.lo, 0.2, `On dot ${i} must blink down to lo = 0.2`)
       assert.equal(dot.row, 2, `On dot ${i} must be on middle row 2`)
+      assert.equal(dot.resting, 1, `On dot ${i} must have resting = 1`)
     } else {
       offCount++
       assert.equal(dot.hi, 0.15, `Off dot ${i} must rest at dim = 0.15`)
       assert.equal(dot.lo, 0.15, `Off dot ${i} must stay at dim = 0.15 without blinking`)
       assert.equal(dot.duration, undefined, `Off dot ${i} must not have blink animation`)
+      assert.equal(dot.resting, 0.15, `Off dot ${i} must have resting = 0.15`)
     }
   }
   assert.equal(onCount, 3, 'Must have exactly 3 on dots')
@@ -118,12 +122,56 @@ test('bubbleDotMatrix: warning state activates exclamation mark glyph with slow 
       assert.equal(dot.lo, 0.45, `Warning dot ${i} must have lo = 0.45`)
       assert.equal(dot.duration, 1.6, `Warning dot ${i} must have 1.6s period`)
       assert.equal(dot.delay, 0, `Warning dots must pulse synchronously with 0s delay`)
+      assert.equal(dot.resting, 1, `Warning dot ${i} must have resting = 1`)
     } else {
       offCount++
       assert.equal(dot.hi, 0.15, `Off dot ${i} must rest at dim = 0.15`)
       assert.equal(dot.duration, undefined, `Off dot ${i} must not have blink animation`)
+      assert.equal(dot.resting, 0.15, `Off dot ${i} must have resting = 0.15`)
     }
   }
   assert.equal(onCount, 4, 'Must have exactly 4 on dots')
   assert.equal(offCount, 21, 'Must have exactly 21 dim resting dots')
+})
+
+test('bubbleDotMatrix: reduced-motion resting patterns distinctly differentiate thinking and loading', () => {
+  // Thinking resting pattern: exactly 5 dots along the diagonal [0,0], [1,1], [2,2], [3,3], [4,4]
+  assert.equal(THINKING_RESTING_GLYPH.size, 5, 'Thinking resting glyph must have 5 diagonal dots')
+  for (let r = 0; r < 5; r++) {
+    assert.ok(THINKING_RESTING_GLYPH.has(r * 5 + r), `Thinking resting glyph must have [${r}, ${r}]`)
+  }
+
+  // Loading resting pattern: fixed set of 8 scattered constellation dots
+  assert.equal(LOADING_RESTING_GLYPH.size, 8, 'Loading resting glyph must have 8 scattered dots')
+
+  // Verify that thinking and loading have distinct resting opacity vectors
+  const thinkingRestingVector: number[] = []
+  const loadingRestingVector: number[] = []
+
+  for (let i = 0; i < TOTAL_DOTS; i++) {
+    const thinkingDot = getDotParameters('thinking', i)
+    const loadingDot = getDotParameters('loading', i)
+
+    thinkingRestingVector.push(thinkingDot.resting)
+    loadingRestingVector.push(loadingDot.resting)
+
+    if (THINKING_RESTING_GLYPH.has(i)) {
+      assert.equal(thinkingDot.resting, 1, `Thinking diagonal dot ${i} must rest at 1.0`)
+    } else {
+      assert.equal(thinkingDot.resting, 0.2, `Thinking non-diagonal dot ${i} must rest at 0.2`)
+    }
+
+    if (LOADING_RESTING_GLYPH.has(i)) {
+      assert.equal(loadingDot.resting, 1, `Loading constellation dot ${i} must rest at 1.0`)
+    } else {
+      assert.equal(loadingDot.resting, 0.2, `Loading background dot ${i} must rest at 0.2`)
+    }
+  }
+
+  // Invariant: resting patterns must NOT be identical under reduced motion
+  assert.notDeepEqual(
+    thinkingRestingVector,
+    loadingRestingVector,
+    'Thinking and loading resting patterns must be distinctly different under reduced motion'
+  )
 })
