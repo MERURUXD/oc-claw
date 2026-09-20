@@ -3,12 +3,12 @@ import assert from 'node:assert/strict'
 import { SHIMMER_TIMING, isShimmerActive } from './bubbleShimmer.ts'
 
 test('bubbleShimmer: timing constants invariants', () => {
-  assert.equal(SHIMMER_TIMING.initialDelayMs, 300, 'Initial delay should be 300ms')
-  assert.equal(SHIMMER_TIMING.activeMs, 1200, 'Sweep animation duration should be 1200ms')
-  assert.equal(SHIMMER_TIMING.intervalMs, 2700, 'Cycle interval should be 2700ms')
+  assert.equal(SHIMMER_TIMING.initialDelayMs, 600, 'Initial delay should be 600ms')
+  assert.equal(SHIMMER_TIMING.activeMs, 1800, 'Sweep animation duration should be 1800ms')
+  assert.equal(SHIMMER_TIMING.intervalMs, 4200, 'Cycle interval should be 4200ms')
   assert.ok(SHIMMER_TIMING.intervalMs > SHIMMER_TIMING.activeMs, 'Interval must be longer than active sweep')
   const pauseMs = SHIMMER_TIMING.intervalMs - SHIMMER_TIMING.activeMs
-  assert.equal(pauseMs, 1500, 'Quiet resting gap should be exactly 1500ms')
+  assert.equal(pauseMs, 2400, 'Quiet resting gap should be exactly 2400ms')
 })
 
 test('bubbleShimmer: isShimmerActive identifies active vs waiting states accurately', () => {
