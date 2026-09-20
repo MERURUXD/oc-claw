@@ -4,7 +4,7 @@ import { emit, listen } from '@tauri-apps/api/event'
 import { useTranslation } from 'react-i18next'
 import type { TFunction } from 'i18next'
 import { motion, useReducedMotion } from 'motion/react'
-import { CircleHelp, ShieldAlert, Loader2 } from 'lucide-react'
+import { BubbleDotMatrix, toDotMatrixState } from './BubbleDotMatrix'
 import type {
   BubbleSessionDetail,
   BubbleTransitionEvent,
@@ -32,8 +32,9 @@ import {
 } from '../lib/bubbleGeometryLifecycle'
 import { traceBubbleEvent } from '../lib/bubbleTrace'
 import { QuotaMiniBadge } from './QuotaCapsule'
+import { SHIMMER_TIMING, isShimmerActive } from '../lib/bubbleShimmer'
 
-export { BUBBLE_WIDTH, BUBBLE_WIDTH_MOTION }
+export { BUBBLE_WIDTH, BUBBLE_WIDTH_MOTION, SHIMMER_TIMING, isShimmerActive }
 
 /**
  * Centralized motion and geometry constants for the mascot status bubble.
@@ -66,12 +67,6 @@ export const BUBBLE_MOTION = {
   exitFadeDelay: 0.08,
 }
 
-export const SHIMMER_TIMING = {
-  initialDelayMs: 500,
-  activeMs: 1400,
-  intervalMs: 4600,
-}
-
 export type BubblePlacement = 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right'
 
 export function getBubbleEntryOffset(placement: BubblePlacement = 'top-left') {
@@ -86,6 +81,74 @@ export function getBubbleEntryOffset(placement: BubblePlacement = 'top-left') {
     default:
       return { x: -BUBBLE_MOTION.offsetX, y: -BUBBLE_MOTION.offsetY }
   }
+}
+
+/**
+ * Codex-style Cadenced Shimmer for session title:
+ * - 300ms initial delay after active
+ * - 1200ms active sweep (mask/sweep translated opposite to highlight layer)
+ * - 2700ms cadence interval (1.2s sweep, 1.5s quiet)
+ * - steps(60, end) timing
+ * - Stops immediately when inactive (e.g. waiting / stopped)
+ * - Completely disabled under prefers-reduced-motion
+ * - Isolated against QuotaMiniBadge 1-second ticker rerenders
+ */
+export function CadencedShimmerText({
+  children,
+  active,
+  reducedMotion = false,
+  className = '',
+}: {
+  children: React.ReactNode
+  active: boolean
+  reducedMotion?: boolean
+  className?: string
+}) {
+  const [isShimmering, setIsShimmering] = useState(false)
+
+  useEffect(() => {
+    if (!active || reducedMotion) {
+      setIsShimmering(false)
+      return
+    }
+
+    let activeTimer: ReturnType<typeof setTimeout> | null = null
+    let intervalTimer: ReturnType<typeof setInterval> | null = null
+    let initialTimer: ReturnType<typeof setTimeout> | null = null
+
+    const triggerSweep = () => {
+      setIsShimmering(true)
+      if (activeTimer) clearTimeout(activeTimer)
+      activeTimer = setTimeout(() => {
+        setIsShimmering(false)
+      }, SHIMMER_TIMING.activeMs)
+    }
+
+    initialTimer = setTimeout(() => {
+      triggerSweep()
+      intervalTimer = setInterval(() => {
+        triggerSweep()
+      }, SHIMMER_TIMING.intervalMs)
+    }, SHIMMER_TIMING.initialDelayMs)
+
+    return () => {
+      if (initialTimer) clearTimeout(initialTimer)
+      if (intervalTimer) clearInterval(intervalTimer)
+      if (activeTimer) clearTimeout(activeTimer)
+      setIsShimmering(false)
+    }
+  }, [active, reducedMotion])
+
+  return (
+    <div className={`mascot-bubble-title-wrapper ${className}`}>
+      <span className="mascot-bubble-main-title truncate">{children}</span>
+      {isShimmering && !reducedMotion && (
+        <span className="mascot-bubble-shimmer-sweep" aria-hidden="true">
+          <span className="mascot-bubble-shimmer-highlight truncate">{children}</span>
+        </span>
+      )}
+    </div>
+  )
 }
 
 export type BubblePhase =
@@ -157,109 +220,7 @@ function hashSessionId(id: string): number {
 }
 
 function StatusIcon({ kind, isMeasure }: { kind: BubbleStatusKind; isMeasure?: boolean }) {
-  switch (kind) {
-    case 'answer':
-      return (
-        <CircleHelp
-          className={`mascot-status-icon-svg ${isMeasure ? '' : 'mascot-status-icon--attention'}`}
-          size={14}
-          strokeWidth={2}
-        />
-      )
-    case 'approval':
-      return (
-        <ShieldAlert
-          className={`mascot-status-icon-svg ${isMeasure ? '' : 'mascot-status-icon--attention'}`}
-          size={14}
-          strokeWidth={2}
-        />
-      )
-    case 'running':
-      return (
-        <Loader2
-          className={`mascot-status-icon-svg ${isMeasure ? '' : 'mascot-status-icon--spin'}`}
-          size={14}
-          strokeWidth={2}
-        />
-      )
-    case 'working':
-    default:
-      return (
-        <span className="mascot-status-dots" aria-hidden="true">
-          <span className="mascot-status-dot" />
-          <span className="mascot-status-dot" />
-          <span className="mascot-status-dot" />
-        </span>
-      )
-  }
-}
-
-/**
- * Codex-style Cadenced Shimmer for session title:
- * - 500ms initial delay after active
- * - 1400ms active sweep (mask/sweep translated opposite to highlight layer)
- * - 4600ms cadence interval (1.4s sweep, ~3.2s quiet)
- * - steps(60, end) timing
- * - Stops immediately when inactive (e.g. waiting / stopped)
- * - Completely disabled under prefers-reduced-motion
- * - Isolated against QuotaMiniBadge 1-second ticker rerenders
- */
-export function CadencedShimmerText({
-  children,
-  active,
-  reducedMotion = false,
-  className = '',
-}: {
-  children: React.ReactNode
-  active: boolean
-  reducedMotion?: boolean
-  className?: string
-}) {
-  const [isShimmering, setIsShimmering] = useState(false)
-
-  useEffect(() => {
-    if (!active || reducedMotion) {
-      setIsShimmering(false)
-      return
-    }
-
-    let activeTimer: ReturnType<typeof setTimeout> | null = null
-    let intervalTimer: ReturnType<typeof setInterval> | null = null
-    let initialTimer: ReturnType<typeof setTimeout> | null = null
-
-    const triggerSweep = () => {
-      setIsShimmering(true)
-      if (activeTimer) clearTimeout(activeTimer)
-      activeTimer = setTimeout(() => {
-        setIsShimmering(false)
-      }, SHIMMER_TIMING.activeMs)
-    }
-
-    initialTimer = setTimeout(() => {
-      triggerSweep()
-      intervalTimer = setInterval(() => {
-        triggerSweep()
-      }, SHIMMER_TIMING.intervalMs)
-    }, SHIMMER_TIMING.initialDelayMs)
-
-    return () => {
-      if (initialTimer) clearTimeout(initialTimer)
-      if (intervalTimer) clearInterval(intervalTimer)
-      if (activeTimer) clearTimeout(activeTimer)
-      setIsShimmering(false)
-    }
-  }, [active, reducedMotion])
-
-  return (
-    <div className={`mascot-bubble-title-wrapper ${className}`}>
-      <span className="mascot-bubble-main-title truncate">{children}</span>
-      {isShimmering && !reducedMotion && (
-        <span className="mascot-bubble-shimmer-sweep" aria-hidden="true">
-          <span className="mascot-bubble-shimmer-highlight truncate">{children}</span>
-        </span>
-      )}
-    </div>
-  )
+  return <BubbleDotMatrix state={toDotMatrixState(kind)} size="detailed" isMeasure={isMeasure} />
 }
 
 /**
@@ -436,7 +397,6 @@ function SessionBubbleRow({
 }: SessionBubbleRowProps) {
   const fallback = fallbackThinkingText || thinkingText
   const status = resolveBubbleStatus(session, t, fallback)
-  const isWaiting = status.kind === 'answer' || status.kind === 'approval'
 
   const mode = getRowMotionMode({
     phase,
@@ -561,7 +521,7 @@ function SessionBubbleRow({
           {/* Line 1: Session Title / Topic + Metadata */}
           <div className="mascot-bubble-title-line">
             <CadencedShimmerText
-              active={(session.status === 'processing' || session.status === 'tool_running') && !isWaiting}
+              active={isShimmerActive(session.status, status.kind)}
               reducedMotion={Boolean(prefersReducedMotion)}
             >
               {session.title}
@@ -588,7 +548,7 @@ function SessionBubbleRow({
           ) : (
             <div className={`mascot-bubble-action-line ${status.className}`}>
               <span className={`mascot-bubble-status-badge ${status.className}`}>
-                <span className="mascot-bubble-status-icon" key={status.kind} aria-hidden="true">
+                <span className="mascot-bubble-status-icon" aria-hidden="true">
                   <StatusIcon kind={status.kind} />
                 </span>
                 <span className="mascot-bubble-status-label">{status.statusLabel}</span>
@@ -1628,9 +1588,8 @@ export default function MascotBubble() {
             >
               {hasRunning && (
                 <div className="mascot-bubble-item">
-                  <span className="mascot-bubble-beacon">
-                    <span className="mascot-bubble-beacon-ring is-running" />
-                    <span className="mascot-bubble-beacon-dot is-running" />
+                  <span className="mascot-bubble-compact-matrix">
+                    <BubbleDotMatrix state="loading" size="compact" />
                   </span>
                   <span className="mascot-bubble-count is-running">{displaySummary.running}</span>
                   <span className="mascot-bubble-label">running</span>
@@ -1641,9 +1600,8 @@ export default function MascotBubble() {
 
               {hasWaiting && (
                 <div className="mascot-bubble-item">
-                  <span className="mascot-bubble-beacon">
-                    <span className="mascot-bubble-beacon-ring is-waiting" />
-                    <span className="mascot-bubble-beacon-dot is-waiting" />
+                  <span className="mascot-bubble-compact-matrix is-waiting">
+                    <BubbleDotMatrix state="waiting" size="compact" />
                   </span>
                   <span className="mascot-bubble-count is-waiting">{displaySummary.waiting}</span>
                   <span className="mascot-bubble-label">waiting</span>

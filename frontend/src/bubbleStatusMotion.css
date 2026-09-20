@@ -1,72 +1,78 @@
-/* Running-state polish layered after index.css.
- * Keep animation compositor-only while making the loader read more like a
- * compact Fluent ProgressRing: quiet track + short cyan arc.
+/* Bubble status motion: 5×5 Dot Matrix state indicators and smooth transitions.
+ * Replaces the legacy running spinner patch with deterministic dot-matrix animation.
  */
 
-.mascot-bubble-detailed.status-running {
-  background: linear-gradient(
-      0deg,
-      rgba(56, 189, 248, 0.024),
-      rgba(56, 189, 248, 0.024)
-    ),
-    var(--bubble-surface);
-  border-color: rgba(56, 189, 248, 0.11);
+@property --dot-matrix-hi {
+  syntax: '<number>';
+  inherits: false;
+  initial-value: 1;
 }
 
-.mascot-bubble-detailed.status-running:hover {
-  background: linear-gradient(
-      0deg,
-      rgba(56, 189, 248, 0.04),
-      rgba(56, 189, 248, 0.04)
-    ),
-    rgba(38, 38, 38, 0.92);
-  border-color: rgba(56, 189, 248, 0.19);
+@property --dot-matrix-lo {
+  syntax: '<number>';
+  inherits: false;
+  initial-value: 0.15;
 }
 
-.status-running .mascot-bubble-status-badge {
-  color: rgba(56, 189, 248, 0.88);
+@keyframes dot-matrix-blink {
+  0%,
+  100% {
+    opacity: var(--dot-matrix-hi, 1);
+  }
+  50% {
+    opacity: var(--dot-matrix-lo, 0.15);
+  }
 }
 
-.status-running .mascot-bubble-status-icon {
-  position: relative;
+.bubble-dot-matrix {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  line-height: 0;
+  vertical-align: middle;
+}
+
+.bubble-dot-matrix--detailed {
   width: 14px;
   height: 14px;
 }
 
-/* Static low-contrast track behind the rotating arc. */
-.status-running .mascot-bubble-status-icon::before {
-  content: '';
-  position: absolute;
-  inset: 1px;
-  box-sizing: border-box;
-  border: 1.5px solid currentColor;
-  border-radius: 50%;
-  opacity: 0.16;
-  pointer-events: none;
+.bubble-dot-matrix--compact {
+  width: 10px;
+  height: 10px;
 }
 
-/* Loader2 becomes the short foreground arc rather than a near-complete ring. */
-.status-running .mascot-status-icon-svg {
-  position: relative;
-  z-index: 1;
-  width: 14px;
-  height: 14px;
-  opacity: 0.92;
-  stroke-linecap: round;
+.bubble-dot-matrix-svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+  overflow: visible;
 }
 
-.status-running .mascot-status-icon-svg path {
-  stroke-dasharray: 12 48;
+.bubble-dot-matrix-dot {
+  opacity: var(--dot-matrix-resting, var(--dot-matrix-hi, 1));
+  animation-name: dot-matrix-blink;
+  animation-timing-function: ease-in-out;
+  animation-iteration-count: infinite;
+  transition:
+    opacity 0.3s ease,
+    --dot-matrix-hi 0.3s ease,
+    --dot-matrix-lo 0.3s ease;
+  will-change: opacity;
 }
 
-.status-running .mascot-status-icon--spin {
-  animation-duration: 1.25s;
-  animation-timing-function: linear;
+/* Measurement mode: no animation, zero overhead */
+.bubble-dot-matrix--measure .bubble-dot-matrix-dot {
+  animation: none !important;
+  transition: none !important;
+  opacity: var(--dot-matrix-resting, 1) !important;
 }
 
+/* Accessible reduced motion: halt continuous blinking, preserve resting pattern glyph */
 @media (prefers-reduced-motion: reduce) {
-  .status-running .mascot-status-icon--spin {
+  .bubble-dot-matrix-dot {
     animation: none !important;
-    transform: rotate(-35deg);
+    opacity: var(--dot-matrix-resting, 1) !important;
   }
 }

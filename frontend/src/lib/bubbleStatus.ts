@@ -87,10 +87,10 @@ function truncateLine(text: string, maxLen = 80): string {
 
 /**
  * Resolves a session into one of the four centralized status presentations:
- * 1. answer: needs user answer (CircleHelp, blue-violet accent tint)
- * 2. approval: waiting for user confirmation (ShieldAlert, amber tint)
- * 3. running: actively executing a command (Spinner, cyan tint)
- * 4. working: generic working/processing state (ThreeDots, neutral/subtle tint)
+ * 1. answer: needs user answer (Dot Matrix waiting, blue-violet accent tint)
+ * 2. approval: waiting for user confirmation (Dot Matrix warning, amber tint)
+ * 3. running: actively executing a command (Dot Matrix loading, neutral tint)
+ * 4. working: generic working/processing state (Dot Matrix thinking, neutral tint)
  */
 export function resolveBubbleStatus(
   session: BubbleSessionDetail,

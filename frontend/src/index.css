@@ -211,7 +211,7 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
   gap: 4px;
 }
 
-.mascot-bubble-beacon {
+.mascot-bubble-compact-matrix {
   position: relative;
   display: inline-flex;
   align-items: center;
@@ -219,56 +219,11 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
   width: 10px;
   height: 10px;
   flex: none;
+  color: rgba(255, 255, 255, 0.72);
 }
 
-.mascot-bubble-beacon-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  z-index: 1;
-  flex: none;
-}
-
-.mascot-bubble-beacon-dot.is-running {
-  background: #38bdf8;
-  box-shadow: 0 0 6px rgba(56, 189, 248, 0.9), 0 0 12px rgba(56, 189, 248, 0.4);
-}
-
-.mascot-bubble-beacon-dot.is-waiting {
-  background: #fbbf24;
-  box-shadow: 0 0 6px rgba(251, 191, 36, 0.9), 0 0 12px rgba(251, 191, 36, 0.4);
-}
-
-.mascot-bubble-beacon-ring {
-  position: absolute;
-  inset: 0;
-  border-radius: 50%;
-  pointer-events: none;
-}
-
-.mascot-bubble-beacon-ring.is-running {
-  background: rgba(56, 189, 248, 0.6);
-  animation: mascot-beacon-pulse 2s cubic-bezier(0, 0, 0.2, 1) infinite;
-}
-
-.mascot-bubble-beacon-ring.is-waiting {
-  background: rgba(251, 191, 36, 0.6);
-  animation: mascot-beacon-pulse 2.2s cubic-bezier(0, 0, 0.2, 1) infinite;
-}
-
-@keyframes mascot-beacon-pulse {
-  0% {
-    transform: scale(0.8);
-    opacity: 0.85;
-  }
-  70% {
-    transform: scale(2.2);
-    opacity: 0;
-  }
-  100% {
-    transform: scale(2.2);
-    opacity: 0;
-  }
+.mascot-bubble-compact-matrix.is-waiting {
+  color: #fbbf24;
 }
 
 .mascot-bubble-count {
@@ -280,8 +235,7 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
 }
 
 .mascot-bubble-count.is-running {
-  color: #38bdf8;
-  text-shadow: 0 0 8px rgba(56, 189, 248, 0.4);
+  color: rgba(241, 245, 249, 0.95);
 }
 
 .mascot-bubble-count.is-waiting {
@@ -366,13 +320,13 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
 }
 
 .mascot-bubble-detailed.status-running {
-  background: linear-gradient(0deg, rgba(56, 189, 248, 0.035), rgba(56, 189, 248, 0.035)), var(--bubble-surface);
-  border-color: rgba(56, 189, 248, 0.14);
+  background: linear-gradient(0deg, rgba(255, 255, 255, 0.015), rgba(255, 255, 255, 0.015)), var(--bubble-surface);
+  border-color: rgba(255, 255, 255, 0.10);
 }
 
 .mascot-bubble-detailed.status-running:hover {
-  background: linear-gradient(0deg, rgba(56, 189, 248, 0.055), rgba(56, 189, 248, 0.055)), rgba(38, 38, 38, 0.92);
-  border-color: rgba(56, 189, 248, 0.24);
+  background: rgba(38, 38, 38, 0.92);
+  border-color: rgba(255, 255, 255, 0.18);
 }
 
 .mascot-bubble-detailed.status-working {
@@ -425,7 +379,7 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
   max-width: 100%;
 }
 
-/* Codex ThinkingShimmer mask/sweep */
+/* Codex ThinkingShimmer mask/sweep (tuned for wider beam and tighter cadence) */
 .mascot-bubble-shimmer-sweep {
   position: absolute;
   top: 0;
@@ -437,16 +391,16 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
   -webkit-mask-image: linear-gradient(
     90deg,
     transparent 0%,
-    black 18% 34%,
-    transparent 55% 100%
+    black 15% 45%,
+    transparent 65% 100%
   );
   mask-image: linear-gradient(
     90deg,
     transparent 0%,
-    black 18% 34%,
-    transparent 55% 100%
+    black 15% 45%,
+    transparent 65% 100%
   );
-  animation: codex-shimmer-sweep 1.4s steps(60, end) 1 forwards;
+  animation: codex-shimmer-sweep 1.2s steps(60, end) 1 forwards;
   will-change: transform;
 }
 
@@ -462,25 +416,25 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 100%;
-  animation: codex-shimmer-highlight 1.4s steps(60, end) 1 forwards;
+  animation: codex-shimmer-highlight 1.2s steps(60, end) 1 forwards;
   will-change: transform;
 }
 
 @keyframes codex-shimmer-sweep {
   0% {
-    transform: translateX(-50%);
+    transform: translateX(-70%);
   }
   100% {
-    transform: translateX(125%);
+    transform: translateX(110%);
   }
 }
 
 @keyframes codex-shimmer-highlight {
   0% {
-    transform: translateX(50%);
+    transform: translateX(70%);
   }
   100% {
-    transform: translateX(-125%);
+    transform: translateX(-110%);
   }
 }
 
@@ -528,7 +482,7 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
 }
 
 .status-running .mascot-bubble-status-badge {
-  color: #38bdf8;
+  color: rgba(255, 255, 255, 0.72);
 }
 
 .status-working .mascot-bubble-status-badge {
@@ -539,12 +493,6 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 14px;
-  height: 14px;
-  flex: none;
-}
-
-.mascot-status-icon-svg {
   width: 14px;
   height: 14px;
   flex: none;
@@ -579,93 +527,6 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
   color: rgba(255, 255, 255, 0.78);
   margin-right: 4px;
   flex: none;
-}
-
-/* Micro-animation: running command spinner (transform only) */
-@keyframes status-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-.mascot-status-icon--spin {
-  animation: status-spin 1s linear infinite;
-  will-change: transform;
-}
-
-/* Micro-animation: attention entry for user-action states (transform & opacity only) */
-@keyframes status-icon-emphasis {
-  0% {
-    opacity: 0;
-    transform: scale(0.90);
-  }
-  60% {
-    opacity: 1;
-    transform: scale(1.04);
-  }
-  100% {
-    opacity: 1;
-    transform: scale(1);
-  }
-}
-
-.mascot-status-icon--attention {
-  animation: status-icon-emphasis 220ms cubic-bezier(0.16, 1, 0.3, 1) 1 forwards;
-  will-change: transform, opacity;
-}
-
-/* Micro-animation: 3-dot working indicator (opacity only) */
-.mascot-status-dots {
-  display: inline-flex;
-  align-items: center;
-  gap: 2.5px;
-  height: 14px;
-  flex: none;
-}
-
-.mascot-status-dot {
-  width: 3.5px;
-  height: 3.5px;
-  border-radius: 50%;
-  background-color: currentColor;
-  animation: mascot-dot-pulse 1.35s ease-in-out infinite;
-  will-change: opacity;
-}
-
-.mascot-status-dot:nth-child(1) {
-  animation-delay: 0ms;
-}
-
-.mascot-status-dot:nth-child(2) {
-  animation-delay: 140ms;
-}
-
-.mascot-status-dot:nth-child(3) {
-  animation-delay: 280ms;
-}
-
-@keyframes mascot-dot-pulse {
-  0%, 100% {
-    opacity: 0.28;
-  }
-  50% {
-    opacity: 1;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .mascot-status-icon--spin {
-    animation: none !important;
-  }
-  .mascot-status-icon--attention {
-    animation: none !important;
-    transform: none !important;
-    opacity: 1 !important;
-  }
-  .mascot-status-dot {
-    animation: none !important;
-    opacity: 0.8 !important;
-  }
 }
 
 .mascot-bubble-badge {
