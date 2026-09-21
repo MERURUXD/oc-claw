@@ -54,6 +54,9 @@ pub struct ApprovalActions {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingInteraction {
+    /// Live hook evidence must not be cleared by absence in a transcript.
+    #[serde(default, skip_serializing)]
+    pub hook_owned: bool,
     pub kind: String, // "approval" | "user_input"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interaction_type: Option<String>, // "command" | "file_change" | "permissions" | "mcp" | "user_input" | "unknown"
@@ -1229,6 +1232,7 @@ pub fn reconstruct_codex_pending_interaction(
                                 let item_id = w_item_id.or_else(|| p.get("item_id").or_else(|| p.get("id")).or_else(|| parsed.get("item_id")).or_else(|| parsed.get("id")).and_then(|v| v.as_str()).map(|s| s.to_string()));
                                 let call_id_opt = if !w_call_id.is_empty() { Some(w_call_id) } else if !call_id.is_empty() { Some(call_id.to_string()) } else { None };
                                 return Some(PendingInteraction {
+                                    hook_owned: false,
                                     kind: "approval".to_string(),
                                     interaction_type: Some("permissions".to_string()),
                                     turn_id: resolved_turn_id,
@@ -1276,6 +1280,7 @@ pub fn reconstruct_codex_pending_interaction(
                                 let resolved_turn_id = line_turn_id.or(current_turn_id).map(|s| s.to_string());
                                 let call_id_opt = if !call_id.is_empty() { Some(call_id.to_string()) } else { None };
                                 return Some(PendingInteraction {
+                                    hook_owned: false,
                                     kind: "approval".to_string(),
                                     interaction_type: Some("permissions".to_string()),
                                     turn_id: resolved_turn_id,
@@ -1302,6 +1307,7 @@ pub fn reconstruct_codex_pending_interaction(
                                     let resolved_turn_id = line_turn_id.or(current_turn_id).map(|s| s.to_string());
                                     let call_id_opt = if !call_id.is_empty() { Some(call_id.to_string()) } else { None };
                                     return Some(PendingInteraction {
+                                        hook_owned: false,
                                         kind: "approval".to_string(),
                                         interaction_type: Some("permissions".to_string()),
                                         turn_id: resolved_turn_id,
@@ -1385,6 +1391,7 @@ pub fn reconstruct_codex_pending_interaction(
                         let detail = if !prompt_text.is_empty() { Some(prompt_text) } else { None };
 
                         return Some(PendingInteraction {
+                            hook_owned: false,
                             kind: "user_input".to_string(),
                             interaction_type: Some("user_input".to_string()),
                             turn_id: resolved_turn_id,
@@ -1439,6 +1446,7 @@ pub fn reconstruct_codex_pending_interaction(
                     };
 
                     return Some(PendingInteraction {
+                        hook_owned: false,
                         kind: "approval".to_string(),
                         interaction_type,
                         turn_id: resolved_turn_id,
@@ -1456,7 +1464,8 @@ pub fn reconstruct_codex_pending_interaction(
         }
     }
 
-    None
+    // A blocking approval takes precedence over a concurrently open async question.
+    crate::interaction_state::codex_async_question(&lines, current_turn_id)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1592,6 +1601,7 @@ pub fn extract_antigravity_execution_activity(lines: &[&str]) -> AntigravityExec
             || msg_type == "RUN_COMMAND" || msg_type == "EXECUTE_COMMAND"
             || msg_type == "CODE_ACTION" || msg_type == "WRITE_FILE" || msg_type == "WRITE_TO_FILE"
             || msg_type == "REPLACE_FILE_CONTENT" || msg_type == "REPLACE" || msg_type == "PATCH"
+            || msg_type == "ASK_QUESTION" || msg_type == "ASK_PERMISSION"
             || msg_type.contains("TOOL") || msg_type.contains("ACTION")
         );
 
@@ -1629,7 +1639,17 @@ pub fn extract_antigravity_execution_activity(lines: &[&str]) -> AntigravityExec
     let completed_count = exec_steps.iter().filter(|s| s.status == "DONE").count();
 
     if let Some(last_exec) = exec_steps.last() {
-        if last_exec.status == "RUNNING" {
+        if matches!(last_exec.status.as_str(), "ERROR" | "CANCELED" | "CANCELLED" | "INTERRUPTED" | "HALTED" | "CLEARED") {
+            return AntigravityExecutionActivity {
+                activity: None,
+                tool: None,
+                tool_input: None,
+                origin: AntigravityActivityOrigin::ExecutionStep,
+                is_running: false,
+                step_index: last_exec.step_index,
+            };
+        }
+        if matches!(last_exec.status.as_str(), "RUNNING" | "WAITING") {
             let (tool_name, tool_args) = if let Some(mapped_name) = map_execution_type_to_tool_name(&last_exec.type_name) {
                 let args = if last_exec.args.is_object() && !last_exec.args.as_object().unwrap().is_empty() {
                     last_exec.args.clone()

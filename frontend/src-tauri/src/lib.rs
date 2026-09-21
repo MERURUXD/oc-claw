@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 mod presentation;
+mod interaction_state;
 mod bubble_trace;
 static PRESENTATION: presentation::Suppression = presentation::Suppression::new();
 static EXTRA_MASCOTS_HIDDEN: AtomicBool = AtomicBool::new(false);
@@ -7695,56 +7696,13 @@ fn find_codex_session_file(session_id: &str) -> Option<PathBuf> {
 
 fn ensure_codex_hooks_feature_enabled(codex_dir: &std::path::Path) -> Result<(), String> {
     let config_path = codex_dir.join("config.toml");
-    let mut content = if config_path.exists() {
+    let content = if config_path.exists() {
         std::fs::read_to_string(&config_path).map_err(|e| e.to_string())?
-    } else {
-        String::new()
-    };
-
-    let mut lines: Vec<String> = content.lines().map(|line| line.to_string()).collect();
-    let mut features_start: Option<usize> = None;
-    let mut features_end = lines.len();
-    for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed == "[features]" {
-            features_start = Some(idx);
-            continue;
-        }
-        if features_start.is_some()
-            && idx > features_start.unwrap_or(0)
-            && trimmed.starts_with('[')
-            && trimmed.ends_with(']')
-        {
-            features_end = idx;
-            break;
-        }
+    } else { String::new() };
+    let migrated = interaction_state::codex_hooks_config(&content);
+    if migrated != content {
+        std::fs::write(&config_path, migrated).map_err(|e| e.to_string())?;
     }
-
-    if let Some(start) = features_start {
-        let mut found_codex_hooks = false;
-        for line in lines.iter_mut().take(features_end).skip(start + 1) {
-            let trimmed = line.trim_start();
-            if (trimmed.starts_with("codex_hooks ")
-                || trimmed.starts_with("codex_hooks=")
-                || trimmed.starts_with("codex_hooks\t"))
-                && trimmed.contains('=')
-            {
-                *line = "codex_hooks = true".to_string();
-                found_codex_hooks = true;
-            }
-        }
-        if !found_codex_hooks {
-            lines.insert(start + 1, "codex_hooks = true".to_string());
-        }
-        content = lines.join("\n");
-    } else {
-        if !content.is_empty() && !content.ends_with('\n') {
-            content.push('\n');
-        }
-        content.push_str("\n[features]\ncodex_hooks = true\n");
-    }
-
-    std::fs::write(&config_path, content).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -9160,6 +9118,25 @@ fn update_antigravity_session_from_transcript(session: &mut ClaudeSession) -> bo
     let (active_subs, agg_status) = aggregate_antigravity_root_subagents(&session.session_id);
     let has_active_subs = !active_subs.is_empty();
 
+    let transcript_interaction = interaction_state::antigravity_pending(&lines);
+    if let Some(interaction) = session.pending_interaction.clone().filter(|p| p.hook_owned)
+        .or(transcript_interaction) {
+        session.status = "waiting".to_string();
+        session.is_processing = false;
+        session.needs_review = Some(interaction.kind == "approval");
+        session.tool = interaction.tool.clone();
+        session.tool_input = interaction.detail.clone();
+        session.pending_interaction = Some(interaction);
+        session.activity = None;
+        session.active_subagents = if has_active_subs { Some(active_subs) } else { None };
+        return true;
+    }
+    if session.pending_interaction.is_some() {
+        session.pending_interaction = None;
+        session.needs_review = None;
+        if session.status == "waiting" { session.status = "processing".to_string(); }
+    }
+
     if has_active_subs {
         session.status = agg_status;
         session.is_processing = true;
@@ -9615,7 +9592,8 @@ fn start_session_file_watcher(
                 let mut changed = false;
 
                 if session.source == "codex" {
-                    if let Some(interaction) = session_activity::reconstruct_codex_pending_interaction(&path2, session.turn_id.as_deref()) {
+                    if let Some(interaction) = session.pending_interaction.clone().filter(|p| p.hook_owned)
+                        .or_else(|| session_activity::reconstruct_codex_pending_interaction(&path2, session.turn_id.as_deref())) {
                         let is_review = interaction.kind == "approval";
                         let interaction_changed = session.pending_interaction.as_ref() != Some(&interaction);
                         if session.status != "waiting" || session.needs_review != Some(is_review) || interaction_changed {
@@ -9687,6 +9665,8 @@ fn start_session_file_watcher(
                         session.tool_input = None;
                         session.activity = None;
                         session.permission_suggestions = None;
+                        session.pending_interaction = None;
+                        session.needs_review = None;
                         changed = true;
                     }
                 }
@@ -9958,7 +9938,8 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
             if session.source == "cursor" || session.source == "codex" || session.source == "opencode" || session.source == "antigravity" || is_desktop_hosted {
                 if session.source == "codex" {
                     if let Some(path) = resolve_session_jsonl_path(&session.session_id, Some(&session.cwd)) {
-                        if let Some(interaction) = session_activity::reconstruct_codex_pending_interaction(&path, session.turn_id.as_deref()) {
+                        if let Some(interaction) = session.pending_interaction.clone().filter(|p| p.hook_owned)
+                            .or_else(|| session_activity::reconstruct_codex_pending_interaction(&path, session.turn_id.as_deref())) {
                             session.status = "waiting".to_string();
                             session.is_processing = false;
                             let is_review = interaction.kind == "approval";
@@ -9993,6 +9974,7 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
                     }
                 }
                 if session.source == "antigravity" {
+                    update_antigravity_session_from_transcript(session);
                     if session.status != "waiting" {
                         let has_running_subs = session.active_subagents.as_ref()
                             .map(|subs| subs.iter().any(|s| s.status != "stopped"))
@@ -10025,6 +10007,10 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
                 // hook event; its explicit Stop/SessionEnd hooks are the normal
                 // completion boundary, so it needs a much wider fallback than
                 // terminal-style clients.
+                if session.status == "waiting" && session.pending_interaction.is_some()
+                    && matches!(session.source.as_str(), "codex" | "antigravity") {
+                    continue;
+                }
                 let age_ms = now_ms.saturating_sub(session.updated_at);
                 let timeout_limit = if session.source == "codex" {
                     30 * 60_000
@@ -16314,26 +16300,8 @@ try {
         if (-not $obj.cwd -and -not $obj.workdir) {
             try { $obj | Add-Member -NotePropertyName cwd -NotePropertyValue (Get-Location).Path -Force } catch {}
         }
-        if (-not $obj.pid) {
-            try {
-                $current = $PID
-                for ($i = 0; $i -lt 10; $i++) {
-                    $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$current"
-                    if (-not $proc) { break }
-                    $parentId = $proc.ParentProcessId
-                    if (-not $parentId -or $parentId -eq 0 -or $parentId -eq $current) { break }
-                    $parent = Get-CimInstance Win32_Process -Filter "ProcessId=$parentId"
-                    if (-not $parent) { break }
-                    $exe = ''
-                    if ($parent.ExecutablePath) { $exe = $parent.ExecutablePath.ToLower() }
-                    if ($exe -and ($exe.EndsWith('\codex.exe') -or $exe.EndsWith('\node.exe') -or $exe.EndsWith('\powershell.exe') -or $exe.EndsWith('\pwsh.exe'))) {
-                        $obj | Add-Member -NotePropertyName pid -NotePropertyValue ([int]$parent.ProcessId) -Force
-                        break
-                    }
-                    $current = $parentId
-                }
-            } catch {}
-        }
+        # No WMI process-tree discovery on the synchronous approval path.
+        # Codex is identified by source/session_id; preserve pid only if supplied.
         $raw = $obj | ConvertTo-Json -Compress -Depth 30
     }
 
@@ -16527,6 +16495,7 @@ except:
     let hook_configs = vec![
         ("SessionStart", false),
         ("SessionEnd", false),
+        ("Interrupt", false),
         ("UserPromptSubmit", false),
         ("PreToolUse", true),
         ("PermissionRequest", true),
@@ -16633,6 +16602,7 @@ pub fn parse_codex_permission_request(event: &serde_json::Value) -> Option<Pendi
         .map(|s| s.to_string());
 
     Some(PendingInteraction {
+        hook_owned: false,
         kind: "approval".to_string(),
         interaction_type: Some("permissions".to_string()),
         turn_id: incoming_turn_id,
@@ -16759,6 +16729,7 @@ pub fn apply_codex_permission_relay_to_session(
 
         let mut pi = parse_codex_permission_request(parsed_event).unwrap_or_else(|| {
             PendingInteraction {
+                hook_owned: false,
                 kind: "approval".to_string(),
                 interaction_type: Some("permissions".to_string()),
                 turn_id: if turn_id.is_empty() { None } else { Some(turn_id.to_string()) },
@@ -17500,6 +17471,7 @@ mod codex_adapter_tests {
             activity_origin: None,
             turn_id: Some("turn_live".to_string()),
             pending_interaction: Some(PendingInteraction {
+                hook_owned: false,
                 kind: "approval".to_string(),
                 interaction_type: Some("permissions".to_string()),
                 turn_id: Some("turn_live".to_string()),
@@ -17991,6 +17963,7 @@ mod codex_adapter_tests {
             activity_origin: None,
             turn_id: Some("turn_B".to_string()),
             pending_interaction: Some(PendingInteraction {
+                hook_owned: false,
                 kind: "approval".to_string(),
                 interaction_type: Some("permissions".to_string()),
                 turn_id: Some("turn_B".to_string()),
@@ -18061,6 +18034,7 @@ mod codex_adapter_tests {
             activity_origin: None,
             turn_id: Some("turn_1".to_string()),
             pending_interaction: Some(PendingInteraction {
+                hook_owned: false,
                 kind: "user_input".to_string(),
                 interaction_type: Some("user_input".to_string()),
                 turn_id: Some("turn_1".to_string()),
@@ -18129,6 +18103,7 @@ mod codex_adapter_tests {
             activity_origin: None,
             turn_id: Some("turn_1".to_string()),
             pending_interaction: Some(PendingInteraction {
+                hook_owned: false,
                 kind: "approval".to_string(),
                 interaction_type: Some("permissions".to_string()),
                 turn_id: Some("turn_1".to_string()),
@@ -18199,6 +18174,7 @@ mod codex_adapter_tests {
             activity_origin: None,
             turn_id: Some("turn_1".to_string()),
             pending_interaction: Some(PendingInteraction {
+                hook_owned: false,
                 kind: "approval".to_string(),
                 interaction_type: Some("permissions".to_string()),
                 turn_id: Some("turn_1".to_string()),
@@ -18768,7 +18744,7 @@ mod codex_adapter_tests {
             "tool": "run_command"
         }).to_string();
         let resp_pre = antigravity_hook_response_for_event(&pre_event);
-        assert_eq!(resp_pre, b"{\"decision\":\"allow\",\"permissionOverrides\":[\"*\"]}");
+        assert_eq!(resp_pre, b"{}");
 
         let other_event = serde_json::json!({
             "event": "PreInvocation"
@@ -18976,7 +18952,7 @@ fn process_claude_event(
         let hook_event = match raw_hook_event.as_str() {
             "beforeSubmitPrompt" => "UserPromptSubmit".to_string(),
             "hook-user-prompt-submit" => "UserPromptSubmit".to_string(),
-            "PreInvocation" => "UserPromptSubmit".to_string(),
+            "PreInvocation" | "PostInvocation" => "ModelInvocation".to_string(),
             "sessionStart" => "SessionStart".to_string(),
             "sessionEnd" => "SessionEnd".to_string(),
             "agentStop" => "Stop".to_string(),
@@ -19067,7 +19043,7 @@ fn process_claude_event(
             "UserPromptSubmit" | "GatewayAgentStart" => {
                 if is_local_slash { "stopped".to_string() } else { "processing".to_string() }
             }
-            "GatewayAgentStep" => "processing".to_string(),
+            "GatewayAgentStep" | "ModelInvocation" => "processing".to_string(),
             "GatewayAgentEnd" => "stopped".to_string(),
             "HermesPostLlm" => "processing".to_string(),
             "PreCompact" => "compacting".to_string(),
@@ -19087,6 +19063,7 @@ fn process_claude_event(
                     && (tool == "AskUserQuestion" || tool == "AskQuestion" || tool == "ask_question");
                 if tool == "AskUserQuestion" || tool == "AskQuestion" || tool == "ask_question"
                     || is_interactive_tool(tool)
+                    || (source_override == Some("codex") && interaction_state::is_question(tool))
                     || pretool_needs_waiting
                     || is_agy_wait
                 {
@@ -19101,6 +19078,7 @@ fn process_claude_event(
             "SubagentStart" => "processing".to_string(),
             "SubagentStop" => "processing".to_string(),
             "SessionEnd" => "ended".to_string(),
+            "Interrupt" => "stopped".to_string(),
             "PermissionRequest" => "waiting".to_string(),
             // Automatic compaction can happen in the middle of a turn. Codex
             // emits SessionStart(source=compact) before immediately continuing
@@ -19151,6 +19129,13 @@ fn process_claude_event(
 
         {
             let mut sessions = state.lock().unwrap();
+            if let Some(session) = sessions.get(&session_id) {
+                if matches!(session.source.as_str(), "codex" | "antigravity")
+                    && interaction_state::stale_turn(session.turn_id.as_deref(), &event, &hook_event) {
+                    return None;
+                }
+            }
+            let previous_interaction = sessions.get(&session_id).and_then(|s| s.pending_interaction.clone());
             let prev_status = sessions.get(&session_id).map(|s| s.status.clone()).unwrap_or_default();
             was_processing = matches!(prev_status.as_str(), "processing" | "tool_running" | "compacting");
             was_compacting = prev_status == "compacting";
@@ -19650,11 +19635,31 @@ fn process_claude_event(
                     session.pending_interaction = None;
                 }
 
+                if matches!(session.source.as_str(), "codex" | "antigravity") {
+                    let observed = interaction_state::from_hook(&event, &hook_event, &session.source);
+                    let retained = previous_interaction.filter(|p| !stop_was_interrupted && interaction_state::retain(p, &event, &hook_event));
+                    if let Some(interaction) = observed.or(retained) {
+                        session.needs_review = Some(interaction.kind == "approval");
+                        session.tool = interaction.tool.clone();
+                        session.tool_input = interaction.detail.clone();
+                        session.pending_interaction = Some(interaction);
+                        session.status = "waiting".to_string();
+                        session.is_processing = false;
+                        session.activity = None;
+                        status = "waiting".to_string();
+                    }
+                }
+
+                if session.source == "antigravity" && hook_event == "ModelInvocation" {
+                    update_antigravity_session_from_transcript(session);
+                    status = session.status.clone();
+                }
+
                 // For waiting/permission events, capture tab focus now (real-time,
                 // not polling) so the waiting popup can be suppressed when the
                 // user is already watching the session's terminal tab.
                 if hook_event == "PermissionRequest"
-                    || (hook_event == "PreToolUse" && status == "waiting") {
+                    || (matches!(hook_event.as_str(), "PreToolUse" | "ModelInvocation") && status == "waiting") {
                     wait_tab_active = user_looking_at_session_tab(session);
                 }
 
@@ -19673,7 +19678,7 @@ fn process_claude_event(
         // Also suppress sound while sub-agents are still running (pending_agents > 0).
         // Each PreToolUse(Agent) increments the counter, each SubagentStop decrements it.
         // Sound only plays when all sub-agents have completed.
-        let is_wait_event = (hook_event == "PermissionRequest"
+        let is_wait_event = ((hook_event == "ModelInvocation" && status == "waiting") || hook_event == "PermissionRequest"
             || (hook_event == "PreToolUse" && status == "waiting"))
             // Suppress the waiting popup when the user is already looking at the
             // session's terminal tab (same focus rule as the completion popup).
@@ -19700,7 +19705,8 @@ fn process_claude_event(
         if was_processing && !was_compacting
             && (is_completion_stop || is_wait_event) {
             let is_waiting = is_wait_event;
-            let session_needs_review = hook_event == "PermissionRequest" || pretool_needs_waiting;
+            let session_needs_review = session_pending_interaction.as_ref().map_or(
+                hook_event == "PermissionRequest" || pretool_needs_waiting, |p| p.kind == "approval");
             if cfg!(debug_assertions) {
                 log::info!(
                     "[claude_event] emit claude-task-complete session={} waiting={} needsReview={} source={} host={:?}",
@@ -20139,30 +20145,17 @@ if not data.get('cwd') and data.get('workspacePaths'):
 
 payload = json.dumps(data)
 
-response_str = ''
+# Status transport only. No reply from OC-Claw is needed.
 if os.path.exists('$SOCKET_PATH'):
     try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.connect('$SOCKET_PATH')
-        sock.sendall(payload.encode('utf-8'))
-        sock.shutdown(socket.SHUT_WR)
-        chunks = []
-        while True:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        sock.close()
-        response_str = b''.join(chunks).decode('utf-8', errors='ignore').strip()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.5)
+            sock.connect('$SOCKET_PATH')
+            sock.sendall(payload.encode('utf-8'))
+            sock.shutdown(socket.SHUT_WR)
     except:
         pass
-
-if hook_event != 'PreToolUse':
-    response_str = '{}'
-elif not response_str:
-    response_str = json.dumps({'decision': 'allow', 'permissionOverrides': ['*']})
-
-sys.stdout.write(response_str)
+sys.stdout.write('{}')
 sys.exit(0)
 "
 "#;
@@ -20220,35 +20213,24 @@ try {
 
     $client = [System.Net.Sockets.TcpClient]::new()
     $connectTask = $client.ConnectAsync('127.0.0.1', 19288)
-    if (-not $connectTask.Wait(1000)) {
+    if (-not $connectTask.Wait(500)) {
         throw "Connect timeout"
     }
     $stream = $client.GetStream()
-    $stream.ReadTimeout = 115000
-    $stream.WriteTimeout = 2000
+    $stream.WriteTimeout = 500
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
     $stream.Write($bytes, 0, $bytes.Length)
     $stream.Flush()
     $client.Client.Shutdown([System.Net.Sockets.SocketShutdown]::Send)
 
-    $reader = [System.IO.StreamReader]::new($stream, [System.Text.Encoding]::UTF8)
-    $responseStr = $reader.ReadToEnd()
-    $client.Close()
-
-    if ($hookEvent -ne 'PreToolUse') {
-        $responseStr = '{}'
-    } elseif ([string]::IsNullOrWhiteSpace($responseStr)) {
-        $responseStr = '{"decision":"allow","permissionOverrides":["*"]}'
-    }
-    [Console]::Out.Write($responseStr)
-    [Console]::Out.Flush()
-    exit 0
+    # Observation only: never wait for or emit a permission decision.
+    [Console]::Out.Write('{}')
 } catch {
-    $gatingResponse = if ($eventArg -eq 'PreToolUse' -or $hookEvent -eq 'PreToolUse') { '{"decision":"allow","permissionOverrides":["*"]}' } else { '{}' }
-    [Console]::Out.Write($gatingResponse)
-    [Console]::Out.Flush()
-    exit 0
+    [Console]::Out.Write('{}')
+} finally {
+    if ($client) { $client.Dispose() }
 }
+
 "#;
         std::fs::write(&hook_path, ps1_script).map_err(|e| e.to_string())?;
     }
@@ -20275,26 +20257,32 @@ try {
 
     let plugin_hooks_path = plugin_dir.join("hooks.json");
     let pre_inv_cmd = format!("{} PreInvocation", hook_command);
-    let pre_tool_cmd = format!("{} PreToolUse", hook_command);
+    let post_inv_cmd = format!("{} PostInvocation", hook_command);
     let post_tool_cmd = format!("{} PostToolUse", hook_command);
     let stop_cmd = format!("{} Stop", hook_command);
 
-    let hooks_json = serde_json::json!({
+    // PreToolUse is a gating API in Antigravity, not an observation API.
+    // Do not install it: an allow/ask/deny reply changes native permissions.
+    let enabled = std::fs::read_to_string(&plugin_hooks_path).ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.pointer("/occlaw/enabled").and_then(|v| v.as_bool()));
+    let mut hooks_json = serde_json::json!({
         "occlaw": {
             "PreInvocation": [
-                { "type": "command", "command": pre_inv_cmd, "timeout": 10 }
+                { "type": "command", "command": pre_inv_cmd, "timeout": 5 }
             ],
-            "PreToolUse": [
-                { "matcher": "*", "hooks": [{ "type": "command", "command": pre_tool_cmd, "timeout": 120 }] }
+            "PostInvocation": [
+                { "type": "command", "command": post_inv_cmd, "timeout": 5 }
             ],
             "PostToolUse": [
-                { "matcher": "*", "hooks": [{ "type": "command", "command": post_tool_cmd, "timeout": 10 }] }
+                { "matcher": "*", "hooks": [{ "type": "command", "command": post_tool_cmd, "timeout": 5 }] }
             ],
             "Stop": [
-                { "type": "command", "command": stop_cmd, "timeout": 10 }
+                { "type": "command", "command": stop_cmd, "timeout": 5 }
             ]
         }
     });
+    if let Some(enabled) = enabled { hooks_json["occlaw"]["enabled"] = serde_json::json!(enabled); }
     let hooks_json_str = serde_json::to_string_pretty(&hooks_json).map_err(|e| e.to_string())?;
     std::fs::write(&plugin_hooks_path, hooks_json_str).map_err(|e| e.to_string())?;
     log::info!("[antigravity_hooks] installed hooks plugin to {:?}", plugin_dir);
@@ -22273,20 +22261,9 @@ fn start_hermes_socket_server(
     }
 }
 
-fn antigravity_hook_response_for_event(event_text: &str) -> &'static [u8] {
-    let is_pre_tool_use = serde_json::from_str::<serde_json::Value>(event_text)
-        .ok()
-        .and_then(|v| {
-            v.get("event")
-                .and_then(|e| e.as_str())
-                .map(|s| s == "PreToolUse")
-        })
-        .unwrap_or(false);
-    if is_pre_tool_use {
-        b"{\"decision\":\"allow\",\"permissionOverrides\":[\"*\"]}"
-    } else {
-        b"{}"
-    }
+fn antigravity_hook_response_for_event(_event_text: &str) -> &'static [u8] {
+    // Compatibility acknowledgement only; native permissions belong to AGY.
+    b"{}"
 }
 
 /// Start the Antigravity (AGY) agent IPC server.
@@ -22318,9 +22295,9 @@ fn start_antigravity_socket_server(
                         let mut buf = String::new();
                         let _ = stream.read_to_string(&mut buf);
                         if !buf.is_empty() {
-                            process_claude_event(&buf, &state, &app, Some("antigravity"));
                             let _ = stream.write_all(antigravity_hook_response_for_event(&buf));
                             let _ = stream.flush();
+                            process_claude_event(&buf, &state, &app, Some("antigravity"));
                         }
                     });
                 }
@@ -22361,9 +22338,9 @@ fn start_antigravity_socket_server(
                         }
                         let text = String::from_utf8_lossy(&buf);
                         if !text.is_empty() {
-                            process_claude_event(&text, &state, &app, Some("antigravity"));
                             let _ = stream.write_all(antigravity_hook_response_for_event(&text));
                             let _ = stream.flush();
+                            process_claude_event(&text, &state, &app, Some("antigravity"));
                         }
                     });
                 }
