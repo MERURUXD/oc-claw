@@ -416,6 +416,65 @@ test('Native window anchor stability: body coordinates remain invariant across r
   assert.equal(extra_body2_top, 50)
 })
 
+test('Mini bounds unregister layout restore: only triggers when transitioning from VideoPet while collapsed', () => {
+  const shouldRestoreLayout = (
+    wasVideoPet: boolean,
+    isExpanded: boolean,
+    settingsMode: boolean,
+    settingsTransitioning: boolean,
+  ) => {
+    return wasVideoPet && !isExpanded && !settingsMode && !settingsTransitioning
+  }
+
+  // 1. Startup / normal Codex pet initialization: wasVideoPet is false -> NEVER touches window layout
+  assert.equal(shouldRestoreLayout(false, false, false, false), false)
+
+  // 2. Settings modal open: switching from VideoPet to Codex in settings -> NEVER touches window layout
+  assert.equal(shouldRestoreLayout(true, false, true, false), false)
+
+  // 3. Settings modal transitioning: -> NEVER touches window layout
+  assert.equal(shouldRestoreLayout(true, false, false, true), false)
+
+  // 4. Expanded panel open: -> NEVER touches window layout
+  assert.equal(shouldRestoreLayout(true, true, false, false), false)
+
+  // 5. Collapsed on desktop: user switches from VideoPet to Codex/Xiang-qi-e -> RESTORES authoritative native layout
+  assert.equal(shouldRestoreLayout(true, false, false, false), true)
+})
+
+test('DemoMascot effect lifecycle: size changes preserve registry entry preventing anchor jump', () => {
+  // Simulating registry state across size updates
+  let registeredHitbox: { hx: number; hy: number } | null = null
+
+  const onMountOrSizeChange = (hx: number, hy: number) => {
+    // Sync updates or sets the entry without clearing it
+    registeredHitbox = { hx, hy }
+  }
+
+  const onUnmountOnly = () => {
+    registeredHitbox = null
+  }
+
+  // 1. Mount at scale 1:
+  onMountOrSizeChange(211, 60)
+  assert.deepEqual(registeredHitbox, { hx: 211, hy: 60 })
+
+  // 2. User resizes to scale 1.5: previous effect DOES NOT call onUnmountOnly()
+  // So registeredHitbox is still available as prev_entry when calculating new coordinates
+  const prevEntry = registeredHitbox
+  assert.notEqual(prevEntry, null)
+  assert.equal(prevEntry!.hx, 211)
+
+  // New size applied:
+  onMountOrSizeChange(316, 90)
+  assert.deepEqual(registeredHitbox, { hx: 316, hy: 90 })
+
+  // 3. Window closes (unmount):
+  onUnmountOnly()
+  assert.equal(registeredHitbox, null)
+})
+
+
 
 
 

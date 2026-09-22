@@ -112,13 +112,21 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
     }
   }, [])
 
-  // Sync window size with pet canvas bounds when pet loads or size changes
+  // Sync window size with pet canvas bounds when pet loads or size changes.
+  // We explicitly DO NOT unregister in this effect's cleanup so that size changes (e.g. slider, drag)
+  // maintain body-anchor continuity in Rust's prev_entry registry.
   useEffect(() => {
     if (size > 0 && pet) {
       syncMascotWindowLayout(pet, size)
     }
+  }, [pet, size, syncMascotWindowLayout])
+
+  // Unregister canvas bounds ONLY when component unmounts or pet identity changes
+  const petId = pet?.id
+  const isVideo = pet ? isVideoPet(pet) : false
+  useEffect(() => {
     return () => {
-      if (pet && isVideoPet(pet)) {
+      if (isVideo) {
         const win = getCurrentWebviewWindow()
         invoke('set_pet_canvas_bounds', {
           windowLabel: win.label,
@@ -132,7 +140,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
         }).catch(() => {})
       }
     }
-  }, [pet, size, syncMascotWindowLayout])
+  }, [petId, isVideo])
 
   // Match the primary mascot's size. Read the persisted scale on mount and keep
   // in sync with live slider changes broadcast by the main window. The owning

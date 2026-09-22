@@ -5325,8 +5325,12 @@ export default function Mini() {
       : null
   }, [largeMascot, miniPet, largeMascotVisualSize])
 
+  const prevActiveMiniPetMetricsRef = useRef(activeMiniPetMetrics)
   // Sync canvas and hitbox bounds to Tauri for native window sizing and cursor pass-through
   useEffect(() => {
+    const wasVideoPet = !!prevActiveMiniPetMetricsRef.current
+    prevActiveMiniPetMetricsRef.current = activeMiniPetMetrics
+
     if (!activeMiniPetMetrics) {
       invoke('set_pet_canvas_bounds', {
         windowLabel: 'mini',
@@ -5338,6 +5342,28 @@ export default function Mini() {
         hitboxH: null,
         anchorMode: 'bottom-right',
       }).catch(() => {})
+
+      // If we transitioned from VideoPet to null while in collapsed mode
+      // (not expanded, not in settings, not transitioning), restore native window layout
+      // using the authoritative layout commands that know the current mode and scale.
+      if (wasVideoPet && !expandedRef.current && !settingsModeRef.current && !settingsTransitioningRef.current) {
+        if (appModeRef.current === 'pet') {
+          invoke('set_pet_mode_window', {
+            active: true,
+            mascotScale: mascotScaleRef.current,
+            largeMascotScale: largeMascotScaleRef.current,
+          }).catch(() => {})
+        } else {
+          invoke('set_mini_expanded', {
+            expanded: false,
+            position: mascotPositionRef.current,
+            efficiency: true,
+            mascotScale: mascotScaleRef.current,
+            largeMascot: largeMascotRef.current,
+            largeMascotScale: largeMascotScaleRef.current,
+          }).catch(() => {})
+        }
+      }
       return
     }
 
