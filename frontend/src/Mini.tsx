@@ -3881,7 +3881,7 @@ export default function Mini() {
       // sprite via updateWalkDir so the pet visibly runs while moving.
       if (!moveModeRef.current && appModeRef.current !== 'pet') {
         if (e.button !== 0 || e.ctrlKey || collapsingRef.current) return
-        if (miniPetRef.current) {
+        if (!largeMascotRef.current && miniPetRef.current) {
           const visualSize = Math.round(MASCOT_BASE_SIZE * mascotScaleRef.current) * largeMascotScaleRef.current
           const m = getPetRenderMetrics(miniPetRef.current, visualSize)
           const rect = e.currentTarget.getBoundingClientRect()
@@ -5304,13 +5304,13 @@ export default function Mini() {
     emit('mascot-visual-size', { size: largeMascotVisualSize }).catch(() => {})
   }, [largeMascotVisualSize, appMode])
 
-  const miniPetMetrics = useMemo(() => {
-    return miniPet ? getPetRenderMetrics(miniPet, largeMascotVisualSize) : null
-  }, [miniPet, largeMascotVisualSize])
+  const activeMiniPetMetrics = useMemo(() => {
+    return (!largeMascot && miniPet) ? getPetRenderMetrics(miniPet, largeMascotVisualSize) : null
+  }, [largeMascot, miniPet, largeMascotVisualSize])
 
   // Sync canvas and hitbox bounds to Tauri for native window sizing and cursor pass-through
   useEffect(() => {
-    if (!miniPetMetrics) {
+    if (!activeMiniPetMetrics) {
       invoke('set_pet_canvas_bounds', {
         canvasW: null,
         canvasH: null,
@@ -5323,14 +5323,14 @@ export default function Mini() {
     }
 
     invoke('set_pet_canvas_bounds', {
-      canvasW: miniPetMetrics.canvas.width,
-      canvasH: miniPetMetrics.canvas.height,
-      hitboxX: miniPetMetrics.hitbox.left,
-      hitboxY: miniPetMetrics.hitbox.top,
-      hitboxW: miniPetMetrics.hitbox.width,
-      hitboxH: miniPetMetrics.hitbox.height,
+      canvasW: activeMiniPetMetrics.canvas.width,
+      canvasH: activeMiniPetMetrics.canvas.height,
+      hitboxX: activeMiniPetMetrics.hitbox.left,
+      hitboxY: activeMiniPetMetrics.hitbox.top,
+      hitboxW: activeMiniPetMetrics.hitbox.width,
+      hitboxH: activeMiniPetMetrics.hitbox.height,
     }).catch(() => {})
-  }, [miniPetMetrics])
+  }, [activeMiniPetMetrics])
 
 
 
@@ -5385,7 +5385,7 @@ export default function Mini() {
               // commit and native window resize.
               // Fallback to `right: 0` until petBaseWinW has been measured.
               left: (appMode === 'pet' && largeMascot && petBaseWinW != null)
-                ? Math.max(0, Math.round(petBaseWinW - (miniPetMetrics?.canvas.width ?? largeMascotVisualSize)))
+                ? Math.max(0, Math.round(petBaseWinW - (activeMiniPetMetrics?.canvas.width ?? largeMascotVisualSize)))
                 : undefined,
               right: (appMode === 'pet' && largeMascot && petBaseWinW == null)
                 ? 0
@@ -5486,8 +5486,8 @@ export default function Mini() {
               <div
                 style={{
                   position: 'relative',
-                  width: miniPetMetrics?.canvas.width ?? largeMascotVisualSize,
-                  height: miniPetMetrics?.canvas.height ?? getPetRenderMetrics(miniPet, largeMascotVisualSize).height,
+                  width: activeMiniPetMetrics?.canvas.width ?? largeMascotVisualSize,
+                  height: activeMiniPetMetrics?.canvas.height ?? getPetRenderMetrics(miniPet, largeMascotVisualSize).height,
                 }}
               >
                 <MiniPetMascot
@@ -5524,10 +5524,10 @@ export default function Mini() {
               <div
                 style={{
                   position: 'absolute',
-                  left: miniPetMetrics ? miniPetMetrics.hitbox.left + miniPetMetrics.hitbox.width - 15 : undefined,
-                  top: miniPetMetrics ? miniPetMetrics.hitbox.top + miniPetMetrics.hitbox.height - 13 : undefined,
-                  bottom: miniPetMetrics ? undefined : 8,
-                  right: miniPetMetrics ? undefined : 10,
+                  left: activeMiniPetMetrics ? activeMiniPetMetrics.hitbox.left + activeMiniPetMetrics.hitbox.width - 15 : undefined,
+                  top: activeMiniPetMetrics ? activeMiniPetMetrics.hitbox.top + activeMiniPetMetrics.hitbox.height - 13 : undefined,
+                  bottom: activeMiniPetMetrics ? undefined : 8,
+                  right: activeMiniPetMetrics ? undefined : 10,
                   width: collapsedStatusSize,
                   height: collapsedStatusSize,
                   borderRadius: '50%',
@@ -5547,10 +5547,10 @@ export default function Mini() {
                 title={t('settings.largeMascotScale', 'Mascot Size')}
                 style={{
                   position: 'absolute',
-                  left: miniPetMetrics ? miniPetMetrics.hitbox.left + miniPetMetrics.hitbox.width - MASCOT_RESIZE_HANDLE_SIZE : undefined,
-                  top: miniPetMetrics ? miniPetMetrics.hitbox.top + miniPetMetrics.hitbox.height - MASCOT_RESIZE_HANDLE_SIZE : undefined,
-                  right: miniPetMetrics ? undefined : 0,
-                  bottom: miniPetMetrics ? undefined : 0,
+                  left: activeMiniPetMetrics ? activeMiniPetMetrics.hitbox.left + activeMiniPetMetrics.hitbox.width - MASCOT_RESIZE_HANDLE_SIZE : undefined,
+                  top: activeMiniPetMetrics ? activeMiniPetMetrics.hitbox.top + activeMiniPetMetrics.hitbox.height - MASCOT_RESIZE_HANDLE_SIZE : undefined,
+                  right: activeMiniPetMetrics ? undefined : 0,
+                  bottom: activeMiniPetMetrics ? undefined : 0,
                   width: MASCOT_RESIZE_HANDLE_SIZE,
                   height: MASCOT_RESIZE_HANDLE_SIZE,
                   cursor: MASCOT_RESIZE_CURSOR,

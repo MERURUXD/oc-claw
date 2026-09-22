@@ -288,5 +288,30 @@ test('dual geometry model: separates character interaction hitbox from OS window
   assert.equal(cMetrics.height, 208)
 })
 
+test('activeMiniPetMetrics: large mascot (Xiang-qi-e) isolates from background miniPet custom canvas bounds', () => {
+  const shenshenPet: VideoPet = {
+    renderer: 'video-clips',
+    id: 'shenshen',
+    displayName: '申申',
+    canvas: DSH_GEOMETRY,
+    animations: {},
+  }
+  const resolveActiveMetrics = (largeMascot: boolean, miniPet: PetAsset | null, visualSize: number) => {
+    return (!largeMascot && miniPet) ? getPetRenderMetrics(miniPet, visualSize) : null
+  }
+
+  // When largeMascot is active (e.g. Xiang-qi-e), activeMiniPetMetrics must be null
+  // so set_pet_canvas_bounds resets to null and Rust uses legacy Xiang-qi-e window sizing
+  const metricsWhenLarge = resolveActiveMetrics(true, shenshenPet, 215)
+  assert.equal(metricsWhenLarge, null)
+
+  // When largeMascot is false and miniPet is Shenshen, activeMiniPetMetrics is computed
+  const metricsWhenMini = resolveActiveMetrics(false, shenshenPet, 108)
+  assert.notEqual(metricsWhenMini, null)
+  assert.equal(metricsWhenMini!.canvas.width, 320)
+  assert.equal(metricsWhenMini!.canvas.height, 180)
+})
+
+
 
 
