@@ -584,7 +584,12 @@ export default function Mini() {
   const quotaRecoveryRef = useRef<QuotaRecoveryStateMachine>(createQuotaRecoveryStateMachine())
   const [quotaRevealRequest, setQuotaRevealRequest] = useState<{ id: number; harness: 'codex' | 'antigravity' } | null>(null)
   const quotaRevealSeqRef = useRef(0)
+  const consumedQuotaRevealIdRef = useRef<number | null>(null)
   const pendingQuotaRevealRef = useRef<'codex' | 'antigravity' | null>(null)
+  const handleQuotaRevealHandled = useCallback((id: number) => {
+    consumedQuotaRevealIdRef.current = id
+    setQuotaRevealRequest((prev) => (prev?.id === id ? null : prev))
+  }, [])
   const resetTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
   const resetRetryStateRef = useRef<Map<string, { resetsAt: string; retryCount: number }>>(new Map())
   const [waitingSound, setWaitingSound] = useState(false)
@@ -820,6 +825,7 @@ export default function Mini() {
   const { t, i18n } = useTranslation()
   const [updateModalOpen, setUpdateModalOpen] = useState(false)
   const updateModalOpenRef = useRef(false)
+  const updateModalRestoringRef = useRef(false)
 
   const readPanelDismissSnapshot = useCallback((): PanelDismissSnapshot => ({
     pinned: pinnedRef.current,
@@ -3237,6 +3243,7 @@ export default function Mini() {
     if (settingsModeRef.current || settingsTransitioningRef.current) return
     if (
       updateModalOpenRef.current ||
+      updateModalRestoringRef.current ||
       isCreateModalOpenRef.current ||
       nativeDialogActiveRef.current ||
       collapsingRef.current
@@ -3505,6 +3512,7 @@ export default function Mini() {
     const wasExpanded = updateModalPrevExpandedRef.current
     updateModalWindowAdjustedRef.current = false
     if (settingsModeRef.current) return
+    updateModalRestoringRef.current = true
     try {
       if (wasExpanded) {
         await syncExpandedWindowLayout(viewModeRef.current)
@@ -3519,7 +3527,9 @@ export default function Mini() {
         expandedWindowModeRef.current = null
         setShowPanel(false)
       }
-    } catch {}
+    } catch {} finally {
+      updateModalRestoringRef.current = false
+    }
   }, [restoreCollapsedMascotPosition, syncExpandedWindowLayout])
 
   const openAvailableUpdateModal = useCallback(
@@ -3545,12 +3555,13 @@ export default function Mini() {
     [ensureUpdateModalWindow],
   )
 
-  const closeUpdateModal = useCallback(() => {
+  const closeUpdateModal = useCallback(async () => {
     updateModalRunOwnedRef.current = false
     updateModalOpenRef.current = false
     setUpdateModalOpen(false)
-    void restoreWindowAfterUpdateModal()
-  }, [restoreWindowAfterUpdateModal])
+    await restoreWindowAfterUpdateModal()
+    flushPendingQuotaRevealIfSafe()
+  }, [restoreWindowAfterUpdateModal, flushPendingQuotaRevealIfSafe])
 
   const skipCurrentUpdateVersion = useCallback(async () => {
     if (!updateModalInfo?.latest) return
@@ -3560,8 +3571,9 @@ export default function Mini() {
     updateModalRunOwnedRef.current = false
     updateModalOpenRef.current = false
     setUpdateModalOpen(false)
-    void restoreWindowAfterUpdateModal()
-  }, [restoreWindowAfterUpdateModal, updateModalInfo?.latest])
+    await restoreWindowAfterUpdateModal()
+    flushPendingQuotaRevealIfSafe()
+  }, [restoreWindowAfterUpdateModal, updateModalInfo?.latest, flushPendingQuotaRevealIfSafe])
 
   const runUpdateFromModal = useCallback(async () => {
     if (!updateModalInfo?.url) return
@@ -4246,6 +4258,7 @@ export default function Mini() {
     setSelectedSessionKey(null)
     setShowClaudeStats(false)
     setQuotaOverlayRequiredHeight(0)
+    setQuotaRevealRequest(null)
     const wasSettings = settingsModeRef.current
     if (wasSettings) {
       setShowSettingsOverlay(false)
@@ -7615,7 +7628,12 @@ export default function Mini() {
             <QuotaSideRail
               onOverlayHeightChange={setQuotaOverlayRequiredHeight}
               uiScale={uiScale}
-              revealRequest={quotaRevealRequest}
+              revealRequest={
+                quotaRevealRequest && quotaRevealRequest.id !== consumedQuotaRevealIdRef.current
+                  ? quotaRevealRequest
+                  : null
+              }
+              onRevealHandled={handleQuotaRevealHandled}
             />
           </div>
         </div>

@@ -452,10 +452,12 @@ export function QuotaSideRail({
   onOverlayHeightChange,
   uiScale = 1.0,
   revealRequest,
+  onRevealHandled,
 }: {
   onOverlayHeightChange?: (height: number) => void
   uiScale?: number
   revealRequest?: { id: number; harness: 'codex' | 'antigravity' } | null
+  onRevealHandled?: (id: number) => void
 }) {
   const codex = useHarnessQuota('codex')
   const antigravity = useHarnessQuota('antigravity')
@@ -467,6 +469,12 @@ export function QuotaSideRail({
     setPrevRevealId(revealRequest.id)
     setActivePopover(revealRequest.harness)
   }
+
+  useEffect(() => {
+    if (revealRequest) {
+      onRevealHandled?.(revealRequest.id)
+    }
+  }, [revealRequest, onRevealHandled])
 
   const railRef = useRef<HTMLDivElement>(null)
   const popoverRef = useRef<HTMLDivElement>(null)
