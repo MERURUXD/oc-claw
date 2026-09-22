@@ -6526,7 +6526,7 @@ export default function Mini() {
                                        此面板。包含四个操作按钮：拒绝、允许一次、
                                        全部允许、自动批准。
                                        用途：让用户无需切换到终端即可快速处理权限请求。 */}
-                                    {isWaiting && cs.source !== 'cursor' && !dismissedWaitingIds.has(cs.sessionId) && (
+                                    {(isWaiting || isReview) && cs.source !== 'cursor' && !dismissedWaitingIds.has(cs.sessionId) && (
                                       <div className="mt-2 flex flex-col" style={{ maxHeight: panelMaxHeight - 140 }}>
                                         {cs.source === 'codex' ? (
                                           <div className="flex flex-col gap-2 mb-2" style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
