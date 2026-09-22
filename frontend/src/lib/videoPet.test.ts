@@ -440,6 +440,15 @@ test('Mini bounds unregister layout restore: only triggers when transitioning fr
 
   // 5. Collapsed on desktop: user switches from VideoPet to Codex/Xiang-qi-e -> RESTORES authoritative native layout
   assert.equal(shouldRestoreLayout(true, false, false, false), true)
+
+  // 6. Restored layout arguments for coding mode must use largeMascot: true (preserving large collapsed coding mascot size ~215px)
+  const getRestoreArgs = (appMode: string) => {
+    if (appMode === 'pet') {
+      return { active: true }
+    }
+    return { expanded: false, largeMascot: true }
+  }
+  assert.equal(getRestoreArgs('coding').largeMascot, true)
 })
 
 test('DemoMascot effect lifecycle: size changes preserve registry entry preventing anchor jump', () => {

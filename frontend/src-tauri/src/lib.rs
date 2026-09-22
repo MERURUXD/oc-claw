@@ -115,7 +115,6 @@ fn remove_mascot_hitbox_entry(label: &str) -> Option<MascotHitboxEntry> {
     }
 }
 
-#[cfg(target_os = "windows")]
 static PASSTHROUGH_THREAD_RUNNING: AtomicBool = AtomicBool::new(false);
 #[derive(Clone, Copy, Debug)]
 pub struct BubbleAnchor {
@@ -5852,39 +5851,98 @@ fn set_window_ignores_mouse_events(app: &tauri::AppHandle, label: &str, ignore: 
     }
 }
 
+/// Native Cocoa cursor hit-test helper for mascot windows on macOS.
+/// Operates entirely in Cocoa screen points (bottom-left origin), eliminating multi-monitor height inversion errors.
 #[cfg(target_os = "macos")]
-fn macos_primary_screen_height() -> f64 {
-    if let Ok(guard) = NOTCH_SCREEN_INFO.lock() {
-        if let Some((_, _, _, sh, _)) = *guard {
-            if sh > 0.0 {
-                return sh;
-            }
+fn hit_test_mascot_window_macos(
+    win: &tauri::WebviewWindow,
+    cursor: (f64, f64),
+    custom_entry: Option<MascotHitboxEntry>,
+    is_pet_mode: bool,
+) -> bool {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::NSRect;
+
+    let (fx, fy, fw, fh) = if let Ok(ns_win) = win.ns_window() {
+        let obj = unsafe { &*(ns_win as *mut AnyObject) };
+        let frame: NSRect = unsafe { msg_send![obj, frame] };
+        (frame.origin.x, frame.origin.y, frame.size.width, frame.size.height)
+    } else {
+        return true;
+    };
+
+    let (cx, cy) = cursor;
+
+    if let Some(entry) = custom_entry {
+        // If window is significantly larger than declared canvas, it is in expanded/modal/settings mode.
+        if fw > entry.canvas_w + 30.0 || fh > entry.canvas_h + 30.0 {
+            return true;
         }
-    }
-    unsafe {
-        use objc2::runtime::{AnyClass, AnyObject};
-        use objc2::msg_send;
-        use objc2_foundation::NSRect;
-        if let Some(cls) = AnyClass::get(c"NSScreen") {
-            let screens: *mut AnyObject = msg_send![cls, screens];
-            if !screens.is_null() {
-                let count: usize = msg_send![&*screens, count];
-                if count > 0 {
-                    let screen: *mut AnyObject = msg_send![&*screens, objectAtIndex: 0usize];
-                    if !screen.is_null() {
-                        let sf: NSRect = msg_send![&*screen, frame];
-                        return sf.size.height;
-                    }
+
+        let resize_handle = 34.0_f64;
+        let hit_left = fx + entry.hitbox_x;
+        let hit_right = hit_left + entry.hitbox_w;
+        let hit_bottom = fy + fh - (entry.hitbox_y + entry.hitbox_h);
+        let hit_top = fy + fh - entry.hitbox_y;
+
+        let over_body = cx >= hit_left && cx <= hit_right && cy >= hit_bottom && cy <= hit_top;
+        let over_resize = cx >= hit_right - resize_handle && cx <= hit_right
+            && cy >= hit_bottom && cy <= hit_bottom + resize_handle;
+        over_body || over_resize
+    } else if is_pet_mode {
+        // Legacy Xiang-qi-e pet mode hit-testing in Cocoa coordinates
+        let (current_mascot_scale, current_large_scale) = PET_MASCOT_SCALES
+            .lock()
+            .map(|g| *g)
+            .unwrap_or((1.0, LARGE_MASCOT_SIZE_MULTIPLIER));
+        let (mascot_w, mascot_h) = large_collapsed_mascot_window_size(current_mascot_scale, current_large_scale);
+        let resize_handle = 34.0_f64.min(mascot_w).min(mascot_h);
+        let edge_threshold = 30.0_f64;
+
+        let mascot_left = fx + fw - mascot_w;
+        let mascot_right = mascot_left + mascot_w;
+        let mascot_bottom = fy;
+        let mascot_top = mascot_bottom + mascot_h;
+
+        let near_edge = if let Ok(ns_win) = win.ns_window() {
+            unsafe {
+                let obj = &*(ns_win as *mut AnyObject);
+                let screen: *mut AnyObject = msg_send![obj, screen];
+                if !screen.is_null() {
+                    let sf: NSRect = msg_send![&*screen, frame];
+                    mascot_left < sf.origin.x + edge_threshold || mascot_right > sf.origin.x + sf.size.width - edge_threshold
+                } else {
+                    false
                 }
             }
-        }
+        } else {
+            false
+        };
+
+        let hit_w = mascot_w * (1.8 / 3.0);
+        let hit_h = mascot_h * (2.5 / 3.0);
+        let inset_x = (mascot_w - hit_w) / 2.0;
+        let inset_y = (mascot_h - hit_h) / 2.0;
+        let ix = if near_edge { inset_x * 0.5 } else { inset_x };
+        let iy = inset_y;
+        let hit_left = mascot_left + ix;
+        let hit_right = mascot_right - ix;
+        let hit_bottom = mascot_bottom + iy;
+        let hit_top = mascot_top - iy;
+
+        let over_body = cx >= hit_left && cx <= hit_right && cy >= hit_bottom && cy <= hit_top;
+        let over_resize = cx >= mascot_right - resize_handle && cx <= mascot_right
+            && cy >= mascot_bottom && cy <= mascot_bottom + resize_handle;
+        over_body || over_resize
+    } else {
+        true
     }
-    1080.0
 }
 
-/// Cross-platform cursor hit-test helper for mascot windows (macOS and Windows).
+/// Windows cursor hit-test helper for mascot windows.
 /// Compares cursor coordinates against character body hitbox or bottom-right resize handle in logical pixels.
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(target_os = "windows")]
 fn hit_test_mascot_window(
     win: &tauri::WebviewWindow,
     cursor_logical: Option<(f64, f64)>,
@@ -6131,8 +6189,6 @@ fn mascot_passthrough_poll_macos(app: tauri::AppHandle) {
 
         let mouse_held = (macos_pressed_mouse_buttons() & 1) != 0;
         let cursor_cocoa = macos_cursor_position();
-        let screen_h = macos_primary_screen_height();
-        let cursor_logical = Some((cursor_cocoa.0, screen_h - cursor_cocoa.1));
 
         // 1. Primary "mini" window
         if let Some(mini_win) = app.get_webview_window("mini") {
@@ -6146,12 +6202,12 @@ fn mascot_passthrough_poll_macos(app: tauri::AppHandle) {
                 if menu_open || pomodoro_active {
                     true
                 } else {
-                    hit_test_mascot_window(&mini_win, cursor_logical, mini_custom, true)
+                    hit_test_mascot_window_macos(&mini_win, cursor_cocoa, mini_custom, true)
                 }
             } else {
                 // Coding mode:
                 if mini_custom.is_some() {
-                    hit_test_mascot_window(&mini_win, cursor_logical, mini_custom, false)
+                    hit_test_mascot_window_macos(&mini_win, cursor_cocoa, mini_custom, false)
                 } else {
                     // Codex pet or default: keep fully interactive!
                     true
@@ -6174,7 +6230,7 @@ fn mascot_passthrough_poll_macos(app: tauri::AppHandle) {
                 let should_be_interactive = if mouse_held {
                     true
                 } else {
-                    hit_test_mascot_window(&extra_win, cursor_logical, Some(*entry), false)
+                    hit_test_mascot_window_macos(&extra_win, cursor_cocoa, Some(*entry), false)
                 };
                 let want_ignore = !should_be_interactive;
                 if last_states.get(label).copied() != Some(want_ignore) {

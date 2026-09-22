@@ -5359,7 +5359,7 @@ export default function Mini() {
             position: mascotPositionRef.current,
             efficiency: true,
             mascotScale: mascotScaleRef.current,
-            largeMascot: largeMascotRef.current,
+            largeMascot: true,
             largeMascotScale: largeMascotScaleRef.current,
           }).catch(() => {})
         }
