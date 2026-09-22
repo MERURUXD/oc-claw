@@ -6,10 +6,12 @@ export function DebugSettingsSection({
   onDebugInjectPreset,
   onClearDebugInject,
   debugInjectCount = 0,
+  onTriggerQuotaRecovery,
 }: {
   onDebugInjectPreset?: (preset: DebugInjectPreset) => void
   onClearDebugInject?: () => void
   debugInjectCount?: number
+  onTriggerQuotaRecovery?: (harness: 'codex' | 'antigravity') => void
 }) {
   const isZh = typeof navigator !== 'undefined' && navigator.language.toLowerCase().startsWith('zh')
   const [bubbleTraceEnabled, setBubbleTraceEnabled] = useState(false)
@@ -97,6 +99,35 @@ export function DebugSettingsSection({
         >
           {isZh ? '清除调试注入' : 'Clear debug inject'}
         </button>
+
+        <div className="border-t border-white/5 pt-3 flex flex-col gap-1">
+          <span className="text-sm font-medium text-white/90">
+            {isZh ? '配额恢复提醒测试' : 'Quota Recovery Alert Test'}
+          </span>
+          <span className="text-xs text-white/40">
+            {isZh
+              ? '触发真实的配额恢复流程：退出设置、播放恢复提示音、拉起主面板并展开对应 provider 配额卡片。'
+              : 'Trigger the real quota recovery flow: exit settings, play recovery sound, expand panel, and reveal provider quota popover.'}
+          </span>
+        </div>
+        <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={() => onTriggerQuotaRecovery?.('codex')}
+            disabled={!onTriggerQuotaRecovery}
+            className="flex-1 px-3 py-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-sm text-white/80 transition-colors disabled:opacity-40 cursor-pointer text-center"
+          >
+            {isZh ? '触发 Codex 恢复提醒' : 'Trigger Codex Recovery'}
+          </button>
+          <button
+            type="button"
+            onClick={() => onTriggerQuotaRecovery?.('antigravity')}
+            disabled={!onTriggerQuotaRecovery}
+            className="flex-1 px-3 py-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-sm text-white/80 transition-colors disabled:opacity-40 cursor-pointer text-center"
+          >
+            {isZh ? '触发 Antigravity 恢复提醒' : 'Trigger Antigravity Recovery'}
+          </button>
+        </div>
       </div>
     </section>
   )

@@ -11,6 +11,7 @@ type SettingsTabProps = BaseSettingsTabProps & {
   onDebugInjectPreset?: (preset: DebugInjectPreset) => void
   onClearDebugInject?: () => void
   debugInjectCount?: number
+  onTriggerQuotaRecovery?: (harness: 'codex' | 'antigravity') => void
 }
 
 const STORE_KEY = 'developer_mode'
@@ -39,6 +40,7 @@ export function SettingsTab({
   onDebugInjectPreset,
   onClearDebugInject,
   debugInjectCount = 0,
+  onTriggerQuotaRecovery,
   ...props
 }: SettingsTabProps) {
   const { t } = useTranslation()
@@ -95,6 +97,7 @@ export function SettingsTab({
           onDebugInjectPreset={onDebugInjectPreset}
           onClearDebugInject={onClearDebugInject}
           debugInjectCount={debugInjectCount}
+          onTriggerQuotaRecovery={onTriggerQuotaRecovery}
         />
       )}
     </>
