@@ -66,7 +66,7 @@ import {
 import { MiniPetMascot, type MascotReaction } from './components/MiniPetMascot'
 import { BufferedVideo } from './components/BufferedVideo'
 import { PetRenderer } from './components/PetRenderer'
-import { getPetAspectRatio, getPetRenderMetrics, type PetAsset } from './lib/petAsset'
+import { getPetAspectRatio, getPetRenderMetrics, isVideoPet, type PetAsset } from './lib/petAsset'
 import { PetPicker } from './components/PetPicker'
 import { PetGallery } from './components/PetGallery'
 
@@ -3723,11 +3723,24 @@ export default function Mini() {
     const clamped = clampLargeMascotScale(value)
     setLargeMascotScale(clamped)
     largeMascotScaleRef.current = clamped
+    const nextVisualSize = Math.round(MASCOT_BASE_SIZE * mascotScaleRef.current) * clamped
     emit('mascot-visual-size', {
-      size: Math.round(MASCOT_BASE_SIZE * mascotScaleRef.current) * clamped,
+      size: nextVisualSize,
     }).catch(() => {})
 
-    if (appModeRef.current === 'pet') {
+    if (!largeMascotRef.current && miniPetRef.current && isVideoPet(miniPetRef.current)) {
+      const m = getPetRenderMetrics(miniPetRef.current, nextVisualSize)
+      await invoke('set_pet_canvas_bounds', {
+        windowLabel: 'mini',
+        canvasW: m.canvas.width,
+        canvasH: m.canvas.height,
+        hitboxX: m.hitbox.left,
+        hitboxY: m.hitbox.top,
+        hitboxW: m.hitbox.width,
+        hitboxH: m.hitbox.height,
+        anchorMode: 'bottom-right',
+      }).catch(() => {})
+    } else if (appModeRef.current === 'pet') {
       await invoke('set_pet_mode_window', {
         active: true,
         mascotScale: mascotScaleRef.current,
@@ -5307,30 +5320,36 @@ export default function Mini() {
   }, [largeMascotVisualSize, appMode])
 
   const activeMiniPetMetrics = useMemo(() => {
-    return (!largeMascot && miniPet) ? getPetRenderMetrics(miniPet, largeMascotVisualSize) : null
+    return (!largeMascot && miniPet && isVideoPet(miniPet))
+      ? getPetRenderMetrics(miniPet, largeMascotVisualSize)
+      : null
   }, [largeMascot, miniPet, largeMascotVisualSize])
 
   // Sync canvas and hitbox bounds to Tauri for native window sizing and cursor pass-through
   useEffect(() => {
     if (!activeMiniPetMetrics) {
       invoke('set_pet_canvas_bounds', {
+        windowLabel: 'mini',
         canvasW: null,
         canvasH: null,
         hitboxX: null,
         hitboxY: null,
         hitboxW: null,
         hitboxH: null,
+        anchorMode: 'bottom-right',
       }).catch(() => {})
       return
     }
 
     invoke('set_pet_canvas_bounds', {
+      windowLabel: 'mini',
       canvasW: activeMiniPetMetrics.canvas.width,
       canvasH: activeMiniPetMetrics.canvas.height,
       hitboxX: activeMiniPetMetrics.hitbox.left,
       hitboxY: activeMiniPetMetrics.hitbox.top,
       hitboxW: activeMiniPetMetrics.hitbox.width,
       hitboxH: activeMiniPetMetrics.hitbox.height,
+      anchorMode: 'bottom-right',
     }).catch(() => {})
   }, [activeMiniPetMetrics])
 

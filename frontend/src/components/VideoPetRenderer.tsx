@@ -22,6 +22,7 @@ export interface VideoPetRendererProps {
   // Loop override. When true, treats even one-shot clips as looping (e.g. during continuous hover).
   loop?: boolean
   playbackRate?: number
+  replayToken?: number | string
   transparency?: VideoTransparencyMode
   chromaKeyOptions?: ChromaKeyOptions
   // 'body': container sized to bodyBox, canvas offset with overflow visible (for cards/lists)
@@ -72,6 +73,7 @@ export function VideoPetRenderer({
   transparency,
   chromaKeyOptions,
   playbackRate = 1,
+  replayToken,
   layoutMode = 'body',
   className,
   style,
@@ -127,6 +129,7 @@ export function VideoPetRenderer({
           src={animMeta?.src}
           loop={isLooping}
           playbackRate={effectivePlaybackRate}
+          replayToken={replayToken}
           onEnded={isLooping ? undefined : onOneShotEnd}
           transparency={transparency ?? pet.transparency ?? 'native'}
           chromaKeyOptions={chromaKeyOptions ?? pet.chromaKeyOptions}

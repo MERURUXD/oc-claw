@@ -9,6 +9,7 @@ export interface BufferedVideoProps {
   getAlternateSrc?: (url: string) => string | undefined
   loop?: boolean
   playbackRate?: number
+  replayToken?: number | string
   onPlaying?: () => void
   onEnded?: () => void
   onError?: (error: unknown) => void
@@ -44,6 +45,7 @@ export function BufferedVideo({
   getAlternateSrc,
   loop = true,
   playbackRate = 1,
+  replayToken,
   onPlaying,
   onEnded,
   onError,
@@ -65,6 +67,7 @@ export function BufferedVideo({
   const activeBufferRef = useRef<0 | 1>(0)
   const [activeBuffer, setActiveBuffer] = useState<0 | 1>(0)
   const prevSrcRef = useRef<string | undefined>(undefined)
+  const prevReplayTokenRef = useRef<number | string | undefined>(undefined)
   const generationRef = useRef(0)
 
   const onPlayingRef = useRef(onPlaying)
@@ -89,11 +92,12 @@ export function BufferedVideo({
 
   const useChromaKey = effectiveTransparency === 'windows-chroma-key'
 
-  // Video swapping and loading lifecycle (strictly depends on src;
+  // Video swapping and loading lifecycle (depends on src and replayToken;
   // playbackRate and altSrc are accessed via refs to prevent listener cancellation races)
   useEffect(() => {
     if (!src) {
       prevSrcRef.current = undefined
+      prevReplayTokenRef.current = undefined
       return
     }
 
@@ -104,13 +108,24 @@ export function BufferedVideo({
 
     if (!front || !back) {
       prevSrcRef.current = undefined
+      prevReplayTokenRef.current = undefined
       return
     }
 
-    if (prevSrcRef.current === src) return
+    const isSrcChange = prevSrcRef.current !== src
+    const isReplayChange =
+      replayToken !== undefined &&
+      prevReplayTokenRef.current !== undefined &&
+      prevReplayTokenRef.current !== replayToken
+
+    if (!isSrcChange && !isReplayChange) {
+      prevReplayTokenRef.current = replayToken
+      return
+    }
 
     const isFirstLoad = prevSrcRef.current === undefined
     prevSrcRef.current = src
+    prevReplayTokenRef.current = replayToken
     const generation = ++generationRef.current
 
     let cancelled = false
@@ -222,7 +237,7 @@ export function BufferedVideo({
       cancelled = true
       clearListeners()
     }
-  }, [src])
+  }, [src, replayToken])
 
   // Update playbackRate on existing video elements if changed mid-playback
   useEffect(() => {

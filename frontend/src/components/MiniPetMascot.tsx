@@ -178,6 +178,8 @@ export function MiniPetMascot({
             ? 'jumping'
             : baseState
 
+  const isVideo = !isCodexPet(pet)
+
   const spriteKey = isMovement
     ? `move-${renderState}`
     : isReactionActive && reaction
@@ -185,6 +187,15 @@ export function MiniPetMascot({
       : showJump
         ? `jump-${jumpKey}`
         : `base-${renderState}`
+
+  // For Codex, SpritePet uses spriteKey to reset its internal frame state or remount for jump loops.
+  // For VideoPet, component identity must remain stable so BufferedVideo stays mounted and seamlessly swaps
+  // front and back buffers without unmounting or flashing transparent/empty frames.
+  const rendererKey = isVideo ? `videopet-${pet.id}` : spriteKey
+
+  // For VideoPet, one-shot replay requests (such as repeating a hover jump or reaction) are communicated
+  // via replayToken so BufferedVideo reloads the clip in the back buffer without unmounting.
+  const replayToken = showJump ? jumpKey : isReactionActive && reaction ? reaction.id : 0
 
   const onOneShotEnd = showJump
     ? handleJumpEnd
@@ -200,10 +211,11 @@ export function MiniPetMascot({
       style={{ display: 'inline-block', lineHeight: 0, ...style }}
     >
       <PetRenderer
-        key={spriteKey}
+        key={rendererKey}
         pet={pet}
         state={renderState}
         size={size}
+        replayToken={replayToken}
         onOneShotEnd={onOneShotEnd}
         layoutMode={layoutMode}
       />

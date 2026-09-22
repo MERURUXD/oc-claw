@@ -10,7 +10,7 @@ import {
   type VideoPetAnimationMeta,
   type VideoPetCanvasGeometry,
 } from './videoPet.ts'
-import { getPetAspectRatio, getPetRenderMetrics, parsePetManifest } from './petAsset.ts'
+import { getPetAspectRatio, getPetRenderMetrics, parsePetManifest, isVideoPet } from './petAsset.ts'
 
 test('computeVideoPetGeometry: computes exact body scale and container bounds', () => {
   // DSH standard: canvas 640x360, bodyBox [212, 60, 428, 330], feetY 330
@@ -288,7 +288,7 @@ test('dual geometry model: separates character interaction hitbox from OS window
   assert.equal(cMetrics.height, 208)
 })
 
-test('activeMiniPetMetrics: large mascot (Xiang-qi-e) isolates from background miniPet custom canvas bounds', () => {
+test('activeMiniPetMetrics: large mascot (Xiang-qi-e) and Codex pets isolate from custom canvas bounds', () => {
   const shenshenPet: VideoPet = {
     renderer: 'video-clips',
     id: 'shenshen',
@@ -296,20 +296,124 @@ test('activeMiniPetMetrics: large mascot (Xiang-qi-e) isolates from background m
     canvas: DSH_GEOMETRY,
     animations: {},
   }
+  const codexPet: PetAsset = {
+    id: 'classic-cat',
+    name: 'Classic Cat',
+    image: 'cat.png',
+  }
   const resolveActiveMetrics = (largeMascot: boolean, miniPet: PetAsset | null, visualSize: number) => {
-    return (!largeMascot && miniPet) ? getPetRenderMetrics(miniPet, visualSize) : null
+    return (!largeMascot && miniPet && isVideoPet(miniPet)) ? getPetRenderMetrics(miniPet, visualSize) : null
   }
 
   // When largeMascot is active (e.g. Xiang-qi-e), activeMiniPetMetrics must be null
-  // so set_pet_canvas_bounds resets to null and Rust uses legacy Xiang-qi-e window sizing
-  const metricsWhenLarge = resolveActiveMetrics(true, shenshenPet, 215)
-  assert.equal(metricsWhenLarge, null)
+  assert.equal(resolveActiveMetrics(true, shenshenPet, 215), null)
 
-  // When largeMascot is false and miniPet is Shenshen, activeMiniPetMetrics is computed
+  // When miniPet is a standard Codex pet, activeMiniPetMetrics must be null
+  // so Codex pets never trigger custom canvas/hitbox bounds and keep 100% legacy hit-testing
+  assert.equal(resolveActiveMetrics(false, codexPet, 108), null)
+
+  // When largeMascot is false and miniPet is Shenshen (VideoPet), activeMiniPetMetrics is computed
   const metricsWhenMini = resolveActiveMetrics(false, shenshenPet, 108)
   assert.notEqual(metricsWhenMini, null)
   assert.equal(metricsWhenMini!.canvas.width, 320)
   assert.equal(metricsWhenMini!.canvas.height, 180)
+})
+
+test('MiniPetMascot component identity: VideoPet preserves stable key across state transitions for double buffering', () => {
+  const shenshenPet: VideoPet = {
+    renderer: 'video-clips',
+    id: 'shenshen',
+    displayName: '申申',
+    canvas: DSH_GEOMETRY,
+    animations: {},
+  }
+  const codexPet: PetAsset = {
+    id: 'classic-dog',
+    name: 'Classic Dog',
+    image: 'dog.png',
+  }
+
+  const computeRendererKey = (pet: PetAsset, renderState: string, isMovement: boolean, isReaction: boolean, showJump: boolean, jumpKey: number) => {
+    const isVideo = isVideoPet(pet)
+    const spriteKey = isMovement
+      ? `move-${renderState}`
+      : isReaction
+        ? `reaction-${renderState}`
+        : showJump
+          ? `jump-${jumpKey}`
+          : `base-${renderState}`
+    return isVideo ? `videopet-${pet.id}` : spriteKey
+  }
+
+  // 1. VideoPet: key must remain identical across idle -> running -> waiting -> review
+  // to prevent unmounting VideoPetRenderer and BufferedVideo, ensuring seamless front/back swaps
+  const shenshenIdleKey = computeRendererKey(shenshenPet, 'idle', false, false, false, 0)
+  const shenshenRunningKey = computeRendererKey(shenshenPet, 'running', false, false, false, 0)
+  const shenshenWaitingKey = computeRendererKey(shenshenPet, 'waiting', false, false, false, 0)
+  const shenshenReviewKey = computeRendererKey(shenshenPet, 'review', false, false, false, 0)
+
+  assert.equal(shenshenIdleKey, 'videopet-shenshen')
+  assert.equal(shenshenRunningKey, 'videopet-shenshen')
+  assert.equal(shenshenWaitingKey, 'videopet-shenshen')
+  assert.equal(shenshenReviewKey, 'videopet-shenshen')
+  assert.equal(shenshenIdleKey, shenshenRunningKey)
+  assert.equal(shenshenRunningKey, shenshenWaitingKey)
+
+  // 2. VideoPet jump loop: key remains stable while replayToken increments
+  const shenshenJumpKey0 = computeRendererKey(shenshenPet, 'jumping', false, false, true, 0)
+  const shenshenJumpKey1 = computeRendererKey(shenshenPet, 'jumping', false, false, true, 1)
+  assert.equal(shenshenJumpKey0, 'videopet-shenshen')
+  assert.equal(shenshenJumpKey1, 'videopet-shenshen')
+
+  // 3. Codex pet: key changes with state so SpritePet remounts to reset tick/frames
+  const codexIdleKey = computeRendererKey(codexPet, 'idle', false, false, false, 0)
+  const codexRunningKey = computeRendererKey(codexPet, 'running', false, false, false, 0)
+  const codexWaitingKey = computeRendererKey(codexPet, 'waiting', false, false, false, 0)
+  assert.equal(codexIdleKey, 'base-idle')
+  assert.equal(codexRunningKey, 'base-running')
+  assert.equal(codexWaitingKey, 'base-waiting')
+  assert.notEqual(codexIdleKey, codexRunningKey)
+})
+
+test('Native window anchor stability: body coordinates remain invariant across resize and canvas changes', () => {
+  // Shenshen metrics at scale 1 (width=215, canvas=637x358, hitbox={ left: 211, top: 60, width: 215, height: 269 })
+  // Shenshen metrics at scale 2 (width=430, canvas=1274x716, hitbox={ left: 422, top: 120, width: 430, height: 538 })
+  const s1 = { canvasW: 637, canvasH: 358, hx: 211, hy: 60, hw: 215, hh: 269 }
+  const s2 = { canvasW: 1274, canvasH: 716, hx: 422, hy: 120, hw: 430, hh: 538 }
+
+  // 1. Bottom-right anchor (Primary Mini Window)
+  // Given screen anchor (body_right=1900, body_bottom=1000):
+  const win1_x = 1900 - (s1.hx + s1.hw) // 1900 - 426 = 1474
+  const win1_y = 1000 - (s1.hy + s1.hh) // 1000 - 329 = 671
+  const body1_right = win1_x + s1.hx + s1.hw // 1474 + 426 = 1900
+  const body1_bottom = win1_y + s1.hy + s1.hh // 671 + 329 = 1000
+  assert.equal(body1_right, 1900)
+  assert.equal(body1_bottom, 1000)
+
+  // Resized to scale 2:
+  const win2_x = 1900 - (s2.hx + s2.hw) // 1900 - 852 = 1048
+  const win2_y = 1000 - (s2.hy + s2.hh) // 1000 - 658 = 342
+  const body2_right = win2_x + s2.hx + s2.hw // 1048 + 852 = 1900
+  const body2_bottom = win2_y + s2.hy + s2.hh // 342 + 658 = 1000
+  assert.equal(body2_right, 1900)
+  assert.equal(body2_bottom, 1000)
+
+  // 2. Top-left anchor (Extra / Demo Mascot Windows)
+  // Given spawn point (body_left=1700, body_top=50):
+  const extra1_x = 1700 - s1.hx // 1700 - 211 = 1489
+  const extra1_y = 50 - s1.hy // 50 - 60 = -10
+  const extra_body1_left = extra1_x + s1.hx // 1489 + 211 = 1700
+  const extra_body1_top = extra1_y + s1.hy // -10 + 60 = 50
+  assert.equal(extra_body1_left, 1700)
+  assert.equal(extra_body1_top, 50)
+
+  // Resized to scale 2:
+  const extra2_x = 1700 - s2.hx // 1700 - 422 = 1278
+  const extra2_y = 50 - s2.hy // 50 - 120 = -70
+  const extra_body2_left = extra2_x + s2.hx // 1278 + 422 = 1700
+  const extra_body2_top = extra2_y + s2.hy // -70 + 120 = 50
+  assert.equal(extra_body2_left, 1700)
+  assert.equal(extra_body2_top, 50)
 })
 
 

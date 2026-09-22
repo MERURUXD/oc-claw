@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { invoke } from '@tauri-apps/api/core'
 import { emit, listen } from '@tauri-apps/api/event'
 import { load } from '@tauri-apps/plugin-store'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
@@ -6,7 +7,7 @@ import { LogicalPosition, LogicalSize } from '@tauri-apps/api/dpi'
 import { Maximize2 } from 'lucide-react'
 import { MiniPetMascot, type MascotReaction } from './components/MiniPetMascot'
 import { loadCodexPetById, loadDefaultCodexPet, type CodexPetState } from './lib/codexPet'
-import { getPetAspectRatio, getPetRenderMetrics, type PetAsset } from './lib/petAsset'
+import { getPetAspectRatio, getPetRenderMetrics, isVideoPet, type PetAsset } from './lib/petAsset'
 
 const isWindowsPlatform =
   typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows')
@@ -91,14 +92,47 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
     }
   }, [petIdFromUrl])
 
+  const syncMascotWindowLayout = useCallback((currentPet: PetAsset | null, newSize: number) => {
+    if (!currentPet || newSize <= 0) return
+    const win = getCurrentWebviewWindow()
+    const metrics = getPetRenderMetrics(currentPet, newSize)
+    if (isVideoPet(currentPet)) {
+      invoke('set_pet_canvas_bounds', {
+        windowLabel: win.label,
+        canvasW: metrics.canvas.width,
+        canvasH: metrics.canvas.height,
+        hitboxX: metrics.hitbox.left,
+        hitboxY: metrics.hitbox.top,
+        hitboxW: metrics.hitbox.width,
+        hitboxH: metrics.hitbox.height,
+        anchorMode: 'top-left',
+      }).catch(() => {})
+    } else {
+      win.setSize(new LogicalSize(metrics.canvas.width, metrics.canvas.height)).catch(() => {})
+    }
+  }, [])
+
   // Sync window size with pet canvas bounds when pet loads or size changes
   useEffect(() => {
     if (size > 0 && pet) {
-      const win = getCurrentWebviewWindow()
-      const metrics = getPetRenderMetrics(pet, size)
-      win.setSize(new LogicalSize(metrics.canvas.width, metrics.canvas.height)).catch(() => {})
+      syncMascotWindowLayout(pet, size)
     }
-  }, [pet, size])
+    return () => {
+      if (pet && isVideoPet(pet)) {
+        const win = getCurrentWebviewWindow()
+        invoke('set_pet_canvas_bounds', {
+          windowLabel: win.label,
+          canvasW: null,
+          canvasH: null,
+          hitboxX: null,
+          hitboxY: null,
+          hitboxW: null,
+          hitboxH: null,
+          anchorMode: 'top-left',
+        }).catch(() => {})
+      }
+    }
+  }, [pet, size, syncMascotWindowLayout])
 
   // Match the primary mascot's size. Read the persisted scale on mount and keep
   // in sync with live slider changes broadcast by the main window. The owning
@@ -110,9 +144,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
       if (cancelled || !Number.isFinite(next) || next <= 0) return
       setSize(next)
       largeScaleRef.current = clampLargeMascotScale(next / Math.max(1, baseSizeRef.current))
-      const win = getCurrentWebviewWindow()
-      const metrics = getPetRenderMetrics(petRef.current, next)
-      win.setSize(new LogicalSize(metrics.canvas.width, metrics.canvas.height)).catch(() => {})
+      syncMascotWindowLayout(petRef.current, next)
     }
     ;(async () => {
       try {
@@ -139,7 +171,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
       cancelled = true
       unlisten.then((fn) => fn())
     }
-  }, [])
+  }, [syncMascotWindowLayout])
 
   const handleResizePointerDown = useCallback((e: React.PointerEvent) => {
     if (e.button !== 0 || e.ctrlKey) return
@@ -160,9 +192,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
       largeScaleRef.current = clamped
       const nextSize = baseSize * clamped
       setSize(nextSize)
-      const win = getCurrentWebviewWindow()
-      const metrics = getPetRenderMetrics(petRef.current, nextSize)
-      win.setSize(new LogicalSize(metrics.canvas.width, metrics.canvas.height)).catch(() => {})
+      syncMascotWindowLayout(petRef.current, nextSize)
       emit('mascot-scale-change', { scale: clamped }).catch(() => {})
       emit('mascot-visual-size', { size: nextSize }).catch(() => {})
     }

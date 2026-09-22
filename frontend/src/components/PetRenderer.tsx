@@ -13,6 +13,7 @@ export interface PetRendererProps {
   onOneShotEnd?: () => void
   loop?: boolean
   flipHorizontal?: boolean
+  replayToken?: number | string
   transparency?: VideoTransparencyMode
   chromaKeyOptions?: ChromaKeyOptions
   layoutMode?: 'body' | 'canvas'
@@ -31,6 +32,7 @@ export function PetRenderer({
   onOneShotEnd,
   loop,
   flipHorizontal,
+  replayToken,
   transparency,
   chromaKeyOptions,
   layoutMode,
@@ -46,6 +48,7 @@ export function PetRenderer({
         onOneShotEnd={onOneShotEnd}
         loop={loop}
         flipHorizontal={flipHorizontal}
+        replayToken={replayToken}
         transparency={transparency}
         chromaKeyOptions={chromaKeyOptions}
         layoutMode={layoutMode}
