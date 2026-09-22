@@ -219,6 +219,7 @@
     "quotaRecoverySoundDesc": "配额恢复至 10% 及以上时播放的提示音",
     "defaultSound": "默认",
     "manboSound": "曼波",
+    "rockSound": "巨石强森",
     "ccSound": "Claude Code 完成提示音",
     "ccSoundDesc": "Claude Code 任务完成时播放提示音",
     "codexSound": "Codex 完成提示音",

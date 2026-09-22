@@ -577,8 +577,8 @@ export default function Mini() {
   const [opencodeSoundEnabled, setOpencodeSoundEnabled] = useState(true)
   const [hermesSoundEnabled, setHermesSoundEnabled] = useState(false)
   const [antigravitySoundEnabled, setAntigravitySoundEnabled] = useState(true)
-  const [notifySound, setNotifySound] = useState<'default' | 'manbo'>('default')
-  const [quotaRecoverySound, setQuotaRecoverySound] = useState<'default'>('default')
+  const [notifySound, setNotifySound] = useState<'default' | 'manbo' | 'therock'>('default')
+  const [quotaRecoverySound, setQuotaRecoverySound] = useState<'default' | 'manbo' | 'therock'>('default')
   const quotaRecoverySoundRef = useRef(quotaRecoverySound)
   quotaRecoverySoundRef.current = quotaRecoverySound
   const quotaRecoveryRef = useRef<QuotaRecoveryStateMachine>(createQuotaRecoveryStateMachine())
@@ -1822,10 +1822,16 @@ export default function Mini() {
 
   const playQuotaRecoverySound = useCallback(() => {
     // Independent Quota Recovery Sound (does not read notifySoundRef or soundEnabled)
-    if (navigator.userAgent.includes('Windows')) {
-      new Audio('/audio/glass.mp3').play().catch(() => {})
+    if (quotaRecoverySoundRef.current === 'therock') {
+      new Audio('/audio/therock.mp3').play().catch(() => {})
+    } else if (quotaRecoverySoundRef.current === 'manbo') {
+      new Audio('/audio/manbo.m4a').play().catch(() => {})
     } else {
-      invoke('play_sound', { name: 'Purr' }).catch(() => {})
+      if (navigator.userAgent.includes('Windows')) {
+        new Audio('/audio/glass.mp3').play().catch(() => {})
+      } else {
+        invoke('play_sound', { name: 'Purr' }).catch(() => {})
+      }
     }
   }, [])
 
@@ -1842,10 +1848,12 @@ export default function Mini() {
     console.log('[OC-SOUND] PLAYING sound:', notifySoundRef.current)
     if (notifySoundRef.current === 'manbo') {
       new Audio('/audio/manbo.m4a').play().catch(() => {})
+    } else if (notifySoundRef.current === 'therock') {
+      new Audio('/audio/therock.mp3').play().catch(() => {})
     } else {
       playDefaultSound()
     }
-  }, [])
+  }, [playDefaultSound])
 
   const prevHealthRef = useRef<Record<string, boolean>>({})
   const prevSessionHealthRef = useRef<Record<string, boolean>>({})
@@ -2198,9 +2206,9 @@ export default function Mini() {
       const agysnd = await store.get('antigravity_sound_enabled')
       if (typeof agysnd === 'boolean') setAntigravitySoundEnabled(agysnd)
       const ns = (await store.get('notify_sound')) as string
-      if (ns === 'default' || ns === 'manbo') setNotifySound(ns)
+      if (ns === 'default' || ns === 'manbo' || ns === 'therock') setNotifySound(ns)
       const qrs = (await store.get('quota_recovery_sound')) as string
-      if (qrs === 'default') setQuotaRecoverySound(qrs)
+      if (qrs === 'default' || qrs === 'manbo' || qrs === 'therock') setQuotaRecoverySound(qrs)
       const ws = await store.get('waiting_sound')
       if (typeof ws === 'boolean') setWaitingSound(ws)
       const acc = await store.get('auto_close_completion')
@@ -2929,6 +2937,8 @@ export default function Mini() {
       if (ev.payload?.waiting && !waitingSoundRef.current) return
       if (notifySoundRef.current === 'manbo') {
         new Audio('/audio/manbo.m4a').play().catch(() => {})
+      } else if (notifySoundRef.current === 'therock') {
+        new Audio('/audio/therock.mp3').play().catch(() => {})
       } else {
         playDefaultSound()
       }
@@ -5941,6 +5951,7 @@ export default function Mini() {
                   await store.save()
                   if (next) {
                     if (notifySound === 'manbo') new Audio('/audio/manbo.m4a').play().catch(() => {})
+                    else if (notifySound === 'therock') new Audio('/audio/therock.mp3').play().catch(() => {})
                     else playDefaultSound()
                   }
                 }}
@@ -7843,6 +7854,9 @@ export default function Mini() {
                         notifySound={notifySound}
                         onChangeNotifySound={async (v) => {
                           setNotifySound(v)
+                          if (v === 'manbo') new Audio('/audio/manbo.m4a').play().catch(() => {})
+                          else if (v === 'therock') new Audio('/audio/therock.mp3').play().catch(() => {})
+                          else playDefaultSound()
                           const store = await getStore()
                           await store.set('notify_sound', v)
                           await store.save()
@@ -7850,6 +7864,9 @@ export default function Mini() {
                         quotaRecoverySound={quotaRecoverySound}
                         onChangeQuotaRecoverySound={async (v) => {
                           setQuotaRecoverySound(v)
+                          if (v === 'therock') new Audio('/audio/therock.mp3').play().catch(() => {})
+                          else if (v === 'manbo') new Audio('/audio/manbo.m4a').play().catch(() => {})
+                          else playDefaultSound()
                           const store = await getStore()
                           await store.set('quota_recovery_sound', v)
                           await store.save()

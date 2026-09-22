@@ -192,6 +192,7 @@
     "quotaRecoverySoundDesc": "クォータが10%以上に回復した時に再生するサウンド",
     "defaultSound": "デフォルト",
     "manboSound": "マンボ",
+    "rockSound": "ザ・ロック",
     "ccSound": "Claude Code 完了サウンド",
     "ccSoundDesc": "Claude Codeのタスク完了時にサウンドを再生",
     "enableCursor": "Cursor を有効化",

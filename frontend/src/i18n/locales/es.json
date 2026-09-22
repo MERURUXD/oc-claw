@@ -191,6 +191,7 @@
     "quotaRecoverySoundDesc": "Sonido reproducido cuando la cuota se recupera al 10% o más",
     "defaultSound": "Predeterminado",
     "manboSound": "Mambo",
+    "rockSound": "The Rock",
     "ccSound": "Sonido de finalización Claude Code",
     "ccSoundDesc": "Reproducir sonido cuando Claude Code termina una tarea",
     "enableCursor": "Habilitar Cursor",

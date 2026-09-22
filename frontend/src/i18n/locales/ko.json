@@ -191,6 +191,7 @@
     "quotaRecoverySoundDesc": "할당량이 10% 이상으로 복구될 때 재생되는 소리",
     "defaultSound": "기본값",
     "manboSound": "맘보",
+    "rockSound": "더 락",
     "ccSound": "Claude Code 완료 소리",
     "ccSoundDesc": "Claude Code 작업 완료 시 소리 재생",
     "enableCursor": "Cursor 활성화",
