@@ -77,6 +77,10 @@ static PET_CANVAS_BOUNDS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 /// pet_passthrough_poll_windows so clicks on transparent canvas areas outside the character body
 /// pass through to underlying windows.
 static PET_HITBOX_BOUNDS: Mutex<Option<(f64, f64, f64, f64)>> = Mutex::new(None);
+#[cfg(target_os = "windows")]
+static CODING_PASSTHROUGH_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "windows")]
+static CODING_PASSTHROUGH_THREAD_ALIVE: AtomicBool = AtomicBool::new(false);
 #[derive(Clone, Copy, Debug)]
 pub struct BubbleAnchor {
     pub card_right: f64,
@@ -4065,6 +4069,8 @@ fn efficiency_hover_poll(app: tauri::AppHandle) {
     let mut was_inside = false;
     let mut was_over_mascot = false;
     let mut last_enter_emit = Instant::now();
+    #[cfg(target_os = "macos")]
+    let mut was_ignoring_mouse = false;
     // Drag state machine, driven entirely by NSEvent.pressedMouseButtons +
     // NSEvent.mouseLocation. The webview cannot observe mouseDown on a
     // non-key floating window, so the JS-side drag would otherwise need a
@@ -4124,14 +4130,31 @@ fn efficiency_hover_poll(app: tauri::AppHandle) {
             // bottom-right corner). Hover/drag should only fire on the
             // visible body, so we inset to ~35% wide x 65% tall around the
             // upper-centre where the head/torso sit.
+            let custom_hitbox = PET_HITBOX_BOUNDS.lock().ok().and_then(|g| *g);
+            let resize_handle = 34.0_f64;
+
             let over_mascot = if is_expanded {
                 false
             } else if let Some((fx, fy, fw, fh)) = frame {
-                let l = fx + fw * 0.32;
-                let r = fx + fw * 0.68;
-                let b = fy + fh * 0.25; // NSEvent y axis grows upward
-                let t = fy + fh * 0.90;
-                cursor.0 >= l && cursor.0 <= r && cursor.1 >= b && cursor.1 <= t
+                if let Some((hx, hy, hw, hh)) = custom_hitbox {
+                    let hit_left = fx + hx;
+                    let hit_right = hit_left + hw;
+                    let hit_bottom = fy + fh - (hy + hh);
+                    let hit_top = fy + fh - hy;
+                    let over_body = cursor.0 >= hit_left && cursor.0 <= hit_right
+                        && cursor.1 >= hit_bottom && cursor.1 <= hit_top;
+                    let over_resize = cursor.0 >= hit_right - resize_handle
+                        && cursor.0 <= hit_right
+                        && cursor.1 >= hit_bottom
+                        && cursor.1 <= hit_bottom + resize_handle;
+                    over_body || over_resize
+                } else {
+                    let l = fx + fw * 0.32;
+                    let r = fx + fw * 0.68;
+                    let b = fy + fh * 0.25; // NSEvent y axis grows upward
+                    let t = fy + fh * 0.90;
+                    cursor.0 >= l && cursor.0 <= r && cursor.1 >= b && cursor.1 <= t
+                }
             } else {
                 false
             };
@@ -4207,6 +4230,33 @@ fn efficiency_hover_poll(app: tauri::AppHandle) {
                 was_over_mascot = hover_signal;
             }
 
+            #[cfg(target_os = "macos")]
+            {
+                let should_ignore_mouse = if is_expanded || drag_active {
+                    false
+                } else if custom_hitbox.is_some() {
+                    !over_mascot
+                } else {
+                    false
+                };
+
+                if should_ignore_mouse != was_ignoring_mouse {
+                    let app_c = app.clone();
+                    let _ = app.run_on_main_thread(move || {
+                        if let Some(win) = app_c.get_webview_window("mini") {
+                            if let Ok(ns_win) = win.ns_window() {
+                                use objc2::msg_send;
+                                let obj = unsafe { &*(ns_win as *mut objc2::runtime::AnyObject) };
+                                unsafe {
+                                    let _: () = msg_send![obj, setIgnoresMouseEvents: should_ignore_mouse];
+                                }
+                            }
+                        }
+                    });
+                    was_ignoring_mouse = should_ignore_mouse;
+                }
+            }
+
             // Adaptive polling: fastest while dragging (60fps) so the
             // window keeps up with the cursor; slower when just hovering;
             // very slow when far from the mascot to save battery.
@@ -4235,6 +4285,21 @@ fn efficiency_hover_poll(app: tauri::AppHandle) {
             500
         };
         std::thread::sleep(Duration::from_millis(sleep_ms));
+    }
+    #[cfg(target_os = "macos")]
+    if was_ignoring_mouse {
+        let app_exit = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            if let Some(win) = app_exit.get_webview_window("mini") {
+                if let Ok(ns_win) = win.ns_window() {
+                    use objc2::msg_send;
+                    let obj = unsafe { &*(ns_win as *mut objc2::runtime::AnyObject) };
+                    unsafe {
+                        let _: () = msg_send![obj, setIgnoresMouseEvents: false];
+                    }
+                }
+            }
+        });
     }
     EFFICIENCY_HOVER_THREAD_ALIVE.store(false, Ordering::SeqCst);
 }
@@ -5460,6 +5525,7 @@ async fn set_pet_pomodoro_active(active: bool) -> Result<(), String> {
 /// transparent canvas pixels non-interactive (pass-through).
 #[tauri::command]
 async fn set_pet_canvas_bounds(
+    app: tauri::AppHandle,
     canvas_w: Option<f64>,
     canvas_h: Option<f64>,
     hitbox_x: Option<f64>,
@@ -5477,13 +5543,31 @@ async fn set_pet_canvas_bounds(
         }
     }
 
-    if let (Some(x), Some(y), Some(w), Some(h)) = (hitbox_x, hitbox_y, hitbox_w, hitbox_h) {
+    let has_hitbox = if let (Some(x), Some(y), Some(w), Some(h)) = (hitbox_x, hitbox_y, hitbox_w, hitbox_h) {
         if let Ok(mut guard) = PET_HITBOX_BOUNDS.lock() {
             *guard = Some((x, y, w, h));
         }
+        true
     } else {
         if let Ok(mut guard) = PET_HITBOX_BOUNDS.lock() {
             *guard = None;
+        }
+        false
+    };
+
+    #[cfg(target_os = "windows")]
+    {
+        if has_hitbox {
+            CODING_PASSTHROUGH_ACTIVE.store(true, Ordering::SeqCst);
+            if !CODING_PASSTHROUGH_THREAD_ALIVE.load(Ordering::SeqCst) {
+                let app_c = app.clone();
+                std::thread::spawn(move || coding_passthrough_poll_windows(app_c));
+            }
+        } else {
+            CODING_PASSTHROUGH_ACTIVE.store(false, Ordering::SeqCst);
+            if let Some(win) = app.get_webview_window("mini") {
+                let _ = win.set_ignore_cursor_events(false);
+            }
         }
     }
 
@@ -5903,6 +5987,116 @@ fn pet_passthrough_poll_windows(app: tauri::AppHandle, mascot_scale: f64, large_
         let _ = win.set_ignore_cursor_events(false);
     }
     PET_PASSTHROUGH_THREAD_ALIVE.store(false, Ordering::SeqCst);
+}
+
+/// Windows polling loop for coding-mode mascot click pass-through when custom
+/// canvas bounds are active (e.g. Shenshen with enlarged canvas).
+/// Ensures that transparent effect pixels outside the character body/resize hitbox
+/// pass through to underlying applications.
+#[cfg(target_os = "windows")]
+fn coding_passthrough_poll_windows(app: tauri::AppHandle) {
+    use std::time::Duration;
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    const VK_LBUTTON: i32 = 0x01;
+    const VK_RBUTTON: i32 = 0x02;
+
+    CODING_PASSTHROUGH_THREAD_ALIVE.store(true, Ordering::SeqCst);
+    let mut last_state: Option<bool> = None;
+    let mut was_interactive = true;
+
+    while CODING_PASSTHROUGH_ACTIVE.load(Ordering::SeqCst) {
+        let is_expanded = MINI_IS_EXPANDED.load(Ordering::SeqCst);
+        let in_pet_mode = PET_PASSTHROUGH_ACTIVE.load(Ordering::SeqCst);
+        let custom_hitbox = PET_HITBOX_BOUNDS.lock().ok().and_then(|g| *g);
+
+        let mouse_held = unsafe {
+            ((GetAsyncKeyState(VK_LBUTTON) as u16) & 0x8000) != 0
+                || ((GetAsyncKeyState(VK_RBUTTON) as u16) & 0x8000) != 0
+        };
+
+        let should_be_interactive = if is_expanded || in_pet_mode {
+            true
+        } else if was_interactive && mouse_held {
+            // Keep interactive during active drag or click inside the mascot
+            true
+        } else if let Some((hx, hy, hw, hh)) = custom_hitbox {
+            let cursor = unsafe {
+                let mut pt = POINT::default();
+                if GetCursorPos(&mut pt).is_ok() {
+                    Some((pt.x as f64, pt.y as f64))
+                } else {
+                    None
+                }
+            };
+            let win = app.get_webview_window("mini");
+            match (win, cursor) {
+                (Some(win), Some((cx, cy))) => {
+                    let pos = win.outer_position().ok();
+                    let size = win.outer_size().ok();
+                    let scale = win.scale_factor().unwrap_or(1.0);
+                    if let (Some(pos), Some(size)) = (pos, size) {
+                        if let Ok(guard) = PET_CANVAS_BOUNDS.lock() {
+                            if let Some((cw, ch)) = *guard {
+                                // If the window is significantly larger than the canvas bounds,
+                                // it is in expanded/settings/modal mode, so stay interactive.
+                                if size.width as f64 > (cw * scale) + 20.0
+                                    || size.height as f64 > (ch * scale) + 20.0
+                                {
+                                    true
+                                } else {
+                                    let fx = pos.x as f64;
+                                    let fy = pos.y as f64;
+                                    let resize_handle = 34.0_f64 * scale;
+
+                                    let hit_left = fx + hx * scale;
+                                    let hit_right = hit_left + hw * scale;
+                                    let hit_top = fy + hy * scale;
+                                    let hit_bottom = hit_top + hh * scale;
+
+                                    let over_body = cx >= hit_left
+                                        && cx <= hit_right
+                                        && cy >= hit_top
+                                        && cy <= hit_bottom;
+                                    let over_resize = cx >= hit_right - resize_handle
+                                        && cx <= hit_right
+                                        && cy >= hit_bottom - resize_handle
+                                        && cy <= hit_bottom;
+
+                                    over_body || over_resize
+                                }
+                            } else {
+                                true
+                            }
+                        } else {
+                            true
+                        }
+                    } else {
+                        true
+                    }
+                }
+                _ => true,
+            }
+        } else {
+            true
+        };
+
+        if last_state != Some(should_be_interactive) {
+            if let Some(win) = app.get_webview_window("mini") {
+                let _ = win.set_ignore_cursor_events(!should_be_interactive);
+            }
+            last_state = Some(should_be_interactive);
+        }
+        was_interactive = should_be_interactive;
+
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    if let Some(win) = app.get_webview_window("mini") {
+        let _ = win.set_ignore_cursor_events(false);
+    }
+    CODING_PASSTHROUGH_THREAD_ALIVE.store(false, Ordering::SeqCst);
 }
 
 /// Resize the mini window to 3/4 of screen, centered, with normal window level.

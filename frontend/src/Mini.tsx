@@ -3776,7 +3776,9 @@ export default function Mini() {
     const startScale = largeMascotScaleRef.current
     const startSize = Math.round(MASCOT_BASE_SIZE * mascotScaleRef.current) * startScale
     const baseSize = Math.max(1, Math.round(MASCOT_BASE_SIZE * mascotScaleRef.current))
-    const aspect = getPetAspectRatio(miniPet)
+    const aspect = largeMascotRef.current
+      ? 208 / 192
+      : getPetAspectRatio(miniPetRef.current)
     const pid = e.pointerId
     let rafId: number | null = null
     let latestScale = startScale
