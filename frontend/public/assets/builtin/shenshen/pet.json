@@ -1,0 +1,47 @@
+{
+  "id": "shenshen",
+  "displayName": "申申",
+  "description": "透明 WebM 视频桌宠 (DSH)",
+  "renderer": "video-clips",
+  "canvas": {
+    "width": 640,
+    "height": 360,
+    "bodyBox": [212, 60, 428, 330],
+    "feetY": 330
+  },
+  "fps": 24,
+  "noMirror": [
+    "写代码"
+  ],
+  "animations": {
+    "idle": {
+      "src": "videos/待机呼吸休闲.webm",
+      "loop": true
+    },
+    "work": {
+      "src": "videos/工作状态-忙碌点按.webm",
+      "loop": true
+    },
+    "running": {
+      "src": "videos/工作状态-忙碌点按.webm",
+      "loop": true
+    },
+    "review": {
+      "src": "videos/写代码.webm",
+      "loop": true,
+      "noMirror": true
+    },
+    "drag": {
+      "src": "videos/被鼠标拖拽悬空反馈.webm",
+      "loop": true
+    },
+    "jumping": {
+      "src": "videos/被鼠标拖拽悬空反馈.webm",
+      "loop": true
+    },
+    "fireworks": {
+      "src": "videos/放烟花.webm",
+      "loop": false
+    }
+  }
+}

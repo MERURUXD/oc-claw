@@ -5,7 +5,8 @@ import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { LogicalPosition, LogicalSize } from '@tauri-apps/api/dpi'
 import { Maximize2 } from 'lucide-react'
 import { MiniPetMascot, type MascotReaction } from './components/MiniPetMascot'
-import { loadCodexPetById, loadDefaultCodexPet, type CodexPet, type CodexPetState } from './lib/codexPet'
+import { loadCodexPetById, loadDefaultCodexPet, type CodexPetState } from './lib/codexPet'
+import type { PetAsset } from './lib/petAsset'
 
 const isWindowsPlatform =
   typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows')
@@ -46,7 +47,7 @@ function clampLargeMascotScale(value: number): number {
 export function DemoMascot({ functional = false }: { functional?: boolean }) {
   const params = new URLSearchParams(window.location.hash.split('?')[1] ?? '')
   const petIdFromUrl = params.get('pet') ?? ''
-  const [pet, setPet] = useState<CodexPet | null>(null)
+  const [pet, setPet] = useState<PetAsset | null>(null)
   const [working, setWorking] = useState(false)
   const [waiting, setWaiting] = useState(false)
   const [isReview, setIsReview] = useState(false)

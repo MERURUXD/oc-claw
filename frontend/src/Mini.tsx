@@ -61,10 +61,12 @@ import {
   DEFAULT_PET_QUEUE_IDS,
   loadCodexPetById, loadDefaultCodexPet,
   petStateToCodexState,
-  type CodexPet, type CodexPetState,
+  type CodexPetState,
 } from './lib/codexPet'
 import { MiniPetMascot, type MascotReaction } from './components/MiniPetMascot'
-import { SpritePet } from './components/SpritePet'
+import { BufferedVideo } from './components/BufferedVideo'
+import { PetRenderer } from './components/PetRenderer'
+import type { PetAsset } from './lib/petAsset'
 import { PetPicker } from './components/PetPicker'
 import { PetGallery } from './components/PetGallery'
 
@@ -358,7 +360,7 @@ export default function Mini() {
   // walkDir captures locomotion direction (-1 left, 1 right, 0 stationary)
   // for the main mascot's sprite state override while the native window
   // is being moved by the walk timer.
-  const [miniPet, setMiniPet] = useState<CodexPet | null>(null)
+  const [miniPet, setMiniPet] = useState<PetAsset | null>(null)
   const [walkDir, setWalkDir] = useState<-1 | 0 | 1>(0)
   const walkDirRef = useRef<-1 | 0 | 1>(0)
   const updateWalkDir = useCallback((dir: -1 | 0 | 1) => {
@@ -462,7 +464,7 @@ export default function Mini() {
   // looks each id up via loadCodexPetById. The session-list / slot
   // renderers index into this array by row position so multiple sessions
   // visibly rotate through the configured pets.
-  const [petQueueResolved, setPetQueueResolved] = useState<CodexPet[]>([])
+  const [petQueueResolved, setPetQueueResolved] = useState<PetAsset[]>([])
   const savePetQueue = useCallback(async (next: string[]) => {
     setPetQueue(next)
     const store = await load('settings.json', { defaults: {}, autoSave: true })
@@ -478,7 +480,7 @@ export default function Mini() {
       }
       const resolved = await Promise.all(petQueue.map((id) => loadCodexPetById(id)))
       if (cancelled) return
-      setPetQueueResolved(resolved.filter((p): p is CodexPet => p !== null))
+      setPetQueueResolved(resolved.filter((p): p is PetAsset => p !== null))
     })()
     return () => {
       cancelled = true
@@ -488,7 +490,7 @@ export default function Mini() {
   // the user's main mini pet when the queue is empty or hasn't resolved
   // yet so rows never render with `null`.
   const getQueuePet = useCallback(
-    (index: number): CodexPet | null => {
+    (index: number): PetAsset | null => {
       if (petQueueResolved.length === 0) return miniPet
       return petQueueResolved[((index % petQueueResolved.length) + petQueueResolved.length) % petQueueResolved.length]
     },
@@ -5155,123 +5157,7 @@ export default function Mini() {
       : getLargeVideo(largeCharForRender ?? undefined, mainPetState, largePetAction, fallbackLargeActions)
     : undefined
   const largeVideoUrl = largeVideoBaseUrl ? `${largeVideoBaseUrl}?rev=alpha-fix-2` : undefined
-  // Double-buffer video: two stacked <video> elements swap roles on each
-  // animation change. The old video stays visible until the new one's first
-  // frame is decoded (onLoadedData), eliminating blank-frame flicker.
-  // vid.load() clears the frame buffer immediately, so a single-element
-  // approach always flashes transparent between animations.
-  const largeVideoRefA = useRef<HTMLVideoElement>(null)
-  const largeVideoRefB = useRef<HTMLVideoElement>(null)
-  const largeVideoCanvasRef = useRef<HTMLCanvasElement>(null)
-  // Which buffer (0=A, 1=B) is currently the *front* (visible, playing) video
-  const activeBufferRef = useRef<0 | 1>(0)
-  const [activeBuffer, setActiveBuffer] = useState<0 | 1>(0)
-  const prevLargeVideoUrlRef = useRef<string | undefined>(undefined)
   const useWindowsChromaKey = isWindowsPlatform && !!largeVideoBaseUrl && largeVideoBaseUrl.includes('/large/webm/')
-
-  useEffect(() => {
-    if (!largeVideoUrl) {
-      // No video to show — reset tracking so we load fresh when a URL
-      // appears (e.g. switching back to pet mode restores the same URL).
-      prevLargeVideoUrlRef.current = undefined
-      return
-    }
-
-    const frontIdx = activeBufferRef.current
-    const backIdx: 0 | 1 = frontIdx === 0 ? 1 : 0
-    const front = frontIdx === 0 ? largeVideoRefA.current : largeVideoRefB.current
-    const back = backIdx === 0 ? largeVideoRefA.current : largeVideoRefB.current
-    if (!front || !back) {
-      // Video elements not yet in the DOM (e.g. collapsed view hidden
-      // while panel is expanded for settings). Reset URL tracker so we
-      // retry loading when the elements remount.
-      prevLargeVideoUrlRef.current = undefined
-      return
-    }
-
-    if (prevLargeVideoUrlRef.current === largeVideoUrl) return
-
-    const allowAlternateFormatFallback = !(typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows'))
-
-    const isFirstLoad = prevLargeVideoUrlRef.current === undefined
-    prevLargeVideoUrlRef.current = largeVideoUrl
-
-    let cancelled = false
-    const listeners: Array<() => void> = []
-    const addOnce = (el: HTMLVideoElement, event: 'playing' | 'error', fn: () => void) => {
-      el.addEventListener(event, fn, { once: true })
-      listeners.push(() => el.removeEventListener(event, fn))
-    }
-    const clearListeners = () => {
-      for (const off of listeners) off()
-      listeners.length = 0
-    }
-    const finishSwap = (newFront: 0 | 1) => {
-      if (cancelled) return
-      activeBufferRef.current = newFront
-      setActiveBuffer(newFront)
-      // Only pause the old buffer — do NOT clear its src synchronously.
-      // setActiveBuffer triggers an async React render that sets visibility:hidden,
-      // but removeAttribute('src') + load() would clear the frame buffer
-      // *before* React hides the element, causing a blank flash.
-      // The stale content is safe: the old buffer is hidden, and loadWithFallback
-      // will replace its src before it becomes front again.
-      const old = newFront === 0 ? largeVideoRefB.current : largeVideoRefA.current
-      if (old) {
-        old.pause()
-      }
-    }
-    const loadWithFallback = (
-      target: HTMLVideoElement,
-      url: string,
-      allowFallback: boolean,
-      onReady: () => void,
-      onFailed: () => void,
-    ) => {
-      clearListeners()
-      const ready = () => {
-        clearListeners()
-        onReady()
-      }
-      const failed = () => {
-        clearListeners()
-        if (cancelled) return
-        if (allowFallback) {
-          const alt = getAlternateLargeVideoUrl(url)
-          if (alt && alt !== url) {
-            loadWithFallback(target, alt, false, onReady, onFailed)
-            return
-          }
-        }
-        onFailed()
-      }
-      addOnce(target, 'playing', ready)
-      addOnce(target, 'error', failed)
-      target.currentTime = 0
-      target.src = url
-      target.load()
-      target.play().catch(() => {})
-    }
-
-    if (isFirstLoad) {
-      loadWithFallback(front, largeVideoUrl, allowAlternateFormatFallback, () => {}, () => {})
-      return () => {
-        cancelled = true
-        clearListeners()
-      }
-    }
-
-    // Keep current front visible, preload next on back, swap only after next plays.
-    loadWithFallback(back, largeVideoUrl, allowAlternateFormatFallback, () => finishSwap(backIdx), () => {})
-    return () => {
-      cancelled = true
-      clearListeners()
-    }
-  // `hiding` gates the collapsed mascot view in JSX (along with `expanded`).
-  // Without it in deps, the effect runs while refs are null (hiding=true)
-  // and bails out, then never re-runs when hiding flips back to false and the
-  // <video> elements remount — leaving the mascot blank after closing a popup.
-  }, [largeVideoUrl, expanded, hiding])
 
   const inAgentDetail = selectedAgentId !== null
   const selectedAgent = agents.find((a) => a.id === selectedAgentId)
@@ -5395,59 +5281,7 @@ export default function Mini() {
     emit('mascot-visual-size', { size: largeMascotVisualSize }).catch(() => {})
   }, [largeMascotVisualSize, appMode])
 
-  useEffect(() => {
-    if (!useWindowsChromaKey || !largeMascot) return
-    const canvas = largeVideoCanvasRef.current
-    if (!canvas) return
-    const ctx = canvas.getContext('2d', { willReadFrequently: true })
-    if (!ctx) return
-    let rafId = 0
-    let retryCount = 0
-    const draw = () => {
-      const front = activeBufferRef.current === 0 ? largeVideoRefA.current : largeVideoRefB.current
-      if (front && front.readyState >= 2 && front.videoWidth > 0 && front.videoHeight > 0) {
-        retryCount = 0
-        const targetSize = Math.max(1, Math.round(largeMascotVisualSize))
-        if (canvas.width !== targetSize || canvas.height !== targetSize) {
-          canvas.width = targetSize
-          canvas.height = targetSize
-        }
-        ctx.clearRect(0, 0, canvas.width, canvas.height)
-        ctx.drawImage(front, 0, 0, canvas.width, canvas.height)
-        const frame = ctx.getImageData(0, 0, canvas.width, canvas.height)
-        const data = frame.data
-        // Chroma key black-ish pixels to transparent as a Windows fallback
-        // when WebView2 drops VP9 alpha during decode.
-        for (let i = 0; i < data.length; i += 4) {
-          const maxRgb = Math.max(data[i], data[i + 1], data[i + 2])
-          if (maxRgb <= 12) {
-            data[i + 3] = 0
-          } else if (maxRgb < 28) {
-            const softAlpha = Math.round(((maxRgb - 12) / 16) * 255)
-            if (softAlpha < data[i + 3]) data[i + 3] = softAlpha
-          }
-        }
-        ctx.putImageData(frame, 0, 0)
-      } else if (front && front.src && front.paused) {
-        // Video has a source but isn't playing — kick-start it.
-        // This handles cases where play() was called while the element
-        // was hidden (e.g. during settingsTransitioning display:none) and
-        // WebView2 silently rejected or stalled decoding.
-        // Throttle retries to ~2/sec to avoid spamming play().
-        retryCount++
-        if (retryCount % 30 === 0) front.play().catch(() => {})
-      }
-      rafId = requestAnimationFrame(draw)
-    }
-    rafId = requestAnimationFrame(draw)
-    return () => {
-      cancelAnimationFrame(rafId)
-    }
-  // `expanded` and `hiding` are included so the rAF loop restarts when the
-  // collapsed view (re)mounts — the canvas element is only in the DOM when
-  // `!expanded && !hiding`. Missing `hiding` causes the same "mascot blank
-  // after closing a popup" symptom as the video loader effect above.
-  }, [useWindowsChromaKey, largeMascot, largeMascotVisualSize, activeBuffer, largeVideoUrl, expanded, hiding])
+
 
   return (
     <div
@@ -5551,83 +5385,52 @@ export default function Mini() {
                   />
                 )
               })()}
-              {useWindowsChromaKey && (
-                <canvas
-                  ref={largeVideoCanvasRef}
-                  style={{
-                    position: 'absolute',
-                    inset: 0,
-                    width: '100%',
-                    height: '100%',
-                    pointerEvents: 'none',
-                    transform:
-                      (currentPetAction === 'walk' && walkFlipped) ? 'scaleX(-1)'
-                      : ((currentPetAction === 'peek' || currentPetAction === 'walkout') && peekEdgeRef.current === 'left') ? 'scaleX(-1)'
-                      : undefined,
-                  }}
-                />
-              )}
-              {/* Double-buffer: front buffer stays visible while back buffer preloads.
-                  Swap only after back buffer is already playing to avoid blank frames. */}
-              {[0, 1].map((idx) => {
-                const isFront = activeBuffer === idx
-                const ref = idx === 0 ? largeVideoRefA : largeVideoRefB
-                return (
-                  <video
-                    key={idx}
-                    ref={ref}
-                    autoPlay={isFront}
-                    loop={!(appMode === 'pet' && TRANSIENT_PET_ACTIONS.includes(currentPetAction))}
-                    muted
-                    playsInline
-                    preload="auto"
-                    onError={(e) => {
-                      if (!isFront) return
-                      console.warn('[large-video] error:', (e.target as HTMLVideoElement).error?.message, 'src:', largeVideoUrl)
-                      if (appModeRef.current === 'pet' && TRANSIENT_PET_ACTIONS.includes(currentPetActionRef.current)) {
-                        const d = petDataRef.current
-                        const next: PetAction = d.hunger < 30 ? 'hungry' : 'idle'
-                        setCurrentPetAction(next)
-                        currentPetActionRef.current = next
-                      }
-                    }}
-                    onEnded={() => {
-                      if (!isFront) return
-                      if (appModeRef.current === 'pet' && TRANSIENT_PET_ACTIONS.includes(currentPetActionRef.current)) {
-                        if (currentPetActionRef.current === 'farewell') {
-                          invoke('exit_app').catch(() => {})
-                          return
-                        }
-                        let next: PetAction
-                        if (currentPetActionRef.current === 'dance' && danceFromMusicRef.current) {
-                          danceFromMusicRef.current = false
-                          next = 'music'
-                        } else {
-                          const d = petDataRef.current
-                          next = d.hunger < 30 ? 'hungry' : 'idle'
-                        }
-                        setCurrentPetAction(next)
-                        currentPetActionRef.current = next
-                      }
-                    }}
-                    style={{
-                      position: 'absolute',
-                      inset: 0,
-                      width: '100%',
-                      height: '100%',
-                      objectFit: 'contain',
-                      pointerEvents: 'none',
-                      visibility: isFront ? 'visible' : 'hidden',
-                      opacity: useWindowsChromaKey ? 0 : 1,
-                      transform:
-                        (currentPetAction === 'walk' && walkFlipped) ? 'scaleX(-1)'
-                        : ((currentPetAction === 'peek' || currentPetAction === 'walkout') && peekEdgeRef.current === 'left') ? 'scaleX(-1)'
-                        : undefined,
-                    }}
-                    draggable={false}
-                  />
-                )
-              })}
+              <BufferedVideo
+                src={largeVideoUrl}
+                getAlternateSrc={getAlternateLargeVideoUrl}
+                loop={!(appMode === 'pet' && TRANSIENT_PET_ACTIONS.includes(currentPetAction))}
+                transparency={useWindowsChromaKey ? 'windows-chroma-key' : 'native'}
+                canvasWidth={Math.max(1, Math.round(largeMascotVisualSize))}
+                canvasHeight={Math.max(1, Math.round(largeMascotVisualSize))}
+                transform={
+                  (currentPetAction === 'walk' && walkFlipped) ? 'scaleX(-1)'
+                  : ((currentPetAction === 'peek' || currentPetAction === 'walkout') && peekEdgeRef.current === 'left') ? 'scaleX(-1)'
+                  : undefined
+                }
+                style={{
+                  position: 'absolute',
+                  inset: 0,
+                  width: '100%',
+                  height: '100%',
+                }}
+                onError={(err) => {
+                  console.warn('[large-video] error:', err, 'src:', largeVideoUrl)
+                  if (appModeRef.current === 'pet' && TRANSIENT_PET_ACTIONS.includes(currentPetActionRef.current)) {
+                    const d = petDataRef.current
+                    const next: PetAction = d.hunger < 30 ? 'hungry' : 'idle'
+                    setCurrentPetAction(next)
+                    currentPetActionRef.current = next
+                  }
+                }}
+                onEnded={() => {
+                  if (appModeRef.current === 'pet' && TRANSIENT_PET_ACTIONS.includes(currentPetActionRef.current)) {
+                    if (currentPetActionRef.current === 'farewell') {
+                      invoke('exit_app').catch(() => {})
+                      return
+                    }
+                    let next: PetAction
+                    if (currentPetActionRef.current === 'dance' && danceFromMusicRef.current) {
+                      danceFromMusicRef.current = false
+                      next = 'music'
+                    } else {
+                      const d = petDataRef.current
+                      next = d.hunger < 30 ? 'hungry' : 'idle'
+                    }
+                    setCurrentPetAction(next)
+                    currentPetActionRef.current = next
+                  }
+                }}
+              />
             </div>) : miniPet ? (
               <div
                 style={{
@@ -6225,7 +6028,7 @@ export default function Mini() {
                                         {(() => {
                                           const rowPet = getQueuePet(index)
                                           return rowPet ? (
-                                            <SpritePet pet={rowPet} state={ocSpriteState} size={Math.round(40 * SESSION_SPRITE_DISPLAY_MULTIPLIER)} />
+                                            <PetRenderer pet={rowPet} state={ocSpriteState} size={Math.round(40 * SESSION_SPRITE_DISPLAY_MULTIPLIER)} />
                                           ) : (
                                             <span className="text-white/40 text-lg">{agent?.identityEmoji || '?'}</span>
                                           )
@@ -6432,7 +6235,7 @@ export default function Mini() {
                                           {(() => {
                                             const rowPet = getQueuePet(index)
                                             return rowPet ? (
-                                              <SpritePet pet={rowPet} state={claudeSpriteState} size={Math.round(40 * SESSION_SPRITE_DISPLAY_MULTIPLIER)} />
+                                              <PetRenderer pet={rowPet} state={claudeSpriteState} size={Math.round(40 * SESSION_SPRITE_DISPLAY_MULTIPLIER)} />
                                             ) : (
                                               <span className="text-white/40 text-lg">🤖</span>
                                             )
@@ -7241,7 +7044,7 @@ export default function Mini() {
                           }}
                         >
                           {miniPet ? (
-                            <SpritePet
+                            <PetRenderer
                               pet={miniPet}
                               state="idle"
                               size={Math.round(68 * SESSION_SPRITE_DISPLAY_MULTIPLIER)}
@@ -7310,7 +7113,7 @@ export default function Mini() {
                                 {(() => {
                                   const rowPet = getQueuePet(sortedIdx)
                                   return rowPet ? (
-                                    <SpritePet pet={rowPet} state={slotSpriteState} size={Math.round(56 * SESSION_SPRITE_DISPLAY_MULTIPLIER)} />
+                                    <PetRenderer pet={rowPet} state={slotSpriteState} size={Math.round(56 * SESSION_SPRITE_DISPLAY_MULTIPLIER)} />
                                   ) : null
                                 })()}
                                 {!miniPet && petQueueResolved.length === 0 && (
