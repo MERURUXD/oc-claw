@@ -2,6 +2,15 @@
 // Unlike Codex sprite atlases, video pets use individual transparent video files
 // with declared canvas dimensions, stable body box geometry, and baseline alignment.
 
+export type VideoTransparencyMode = 'native' | 'windows-chroma-key' | 'auto'
+
+export interface ChromaKeyOptions {
+  // Pixels with max(r,g,b) <= lowThreshold are set to completely transparent (alpha = 0). Default: 12.
+  lowThreshold?: number
+  // Pixels with max(r,g,b) between lowThreshold and highThreshold get a soft alpha transition. Default: 28.
+  highThreshold?: number
+}
+
 export interface VideoPetCanvasGeometry {
   width: number
   height: number
@@ -22,7 +31,14 @@ export interface VideoPetAnimationMeta {
   // Optional horizontal displacement stride in pixels per loop cycle
   stridePx?: number
   fps?: number
+  // Optional custom playback rate multiplier for this specific animation
+  playbackRate?: number
 }
+
+export type VideoPetAnimationEntry =
+  | VideoPetAnimationMeta
+  | string
+  | (VideoPetAnimationMeta | string)[]
 
 export interface VideoPet {
   renderer: 'video-clips'
@@ -31,8 +47,11 @@ export interface VideoPet {
   description?: string
   canvas: VideoPetCanvasGeometry
   fps?: number
-  // Animation mapping by state or action key (e.g. idle, work, drag, etc.)
-  animations: Record<string, VideoPetAnimationMeta | string>
+  transparency?: VideoTransparencyMode
+  chromaKeyOptions?: ChromaKeyOptions
+  // Animation mapping by state or action key (e.g. idle, work, drag, etc.).
+  // Supports single clip strings, metadata objects, or pools (arrays) of candidates.
+  animations: Record<string, VideoPetAnimationEntry>
   // List of animation names or keys where horizontal mirroring is forbidden
   noMirror?: string[]
   baseDir?: string
@@ -50,23 +69,19 @@ export const DSH_GEOMETRY: VideoPetCanvasGeometry = {
   feetY: DSH_FEET_Y,
 } as const
 
-// Standard DSH text clips where mirroring would reverse visible Chinese characters
-export const DSH_NO_MIRROR_CLIPS: readonly string[] = [
-  '是啊，吃什么',
-  '写代码',
-  '写福字',
-  '收红包',
-  '吃Token',
-  '深度思考碎碎念',
-] as const
-
 /**
- * Normalizes an animation entry to VideoPetAnimationMeta.
+ * Normalizes an animation entry (single string, object, or candidate pool) to VideoPetAnimationMeta.
  */
 export function normalizeVideoAnimation(
-  entry: VideoPetAnimationMeta | string | undefined,
+  entry: VideoPetAnimationEntry | undefined,
+  index = 0,
 ): VideoPetAnimationMeta | null {
   if (!entry) return null
+  if (Array.isArray(entry)) {
+    if (entry.length === 0) return null
+    const candidate = entry[Math.abs(index) % entry.length]
+    return normalizeVideoAnimation(candidate)
+  }
   if (typeof entry === 'string') {
     return { src: entry, loop: true }
   }
@@ -79,22 +94,23 @@ export function normalizeVideoAnimation(
 export function resolveVideoAnimation(
   pet: VideoPet,
   key: string,
+  poolIndex = 0,
 ): { key: string; meta: VideoPetAnimationMeta } | null {
   const direct = pet.animations[key]
   if (direct) {
-    const meta = normalizeVideoAnimation(direct)
+    const meta = normalizeVideoAnimation(direct, poolIndex)
     if (meta) return { key, meta }
   }
 
   // Common fallbacks
   if (key !== 'idle' && pet.animations['idle']) {
-    const meta = normalizeVideoAnimation(pet.animations['idle'])
+    const meta = normalizeVideoAnimation(pet.animations['idle'], poolIndex)
     if (meta) return { key: 'idle', meta }
   }
 
   const firstKey = Object.keys(pet.animations)[0]
   if (firstKey && pet.animations[firstKey]) {
-    const meta = normalizeVideoAnimation(pet.animations[firstKey])
+    const meta = normalizeVideoAnimation(pet.animations[firstKey], poolIndex)
     if (meta) return { key: firstKey, meta }
   }
 
@@ -105,6 +121,7 @@ export function resolveVideoAnimation(
  * Calculates container and canvas dimensions and positioning offsets so that
  * the character's body box cleanly fills the container while preserving extra
  * space for animation effects (particles, fireworks, gestures) outside the box.
+ * Baseline alignment rests on feetY anchored to the bottom of the container.
  */
 export interface VideoPetRenderGeometry {
   containerWidth: number
@@ -121,7 +138,8 @@ export function computeVideoPetGeometry(
   visualSize: number,
 ): VideoPetRenderGeometry {
   const bodyW = Math.max(1, canvas.bodyBox[2] - canvas.bodyBox[0])
-  const bodyH = Math.max(1, canvas.bodyBox[3] - canvas.bodyBox[1])
+  const feetY = canvas.feetY ?? canvas.bodyBox[3]
+  const bodyH = Math.max(1, feetY - canvas.bodyBox[1])
   const scale = visualSize / bodyW
 
   const containerWidth = Math.round(visualSize)
@@ -131,7 +149,7 @@ export function computeVideoPetGeometry(
   const canvasHeight = Math.round(canvas.height * scale)
 
   const canvasLeft = Math.round(-canvas.bodyBox[0] * scale) || 0
-  const canvasTop = Math.round(-canvas.bodyBox[1] * scale) || 0
+  const canvasTop = Math.round(containerHeight - feetY * scale) || 0
 
   return {
     containerWidth,
@@ -175,6 +193,7 @@ export function mapSemanticStateToVideoCandidates(state: string): string[] {
 
 /**
  * Checks whether an animation should prohibit horizontal mirroring.
+ * Purely generic: checks explicit metadata flag and pet.noMirror list.
  */
 export function isMirrorForbidden(
   pet: VideoPet,
@@ -183,11 +202,11 @@ export function isMirrorForbidden(
 ): boolean {
   if (animationMeta?.noMirror === true) return true
   if (pet.noMirror && pet.noMirror.includes(animationKey)) return true
-  // Also check if the src filename contains any noMirror name
-  if (animationMeta?.src) {
-    const filename = animationMeta.src.split('/').pop()?.replace(/\.[^/.]+$/, '')
-    if (filename && pet.noMirror && pet.noMirror.includes(filename)) return true
-    if (filename && DSH_NO_MIRROR_CLIPS.includes(filename)) return true
+  // Also check if the decoded src filename matches any noMirror entry
+  if (animationMeta?.src && pet.noMirror && pet.noMirror.length > 0) {
+    const rawFilename = animationMeta.src.split('/').pop()?.replace(/\.[^/.]+$/, '')
+    const filename = rawFilename ? decodeURIComponent(rawFilename) : ''
+    if (filename && pet.noMirror.includes(filename)) return true
   }
   return false
 }

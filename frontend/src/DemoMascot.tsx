@@ -6,13 +6,13 @@ import { LogicalPosition, LogicalSize } from '@tauri-apps/api/dpi'
 import { Maximize2 } from 'lucide-react'
 import { MiniPetMascot, type MascotReaction } from './components/MiniPetMascot'
 import { loadCodexPetById, loadDefaultCodexPet, type CodexPetState } from './lib/codexPet'
-import type { PetAsset } from './lib/petAsset'
+import { getPetAspectRatio, getPetRenderMetrics, type PetAsset } from './lib/petAsset'
 
 const isWindowsPlatform =
   typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows')
 
 // Matches Mini.tsx: the collapsed small mascot's visual size is
-// round(MASCOT_BASE_SIZE * mascotScale) * largeMascotScale, driven by the
+// round(MASCOT_BASE_SIZE * mascotScale) * large_mascot_scale, driven by the
 // "Mascot Size" slider (large_mascot_scale). Mirror that here so extra mascots
 // scale together with the primary one.
 function computeMascotSize(mascotScale: number, largeMascotScale: number): number {
@@ -35,19 +35,19 @@ const MASCOT_RESIZE_CURSOR = 'nwse-resize'
 // defaults (mascot_scale 1 × large_mascot_scale 5).
 const DEFAULT_MASCOT_SIZE = computeMascotSize(1, 5)
 
-function clampLargeMascotScale(value: number): number {
-  if (!Number.isFinite(value)) return 5
-  return Math.min(LARGE_MASCOT_SCALE_MAX, Math.max(LARGE_MASCOT_SCALE_MIN, value))
+function clampLargeMascotScale(s: number): number {
+  if (!Number.isFinite(s)) return 5
+  return Math.min(LARGE_MASCOT_SCALE_MAX, Math.max(LARGE_MASCOT_SCALE_MIN, Math.round(s * 10) / 10))
 }
 
 // `functional` mascots (coding-mode multi-mascot feature) emit
 // `extra-mascot-activate` to the main mini window on a click (no drag) so the
 // main panel expands — making each extra mascot equivalent to the primary one.
 // Demo mascots leave `functional` false and stay decorative.
-export function DemoMascot({ functional = false }: { functional?: boolean }) {
-  const params = new URLSearchParams(window.location.hash.split('?')[1] ?? '')
-  const petIdFromUrl = params.get('pet') ?? ''
+export function DemoMascot({ functional = false }: { functional?: boolean } = {}) {
   const [pet, setPet] = useState<PetAsset | null>(null)
+  const petRef = useRef<PetAsset | null>(null)
+  petRef.current = pet
   const [working, setWorking] = useState(false)
   const [waiting, setWaiting] = useState(false)
   const [isReview, setIsReview] = useState(false)
@@ -69,16 +69,35 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
   const baseSizeRef = useRef(MASCOT_BASE_SIZE)
   const largeScaleRef = useRef(5)
 
+  // Parse pet ID from query string or hash
+  const params = new URLSearchParams(typeof window !== 'undefined' ? (window.location.search || (window.location.hash.split('?')[1] ?? '')) : '')
+  const petIdFromUrl = params.get('pet') ?? ''
+
   useEffect(() => {
     let cancelled = false
-    ;(async () => {
-      const found = (petIdFromUrl ? await loadCodexPetById(petIdFromUrl) : null) ?? (await loadDefaultCodexPet())
-      if (!cancelled) setPet(found)
-    })()
+    const id = petIdFromUrl?.trim()
+    if (id) {
+      loadCodexPetById(id).then((p) => {
+        if (!cancelled && p) setPet(p)
+      }).catch(() => {})
+    } else {
+      loadDefaultCodexPet().then((p) => {
+        if (!cancelled && p) setPet(p)
+      }).catch(() => {})
+    }
     return () => {
       cancelled = true
     }
   }, [petIdFromUrl])
+
+  // Sync window size with pet aspect ratio when pet loads or size changes
+  useEffect(() => {
+    if (size > 0 && pet) {
+      const win = getCurrentWebviewWindow()
+      const metrics = getPetRenderMetrics(pet, size)
+      win.setSize(new LogicalSize(metrics.width, metrics.height)).catch(() => {})
+    }
+  }, [pet, size])
 
   // Match the primary mascot's size. Read the persisted scale on mount and keep
   // in sync with live slider changes broadcast by the main window. The owning
@@ -91,9 +110,8 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
       setSize(next)
       largeScaleRef.current = clampLargeMascotScale(next / Math.max(1, baseSizeRef.current))
       const win = getCurrentWebviewWindow()
-      const boxW = Math.ceil(next)
-      const boxH = Math.ceil(next * (208 / 192))
-      win.setSize(new LogicalSize(boxW, boxH)).catch(() => {})
+      const metrics = getPetRenderMetrics(petRef.current, next)
+      win.setSize(new LogicalSize(metrics.width, metrics.height)).catch(() => {})
     }
     ;(async () => {
       try {
@@ -130,7 +148,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
     const startY = e.screenY
     const startSize = size
     const baseSize = Math.max(1, baseSizeRef.current)
-    const aspect = 208 / 192
+    const aspect = getPetAspectRatio(petRef.current)
     const pid = e.pointerId
     let latestScale = largeScaleRef.current
     let rafId: number | null = null
@@ -142,7 +160,8 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
       const nextSize = baseSize * clamped
       setSize(nextSize)
       const win = getCurrentWebviewWindow()
-      win.setSize(new LogicalSize(Math.ceil(nextSize), Math.ceil(nextSize * aspect))).catch(() => {})
+      const metrics = getPetRenderMetrics(petRef.current, nextSize)
+      win.setSize(new LogicalSize(metrics.width, metrics.height)).catch(() => {})
       emit('mascot-scale-change', { scale: clamped }).catch(() => {})
       emit('mascot-visual-size', { size: nextSize }).catch(() => {})
     }

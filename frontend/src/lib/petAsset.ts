@@ -1,11 +1,53 @@
 import type { CodexPet } from './codexPet'
-import type { VideoPet, VideoPetAnimationMeta, VideoPetCanvasGeometry } from './videoPet'
+import type {
+  ChromaKeyOptions,
+  VideoPet,
+  VideoPetAnimationEntry,
+  VideoPetAnimationMeta,
+  VideoPetCanvasGeometry,
+  VideoTransparencyMode,
+} from './videoPet'
 
 export type PetRendererType = 'sprite-atlas' | 'video-clips'
 
 // PetAsset union represents any pet supported by oc-claw:
 // either a traditional Codex/Hatch 8x9 sprite atlas or a video-based pet.
 export type PetAsset = CodexPet | VideoPet
+
+export interface PetRenderMetrics {
+  width: number
+  height: number
+  aspectRatio: number
+}
+
+/**
+ * Returns height-to-width aspect ratio for a given pet asset.
+ * Video pets use their declared nominal bodyBox / feetY baseline ratio.
+ * Codex sprite pets default to 208 / 192 (~1.0833).
+ */
+export function getPetAspectRatio(pet: PetAsset | null | undefined): number {
+  if (isVideoPet(pet)) {
+    const w = Math.max(1, pet.canvas.bodyBox[2] - pet.canvas.bodyBox[0])
+    const feetY = pet.canvas.feetY ?? pet.canvas.bodyBox[3]
+    const h = Math.max(1, feetY - pet.canvas.bodyBox[1])
+    return h / w
+  }
+  return 208 / 192
+}
+
+/**
+ * Computes container render metrics (width, height, aspectRatio)
+ * for a pet given a nominal visual width.
+ */
+export function getPetRenderMetrics(
+  pet: PetAsset | null | undefined,
+  visualWidth: number,
+): PetRenderMetrics {
+  const aspectRatio = getPetAspectRatio(pet)
+  const width = Math.round(visualWidth)
+  const height = Math.round(visualWidth * aspectRatio)
+  return { width, height, aspectRatio }
+}
 
 /**
  * Type guard for VideoPet.
@@ -20,6 +62,21 @@ export function isVideoPet(pet: PetAsset | null | undefined): pet is VideoPet {
  */
 export function isCodexPet(pet: PetAsset | null | undefined): pet is CodexPet {
   return pet != null && (pet.renderer === undefined || pet.renderer === 'sprite-atlas')
+}
+
+function parseAnimationMetaItem(
+  item: Record<string, unknown>,
+  baseUrl: string,
+): VideoPetAnimationMeta {
+  const src = typeof item.src === 'string' ? resolveRelativeUrl(item.src, baseUrl) : ''
+  return {
+    src,
+    loop: typeof item.loop === 'boolean' ? item.loop : true,
+    noMirror: typeof item.noMirror === 'boolean' ? item.noMirror : undefined,
+    stridePx: typeof item.stridePx === 'number' ? item.stridePx : undefined,
+    fps: typeof item.fps === 'number' ? item.fps : undefined,
+    playbackRate: typeof item.playbackRate === 'number' ? item.playbackRate : undefined,
+  }
 }
 
 /**
@@ -69,20 +126,24 @@ export function parsePetManifest(raw: unknown, baseUrl: string): PetAsset | null
       ? (m.animations as Record<string, unknown>)
       : {}
 
-    const animations: Record<string, VideoPetAnimationMeta | string> = {}
+    const animations: Record<string, VideoPetAnimationEntry> = {}
     for (const [key, val] of Object.entries(rawAnims)) {
       if (typeof val === 'string') {
         animations[key] = resolveRelativeUrl(val, baseUrl)
+      } else if (Array.isArray(val)) {
+        animations[key] = val
+          .map((entry) => {
+            if (typeof entry === 'string') {
+              return resolveRelativeUrl(entry, baseUrl)
+            }
+            if (entry && typeof entry === 'object') {
+              return parseAnimationMetaItem(entry as Record<string, unknown>, baseUrl)
+            }
+            return null
+          })
+          .filter((v): v is string | VideoPetAnimationMeta => v !== null)
       } else if (val && typeof val === 'object') {
-        const item = val as Record<string, unknown>
-        const src = typeof item.src === 'string' ? resolveRelativeUrl(item.src, baseUrl) : ''
-        animations[key] = {
-          src,
-          loop: typeof item.loop === 'boolean' ? item.loop : true,
-          noMirror: typeof item.noMirror === 'boolean' ? item.noMirror : undefined,
-          stridePx: typeof item.stridePx === 'number' ? item.stridePx : undefined,
-          fps: typeof item.fps === 'number' ? item.fps : undefined,
-        }
+        animations[key] = parseAnimationMetaItem(val as Record<string, unknown>, baseUrl)
       }
     }
 
@@ -92,6 +153,23 @@ export function parsePetManifest(raw: unknown, baseUrl: string): PetAsset | null
 
     const fps = typeof m.fps === 'number' && m.fps > 0 ? m.fps : 24
 
+    const transparency = (
+      m.transparency === 'native' ||
+      m.transparency === 'windows-chroma-key' ||
+      m.transparency === 'auto'
+    )
+      ? (m.transparency as VideoTransparencyMode)
+      : undefined
+
+    let chromaKeyOptions: ChromaKeyOptions | undefined
+    if (m.chromaKeyOptions && typeof m.chromaKeyOptions === 'object') {
+      const cko = m.chromaKeyOptions as Record<string, unknown>
+      chromaKeyOptions = {
+        lowThreshold: typeof cko.lowThreshold === 'number' ? cko.lowThreshold : undefined,
+        highThreshold: typeof cko.highThreshold === 'number' ? cko.highThreshold : undefined,
+      }
+    }
+
     return {
       renderer: 'video-clips',
       id,
@@ -99,6 +177,8 @@ export function parsePetManifest(raw: unknown, baseUrl: string): PetAsset | null
       description,
       canvas,
       fps,
+      transparency,
+      chromaKeyOptions,
       animations,
       noMirror,
       baseDir: baseUrl,

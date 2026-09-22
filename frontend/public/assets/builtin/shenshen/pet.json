@@ -9,9 +9,15 @@
     "bodyBox": [212, 60, 428, 330],
     "feetY": 330
   },
+  "transparency": "native",
   "fps": 24,
   "noMirror": [
-    "写代码"
+    "写代码",
+    "写福字",
+    "收红包",
+    "吃Token",
+    "深度思考碎碎念",
+    "是啊，吃什么"
   ],
   "animations": {
     "idle": {

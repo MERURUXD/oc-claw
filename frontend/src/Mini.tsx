@@ -66,7 +66,7 @@ import {
 import { MiniPetMascot, type MascotReaction } from './components/MiniPetMascot'
 import { BufferedVideo } from './components/BufferedVideo'
 import { PetRenderer } from './components/PetRenderer'
-import type { PetAsset } from './lib/petAsset'
+import { getPetAspectRatio, getPetRenderMetrics, type PetAsset } from './lib/petAsset'
 import { PetPicker } from './components/PetPicker'
 import { PetGallery } from './components/PetGallery'
 
@@ -78,6 +78,7 @@ interface CharacterMeta {
   restGifs: string[]
   miniActions?: Record<string, string[]>
   largeActions?: Record<string, string>
+  largeTransparency?: 'native' | 'windows-chroma-key' | 'auto'
   audioMap?: Record<string, string>
 }
 
@@ -3773,7 +3774,7 @@ export default function Mini() {
     const startScale = largeMascotScaleRef.current
     const startSize = Math.round(MASCOT_BASE_SIZE * mascotScaleRef.current) * startScale
     const baseSize = Math.max(1, Math.round(MASCOT_BASE_SIZE * mascotScaleRef.current))
-    const aspect = 208 / 192
+    const aspect = getPetAspectRatio(miniPet)
     const pid = e.pointerId
     let rafId: number | null = null
     let latestScale = startScale
@@ -5145,7 +5146,11 @@ export default function Mini() {
     return c?.largeActions
   }, [characters])
   const largeCharForRender = (appMode === 'pet' || appMode === 'coding')
-    ? ({ name: '香企鹅', largeActions: petBuiltinLargeActions } as CharacterMeta)
+    ? ({
+        name: '香企鹅',
+        largeActions: petBuiltinLargeActions,
+        largeTransparency: 'windows-chroma-key',
+      } as CharacterMeta)
     : miniChar
   // hasAnyLargeActions used to gate the legacy header toggle. Toggling is
   // now driven from the pet picker (selecting 香企鹅 enters large-mascot
@@ -5157,7 +5162,8 @@ export default function Mini() {
       : getLargeVideo(largeCharForRender ?? undefined, mainPetState, largePetAction, fallbackLargeActions)
     : undefined
   const largeVideoUrl = largeVideoBaseUrl ? `${largeVideoBaseUrl}?rev=alpha-fix-2` : undefined
-  const useWindowsChromaKey = isWindowsPlatform && !!largeVideoBaseUrl && largeVideoBaseUrl.includes('/large/webm/')
+  const useWindowsChromaKey =
+    isWindowsPlatform && (largeCharForRender?.largeTransparency === 'windows-chroma-key')
 
   const inAgentDetail = selectedAgentId !== null
   const selectedAgent = agents.find((a) => a.id === selectedAgentId)
@@ -5436,7 +5442,7 @@ export default function Mini() {
                 style={{
                   position: 'relative',
                   width: largeMascotVisualSize,
-                  height: Math.round(largeMascotVisualSize * (208 / 192)),
+                  height: getPetRenderMetrics(miniPet, largeMascotVisualSize).height,
                 }}
               >
                 <MiniPetMascot
@@ -6021,7 +6027,7 @@ export default function Mini() {
                                         className="relative shrink-0 flex items-center justify-center cursor-pointer"
                                         style={{
                                           width: Math.round(40 * SESSION_SPRITE_DISPLAY_MULTIPLIER),
-                                          height: Math.round(40 * SESSION_SPRITE_DISPLAY_MULTIPLIER * (208 / 192)),
+                                          height: getPetRenderMetrics(getQueuePet(index), Math.round(40 * SESSION_SPRITE_DISPLAY_MULTIPLIER)).height,
                                         }}
                                       >
                                         <div className="absolute inset-0" style={{ left: -16 }} />
@@ -6228,7 +6234,7 @@ export default function Mini() {
                                           className="relative shrink-0 flex items-center justify-center cursor-pointer"
                                           style={{
                                             width: Math.round(40 * SESSION_SPRITE_DISPLAY_MULTIPLIER),
-                                            height: Math.round(40 * SESSION_SPRITE_DISPLAY_MULTIPLIER * (208 / 192)),
+                                            height: getPetRenderMetrics(getQueuePet(index), Math.round(40 * SESSION_SPRITE_DISPLAY_MULTIPLIER)).height,
                                           }}
                                         >
                                           <div className="absolute inset-0" style={{ left: -16 }} />

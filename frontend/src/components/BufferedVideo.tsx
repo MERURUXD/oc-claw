@@ -1,13 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
+import type { ChromaKeyOptions, VideoTransparencyMode } from '../lib/videoPet'
 
-export interface ChromaKeyOptions {
-  // Pixels with max(r,g,b) <= lowThreshold are set to completely transparent (alpha = 0). Default: 12.
-  lowThreshold?: number
-  // Pixels with max(r,g,b) between lowThreshold and highThreshold get a soft alpha transition. Default: 28.
-  highThreshold?: number
-}
-
-export type VideoTransparencyMode = 'native' | 'windows-chroma-key' | 'auto'
+export type { ChromaKeyOptions, VideoTransparencyMode }
 
 export interface BufferedVideoProps {
   src?: string
@@ -81,6 +75,10 @@ export function BufferedVideo({
   onErrorRef.current = onError
   const getAlternateSrcRef = useRef(getAlternateSrc)
   getAlternateSrcRef.current = getAlternateSrc
+  const altSrcRef = useRef(altSrc)
+  altSrcRef.current = altSrc
+  const playbackRateRef = useRef(playbackRate)
+  playbackRateRef.current = playbackRate
 
   const effectiveTransparency =
     transparency === 'auto'
@@ -91,7 +89,8 @@ export function BufferedVideo({
 
   const useChromaKey = effectiveTransparency === 'windows-chroma-key'
 
-  // Video swapping and loading lifecycle
+  // Video swapping and loading lifecycle (strictly depends on src;
+  // playbackRate and altSrc are accessed via refs to prevent listener cancellation races)
   useEffect(() => {
     if (!src) {
       prevSrcRef.current = undefined
@@ -165,7 +164,7 @@ export function BufferedVideo({
         clearListeners()
         if (cancelled || generationRef.current !== generation) return
         if (allowFallback) {
-          const alt = altSrc ?? getAlternateSrcRef.current?.(targetUrl)
+          const alt = altSrcRef.current ?? getAlternateSrcRef.current?.(targetUrl)
           if (alt && alt !== targetUrl) {
             loadWithFallback(target, alt, false, onReady, onFailed)
             return
@@ -178,7 +177,7 @@ export function BufferedVideo({
       addOnce(target, 'error', failed)
 
       target.currentTime = 0
-      target.playbackRate = playbackRate
+      target.playbackRate = playbackRateRef.current
       target.src = targetUrl
       target.load()
       target.play().catch(() => {})
@@ -223,7 +222,7 @@ export function BufferedVideo({
       cancelled = true
       clearListeners()
     }
-  }, [src, altSrc, playbackRate])
+  }, [src])
 
   // Update playbackRate on existing video elements if changed mid-playback
   useEffect(() => {

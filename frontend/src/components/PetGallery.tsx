@@ -36,7 +36,7 @@ import {
   loadPetdexManifest,
   clearCodexPetCache,
 } from '../lib/codexPet'
-import { isCodexPet, type PetAsset } from '../lib/petAsset'
+import { isCodexPet, getPetRenderMetrics, type PetAsset } from '../lib/petAsset'
 import { loadPetFavorites, savePetFavorites } from '../lib/petStore'
 
 interface PetGalleryProps {
@@ -113,7 +113,7 @@ class SpritePreview extends Component<SpritePreviewProps, { failed: boolean }> {
         <div
           style={{
             width: this.props.size,
-            height: Math.round(this.props.size * (208 / 192)),
+            height: getPetRenderMetrics(this.props.pet, this.props.size).height,
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',

@@ -89,6 +89,11 @@ export function VideoPetRenderer({
   const shouldFlip = isRightFacing && !mirrorBlocked
   const transform = shouldFlip ? 'scaleX(-1)' : undefined
 
+  // Determine effective playback rate (animMeta override > fps ratio > base prop)
+  const effectivePlaybackRate =
+    animMeta?.playbackRate ??
+    (animMeta?.fps && pet.fps ? (animMeta.fps / pet.fps) * playbackRate : playbackRate)
+
   return (
     <div
       className={className}
@@ -115,10 +120,10 @@ export function VideoPetRenderer({
         <BufferedVideo
           src={animMeta?.src}
           loop={isLooping}
-          playbackRate={animMeta?.fps && pet.fps ? (animMeta.fps / pet.fps) * playbackRate : playbackRate}
+          playbackRate={effectivePlaybackRate}
           onEnded={isLooping ? undefined : onOneShotEnd}
-          transparency={transparency}
-          chromaKeyOptions={chromaKeyOptions}
+          transparency={transparency ?? pet.transparency ?? 'native'}
+          chromaKeyOptions={chromaKeyOptions ?? pet.chromaKeyOptions}
           canvasWidth={geo.canvasWidth}
           canvasHeight={geo.canvasHeight}
           transform={transform}

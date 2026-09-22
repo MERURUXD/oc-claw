@@ -148,7 +148,7 @@ test('videoPet helpers: isMirrorForbidden respects flags and canonical text clip
       code: { src: '/pets/写代码.webm', loop: true },
       wave: { src: '/pets/wave.webm', loop: false, noMirror: true },
     },
-    noMirror: ['custom_no_flip'],
+    noMirror: ['custom_no_flip', '写代码'],
   }
 
   // Animation marked with noMirror: true
