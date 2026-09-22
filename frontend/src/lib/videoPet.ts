@@ -124,13 +124,18 @@ export function resolveVideoAnimation(
  * Baseline alignment rests on feetY anchored to the bottom of the container.
  */
 export interface VideoPetRenderGeometry {
-  containerWidth: number
-  containerHeight: number
+  bodyWidth: number
+  bodyHeight: number
   canvasWidth: number
   canvasHeight: number
   canvasLeft: number
   canvasTop: number
+  hitboxLeft: number
+  hitboxTop: number
   scale: number
+  // Backward-compatibility aliases for body container dimensions
+  containerWidth: number
+  containerHeight: number
 }
 
 export function computeVideoPetGeometry(
@@ -142,23 +147,30 @@ export function computeVideoPetGeometry(
   const bodyH = Math.max(1, feetY - canvas.bodyBox[1])
   const scale = visualSize / bodyW
 
-  const containerWidth = Math.round(visualSize)
-  const containerHeight = Math.round(visualSize * (bodyH / bodyW))
+  const bodyWidth = Math.round(visualSize)
+  const bodyHeight = Math.round(visualSize * (bodyH / bodyW))
 
   const canvasWidth = Math.round(canvas.width * scale)
   const canvasHeight = Math.round(canvas.height * scale)
 
-  const canvasLeft = Math.round(-canvas.bodyBox[0] * scale) || 0
-  const canvasTop = Math.round(containerHeight - feetY * scale) || 0
+  const hitboxLeft = Math.round(canvas.bodyBox[0] * scale) || 0
+  const hitboxTop = Math.round(canvas.bodyBox[1] * scale) || 0
+
+  const canvasLeft = -hitboxLeft || 0
+  const canvasTop = -hitboxTop || 0
 
   return {
-    containerWidth,
-    containerHeight,
+    bodyWidth,
+    bodyHeight,
     canvasWidth,
     canvasHeight,
     canvasLeft,
     canvasTop,
+    hitboxLeft,
+    hitboxTop,
     scale,
+    containerWidth: bodyWidth,
+    containerHeight: bodyHeight,
   }
 }
 

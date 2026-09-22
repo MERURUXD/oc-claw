@@ -68,6 +68,15 @@ static PET_POMODORO_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Latest pet-mode mascot scales. The click-through poll thread is long-lived,
 /// so it reads this on each pass instead of capturing the size it started with.
 static PET_MASCOT_SCALES: Mutex<(f64, f64)> = Mutex::new((1.0, LARGE_MASCOT_SIZE_MULTIPLIER));
+/// Declared source canvas dimensions (canvas_w, canvas_h) in logical pixels for VideoPet.
+/// When Some, large_collapsed_mascot_window_size returns these canvas bounds so the OS
+/// window does not clip large animation effects (fireworks, particles, gestures).
+static PET_CANVAS_BOUNDS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
+/// Character interaction hitbox bounds (hitbox_x, hitbox_y, hitbox_w, hitbox_h) in logical pixels
+/// relative to the top-left of the canvas. Used by pet_passthrough_poll and
+/// pet_passthrough_poll_windows so clicks on transparent canvas areas outside the character body
+/// pass through to underlying windows.
+static PET_HITBOX_BOUNDS: Mutex<Option<(f64, f64, f64, f64)>> = Mutex::new(None);
 #[derive(Clone, Copy, Debug)]
 pub struct BubbleAnchor {
     pub card_right: f64,
@@ -3296,10 +3305,20 @@ fn sanitized_mascot_scale(scale: Option<f64>) -> f64 {
 }
 
 fn collapsed_mascot_window_size(scale: f64) -> (f64, f64) {
+    if let Ok(guard) = PET_CANVAS_BOUNDS.lock() {
+        if let Some((cw, ch)) = *guard {
+            return (cw, ch);
+        }
+    }
     (COLLAPSED_MASCOT_BASE_W * scale, COLLAPSED_MASCOT_BASE_H * scale)
 }
 
 fn large_collapsed_mascot_window_size(scale: f64, large_scale: f64) -> (f64, f64) {
+    if let Ok(guard) = PET_CANVAS_BOUNDS.lock() {
+        if let Some((cw, ch)) = *guard {
+            return (cw, ch);
+        }
+    }
     let lms = if large_scale.is_finite() && large_scale >= 1.0 && large_scale <= 6.0 { large_scale } else { LARGE_MASCOT_SIZE_MULTIPLIER };
     let w = 43.0 * scale * lms;
     let h = (w * 208.0 / 192.0).ceil();
@@ -5435,6 +5454,42 @@ async fn set_pet_pomodoro_active(active: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Updates declared pet canvas and hitbox bounds in logical pixels.
+/// Used by VideoPet to allow animation effects to extend beyond the character
+/// body without clipping against the window boundary, while keeping clicks on
+/// transparent canvas pixels non-interactive (pass-through).
+#[tauri::command]
+async fn set_pet_canvas_bounds(
+    canvas_w: Option<f64>,
+    canvas_h: Option<f64>,
+    hitbox_x: Option<f64>,
+    hitbox_y: Option<f64>,
+    hitbox_w: Option<f64>,
+    hitbox_h: Option<f64>,
+) -> Result<(), String> {
+    if let (Some(cw), Some(ch)) = (canvas_w, canvas_h) {
+        if let Ok(mut guard) = PET_CANVAS_BOUNDS.lock() {
+            *guard = Some((cw, ch));
+        }
+    } else {
+        if let Ok(mut guard) = PET_CANVAS_BOUNDS.lock() {
+            *guard = None;
+        }
+    }
+
+    if let (Some(x), Some(y), Some(w), Some(h)) = (hitbox_x, hitbox_y, hitbox_w, hitbox_h) {
+        if let Ok(mut guard) = PET_HITBOX_BOUNDS.lock() {
+            *guard = Some((x, y, w, h));
+        }
+    } else {
+        if let Ok(mut guard) = PET_HITBOX_BOUNDS.lock() {
+            *guard = None;
+        }
+    }
+
+    Ok(())
+}
+
 /// Tell the pet-mode pass-through poll whether the context menu is open.
 /// When `side` is `"right"` the window is widened rightward by 180 px
 /// (left edge stays put).  The frontend sets the mascot CSS to
@@ -5620,11 +5675,8 @@ fn pet_passthrough_poll(app: tauri::AppHandle, mascot_scale: f64, large_mascot_s
             .map(|g| *g)
             .unwrap_or((mascot_scale, large_mascot_scale));
         let (mascot_w, mascot_h) = large_collapsed_mascot_window_size(current_mascot_scale, current_large_scale);
+        let custom_hitbox = PET_HITBOX_BOUNDS.lock().ok().and_then(|g| *g);
         let resize_handle = 34.0_f64.min(mascot_w).min(mascot_h);
-        let hit_w = mascot_w * (2.4 / 3.0);
-        let hit_h = mascot_h * (2.8 / 3.0);
-        let inset_x = (mascot_w - hit_w) / 2.0;
-        let inset_y = (mascot_h - hit_h) / 2.0;
 
         let should_be_interactive = if menu_open || pomodoro_active {
             true
@@ -5640,21 +5692,38 @@ fn pet_passthrough_poll(app: tauri::AppHandle, mascot_scale: f64, large_mascot_s
             } else {
                 mascot_left < edge_threshold
             };
-            // Near screen edge, keep hitbox reasonably generous but never full-rect.
-            // Full-rect near-edge hitboxes make peek feel "too clickable" and steal
-            // hover/clicks away from nearby desktop content.
-            let ix = if near_edge { inset_x * 0.5 } else { inset_x };
-            let iy = inset_y;
-            let hit_left = mascot_left + ix;
-            let hit_right = mascot_right - ix;
-            let hit_bottom = mascot_bottom + iy;
-            let hit_top = mascot_bottom + mascot_h - iy;
-            let over_body = cursor.0 >= hit_left && cursor.0 <= hit_right
-                && cursor.1 >= hit_bottom && cursor.1 <= hit_top;
-            let over_resize = cursor.0 >= mascot_right - resize_handle
-                && cursor.0 <= mascot_right
-                && cursor.1 >= mascot_bottom
-                && cursor.1 <= mascot_bottom + resize_handle;
+
+            let (over_body, over_resize) = if let Some((hx, hy, hw, hh)) = custom_hitbox {
+                let hit_left = mascot_left + hx;
+                let hit_right = hit_left + hw;
+                let hit_bottom = fy + mascot_h - (hy + hh);
+                let hit_top = fy + mascot_h - hy;
+                let over_body = cursor.0 >= hit_left && cursor.0 <= hit_right
+                    && cursor.1 >= hit_bottom && cursor.1 <= hit_top;
+                let over_resize = cursor.0 >= hit_right - resize_handle
+                    && cursor.0 <= hit_right
+                    && cursor.1 >= hit_bottom
+                    && cursor.1 <= hit_bottom + resize_handle;
+                (over_body, over_resize)
+            } else {
+                let hit_w = mascot_w * (2.4 / 3.0);
+                let hit_h = mascot_h * (2.8 / 3.0);
+                let inset_x = (mascot_w - hit_w) / 2.0;
+                let inset_y = (mascot_h - hit_h) / 2.0;
+                let ix = if near_edge { inset_x * 0.5 } else { inset_x };
+                let iy = inset_y;
+                let hit_left = mascot_left + ix;
+                let hit_right = mascot_right - ix;
+                let hit_bottom = mascot_bottom + iy;
+                let hit_top = mascot_bottom + mascot_h - iy;
+                let over_body = cursor.0 >= hit_left && cursor.0 <= hit_right
+                    && cursor.1 >= hit_bottom && cursor.1 <= hit_top;
+                let over_resize = cursor.0 >= mascot_right - resize_handle
+                    && cursor.0 <= mascot_right
+                    && cursor.1 >= mascot_bottom
+                    && cursor.1 <= mascot_bottom + resize_handle;
+                (over_body, over_resize)
+            };
             over_body || over_resize
         } else {
             false
@@ -5723,11 +5792,8 @@ fn pet_passthrough_poll_windows(app: tauri::AppHandle, mascot_scale: f64, large_
             .unwrap_or((mascot_scale, large_mascot_scale));
         // mascot dimensions in logical pixels (matches CSS px on Windows WebView2).
         let (mascot_w_logical, mascot_h_logical) = large_collapsed_mascot_window_size(current_mascot_scale, current_large_scale);
+        let custom_hitbox = PET_HITBOX_BOUNDS.lock().ok().and_then(|g| *g);
         let resize_handle_logical = 34.0_f64.min(mascot_w_logical).min(mascot_h_logical);
-        let hit_w = mascot_w_logical * (1.8 / 3.0);
-        let hit_h = mascot_h_logical * (2.5 / 3.0);
-        let inset_x_logical = (mascot_w_logical - hit_w) / 2.0;
-        let inset_y_logical = (mascot_h_logical - hit_h) / 2.0;
 
         let should_be_interactive = if menu_open || pomodoro_active {
             true
@@ -5761,8 +5827,6 @@ fn pet_passthrough_poll_windows(app: tauri::AppHandle, mascot_scale: f64, large_
                         let mascot_w = mascot_w_logical * scale;
                         let mascot_h = mascot_h_logical * scale;
                         let resize_handle = resize_handle_logical * scale;
-                        let inset_x = inset_x_logical * scale;
-                        let inset_y = inset_y_logical * scale;
                         let edge_threshold = edge_threshold_logical * scale;
 
                         let mascot_right = fx + fw;
@@ -5781,21 +5845,40 @@ fn pet_passthrough_poll_windows(app: tauri::AppHandle, mascot_scale: f64, large_
                             false
                         };
 
-                        // Keep edge hitbox slightly relaxed on X only; do not use
-                        // full-rect hitboxes, which feel too large during peek.
-                        let ix = if near_edge { inset_x * 0.5 } else { inset_x };
-                        let iy = inset_y;
-                        let hit_left = mascot_left + ix;
-                        let hit_right = mascot_right - ix;
-                        let hit_top = mascot_top + iy;
-                        let hit_bottom = mascot_bottom - iy;
+                        let (over_body, over_resize) = if let Some((hx, hy, hw, hh)) = custom_hitbox {
+                            let hit_left = mascot_left + hx * scale;
+                            let hit_right = hit_left + hw * scale;
+                            let hit_top = mascot_top + hy * scale;
+                            let hit_bottom = hit_top + hh * scale;
+                            let over_body = cx >= hit_left && cx <= hit_right
+                                && cy >= hit_top && cy <= hit_bottom;
+                            let over_resize = cx >= hit_right - resize_handle
+                                && cx <= hit_right
+                                && cy >= hit_bottom - resize_handle
+                                && cy <= hit_bottom;
+                            (over_body, over_resize)
+                        } else {
+                            let hit_w = mascot_w_logical * (1.8 / 3.0);
+                            let hit_h = mascot_h_logical * (2.5 / 3.0);
+                            let inset_x_logical = (mascot_w_logical - hit_w) / 2.0;
+                            let inset_y_logical = (mascot_h_logical - hit_h) / 2.0;
+                            let inset_x = inset_x_logical * scale;
+                            let inset_y = inset_y_logical * scale;
+                            let ix = if near_edge { inset_x * 0.5 } else { inset_x };
+                            let iy = inset_y;
+                            let hit_left = mascot_left + ix;
+                            let hit_right = mascot_right - ix;
+                            let hit_top = mascot_top + iy;
+                            let hit_bottom = mascot_bottom - iy;
 
-                        let over_body = cx >= hit_left && cx <= hit_right
-                            && cy >= hit_top && cy <= hit_bottom;
-                        let over_resize = cx >= mascot_right - resize_handle
-                            && cx <= mascot_right
-                            && cy >= mascot_bottom - resize_handle
-                            && cy <= mascot_bottom;
+                            let over_body = cx >= hit_left && cx <= hit_right
+                                && cy >= hit_top && cy <= hit_bottom;
+                            let over_resize = cx >= mascot_right - resize_handle
+                                && cx <= mascot_right
+                                && cy >= mascot_bottom - resize_handle
+                                && cy <= mascot_bottom;
+                            (over_body, over_resize)
+                        };
                         over_body || over_resize
                     } else {
                         false
@@ -23286,7 +23369,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_antigravity_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, resolve_codex_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, get_build_info, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, sync_mascot_bubble, ensure_mascot_bubble, set_mascot_bubble_visible, get_mascot_presentation_suppressed, trace_bubble_event, set_bubble_runtime_trace, get_bubble_runtime_trace, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs, fetch_petdex_manifest, download_codex_pet, delete_custom_codex_pet, get_hermes_remote_conversation, get_harness_quota])
+        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_antigravity_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, resolve_codex_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, get_build_info, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, sync_mascot_bubble, ensure_mascot_bubble, set_mascot_bubble_visible, get_mascot_presentation_suppressed, trace_bubble_event, set_bubble_runtime_trace, get_bubble_runtime_trace, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, set_pet_canvas_bounds, get_now_playing, get_system_idle_time, get_keyboard_idle_secs, fetch_petdex_manifest, download_codex_pet, delete_custom_codex_pet, get_hermes_remote_conversation, get_harness_quota])
         .manage(ActiveAgentPid { pid: Mutex::new(None) })
         .manage(ClaudeState {
             sessions: Arc::new(Mutex::new(HashMap::new())),

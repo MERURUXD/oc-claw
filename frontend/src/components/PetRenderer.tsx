@@ -15,6 +15,7 @@ export interface PetRendererProps {
   flipHorizontal?: boolean
   transparency?: VideoTransparencyMode
   chromaKeyOptions?: ChromaKeyOptions
+  layoutMode?: 'body' | 'canvas'
   className?: string
   style?: React.CSSProperties
 }
@@ -32,6 +33,7 @@ export function PetRenderer({
   flipHorizontal,
   transparency,
   chromaKeyOptions,
+  layoutMode,
   className,
   style,
 }: PetRendererProps) {
@@ -46,6 +48,7 @@ export function PetRenderer({
         flipHorizontal={flipHorizontal}
         transparency={transparency}
         chromaKeyOptions={chromaKeyOptions}
+        layoutMode={layoutMode}
         className={className}
         style={style}
       />

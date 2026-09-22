@@ -64,6 +64,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
     })
   }, [])
   const [resizeHandleHovered, setResizeHandleHovered] = useState(false)
+  const [hitboxHovered, setHitboxHovered] = useState(false)
   const [size, setSize] = useState(DEFAULT_MASCOT_SIZE)
   const dragActiveRef = useRef(false)
   const baseSizeRef = useRef(MASCOT_BASE_SIZE)
@@ -90,12 +91,12 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
     }
   }, [petIdFromUrl])
 
-  // Sync window size with pet aspect ratio when pet loads or size changes
+  // Sync window size with pet canvas bounds when pet loads or size changes
   useEffect(() => {
     if (size > 0 && pet) {
       const win = getCurrentWebviewWindow()
       const metrics = getPetRenderMetrics(pet, size)
-      win.setSize(new LogicalSize(metrics.width, metrics.height)).catch(() => {})
+      win.setSize(new LogicalSize(metrics.canvas.width, metrics.canvas.height)).catch(() => {})
     }
   }, [pet, size])
 
@@ -111,7 +112,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
       largeScaleRef.current = clampLargeMascotScale(next / Math.max(1, baseSizeRef.current))
       const win = getCurrentWebviewWindow()
       const metrics = getPetRenderMetrics(petRef.current, next)
-      win.setSize(new LogicalSize(metrics.width, metrics.height)).catch(() => {})
+      win.setSize(new LogicalSize(metrics.canvas.width, metrics.canvas.height)).catch(() => {})
     }
     ;(async () => {
       try {
@@ -161,7 +162,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
       setSize(nextSize)
       const win = getCurrentWebviewWindow()
       const metrics = getPetRenderMetrics(petRef.current, nextSize)
-      win.setSize(new LogicalSize(metrics.width, metrics.height)).catch(() => {})
+      win.setSize(new LogicalSize(metrics.canvas.width, metrics.canvas.height)).catch(() => {})
       emit('mascot-scale-change', { scale: clamped }).catch(() => {})
       emit('mascot-visual-size', { size: nextSize }).catch(() => {})
     }
@@ -408,29 +409,58 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
 
   if (!pet) return null
 
+  const metrics = getPetRenderMetrics(pet, size)
+
   return (
     <div
-      onPointerDown={handlePointerDown}
       style={{
         position: 'relative',
-        width: '100%',
-        height: '100%',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
+        width: metrics.canvas.width,
+        height: metrics.canvas.height,
         background: 'transparent',
-        cursor: 'grab',
+        pointerEvents: 'none',
+        userSelect: 'none',
       }}
     >
-      <MiniPetMascot
-        pet={pet}
-        baseState={baseState}
-        reaction={mascotReaction}
-        onReactionEnd={clearReaction}
-        size={size}
-        enableHoverJump
-        suppressHover={dragging}
+      <div
+        style={{
+          position: 'absolute',
+          inset: 0,
+          pointerEvents: 'none',
+        }}
+      >
+        <MiniPetMascot
+          pet={pet}
+          baseState={baseState}
+          reaction={mascotReaction}
+          onReactionEnd={clearReaction}
+          size={size}
+          layoutMode="canvas"
+          enableHoverJump
+          externalHover={hitboxHovered}
+          useExternalHover
+          suppressHover={dragging}
+        />
+      </div>
+
+      {/* Interactive hitbox overlay for character body */}
+      <div
+        onPointerDown={handlePointerDown}
+        onPointerEnter={() => setHitboxHovered(true)}
+        onPointerLeave={() => setHitboxHovered(false)}
+        style={{
+          position: 'absolute',
+          left: metrics.hitbox.left,
+          top: metrics.hitbox.top,
+          width: metrics.hitbox.width,
+          height: metrics.hitbox.height,
+          cursor: 'grab',
+          pointerEvents: 'auto',
+          background: 'transparent',
+          zIndex: 10,
+        }}
       />
+
       <div
         data-no-drag
         onPointerEnter={() => setResizeHandleHovered(true)}
@@ -438,8 +468,8 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
         onPointerDown={handleResizePointerDown}
         style={{
           position: 'absolute',
-          right: 0,
-          bottom: 0,
+          left: metrics.hitbox.left + metrics.hitbox.width - MASCOT_RESIZE_HANDLE_SIZE,
+          top: metrics.hitbox.top + metrics.hitbox.height - MASCOT_RESIZE_HANDLE_SIZE,
           width: MASCOT_RESIZE_HANDLE_SIZE,
           height: MASCOT_RESIZE_HANDLE_SIZE,
           cursor: MASCOT_RESIZE_CURSOR,
@@ -481,14 +511,15 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
         <div
           style={{
             position: 'absolute',
-            bottom: 8,
-            right: 10,
+            left: metrics.hitbox.left + metrics.hitbox.width - 15,
+            top: metrics.hitbox.top + metrics.hitbox.height - 13,
             width: 5,
             height: 5,
             borderRadius: '50%',
             background: isReview ? '#c084fc' : waiting ? '#f59e0b' : working ? '#2ecc71' : '#777',
             border: '1.1px solid rgba(0,0,0,0.3)',
             pointerEvents: 'none',
+            zIndex: 11,
           }}
         />
       )}

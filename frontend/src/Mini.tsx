@@ -362,6 +362,8 @@ export default function Mini() {
   // for the main mascot's sprite state override while the native window
   // is being moved by the walk timer.
   const [miniPet, setMiniPet] = useState<PetAsset | null>(null)
+  const miniPetRef = useRef<PetAsset | null>(null)
+  useEffect(() => { miniPetRef.current = miniPet }, [miniPet])
   const [walkDir, setWalkDir] = useState<-1 | 0 | 1>(0)
   const walkDirRef = useRef<-1 | 0 | 1>(0)
   const updateWalkDir = useCallback((dir: -1 | 0 | 1) => {
@@ -3879,6 +3881,21 @@ export default function Mini() {
       // sprite via updateWalkDir so the pet visibly runs while moving.
       if (!moveModeRef.current && appModeRef.current !== 'pet') {
         if (e.button !== 0 || e.ctrlKey || collapsingRef.current) return
+        if (miniPetRef.current) {
+          const visualSize = Math.round(MASCOT_BASE_SIZE * mascotScaleRef.current) * largeMascotScaleRef.current
+          const m = getPetRenderMetrics(miniPetRef.current, visualSize)
+          const rect = e.currentTarget.getBoundingClientRect()
+          const localX = e.clientX - rect.left
+          const localY = e.clientY - rect.top
+          if (
+            localX < m.hitbox.left ||
+            localX > m.hitbox.left + m.hitbox.width ||
+            localY < m.hitbox.top ||
+            localY > m.hitbox.top + m.hitbox.height
+          ) {
+            return
+          }
+        }
         // On macOS the cursor poll in lib.rs (efficiency_hover_poll) drives
         // the drag itself via translate_mini_frame + mini-mascot-walk events.
         // Letting the webview path also call move_mini_by would double the
@@ -5287,6 +5304,34 @@ export default function Mini() {
     emit('mascot-visual-size', { size: largeMascotVisualSize }).catch(() => {})
   }, [largeMascotVisualSize, appMode])
 
+  const miniPetMetrics = useMemo(() => {
+    return miniPet ? getPetRenderMetrics(miniPet, largeMascotVisualSize) : null
+  }, [miniPet, largeMascotVisualSize])
+
+  // Sync canvas and hitbox bounds to Tauri for native window sizing and cursor pass-through
+  useEffect(() => {
+    if (!miniPetMetrics) {
+      invoke('set_pet_canvas_bounds', {
+        canvasW: null,
+        canvasH: null,
+        hitboxX: null,
+        hitboxY: null,
+        hitboxW: null,
+        hitboxH: null,
+      }).catch(() => {})
+      return
+    }
+
+    invoke('set_pet_canvas_bounds', {
+      canvasW: miniPetMetrics.canvas.width,
+      canvasH: miniPetMetrics.canvas.height,
+      hitboxX: miniPetMetrics.hitbox.left,
+      hitboxY: miniPetMetrics.hitbox.top,
+      hitboxW: miniPetMetrics.hitbox.width,
+      hitboxH: miniPetMetrics.hitbox.height,
+    }).catch(() => {})
+  }, [miniPetMetrics])
+
 
 
   return (
@@ -5340,7 +5385,7 @@ export default function Mini() {
               // commit and native window resize.
               // Fallback to `right: 0` until petBaseWinW has been measured.
               left: (appMode === 'pet' && largeMascot && petBaseWinW != null)
-                ? Math.max(0, Math.round(petBaseWinW - largeMascotVisualSize))
+                ? Math.max(0, Math.round(petBaseWinW - (miniPetMetrics?.canvas.width ?? largeMascotVisualSize)))
                 : undefined,
               right: (appMode === 'pet' && largeMascot && petBaseWinW == null)
                 ? 0
@@ -5441,8 +5486,8 @@ export default function Mini() {
               <div
                 style={{
                   position: 'relative',
-                  width: largeMascotVisualSize,
-                  height: getPetRenderMetrics(miniPet, largeMascotVisualSize).height,
+                  width: miniPetMetrics?.canvas.width ?? largeMascotVisualSize,
+                  height: miniPetMetrics?.canvas.height ?? getPetRenderMetrics(miniPet, largeMascotVisualSize).height,
                 }}
               >
                 <MiniPetMascot
@@ -5451,6 +5496,7 @@ export default function Mini() {
                   reaction={mascotReaction}
                   onReactionEnd={clearReaction}
                   size={largeMascotVisualSize}
+                  layoutMode="canvas"
                   enableHoverJump
                   externalHover={mascotHover}
                   useExternalHover={!isWindowsPlatform}
@@ -5478,13 +5524,17 @@ export default function Mini() {
               <div
                 style={{
                   position: 'absolute',
-                  bottom: 8,
-                  right: 10,
+                  left: miniPetMetrics ? miniPetMetrics.hitbox.left + miniPetMetrics.hitbox.width - 15 : undefined,
+                  top: miniPetMetrics ? miniPetMetrics.hitbox.top + miniPetMetrics.hitbox.height - 13 : undefined,
+                  bottom: miniPetMetrics ? undefined : 8,
+                  right: miniPetMetrics ? undefined : 10,
                   width: collapsedStatusSize,
                   height: collapsedStatusSize,
                   borderRadius: '50%',
                   background: mainPetState === 'waiting' ? '#f59e0b' : hasWorking ? '#2ecc71' : '#777',
                   border: `${collapsedStatusBorder}px solid rgba(0,0,0,0.3)`,
+                  zIndex: 11,
+                  pointerEvents: 'none',
                 }}
               />
             )}
@@ -5497,8 +5547,10 @@ export default function Mini() {
                 title={t('settings.largeMascotScale', 'Mascot Size')}
                 style={{
                   position: 'absolute',
-                  right: 0,
-                  bottom: 0,
+                  left: miniPetMetrics ? miniPetMetrics.hitbox.left + miniPetMetrics.hitbox.width - MASCOT_RESIZE_HANDLE_SIZE : undefined,
+                  top: miniPetMetrics ? miniPetMetrics.hitbox.top + miniPetMetrics.hitbox.height - MASCOT_RESIZE_HANDLE_SIZE : undefined,
+                  right: miniPetMetrics ? undefined : 0,
+                  bottom: miniPetMetrics ? undefined : 0,
                   width: MASCOT_RESIZE_HANDLE_SIZE,
                   height: MASCOT_RESIZE_HANDLE_SIZE,
                   cursor: MASCOT_RESIZE_CURSOR,

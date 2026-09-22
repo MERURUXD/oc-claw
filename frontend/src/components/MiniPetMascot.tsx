@@ -37,6 +37,7 @@ interface MiniPetMascotProps {
   // it). Without this, walkDir → run-left/run-right is hidden by the
   // continuous jump animation.
   suppressHover?: boolean
+  layoutMode?: 'body' | 'canvas'
   className?: string
   style?: React.CSSProperties
 }
@@ -56,6 +57,7 @@ export function MiniPetMascot({
   externalHover = false,
   useExternalHover = false,
   suppressHover = false,
+  layoutMode,
   className,
   style,
 }: MiniPetMascotProps) {
@@ -203,6 +205,7 @@ export function MiniPetMascot({
         state={renderState}
         size={size}
         onOneShotEnd={onOneShotEnd}
+        layoutMode={layoutMode}
       />
     </div>
   )

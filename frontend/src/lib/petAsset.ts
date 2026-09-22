@@ -1,12 +1,13 @@
 import type { CodexPet } from './codexPet'
-import type {
-  ChromaKeyOptions,
-  VideoPet,
-  VideoPetAnimationEntry,
-  VideoPetAnimationMeta,
-  VideoPetCanvasGeometry,
-  VideoTransparencyMode,
-} from './videoPet'
+import {
+  computeVideoPetGeometry,
+  type ChromaKeyOptions,
+  type VideoPet,
+  type VideoPetAnimationEntry,
+  type VideoPetAnimationMeta,
+  type VideoPetCanvasGeometry,
+  type VideoTransparencyMode,
+} from './videoPet.ts'
 
 export type PetRendererType = 'sprite-atlas' | 'video-clips'
 
@@ -14,7 +15,24 @@ export type PetRendererType = 'sprite-atlas' | 'video-clips'
 // either a traditional Codex/Hatch 8x9 sprite atlas or a video-based pet.
 export type PetAsset = CodexPet | VideoPet
 
+export interface PetVisualBounds {
+  width: number
+  height: number
+}
+
+export interface PetHitboxBounds {
+  left: number
+  top: number
+  width: number
+  height: number
+}
+
 export interface PetRenderMetrics {
+  body: PetVisualBounds
+  canvas: PetVisualBounds
+  hitbox: PetHitboxBounds
+  scale: number
+  // Backward compatibility: width and height equal body.width and body.height
   width: number
   height: number
   aspectRatio: number
@@ -36,17 +54,43 @@ export function getPetAspectRatio(pet: PetAsset | null | undefined): number {
 }
 
 /**
- * Computes container render metrics (width, height, aspectRatio)
+ * Computes container render metrics (body, canvas, hitbox bounds, and scale)
  * for a pet given a nominal visual width.
  */
 export function getPetRenderMetrics(
   pet: PetAsset | null | undefined,
   visualWidth: number,
 ): PetRenderMetrics {
+  if (isVideoPet(pet)) {
+    const geo = computeVideoPetGeometry(pet.canvas, visualWidth)
+    return {
+      body: { width: geo.bodyWidth, height: geo.bodyHeight },
+      canvas: { width: geo.canvasWidth, height: geo.canvasHeight },
+      hitbox: {
+        left: geo.hitboxLeft,
+        top: geo.hitboxTop,
+        width: geo.bodyWidth,
+        height: geo.bodyHeight,
+      },
+      scale: geo.scale,
+      width: geo.bodyWidth,
+      height: geo.bodyHeight,
+      aspectRatio: geo.bodyHeight / Math.max(1, geo.bodyWidth),
+    }
+  }
+
   const aspectRatio = getPetAspectRatio(pet)
   const width = Math.round(visualWidth)
   const height = Math.round(visualWidth * aspectRatio)
-  return { width, height, aspectRatio }
+  return {
+    body: { width, height },
+    canvas: { width, height },
+    hitbox: { left: 0, top: 0, width, height },
+    scale: 1,
+    width,
+    height,
+    aspectRatio,
+  }
 }
 
 /**

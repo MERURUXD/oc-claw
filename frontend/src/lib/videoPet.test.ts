@@ -236,5 +236,57 @@ test('BufferedVideo contract: generation-based swap prevents stale A->B->C races
   assert.equal(activeSrc, 'animC.webm') // Committed C cleanly
 })
 
+test('dual geometry model: separates character interaction hitbox from OS window canvas bounds', () => {
+  // Shenshen at visualSize = 108
+  const visualSize = 108
+  const geo = computeVideoPetGeometry(DSH_GEOMETRY, visualSize)
+
+  // 1. Nominal body hitbox
+  assert.equal(geo.bodyWidth, 108)
+  assert.equal(geo.bodyHeight, 135)
+  assert.equal(geo.containerWidth, 108)
+  assert.equal(geo.containerHeight, 135)
+
+  // 2. Full OS window canvas bounds
+  assert.equal(geo.canvasWidth, 320)
+  assert.equal(geo.canvasHeight, 180)
+
+  // 3. Canvas-anchored hitbox coordinates (for standalone native window & click testing)
+  assert.equal(geo.hitboxLeft, 106)
+  assert.equal(geo.hitboxTop, 30)
+
+  // 4. Feet baseline alignment: hitboxTop + bodyHeight = 30 + 135 = 165
+  const feetInCanvas = geo.hitboxTop + geo.bodyHeight
+  assert.equal(feetInCanvas, 165)
+  assert.equal(geo.canvasHeight - feetInCanvas, 15) // 15px effect margin below feet
+
+  // 5. Body-anchored offsets (for card/list inline layouts)
+  assert.equal(geo.canvasLeft, -106)
+  assert.equal(geo.canvasTop, -30)
+
+  // 6. PetRenderMetrics contract for VideoPet
+  const videoPet: VideoPet = {
+    renderer: 'video-clips',
+    id: 'shenshen',
+    displayName: '申申',
+    canvas: DSH_GEOMETRY,
+    animations: {},
+  }
+  const vMetrics = getPetRenderMetrics(videoPet, visualSize)
+  assert.deepEqual(vMetrics.body, { width: 108, height: 135 })
+  assert.deepEqual(vMetrics.canvas, { width: 320, height: 180 })
+  assert.deepEqual(vMetrics.hitbox, { left: 106, top: 30, width: 108, height: 135 })
+  assert.equal(vMetrics.width, 108)
+  assert.equal(vMetrics.height, 135)
+
+  // 7. PetRenderMetrics contract for CodexPet (1:1 backward compatibility)
+  const cMetrics = getPetRenderMetrics(null, 192)
+  assert.deepEqual(cMetrics.body, { width: 192, height: 208 })
+  assert.deepEqual(cMetrics.canvas, { width: 192, height: 208 })
+  assert.deepEqual(cMetrics.hitbox, { left: 0, top: 0, width: 192, height: 208 })
+  assert.equal(cMetrics.width, 192)
+  assert.equal(cMetrics.height, 208)
+})
+
 
 

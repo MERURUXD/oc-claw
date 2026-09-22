@@ -24,6 +24,9 @@ export interface VideoPetRendererProps {
   playbackRate?: number
   transparency?: VideoTransparencyMode
   chromaKeyOptions?: ChromaKeyOptions
+  // 'body': container sized to bodyBox, canvas offset with overflow visible (for cards/lists)
+  // 'canvas': container sized to full canvas, canvas positioned at (0, 0) (for native mascot windows)
+  layoutMode?: 'body' | 'canvas'
   className?: string
   style?: React.CSSProperties
 }
@@ -69,6 +72,7 @@ export function VideoPetRenderer({
   transparency,
   chromaKeyOptions,
   playbackRate = 1,
+  layoutMode = 'body',
   className,
   style,
 }: VideoPetRendererProps) {
@@ -94,13 +98,15 @@ export function VideoPetRenderer({
     animMeta?.playbackRate ??
     (animMeta?.fps && pet.fps ? (animMeta.fps / pet.fps) * playbackRate : playbackRate)
 
+  const isCanvasMode = layoutMode === 'canvas'
+
   return (
     <div
       className={className}
       style={{
         position: 'relative',
-        width: geo.containerWidth,
-        height: geo.containerHeight,
+        width: isCanvasMode ? geo.canvasWidth : geo.bodyWidth,
+        height: isCanvasMode ? geo.canvasHeight : geo.bodyHeight,
         display: 'inline-block',
         lineHeight: 0,
         overflow: 'visible',
@@ -110,8 +116,8 @@ export function VideoPetRenderer({
       <div
         style={{
           position: 'absolute',
-          left: geo.canvasLeft,
-          top: geo.canvasTop,
+          left: isCanvasMode ? 0 : geo.canvasLeft,
+          top: isCanvasMode ? 0 : geo.canvasTop,
           width: geo.canvasWidth,
           height: geo.canvasHeight,
           pointerEvents: 'none',
