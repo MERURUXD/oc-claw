@@ -188,6 +188,8 @@
     "minutesShort": "分",
     "completionSound": "完了サウンド",
     "completionSoundDesc": "タスク完了時に再生するサウンド",
+    "quotaRecoverySound": "クォータ回復サウンド",
+    "quotaRecoverySoundDesc": "クォータが10%以上に回復した時に再生するサウンド",
     "defaultSound": "デフォルト",
     "manboSound": "マンボ",
     "ccSound": "Claude Code 完了サウンド",

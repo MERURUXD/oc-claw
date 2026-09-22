@@ -187,6 +187,8 @@
     "minutesShort": "min",
     "completionSound": "Son de fin",
     "completionSoundDesc": "Son joué à la fin d'une tâche",
+    "quotaRecoverySound": "Son de récupération de quota",
+    "quotaRecoverySoundDesc": "Son joué lorsque le quota remonte à 10% ou plus",
     "defaultSound": "Par défaut",
     "manboSound": "Mambo",
     "ccSound": "Son de fin Claude Code",

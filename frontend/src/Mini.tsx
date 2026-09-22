@@ -11,10 +11,11 @@ import { UpdateModal, type UpdateModalInfo, type UpdateModalPhase } from './comp
 import { AgentDetailView } from './components/AgentDetailView'
 import { CreateCharacterModal } from './components/CreateCharacterModal'
 import { ClaudeStatsView } from './components/ClaudeStatsView'
-import { QuotaSideRail } from './components/QuotaCapsule'
+import { QuotaSideRail, fetchHarnessQuota, subscribeHarnessQuota } from './components/QuotaCapsule'
 import { ChatList } from './components/ChatList'
 import { getStore, DEFAULT_CHAR, DEFAULT_CHAR_NAME, loadCharacters, loadOcConnections, saveOcConnections } from './lib/store'
-import type { AgentMetrics, BubbleSessionDetail, BubbleStyle, BubbleTransitionEvent, MascotBubblePayload, OcConnection, SubagentDetail } from './lib/types'
+import type { AgentMetrics, BubbleSessionDetail, BubbleStyle, BubbleTransitionEvent, HarnessQuotaSummary, MascotBubblePayload, OcConnection, SubagentDetail } from './lib/types'
+import { createQuotaRecoveryStateMachine, computeResetCheckDelay, type QuotaRecoveryStateMachine } from './lib/quotaRecovery'
 import { deriveSessionActivity, isSameBubblePayload } from './lib/sessionActivity'
 import {
   beginPanelUiTransition,
@@ -577,6 +578,15 @@ export default function Mini() {
   const [hermesSoundEnabled, setHermesSoundEnabled] = useState(false)
   const [antigravitySoundEnabled, setAntigravitySoundEnabled] = useState(true)
   const [notifySound, setNotifySound] = useState<'default' | 'manbo'>('default')
+  const [quotaRecoverySound, setQuotaRecoverySound] = useState<'default'>('default')
+  const quotaRecoverySoundRef = useRef(quotaRecoverySound)
+  quotaRecoverySoundRef.current = quotaRecoverySound
+  const quotaRecoveryRef = useRef<QuotaRecoveryStateMachine>(createQuotaRecoveryStateMachine())
+  const [quotaRevealRequest, setQuotaRevealRequest] = useState<{ id: number; harness: 'codex' | 'antigravity' } | null>(null)
+  const quotaRevealSeqRef = useRef(0)
+  const pendingQuotaRevealRef = useRef<'codex' | 'antigravity' | null>(null)
+  const resetTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
+  const lastCheckedResetAtRef = useRef<Map<string, string>>(new Map())
   const [waitingSound, setWaitingSound] = useState(false)
   const [autoCloseCompletion, setAutoCloseCompletion] = useState(false)
   const [petSfxEnabled, setPetSfxEnabled] = useState(true)
@@ -1810,6 +1820,15 @@ export default function Mini() {
     }
   }, [])
 
+  const playQuotaRecoverySound = useCallback(() => {
+    // Independent Quota Recovery Sound (does not read notifySoundRef or soundEnabled)
+    if (navigator.userAgent.includes('Windows')) {
+      new Audio('/audio/glass.mp3').play().catch(() => {})
+    } else {
+      invoke('play_sound', { name: 'Purr' }).catch(() => {})
+    }
+  }, [])
+
   const lastOcSoundRef = useRef(0)
   const playOcCompletionSound = useCallback((source: string) => {
     console.log('[OC-SOUND] triggered from', source, 'soundEnabled:', soundEnabledRef.current)
@@ -2180,6 +2199,8 @@ export default function Mini() {
       if (typeof agysnd === 'boolean') setAntigravitySoundEnabled(agysnd)
       const ns = (await store.get('notify_sound')) as string
       if (ns === 'default' || ns === 'manbo') setNotifySound(ns)
+      const qrs = (await store.get('quota_recovery_sound')) as string
+      if (qrs === 'default') setQuotaRecoverySound(qrs)
       const ws = await store.get('waiting_sound')
       if (typeof ws === 'boolean') setWaitingSound(ws)
       const acc = await store.get('auto_close_completion')
@@ -4351,6 +4372,14 @@ export default function Mini() {
           transitionId: bubbleTransitionIdRef.current,
           details: { gen: myGen, reason: 'collapse-timer' },
         })
+        if (pendingQuotaRevealRef.current && appModeRef.current === 'coding' && !settingsModeRef.current) {
+          const pendingHarness = pendingQuotaRevealRef.current
+          pendingQuotaRevealRef.current = null
+          setQuotaRevealRequest({ id: ++quotaRevealSeqRef.current, harness: pendingHarness })
+          if (expandFnRef.current) {
+            void expandFnRef.current()
+          }
+        }
       }, 300)
     }, delay)
   }, [fetchAgents, restoreCollapsedMascotPosition, debugToTerminal, isSettingsPickerBlockingClose])
@@ -4688,11 +4717,142 @@ export default function Mini() {
         settingsTransitioningRef.current = false
         setHiding(false)
         debugToTerminal('close', 'exitSettings finished')
+        if (pendingQuotaRevealRef.current && appModeRef.current === 'coding') {
+          const pendingHarness = pendingQuotaRevealRef.current
+          pendingQuotaRevealRef.current = null
+          setQuotaRevealRequest({ id: ++quotaRevealSeqRef.current, harness: pendingHarness })
+          if (expandFnRef.current) {
+            void expandFnRef.current()
+          }
+        }
       } else {
         debugToTerminal('close', `exitSettings aborted in finally: stale gen=${myGen}`)
       }
     }
   }, [fetchAgents, restoreCollapsedMascotPosition, debugToTerminal, isSettingsPickerBlockingClose, setNativeDialogActive])
+
+  const handleQuotaRecovered = useCallback(
+    async (harness: 'codex' | 'antigravity', isDebug = false) => {
+      console.log('[QuotaRecovery] handleQuotaRecovered for', harness, 'isDebug:', isDebug)
+      playQuotaRecoverySound()
+
+      if (appModeRef.current === 'pet') {
+        pendingQuotaRevealRef.current = harness
+        return
+      }
+
+      if (settingsModeRef.current || settingsTransitioningRef.current) {
+        if (isDebug) {
+          await exitSettings(true)
+          await new Promise<void>((r) => setTimeout(r, 60))
+          setQuotaRevealRequest({ id: ++quotaRevealSeqRef.current, harness })
+          if (!expandedRef.current && expandFnRef.current) {
+            await expandFnRef.current()
+          }
+        } else {
+          pendingQuotaRevealRef.current = harness
+        }
+        return
+      }
+
+      if (
+        updateModalOpenRef.current ||
+        isCreateModalOpenRef.current ||
+        nativeDialogActiveRef.current ||
+        collapsingRef.current
+      ) {
+        pendingQuotaRevealRef.current = harness
+        return
+      }
+
+      setQuotaRevealRequest({ id: ++quotaRevealSeqRef.current, harness })
+      if (!expandedRef.current && expandFnRef.current) {
+        await expandFnRef.current()
+      }
+    },
+    [playQuotaRecoverySound, exitSettings],
+  )
+
+  // Persistent quota recovery monitor across application lifecycle
+  useEffect(() => {
+    let mounted = true
+
+    const onQuotaSummary = (summary: HarnessQuotaSummary | null | undefined) => {
+      if (!mounted || !summary) return
+      const event = quotaRecoveryRef.current.processQuotaSummary(summary)
+      if (event) {
+        void handleQuotaRecovered(event.harness, false)
+      }
+
+      const armedWindows = quotaRecoveryRef.current.getArmedWindows()
+      const currentArmedKeys = new Set<string>()
+
+      for (const armed of armedWindows) {
+        const timerKey = `${armed.harness}:${armed.label}`
+        currentArmedKeys.add(timerKey)
+
+        if (armed.resetsAt) {
+          if (lastCheckedResetAtRef.current.get(timerKey) === armed.resetsAt) {
+            continue
+          }
+          if (resetTimersRef.current.has(timerKey)) {
+            continue
+          }
+
+          const delay = computeResetCheckDelay(armed.resetsAt)
+          if (delay !== null) {
+            const timer = setTimeout(async () => {
+              resetTimersRef.current.delete(timerKey)
+              if (!mounted) return
+              lastCheckedResetAtRef.current.set(timerKey, armed.resetsAt!)
+              try {
+                const res = await fetchHarnessQuota(armed.harness, true)
+                if (mounted && res) {
+                  onQuotaSummary(res)
+                }
+              } catch (err) {
+                console.warn('[QuotaRecovery] reset-aware fetch failed:', err)
+              }
+            }, delay)
+
+            resetTimersRef.current.set(timerKey, timer)
+          }
+        }
+      }
+
+      for (const [key, timer] of resetTimersRef.current.entries()) {
+        if (!currentArmedKeys.has(key)) {
+          clearTimeout(timer)
+          resetTimersRef.current.delete(key)
+          lastCheckedResetAtRef.current.delete(key)
+        }
+      }
+    }
+
+    const unsubCodex = subscribeHarnessQuota('codex', onQuotaSummary)
+    const unsubAntigravity = subscribeHarnessQuota('antigravity', onQuotaSummary)
+
+    // Initial background fetch
+    fetchHarnessQuota('codex', false).then(onQuotaSummary).catch(() => {})
+    fetchHarnessQuota('antigravity', false).then(onQuotaSummary).catch(() => {})
+
+    // Routine 5-minute background polling
+    const pollInterval = setInterval(() => {
+      fetchHarnessQuota('codex', false).then(onQuotaSummary).catch(() => {})
+      fetchHarnessQuota('antigravity', false).then(onQuotaSummary).catch(() => {})
+    }, 300_000)
+
+    return () => {
+      mounted = false
+      clearInterval(pollInterval)
+      unsubCodex()
+      unsubAntigravity()
+      for (const timer of resetTimersRef.current.values()) {
+        clearTimeout(timer)
+      }
+      resetTimersRef.current.clear()
+    }
+  }, [handleQuotaRecovered])
 
   // Click outside to collapse (only when not pinned)
   useEffect(() => {
@@ -7423,6 +7583,7 @@ export default function Mini() {
             <QuotaSideRail
               onOverlayHeightChange={setQuotaOverlayRequiredHeight}
               uiScale={uiScale}
+              revealRequest={quotaRevealRequest}
             />
           </div>
         </div>
@@ -7642,6 +7803,9 @@ export default function Mini() {
                         onDebugInjectPreset={applyDebugInjectPreset}
                         onClearDebugInject={clearDebugInjectSessions}
                         debugInjectCount={debugInjectSessions.length}
+                        onTriggerQuotaRecovery={(harness) => {
+                          void handleQuotaRecovered(harness, true)
+                        }}
                         onChangeBubbleStyle={async (v) => {
                           setBubbleStyle(v)
                           bubbleStyleRef.current = v
@@ -7660,6 +7824,13 @@ export default function Mini() {
                           setNotifySound(v)
                           const store = await getStore()
                           await store.set('notify_sound', v)
+                          await store.save()
+                        }}
+                        quotaRecoverySound={quotaRecoverySound}
+                        onChangeQuotaRecoverySound={async (v) => {
+                          setQuotaRecoverySound(v)
+                          const store = await getStore()
+                          await store.set('quota_recovery_sound', v)
                           await store.save()
                         }}
                         soundEnabled={soundEnabled}

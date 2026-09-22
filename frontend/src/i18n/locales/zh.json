@@ -215,6 +215,8 @@
     "minutesShort": "分钟",
     "completionSound": "完成提示音",
     "completionSoundDesc": "任务完成时播放的提示音",
+    "quotaRecoverySound": "配额恢复提示音",
+    "quotaRecoverySoundDesc": "配额恢复至 10% 及以上时播放的提示音",
     "defaultSound": "默认",
     "manboSound": "曼波",
     "ccSound": "Claude Code 完成提示音",

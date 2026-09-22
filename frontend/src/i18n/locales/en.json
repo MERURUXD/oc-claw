@@ -215,6 +215,8 @@
     "minutesShort": "min",
     "completionSound": "Completion Sound",
     "completionSoundDesc": "Sound played when a task completes",
+    "quotaRecoverySound": "Quota Recovery Sound",
+    "quotaRecoverySoundDesc": "Sound played when quota recovers to 10% or more",
     "defaultSound": "Default",
     "manboSound": "Mambo",
     "ccSound": "Claude Code Completion Sound",

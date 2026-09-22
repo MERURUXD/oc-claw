@@ -38,6 +38,46 @@ function updateHarnessQuotaCache(
   })
 }
 
+export async function fetchHarnessQuota(
+  harness: 'codex' | 'antigravity',
+  forceRefresh = false,
+): Promise<HarnessQuotaSummary | null> {
+  try {
+    const res = await invoke<HarnessQuotaSummary | null>('get_harness_quota', {
+      harness,
+      forceRefresh,
+    })
+    updateHarnessQuotaCache(harness, res)
+    return res
+  } catch (err) {
+    console.warn(`[Quota] Failed to fetch quota for ${harness}:`, err)
+    return null
+  }
+}
+
+export function subscribeHarnessQuota(
+  harness: 'codex' | 'antigravity',
+  cb: QuotaSubscriber,
+): () => void {
+  subscribers[harness].add(cb)
+  if (memoryCache[harness]) {
+    try {
+      cb(memoryCache[harness])
+    } catch {
+      // ignore callback error
+    }
+  }
+  return () => {
+    subscribers[harness].delete(cb)
+  }
+}
+
+export function getHarnessQuotaCache(
+  harness: 'codex' | 'antigravity',
+): HarnessQuotaSummary | null {
+  return memoryCache[harness]
+}
+
 /**
  * Google Gemini / Antigravity 4-point star icon SVG (White clean vector)
  */
@@ -88,14 +128,8 @@ export function useHarnessQuota(harness: 'codex' | 'antigravity' | null | undefi
       }
 
       try {
-        const res = await invoke<HarnessQuotaSummary | null>('get_harness_quota', {
-          harness,
-          forceRefresh,
-        })
-        updateHarnessQuotaCache(harness, res)
+        const res = await fetchHarnessQuota(harness, forceRefresh)
         setData(res)
-      } catch (err) {
-        console.warn(`[Quota] Failed to fetch quota for ${harness}:`, err)
       } finally {
         setLoading(false)
         setIsRefreshing(false)
@@ -486,15 +520,23 @@ export function QuotaMiniBadge({
 export function QuotaSideRail({
   onOverlayHeightChange,
   uiScale = 1.0,
+  revealRequest,
 }: {
   onOverlayHeightChange?: (height: number) => void
   uiScale?: number
+  revealRequest?: { id: number; harness: 'codex' | 'antigravity' } | null
 }) {
   const codex = useHarnessQuota('codex')
   const antigravity = useHarnessQuota('antigravity')
   const now = useQuotaTicker()
 
   const [activePopover, setActivePopover] = useState<'codex' | 'antigravity' | null>(null)
+  const [prevRevealId, setPrevRevealId] = useState<number | null>(null)
+  if (revealRequest && revealRequest.id !== prevRevealId) {
+    setPrevRevealId(revealRequest.id)
+    setActivePopover(revealRequest.harness)
+  }
+
   const railRef = useRef<HTMLDivElement>(null)
   const popoverRef = useRef<HTMLDivElement>(null)
   const lastReportedOverlayHeightRef = useRef(0)

@@ -187,6 +187,8 @@
     "minutesShort": "분",
     "completionSound": "완료 소리",
     "completionSoundDesc": "작업 완료 시 재생되는 소리",
+    "quotaRecoverySound": "할당량 복구 소리",
+    "quotaRecoverySoundDesc": "할당량이 10% 이상으로 복구될 때 재생되는 소리",
     "defaultSound": "기본값",
     "manboSound": "맘보",
     "ccSound": "Claude Code 완료 소리",
