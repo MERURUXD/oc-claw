@@ -7,6 +7,8 @@ import {
   extractQuotaWindows,
   QUOTA_LOW_REMAINING_THRESHOLD,
   RESET_GRACE_PERIOD_MS,
+  RESET_RETRY_INTERVAL_MS,
+  MAX_RESET_RETRIES,
 } from './quotaRecovery.ts'
 import type { HarnessQuotaSummary } from './types.ts'
 
@@ -27,7 +29,7 @@ function createSummary(
   }
 }
 
-test('computeResetCheckDelay: handles null, invalid, future, and past targets', () => {
+test('computeResetCheckDelay: handles null, invalid, future, and bounded retries for past targets', () => {
   assert.equal(computeResetCheckDelay(null), null)
   assert.equal(computeResetCheckDelay(undefined), null)
   assert.equal(computeResetCheckDelay('not-a-date'), null)
@@ -35,11 +37,18 @@ test('computeResetCheckDelay: handles null, invalid, future, and past targets', 
   const now = 1000000000000
   // Target 10 seconds in future: delay should be 10000 + 3000 = 13000ms
   const targetFuture = new Date(now + 10000).toISOString()
-  assert.equal(computeResetCheckDelay(targetFuture, now), 13000)
+  assert.equal(computeResetCheckDelay(targetFuture, now, 0), 13000)
 
-  // Target in the past: delay should be clamped to grace period (3000ms)
+  // Target in the past:
   const targetPast = new Date(now - 5000).toISOString()
-  assert.equal(computeResetCheckDelay(targetPast, now), RESET_GRACE_PERIOD_MS)
+  // retryCount 0 -> grace period (3000ms)
+  assert.equal(computeResetCheckDelay(targetPast, now, 0), RESET_GRACE_PERIOD_MS)
+  // retryCount 1, 2 -> 30s retry interval
+  assert.equal(computeResetCheckDelay(targetPast, now, 1), RESET_RETRY_INTERVAL_MS)
+  assert.equal(computeResetCheckDelay(targetPast, now, 2), RESET_RETRY_INTERVAL_MS)
+  // retryCount >= MAX_RESET_RETRIES (3) -> null (stop retrying)
+  assert.equal(computeResetCheckDelay(targetPast, now, MAX_RESET_RETRIES), null)
+  assert.equal(computeResetCheckDelay(targetPast, now, MAX_RESET_RETRIES + 1), null)
 })
 
 test('calculateRemainingPercent: bounds and calculation', () => {
@@ -230,3 +239,39 @@ test('quota recovery: Codex 与 Antigravity 相互独立', () => {
   const agyEvent = sm.processQuotaSummary(createSummary('antigravity', [{ label: 'daily', percent: 10 }]))
   assert.equal(agyEvent, null)
 })
+
+test('quota recovery: reset 第一次检查仍 low，第二次检查恢复', () => {
+  const sm = createQuotaRecoveryStateMachine()
+  const resetsAt = '2026-09-22T17:00:00Z'
+
+  // 1. Initial observation at T0: quota is low (<10%) -> armed
+  const initialEvent = sm.processQuotaSummary(
+    createSummary('codex', [{ label: '5h', percent: 95, resets_at: resetsAt }]),
+  )
+  assert.equal(initialEvent, null)
+  assert.equal(sm.getWindowState('codex', '5h'), 'armed')
+  const armed = sm.getArmedWindows()
+  assert.equal(armed.length, 1)
+  assert.equal(armed[0].resetsAt, resetsAt)
+
+  // 2. Reset time arrives (first check at reset+3s): backend still returns low quota (e.g. cache lag / slow propagation)
+  const firstCheckEvent = sm.processQuotaSummary(
+    createSummary('codex', [{ label: '5h', percent: 94, resets_at: resetsAt }]),
+  )
+  assert.equal(firstCheckEvent, null)
+  // Window remains armed, resetsAt is unchanged
+  assert.equal(sm.getWindowState('codex', '5h'), 'armed')
+  assert.equal(sm.getArmedWindows().length, 1)
+  assert.equal(sm.getArmedWindows()[0].resetsAt, resetsAt)
+
+  // 3. Second check (retry after 30s): quota is recovered (>=10%, e.g. 100%)
+  const secondCheckEvent = sm.processQuotaSummary(
+    createSummary('codex', [{ label: '5h', percent: 0, resets_at: resetsAt }]),
+  )
+  assert.notEqual(secondCheckEvent, null)
+  assert.equal(secondCheckEvent?.harness, 'codex')
+  assert.deepEqual(secondCheckEvent?.recoveredWindows, ['5h'])
+  assert.equal(sm.getWindowState('codex', '5h'), 'normal')
+  assert.equal(sm.getArmedWindows().length, 0)
+})
+

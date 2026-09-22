@@ -11,11 +11,11 @@ import { UpdateModal, type UpdateModalInfo, type UpdateModalPhase } from './comp
 import { AgentDetailView } from './components/AgentDetailView'
 import { CreateCharacterModal } from './components/CreateCharacterModal'
 import { ClaudeStatsView } from './components/ClaudeStatsView'
-import { QuotaSideRail, fetchHarnessQuota, subscribeHarnessQuota } from './components/QuotaCapsule'
+import { QuotaSideRail } from './components/QuotaCapsule'
 import { ChatList } from './components/ChatList'
 import { getStore, DEFAULT_CHAR, DEFAULT_CHAR_NAME, loadCharacters, loadOcConnections, saveOcConnections } from './lib/store'
 import type { AgentMetrics, BubbleSessionDetail, BubbleStyle, BubbleTransitionEvent, HarnessQuotaSummary, MascotBubblePayload, OcConnection, SubagentDetail } from './lib/types'
-import { createQuotaRecoveryStateMachine, computeResetCheckDelay, type QuotaRecoveryStateMachine } from './lib/quotaRecovery'
+import { createQuotaRecoveryStateMachine, computeResetCheckDelay, fetchHarnessQuota, subscribeHarnessQuota, type QuotaRecoveryStateMachine, type WindowRecord } from './lib/quotaRecovery'
 import { deriveSessionActivity, isSameBubblePayload } from './lib/sessionActivity'
 import {
   beginPanelUiTransition,
@@ -586,7 +586,7 @@ export default function Mini() {
   const quotaRevealSeqRef = useRef(0)
   const pendingQuotaRevealRef = useRef<'codex' | 'antigravity' | null>(null)
   const resetTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
-  const lastCheckedResetAtRef = useRef<Map<string, string>>(new Map())
+  const resetRetryStateRef = useRef<Map<string, { resetsAt: string; retryCount: number }>>(new Map())
   const [waitingSound, setWaitingSound] = useState(false)
   const [autoCloseCompletion, setAutoCloseCompletion] = useState(false)
   const [petSfxEnabled, setPetSfxEnabled] = useState(true)
@@ -3221,6 +3221,27 @@ export default function Mini() {
   }, [syncExpandedWindowLayout])
   expandFnRef.current = expand
 
+  const flushPendingQuotaRevealIfSafe = useCallback(() => {
+    if (!pendingQuotaRevealRef.current) return
+    if (appModeRef.current !== 'coding') return
+    if (settingsModeRef.current || settingsTransitioningRef.current) return
+    if (
+      updateModalOpenRef.current ||
+      isCreateModalOpenRef.current ||
+      nativeDialogActiveRef.current ||
+      collapsingRef.current
+    ) {
+      return
+    }
+
+    const pendingHarness = pendingQuotaRevealRef.current
+    pendingQuotaRevealRef.current = null
+    setQuotaRevealRequest({ id: ++quotaRevealSeqRef.current, harness: pendingHarness })
+    if (!expandedRef.current && expandFnRef.current) {
+      void expandFnRef.current()
+    }
+  }, [])
+
   // Coding-mode multi-mascot & status bubble: a tap on any extra mascot window
   // or the status bubble broadcasts an activation event; mirror the primary
   // mascot's click by expanding the main session panel. No-op in pet mode
@@ -4372,17 +4393,10 @@ export default function Mini() {
           transitionId: bubbleTransitionIdRef.current,
           details: { gen: myGen, reason: 'collapse-timer' },
         })
-        if (pendingQuotaRevealRef.current && appModeRef.current === 'coding' && !settingsModeRef.current) {
-          const pendingHarness = pendingQuotaRevealRef.current
-          pendingQuotaRevealRef.current = null
-          setQuotaRevealRequest({ id: ++quotaRevealSeqRef.current, harness: pendingHarness })
-          if (expandFnRef.current) {
-            void expandFnRef.current()
-          }
-        }
+        flushPendingQuotaRevealIfSafe()
       }, 300)
     }, delay)
-  }, [fetchAgents, restoreCollapsedMascotPosition, debugToTerminal, isSettingsPickerBlockingClose])
+  }, [fetchAgents, restoreCollapsedMascotPosition, debugToTerminal, isSettingsPickerBlockingClose, flushPendingQuotaRevealIfSafe])
   collapseFnRef.current = collapse
 
   // ── Efficiency-mode notch hover tracking (native cursor polling) ──
@@ -4717,67 +4731,94 @@ export default function Mini() {
         settingsTransitioningRef.current = false
         setHiding(false)
         debugToTerminal('close', 'exitSettings finished')
-        if (pendingQuotaRevealRef.current && appModeRef.current === 'coding') {
-          const pendingHarness = pendingQuotaRevealRef.current
-          pendingQuotaRevealRef.current = null
-          setQuotaRevealRequest({ id: ++quotaRevealSeqRef.current, harness: pendingHarness })
-          if (expandFnRef.current) {
-            void expandFnRef.current()
-          }
-        }
+        flushPendingQuotaRevealIfSafe()
       } else {
         debugToTerminal('close', `exitSettings aborted in finally: stale gen=${myGen}`)
       }
     }
-  }, [fetchAgents, restoreCollapsedMascotPosition, debugToTerminal, isSettingsPickerBlockingClose, setNativeDialogActive])
+  }, [fetchAgents, restoreCollapsedMascotPosition, debugToTerminal, isSettingsPickerBlockingClose, setNativeDialogActive, flushPendingQuotaRevealIfSafe])
 
   const handleQuotaRecovered = useCallback(
     async (harness: 'codex' | 'antigravity', isDebug = false) => {
       console.log('[QuotaRecovery] handleQuotaRecovered for', harness, 'isDebug:', isDebug)
       playQuotaRecoverySound()
 
-      if (appModeRef.current === 'pet') {
-        pendingQuotaRevealRef.current = harness
-        return
+      pendingQuotaRevealRef.current = harness
+
+      if (isDebug && (settingsModeRef.current || settingsTransitioningRef.current)) {
+        await exitSettings(true)
+        await new Promise<void>((r) => setTimeout(r, 60))
       }
 
-      if (settingsModeRef.current || settingsTransitioningRef.current) {
-        if (isDebug) {
-          await exitSettings(true)
-          await new Promise<void>((r) => setTimeout(r, 60))
-          setQuotaRevealRequest({ id: ++quotaRevealSeqRef.current, harness })
-          if (!expandedRef.current && expandFnRef.current) {
-            await expandFnRef.current()
-          }
-        } else {
-          pendingQuotaRevealRef.current = harness
-        }
-        return
-      }
-
-      if (
-        updateModalOpenRef.current ||
-        isCreateModalOpenRef.current ||
-        nativeDialogActiveRef.current ||
-        collapsingRef.current
-      ) {
-        pendingQuotaRevealRef.current = harness
-        return
-      }
-
-      setQuotaRevealRequest({ id: ++quotaRevealSeqRef.current, harness })
-      if (!expandedRef.current && expandFnRef.current) {
-        await expandFnRef.current()
-      }
+      flushPendingQuotaRevealIfSafe()
     },
-    [playQuotaRecoverySound, exitSettings],
+    [playQuotaRecoverySound, exitSettings, flushPendingQuotaRevealIfSafe],
   )
+
+  // Flush pending quota reveal whenever unsafe UI states are dismissed
+  useEffect(() => {
+    flushPendingQuotaRevealIfSafe()
+  }, [
+    appMode,
+    settingsMode,
+    settingsTransitioning,
+    updateModalOpen,
+    isCreateModalOpen,
+    nativeDialogActive,
+    flushPendingQuotaRevealIfSafe,
+  ])
 
   // Persistent quota recovery monitor across application lifecycle
   useEffect(() => {
     let mounted = true
+    const resetTimers = resetTimersRef.current
+    const resetRetryState = resetRetryStateRef.current
 
-    const onQuotaSummary = (summary: HarnessQuotaSummary | null | undefined) => {
+    function scheduleResetTimer(armed: WindowRecord) {
+      if (!armed.resetsAt) return
+      const timerKey = `${armed.harness}:${armed.label}`
+      if (resetTimersRef.current.has(timerKey)) return
+
+      let state = resetRetryStateRef.current.get(timerKey)
+      if (!state || state.resetsAt !== armed.resetsAt) {
+        const existingTimer = resetTimersRef.current.get(timerKey)
+        if (existingTimer) {
+          clearTimeout(existingTimer)
+          resetTimersRef.current.delete(timerKey)
+        }
+        state = { resetsAt: armed.resetsAt, retryCount: 0 }
+        resetRetryStateRef.current.set(timerKey, state)
+      }
+
+      const delay = computeResetCheckDelay(armed.resetsAt, Date.now(), state.retryCount)
+      if (delay === null) return
+
+      const timer = setTimeout(async () => {
+        resetTimersRef.current.delete(timerKey)
+        if (!mounted) return
+
+        const curState = resetRetryStateRef.current.get(timerKey)
+        if (curState && curState.resetsAt === armed.resetsAt) {
+          curState.retryCount += 1
+        }
+
+        try {
+          const res = await fetchHarnessQuota(armed.harness, true)
+          if (mounted && res) {
+            onQuotaSummary(res)
+          }
+        } catch (err) {
+          console.warn('[QuotaRecovery] reset-aware fetch failed:', err)
+          if (mounted) {
+            scheduleResetTimer(armed)
+          }
+        }
+      }, delay)
+
+      resetTimersRef.current.set(timerKey, timer)
+    }
+
+    function onQuotaSummary(summary: HarnessQuotaSummary | null | undefined) {
       if (!mounted || !summary) return
       const event = quotaRecoveryRef.current.processQuotaSummary(summary)
       if (event) {
@@ -4790,41 +4831,20 @@ export default function Mini() {
       for (const armed of armedWindows) {
         const timerKey = `${armed.harness}:${armed.label}`
         currentArmedKeys.add(timerKey)
-
-        if (armed.resetsAt) {
-          if (lastCheckedResetAtRef.current.get(timerKey) === armed.resetsAt) {
-            continue
-          }
-          if (resetTimersRef.current.has(timerKey)) {
-            continue
-          }
-
-          const delay = computeResetCheckDelay(armed.resetsAt)
-          if (delay !== null) {
-            const timer = setTimeout(async () => {
-              resetTimersRef.current.delete(timerKey)
-              if (!mounted) return
-              lastCheckedResetAtRef.current.set(timerKey, armed.resetsAt!)
-              try {
-                const res = await fetchHarnessQuota(armed.harness, true)
-                if (mounted && res) {
-                  onQuotaSummary(res)
-                }
-              } catch (err) {
-                console.warn('[QuotaRecovery] reset-aware fetch failed:', err)
-              }
-            }, delay)
-
-            resetTimersRef.current.set(timerKey, timer)
-          }
-        }
+        scheduleResetTimer(armed)
       }
 
       for (const [key, timer] of resetTimersRef.current.entries()) {
         if (!currentArmedKeys.has(key)) {
           clearTimeout(timer)
           resetTimersRef.current.delete(key)
-          lastCheckedResetAtRef.current.delete(key)
+          resetRetryStateRef.current.delete(key)
+        }
+      }
+
+      for (const key of resetRetryStateRef.current.keys()) {
+        if (!currentArmedKeys.has(key)) {
+          resetRetryStateRef.current.delete(key)
         }
       }
     }
@@ -4847,10 +4867,11 @@ export default function Mini() {
       clearInterval(pollInterval)
       unsubCodex()
       unsubAntigravity()
-      for (const timer of resetTimersRef.current.values()) {
+      for (const timer of resetTimers.values()) {
         clearTimeout(timer)
       }
-      resetTimersRef.current.clear()
+      resetTimers.clear()
+      resetRetryState.clear()
     }
   }, [handleQuotaRecovered])
 

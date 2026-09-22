@@ -1,82 +1,12 @@
 import { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react'
-import { invoke } from '@tauri-apps/api/core'
 import { RotateCw } from 'lucide-react'
 import { motion, AnimatePresence } from 'motion/react'
 import type { HarnessQuotaSummary, QuotaWindow } from '../lib/types'
-
-// Module-level cache and subscriber registry so all components viewing
-// the active harness (e.g. side rail + bubble + stats view) stay synchronized.
-type QuotaSubscriber = (data: HarnessQuotaSummary | null) => void
-
-const subscribers: {
-  codex: Set<QuotaSubscriber>
-  antigravity: Set<QuotaSubscriber>
-} = {
-  codex: new Set(),
-  antigravity: new Set(),
-}
-
-const memoryCache: {
-  codex: HarnessQuotaSummary | null
-  antigravity: HarnessQuotaSummary | null
-} = {
-  codex: null,
-  antigravity: null,
-}
-
-function updateHarnessQuotaCache(
-  harness: 'codex' | 'antigravity',
-  summary: HarnessQuotaSummary | null,
-) {
-  memoryCache[harness] = summary
-  subscribers[harness].forEach((cb) => {
-    try {
-      cb(summary)
-    } catch {
-      // ignore callback error
-    }
-  })
-}
-
-export async function fetchHarnessQuota(
-  harness: 'codex' | 'antigravity',
-  forceRefresh = false,
-): Promise<HarnessQuotaSummary | null> {
-  try {
-    const res = await invoke<HarnessQuotaSummary | null>('get_harness_quota', {
-      harness,
-      forceRefresh,
-    })
-    updateHarnessQuotaCache(harness, res)
-    return res
-  } catch (err) {
-    console.warn(`[Quota] Failed to fetch quota for ${harness}:`, err)
-    return null
-  }
-}
-
-export function subscribeHarnessQuota(
-  harness: 'codex' | 'antigravity',
-  cb: QuotaSubscriber,
-): () => void {
-  subscribers[harness].add(cb)
-  if (memoryCache[harness]) {
-    try {
-      cb(memoryCache[harness])
-    } catch {
-      // ignore callback error
-    }
-  }
-  return () => {
-    subscribers[harness].delete(cb)
-  }
-}
-
-export function getHarnessQuotaCache(
-  harness: 'codex' | 'antigravity',
-): HarnessQuotaSummary | null {
-  return memoryCache[harness]
-}
+import {
+  fetchHarnessQuota,
+  subscribeHarnessQuota,
+  getHarnessQuotaCache,
+} from '../lib/quotaRecovery'
 
 /**
  * Google Gemini / Antigravity 4-point star icon SVG (White clean vector)
@@ -107,7 +37,7 @@ export function CodexIcon({ className = 'w-4 h-4' }: { className?: string }) {
 export function useHarnessQuota(harness: 'codex' | 'antigravity' | null | undefined) {
   const [data, setData] = useState<HarnessQuotaSummary | null>(() => {
     if (harness === 'codex' || harness === 'antigravity') {
-      return memoryCache[harness]
+      return getHarnessQuotaCache(harness)
     }
     return null
   })
@@ -130,6 +60,8 @@ export function useHarnessQuota(harness: 'codex' | 'antigravity' | null | undefi
       try {
         const res = await fetchHarnessQuota(harness, forceRefresh)
         setData(res)
+      } catch {
+        // Keep existing data on transient fetch failure
       } finally {
         setLoading(false)
         setIsRefreshing(false)
@@ -145,15 +77,14 @@ export function useHarnessQuota(harness: 'codex' | 'antigravity' | null | undefi
     }
 
     // Set initial data from memory cache if available
-    if (memoryCache[harness]) {
-      setData(memoryCache[harness])
+    const cached = getHarnessQuotaCache(harness)
+    if (cached) {
+      setData(cached)
     }
 
-    const onUpdate: QuotaSubscriber = (next) => {
+    const unsub = subscribeHarnessQuota(harness, (next) => {
       setData(next)
-    }
-
-    subscribers[harness].add(onUpdate)
+    })
 
     // Initial fetch
     fetchQuota(false)
@@ -164,7 +95,7 @@ export function useHarnessQuota(harness: 'codex' | 'antigravity' | null | undefi
     }, 300_000)
 
     return () => {
-      subscribers[harness].delete(onUpdate)
+      unsub()
       clearInterval(interval)
     }
   }, [harness, fetchQuota])

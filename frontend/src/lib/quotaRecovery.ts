@@ -1,7 +1,10 @@
+import { invoke } from '@tauri-apps/api/core'
 import type { HarnessQuotaSummary, QuotaWindow } from './types'
 
 export const QUOTA_LOW_REMAINING_THRESHOLD = 10
 export const RESET_GRACE_PERIOD_MS = 3000
+export const RESET_RETRY_INTERVAL_MS = 30_000
+export const MAX_RESET_RETRIES = 3
 
 export type QuotaHarness = 'codex' | 'antigravity'
 
@@ -27,12 +30,21 @@ export function calculateRemainingPercent(usedPercent: number): number {
 export function computeResetCheckDelay(
   resetsAt: string | null | undefined,
   now = Date.now(),
+  retryCount = 0,
 ): number | null {
   if (!resetsAt) return null
   const targetMs = new Date(resetsAt).getTime()
   if (Number.isNaN(targetMs)) return null
-  const delay = targetMs + RESET_GRACE_PERIOD_MS - now
-  return Math.max(RESET_GRACE_PERIOD_MS, delay)
+
+  if (targetMs + RESET_GRACE_PERIOD_MS > now) {
+    return targetMs + RESET_GRACE_PERIOD_MS - now
+  }
+
+  if (retryCount < MAX_RESET_RETRIES) {
+    return retryCount === 0 ? RESET_GRACE_PERIOD_MS : RESET_RETRY_INTERVAL_MS
+  }
+
+  return null
 }
 
 export function extractQuotaWindows(summary: HarnessQuotaSummary): QuotaWindow[] {
@@ -158,3 +170,78 @@ export function createQuotaRecoveryStateMachine(): QuotaRecoveryStateMachine {
     reset,
   }
 }
+
+// Module-level cache and subscriber registry so all components viewing
+// the active harness (e.g. side rail + bubble + stats view) stay synchronized.
+export type QuotaSubscriber = (data: HarnessQuotaSummary | null) => void
+
+const subscribers: {
+  codex: Set<QuotaSubscriber>
+  antigravity: Set<QuotaSubscriber>
+} = {
+  codex: new Set(),
+  antigravity: new Set(),
+}
+
+const memoryCache: {
+  codex: HarnessQuotaSummary | null
+  antigravity: HarnessQuotaSummary | null
+} = {
+  codex: null,
+  antigravity: null,
+}
+
+function updateHarnessQuotaCache(
+  harness: 'codex' | 'antigravity',
+  summary: HarnessQuotaSummary | null,
+) {
+  memoryCache[harness] = summary
+  subscribers[harness].forEach((cb) => {
+    try {
+      cb(summary)
+    } catch {
+      // ignore callback error
+    }
+  })
+}
+
+export async function fetchHarnessQuota(
+  harness: 'codex' | 'antigravity',
+  forceRefresh = false,
+): Promise<HarnessQuotaSummary | null> {
+  try {
+    const res = await invoke<HarnessQuotaSummary | null>('get_harness_quota', {
+      harness,
+      forceRefresh,
+    })
+    updateHarnessQuotaCache(harness, res)
+    return res
+  } catch (err) {
+    console.warn(`[Quota] Failed to fetch quota for ${harness}:`, err)
+    throw err
+  }
+}
+
+export function subscribeHarnessQuota(
+  harness: 'codex' | 'antigravity',
+  cb: QuotaSubscriber,
+): () => void {
+  subscribers[harness].add(cb)
+  if (memoryCache[harness]) {
+    try {
+      cb(memoryCache[harness])
+    } catch {
+      // ignore callback error
+    }
+  }
+  return () => {
+    subscribers[harness].delete(cb)
+  }
+}
+
+export function getHarnessQuotaCache(
+  harness: 'codex' | 'antigravity',
+): HarnessQuotaSummary | null {
+  return memoryCache[harness]
+}
+
