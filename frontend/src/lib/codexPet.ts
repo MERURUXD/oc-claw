@@ -1,7 +1,10 @@
-// Codex-compatible pet asset model.
-// Each pet is a single 8-column x 9-row atlas of 192x208 cells (1536x1872),
-// matching the openai/skills hatch-pet output format. Row layout is by
-// convention; pet.json itself does not declare it.
+// Codex-compatible pet asset model and unified PetAsset types.
+// Each pet is either a single 8-column x 9-row atlas of 192x208 cells (1536x1872),
+// matching the openai/skills hatch-pet output format, or a video-based pet (VideoPet).
+
+import { parsePetManifest, type PetAsset } from './petAsset'
+export type { PetAsset } from './petAsset'
+export { isCodexPet, isVideoPet, parsePetManifest } from './petAsset'
 
 export type CodexPetState =
   | 'idle'
@@ -20,6 +23,7 @@ export interface CodexPet {
   description: string
   // Resolved absolute URL ready to use as a CSS background-image source.
   spritesheetUrl: string
+  renderer?: 'sprite-atlas'
 }
 
 export const ATLAS = {
@@ -148,20 +152,13 @@ export function petStateToCodexState(state: MiniPetSourceState): CodexPetState {
 const BUILTIN_BASE = '/assets/builtin'
 const MANIFEST_URL = `${BUILTIN_BASE}/pets-manifest.json`
 
-interface RawPetMeta {
-  id: string
-  displayName: string
-  description: string
-  spritesheetPath: string
-}
-
 interface PetsManifest {
   pets: string[]
 }
 
-let cachedPets: Promise<CodexPet[]> | null = null
+let cachedPets: Promise<PetAsset[]> | null = null
 
-export function loadCodexPets(): Promise<CodexPet[]> {
+export function loadCodexPets(): Promise<PetAsset[]> {
   if (!cachedPets) {
     cachedPets = (async () => {
       const manifestRes = await fetch(MANIFEST_URL)
@@ -172,29 +169,24 @@ export function loadCodexPets(): Promise<CodexPet[]> {
       const ids = Array.isArray(manifest.pets) ? manifest.pets : []
 
       const results = await Promise.all(
-        ids.map(async (id): Promise<CodexPet | null> => {
+        ids.map(async (id): Promise<PetAsset | null> => {
           try {
             const res = await fetch(`${BUILTIN_BASE}/${id}/pet.json`)
             if (!res.ok) return null
-            const meta = (await res.json()) as RawPetMeta
-            return {
-              id: meta.id || id,
-              displayName: meta.displayName || id,
-              description: meta.description || '',
-              spritesheetUrl: `${BUILTIN_BASE}/${id}/${meta.spritesheetPath}`,
-            }
+            const raw = await res.json()
+            return parsePetManifest(raw, `${BUILTIN_BASE}/${id}`)
           } catch {
             return null
           }
         }),
       )
-      return results.filter((p): p is CodexPet => p !== null)
+      return results.filter((p): p is PetAsset => p !== null)
     })()
   }
   return cachedPets
 }
 
-export async function loadCodexPetById(id: string): Promise<CodexPet | null> {
+export async function loadCodexPetById(id: string): Promise<PetAsset | null> {
   const builtins = await loadCodexPets()
   const hit = builtins.find((p) => p.id === id)
   if (hit) return hit
@@ -202,7 +194,7 @@ export async function loadCodexPetById(id: string): Promise<CodexPet | null> {
   return customs.find((p) => p.id === id) ?? null
 }
 
-export async function loadDefaultCodexPet(): Promise<CodexPet | null> {
+export async function loadDefaultCodexPet(): Promise<PetAsset | null> {
   const pets = await loadCodexPets()
   if (pets.length === 0) return null
   return pets.find((p) => p.id === DEFAULT_PET_ID) ?? pets[0]
@@ -217,7 +209,7 @@ export function clearCodexPetCache(): void {
 // Pets dropped into `~/.codex/pets/` by the user. Loaded via the Rust
 // `list_custom_codex_pets` command which serves them through the asset
 // protocol so they render outside the bundled `public/` tree.
-export async function loadCustomCodexPets(): Promise<CodexPet[]> {
+export async function loadCustomCodexPets(): Promise<PetAsset[]> {
   try {
     const { invoke } = await import('@tauri-apps/api/core')
     const raw = (await invoke('list_custom_codex_pets')) as Array<{
@@ -225,8 +217,10 @@ export async function loadCustomCodexPets(): Promise<CodexPet[]> {
       displayName: string
       description: string
       spritesheetUrl: string
+      renderer?: string
     }>
     return raw.map((m) => ({
+      renderer: (m.renderer as 'sprite-atlas' | undefined) ?? 'sprite-atlas',
       id: m.id,
       displayName: m.displayName,
       description: m.description,

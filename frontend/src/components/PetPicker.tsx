@@ -13,13 +13,13 @@ import {
   Sparkles,
   X as XIcon,
 } from 'lucide-react'
-import { SpritePet } from './SpritePet'
+import { PetRenderer } from './PetRenderer'
 import {
   clearCodexPetCache,
   loadCodexPets,
   loadCustomCodexPets,
-  type CodexPet,
 } from '../lib/codexPet'
+import type { PetAsset } from '../lib/petAsset'
 import { saveExtraMascots, loadMultiMascotMode, saveMultiMascotMode } from '../lib/petStore'
 
 // Non-codex entries shown at the top of the 看板娘 list (e.g. the legacy
@@ -35,7 +35,7 @@ export interface SpecialPet {
 
 interface PetPickerProps {
   selectedId: string | null
-  onSelect: (pet: CodexPet) => Promise<void> | void
+  onSelect: (pet: PetAsset) => Promise<void> | void
   onSelectSpecial?: (pet: SpecialPet) => Promise<void> | void
   specialPets?: SpecialPet[]
   // Agent rotation queue. When provided, the picker renders an extra
@@ -98,8 +98,8 @@ export function PetPicker({
     typeof petdexUrl === 'string' && /^https?:\/\//i.test(petdexUrl)
       ? petdexUrl
       : null
-  const [builtins, setBuiltins] = useState<CodexPet[]>([])
-  const [customs, setCustoms] = useState<CodexPet[]>([])
+  const [builtins, setBuiltins] = useState<PetAsset[]>([])
+  const [customs, setCustoms] = useState<PetAsset[]>([])
   const [petsOpen, setPetsOpen] = useState(true)
   const [createOpen, setCreateOpen] = useState(false)
   const [queueAddOpen, setQueueAddOpen] = useState(false)
@@ -407,7 +407,7 @@ export function PetPicker({
                     style={{ width: 32, height: 32 }}
                   >
                     {meta ? (
-                      <SpritePet pet={meta} state="idle" size={32} />
+                      <PetRenderer pet={meta} state="idle" size={32} />
                     ) : (
                       <span className="text-[10px] text-white/30">?</span>
                     )}
@@ -467,7 +467,7 @@ export function PetPicker({
                         className="shrink-0 rounded-md bg-black/40 border border-white/10 overflow-hidden flex items-center justify-center"
                         style={{ width: 28, height: 28 }}
                       >
-                        <SpritePet pet={pet} state="idle" size={28} />
+                        <PetRenderer pet={pet} state="idle" size={28} />
                       </div>
                       <span className="text-xs text-white/75 truncate flex-1 text-left">
                         {pet.displayName}
@@ -610,7 +610,7 @@ function PetSection({ title, subtitle, open, onToggle, actions, children }: PetS
 }
 
 interface PetRowProps {
-  pet: CodexPet
+  pet: PetAsset
   selected: boolean
   onSelect: () => void
 }
@@ -628,7 +628,7 @@ function PetRow({ pet, selected, onSelect }: PetRowProps) {
         className="shrink-0 rounded-lg bg-black/40 border border-white/10 overflow-hidden flex items-center justify-center"
         style={{ width: 40, height: 40 }}
       >
-        <SpritePet pet={pet} state="idle" size={40} />
+        <PetRenderer pet={pet} state="idle" size={40} />
       </div>
       <div className="min-w-0 flex-1">
         <div className="text-sm text-white/85 font-medium truncate">{pet.displayName}</div>
@@ -680,7 +680,7 @@ function ExtraMascotControls({
   specialPets,
   onChangePrimarySpecial,
 }: {
-  allPets: CodexPet[]
+  allPets: PetAsset[]
   onNativeDialogStart?: () => void
   onNativeDialogEnd?: () => void
   // When true, render only the inner list/add UI (no outer card or header),
@@ -691,7 +691,7 @@ function ExtraMascotControls({
   // like the extra ones (change pet in place, remove by promoting an extra).
   primaryId?: string | null
   primaryName?: string | null
-  primaryPet?: CodexPet | null
+  primaryPet?: PetAsset | null
   primaryAvatar?: React.ReactNode
   // Change the main mascot's pet (maps to the single-select onSelect in the
   // parent), so the first row is editable without leaving multi-mascot mode.
@@ -865,7 +865,7 @@ function ExtraMascotControls({
                 style={{ width: 32, height: 32 }}
               >
                 {primaryPet ? (
-                  <SpritePet pet={primaryPet} state="idle" size={32} />
+                  <PetRenderer pet={primaryPet} state="idle" size={32} />
                 ) : primaryAvatar ? (
                   primaryAvatar
                 ) : (
@@ -912,7 +912,7 @@ function ExtraMascotControls({
                   style={{ width: 32, height: 32 }}
                 >
                   {meta ? (
-                    <SpritePet pet={meta} state="idle" size={32} />
+                    <PetRenderer pet={meta} state="idle" size={32} />
                   ) : (
                     <span className="text-[10px] text-white/30">?</span>
                   )}
@@ -980,7 +980,7 @@ function ExtraMascotControls({
                     className="shrink-0 rounded-md bg-black/40 border border-white/10 overflow-hidden flex items-center justify-center"
                     style={{ width: 28, height: 28 }}
                   >
-                    <SpritePet pet={pet} state="idle" size={28} />
+                    <PetRenderer pet={pet} state="idle" size={28} />
                   </div>
                   <span className="text-xs text-white/75 truncate flex-1 text-left">
                     {pet.displayName}
@@ -1012,7 +1012,7 @@ function DemoMascotControls({
   onNativeDialogStart,
   onNativeDialogEnd,
 }: {
-  allPets: CodexPet[]
+  allPets: PetAsset[]
   onNativeDialogStart?: () => void
   onNativeDialogEnd?: () => void
 }) {
@@ -1126,7 +1126,7 @@ function DemoMascotControls({
                     style={{ width: 32, height: 32 }}
                   >
                     {meta ? (
-                      <SpritePet pet={meta} state="idle" size={32} />
+                      <PetRenderer pet={meta} state="idle" size={32} />
                     ) : (
                       <span className="text-[10px] text-white/30">?</span>
                     )}
@@ -1170,7 +1170,7 @@ function DemoMascotControls({
                       className="shrink-0 rounded-md bg-black/40 border border-white/10 overflow-hidden flex items-center justify-center"
                       style={{ width: 28, height: 28 }}
                     >
-                      <SpritePet pet={pet} state="idle" size={28} />
+                      <PetRenderer pet={pet} state="idle" size={28} />
                     </div>
                     <span className="text-xs text-white/75 truncate flex-1 text-left">
                       {pet.displayName}

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { SpritePet } from './SpritePet'
+import { PetRenderer } from './PetRenderer'
 import { ANIMATION_ROWS, fpsFor } from '../lib/codexPet'
-import type { CodexPet, CodexPetState } from '../lib/codexPet'
+import type { CodexPetState } from '../lib/codexPet'
+import { isCodexPet, type PetAsset } from '../lib/petAsset'
 
 export interface MascotReaction {
   state: 'waving' | 'failed'
@@ -9,7 +10,7 @@ export interface MascotReaction {
 }
 
 interface MiniPetMascotProps {
-  pet: CodexPet
+  pet: PetAsset
   // Resting state computed by the parent: idle / running (working+compacting) /
   // waiting / review / run-right / run-left. `jumping` is owned by this wrapper via
   // hover and should not be passed in.
@@ -36,6 +37,7 @@ interface MiniPetMascotProps {
   // it). Without this, walkDir → run-left/run-right is hidden by the
   // continuous jump animation.
   suppressHover?: boolean
+  layoutMode?: 'body' | 'canvas'
   className?: string
   style?: React.CSSProperties
 }
@@ -55,6 +57,7 @@ export function MiniPetMascot({
   externalHover = false,
   useExternalHover = false,
   suppressHover = false,
+  layoutMode,
   className,
   style,
 }: MiniPetMascotProps) {
@@ -127,19 +130,19 @@ export function MiniPetMascot({
     }, JUMP_REST_MS)
   }, [])
 
-  // Safety net for jumping: if SpritePet's onOneShotEnd somehow doesn't fire (e.g.
+  // Safety net for jumping: if PetRenderer's onOneShotEnd somehow doesn't fire (e.g.
   // tab throttling), schedule the rest cycle by the animation's nominal
   // duration plus a small buffer.
   useEffect(() => {
     if (!showJump) return
-    const row = ANIMATION_ROWS['jumping']
-    const fps = fpsFor('jumping')
-    const expected = (row.frames / Math.max(fps, 1)) * 1000
+    const expected = isCodexPet(pet)
+      ? (ANIMATION_ROWS['jumping'].frames / Math.max(fpsFor('jumping'), 1)) * 1000
+      : 3000
     const fallback = setTimeout(() => {
       handleJumpEnd()
     }, expected + 200)
     return () => clearTimeout(fallback)
-  }, [showJump, jumpKey, handleJumpEnd])
+  }, [showJump, jumpKey, handleJumpEnd, pet])
 
   // Reaction handling: when reaction is active, handle its completion
   const handleReactionEnd = useCallback(() => {
@@ -148,18 +151,18 @@ export function MiniPetMascot({
     }
   }, [reaction])
 
-  // Safety net for reaction one-shot: if SpritePet's onOneShotEnd somehow doesn't fire,
+  // Safety net for reaction one-shot: if PetRenderer's onOneShotEnd somehow doesn't fire,
   // ensure we clear the reaction after nominal duration + buffer.
   useEffect(() => {
     if (!isReactionActive || !reaction) return
-    const row = ANIMATION_ROWS[reaction.state]
-    const fps = fpsFor(reaction.state)
-    const expected = (row.frames / Math.max(fps, 1)) * 1000
+    const expected = isCodexPet(pet)
+      ? (ANIMATION_ROWS[reaction.state].frames / Math.max(fpsFor(reaction.state), 1)) * 1000
+      : 4000
     const fallback = setTimeout(() => {
       handleReactionEnd()
     }, expected + 250)
     return () => clearTimeout(fallback)
-  }, [isReactionActive, reaction, handleReactionEnd])
+  }, [isReactionActive, reaction, handleReactionEnd, pet])
 
   // Unified priority:
   // movement > failed > waving > review > jumping > baseState
@@ -175,6 +178,8 @@ export function MiniPetMascot({
             ? 'jumping'
             : baseState
 
+  const isVideo = !isCodexPet(pet)
+
   const spriteKey = isMovement
     ? `move-${renderState}`
     : isReactionActive && reaction
@@ -182,6 +187,15 @@ export function MiniPetMascot({
       : showJump
         ? `jump-${jumpKey}`
         : `base-${renderState}`
+
+  // For Codex, SpritePet uses spriteKey to reset its internal frame state or remount for jump loops.
+  // For VideoPet, component identity must remain stable so BufferedVideo stays mounted and seamlessly swaps
+  // front and back buffers without unmounting or flashing transparent/empty frames.
+  const rendererKey = isVideo ? `videopet-${pet.id}` : spriteKey
+
+  // For VideoPet, one-shot replay requests (such as repeating a hover jump or reaction) are communicated
+  // via replayToken so BufferedVideo reloads the clip in the back buffer without unmounting.
+  const replayToken = showJump ? jumpKey : isReactionActive && reaction ? reaction.id : 0
 
   const onOneShotEnd = showJump
     ? handleJumpEnd
@@ -196,12 +210,14 @@ export function MiniPetMascot({
       onMouseLeave={!useExternalHover ? onLeave : undefined}
       style={{ display: 'inline-block', lineHeight: 0, ...style }}
     >
-      <SpritePet
-        key={spriteKey}
+      <PetRenderer
+        key={rendererKey}
         pet={pet}
         state={renderState}
         size={size}
+        replayToken={replayToken}
         onOneShotEnd={onOneShotEnd}
+        layoutMode={layoutMode}
       />
     </div>
   )

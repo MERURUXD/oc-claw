@@ -53,8 +53,6 @@ static PET_MENU_RESTORE_FRAME: Mutex<Option<(f64, f64, f64, f64)>> = Mutex::new(
 static PET_ALPHA_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Whether the pet-mode click-through poll thread should be running.
 static PET_PASSTHROUGH_ACTIVE: AtomicBool = AtomicBool::new(false);
-/// Whether the pet-mode click-through poll thread is alive.
-static PET_PASSTHROUGH_THREAD_ALIVE: AtomicBool = AtomicBool::new(false);
 /// Whether the pet-mode context menu is currently open. When true the poll
 /// thread disables ignoresMouseEvents so the entire expanded window accepts
 /// clicks (for the menu buttons). When false, only the mascot area accepts
@@ -68,6 +66,56 @@ static PET_POMODORO_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Latest pet-mode mascot scales. The click-through poll thread is long-lived,
 /// so it reads this on each pass instead of capturing the size it started with.
 static PET_MASCOT_SCALES: Mutex<(f64, f64)> = Mutex::new((1.0, LARGE_MASCOT_SIZE_MULTIPLIER));
+/// Declared source canvas dimensions (canvas_w, canvas_h) in logical pixels for VideoPet.
+/// When Some, large_collapsed_mascot_window_size returns these canvas bounds so the OS
+/// window does not clip large animation effects (fireworks, particles, gestures).
+static PET_CANVAS_BOUNDS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
+/// Character interaction hitbox bounds (hitbox_x, hitbox_y, hitbox_w, hitbox_h) in logical pixels
+/// relative to the top-left of the canvas. Used by pet_passthrough_poll and
+/// pet_passthrough_poll_windows so clicks on transparent canvas areas outside the character body
+/// pass through to underlying windows.
+static PET_HITBOX_BOUNDS: Mutex<Option<(f64, f64, f64, f64)>> = Mutex::new(None);
+#[derive(Clone, Copy, Debug)]
+pub struct MascotHitboxEntry {
+    pub canvas_w: f64,
+    pub canvas_h: f64,
+    pub hitbox_x: f64,
+    pub hitbox_y: f64,
+    pub hitbox_w: f64,
+    pub hitbox_h: f64,
+}
+
+static REGISTERED_MASCOT_HITBOXES: Mutex<Vec<(String, MascotHitboxEntry)>> = Mutex::new(Vec::new());
+
+fn get_mascot_hitbox_entry(label: &str) -> Option<MascotHitboxEntry> {
+    REGISTERED_MASCOT_HITBOXES.lock().ok().and_then(|reg| {
+        reg.iter().find(|(k, _)| k == label).map(|(_, v)| *v)
+    })
+}
+
+fn set_mascot_hitbox_entry(label: String, entry: MascotHitboxEntry) {
+    if let Ok(mut reg) = REGISTERED_MASCOT_HITBOXES.lock() {
+        if let Some(pos) = reg.iter().position(|(k, _)| k == &label) {
+            reg[pos].1 = entry;
+        } else {
+            reg.push((label, entry));
+        }
+    }
+}
+
+fn remove_mascot_hitbox_entry(label: &str) -> Option<MascotHitboxEntry> {
+    if let Ok(mut reg) = REGISTERED_MASCOT_HITBOXES.lock() {
+        if let Some(pos) = reg.iter().position(|(k, _)| k == label) {
+            Some(reg.remove(pos).1)
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+static PASSTHROUGH_THREAD_RUNNING: AtomicBool = AtomicBool::new(false);
 #[derive(Clone, Copy, Debug)]
 pub struct BubbleAnchor {
     pub card_right: f64,
@@ -3296,10 +3344,20 @@ fn sanitized_mascot_scale(scale: Option<f64>) -> f64 {
 }
 
 fn collapsed_mascot_window_size(scale: f64) -> (f64, f64) {
+    if let Ok(guard) = PET_CANVAS_BOUNDS.lock() {
+        if let Some((cw, ch)) = *guard {
+            return (cw, ch);
+        }
+    }
     (COLLAPSED_MASCOT_BASE_W * scale, COLLAPSED_MASCOT_BASE_H * scale)
 }
 
 fn large_collapsed_mascot_window_size(scale: f64, large_scale: f64) -> (f64, f64) {
+    if let Ok(guard) = PET_CANVAS_BOUNDS.lock() {
+        if let Some((cw, ch)) = *guard {
+            return (cw, ch);
+        }
+    }
     let lms = if large_scale.is_finite() && large_scale >= 1.0 && large_scale <= 6.0 { large_scale } else { LARGE_MASCOT_SIZE_MULTIPLIER };
     let w = 43.0 * scale * lms;
     let h = (w * 208.0 / 192.0).ceil();
@@ -4105,14 +4163,31 @@ fn efficiency_hover_poll(app: tauri::AppHandle) {
             // bottom-right corner). Hover/drag should only fire on the
             // visible body, so we inset to ~35% wide x 65% tall around the
             // upper-centre where the head/torso sit.
+            let custom_hitbox = PET_HITBOX_BOUNDS.lock().ok().and_then(|g| *g);
+            let resize_handle = 34.0_f64;
+
             let over_mascot = if is_expanded {
                 false
             } else if let Some((fx, fy, fw, fh)) = frame {
-                let l = fx + fw * 0.32;
-                let r = fx + fw * 0.68;
-                let b = fy + fh * 0.25; // NSEvent y axis grows upward
-                let t = fy + fh * 0.90;
-                cursor.0 >= l && cursor.0 <= r && cursor.1 >= b && cursor.1 <= t
+                if let Some((hx, hy, hw, hh)) = custom_hitbox {
+                    let hit_left = fx + hx;
+                    let hit_right = hit_left + hw;
+                    let hit_bottom = fy + fh - (hy + hh);
+                    let hit_top = fy + fh - hy;
+                    let over_body = cursor.0 >= hit_left && cursor.0 <= hit_right
+                        && cursor.1 >= hit_bottom && cursor.1 <= hit_top;
+                    let over_resize = cursor.0 >= hit_right - resize_handle
+                        && cursor.0 <= hit_right
+                        && cursor.1 >= hit_bottom
+                        && cursor.1 <= hit_bottom + resize_handle;
+                    over_body || over_resize
+                } else {
+                    let l = fx + fw * 0.32;
+                    let r = fx + fw * 0.68;
+                    let b = fy + fh * 0.25; // NSEvent y axis grows upward
+                    let t = fy + fh * 0.90;
+                    cursor.0 >= l && cursor.0 <= r && cursor.1 >= b && cursor.1 <= t
+                }
             } else {
                 false
             };
@@ -5318,10 +5393,6 @@ async fn set_pet_mode_window(
                         x = x.max(sx).min(sx + sw - win_w);
                         let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(win_w, win_h));
                         unsafe {
-                            // Start with clicks passing through until the poll takes over.
-                            if !was_active {
-                                let _: () = msg_send![obj, setIgnoresMouseEvents: true];
-                            }
                             let _: () = msg_send![obj, setFrame: frame, display: true, animate: false];
                             let _: () = msg_send![obj, setLevel: 27isize];
                             if !PRESENTATION.active() {
@@ -5362,16 +5433,7 @@ async fn set_pet_mode_window(
 
         // Start the click-through poll thread.
         PET_PASSTHROUGH_ACTIVE.store(true, Ordering::SeqCst);
-        #[cfg(target_os = "macos")]
-        if !PET_PASSTHROUGH_THREAD_ALIVE.load(Ordering::SeqCst) {
-            let app2 = app.clone();
-            std::thread::spawn(move || pet_passthrough_poll(app2, mascot_scale, large_mascot_scale));
-        }
-        #[cfg(target_os = "windows")]
-        if !PET_PASSTHROUGH_THREAD_ALIVE.load(Ordering::SeqCst) {
-            let app2 = app.clone();
-            std::thread::spawn(move || pet_passthrough_poll_windows(app2, mascot_scale, large_mascot_scale));
-        }
+        ensure_mascot_passthrough_poll(app.clone());
     } else {
         // Stop the poll thread.
         PET_PASSTHROUGH_ACTIVE.store(false, Ordering::SeqCst);
@@ -5395,7 +5457,6 @@ async fn set_pet_mode_window(
                     let y = current.origin.y;
                     let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(win_w, win_h));
                     unsafe {
-                        let _: () = msg_send![obj, setIgnoresMouseEvents: false];
                         let _: () = msg_send![obj, setFrame: frame, display: true, animate: false];
                     }
                     if let Ok(mut f) = MINI_WINDOW_FRAME.lock() {
@@ -5432,6 +5493,204 @@ async fn set_pet_mode_window(
 #[tauri::command]
 async fn set_pet_pomodoro_active(active: bool) -> Result<(), String> {
     PET_POMODORO_ACTIVE.store(active, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Updates declared pet canvas and hitbox bounds in logical pixels.
+/// Used by VideoPet to allow animation effects to extend beyond the character
+/// body without clipping against the window boundary, while keeping clicks on
+/// transparent canvas pixels non-interactive (pass-through).
+/// Atomically resizes and repositions the native window to keep the character's
+/// body anchor stable on screen across scale changes and transitions.
+#[tauri::command]
+async fn set_pet_canvas_bounds(
+    app: tauri::AppHandle,
+    window_label: Option<String>,
+    canvas_w: Option<f64>,
+    canvas_h: Option<f64>,
+    hitbox_x: Option<f64>,
+    hitbox_y: Option<f64>,
+    hitbox_w: Option<f64>,
+    hitbox_h: Option<f64>,
+    anchor_mode: Option<String>,
+) -> Result<(), String> {
+    let target_label = window_label.unwrap_or_else(|| "mini".to_string());
+
+    if target_label == "mini" {
+        if let (Some(cw), Some(ch)) = (canvas_w, canvas_h) {
+            if let Ok(mut guard) = PET_CANVAS_BOUNDS.lock() {
+                *guard = Some((cw, ch));
+            }
+        } else {
+            if let Ok(mut guard) = PET_CANVAS_BOUNDS.lock() {
+                *guard = None;
+            }
+        }
+
+        if let (Some(x), Some(y), Some(w), Some(h)) = (hitbox_x, hitbox_y, hitbox_w, hitbox_h) {
+            if let Ok(mut guard) = PET_HITBOX_BOUNDS.lock() {
+                *guard = Some((x, y, w, h));
+            }
+        } else {
+            if let Ok(mut guard) = PET_HITBOX_BOUNDS.lock() {
+                *guard = None;
+            }
+        }
+    }
+
+    let has_bounds = canvas_w.is_some() && canvas_h.is_some()
+        && hitbox_x.is_some() && hitbox_y.is_some() && hitbox_w.is_some() && hitbox_h.is_some();
+
+    #[cfg(target_os = "macos")]
+    {
+        let win = app.get_webview_window(&target_label);
+        if let Some(win) = win {
+            let win_clone = win.clone();
+            let target_c = target_label.clone();
+            let anchor_c = anchor_mode.clone();
+            let _ = app.run_on_main_thread(move || {
+                use objc2::runtime::AnyObject;
+                use objc2::msg_send;
+                use objc2_foundation::{NSRect, NSPoint, NSSize};
+                if let Ok(ns_win) = win_clone.ns_window() {
+                    let obj = unsafe { &*(ns_win as *mut AnyObject) };
+                    let current: NSRect = unsafe { msg_send![obj, frame] };
+                    let current_x = current.origin.x;
+                    let current_y = current.origin.y;
+                    let current_w = current.size.width;
+                    let current_h = current.size.height;
+
+                    let prev_entry = get_mascot_hitbox_entry(&target_c);
+
+                    if let (Some(cw), Some(ch), Some(hx), Some(hy), Some(hw), Some(hh)) =
+                        (canvas_w, canvas_h, hitbox_x, hitbox_y, hitbox_w, hitbox_h)
+                    {
+                        let mode = anchor_c.as_deref().unwrap_or(if target_c == "mini" { "bottom-right" } else { "top-left" });
+                        let (new_x, new_y) = match mode {
+                            "top-left" => {
+                                let body_left = if let Some(prev) = prev_entry {
+                                    current_x + prev.hitbox_x
+                                } else {
+                                    current_x
+                                };
+                                let body_top = if let Some(prev) = prev_entry {
+                                    current_y + current_h - prev.hitbox_y
+                                } else {
+                                    current_y + current_h
+                                };
+                                (body_left - hx, body_top - ch + hy)
+                            }
+                            _ => {
+                                // "bottom-right"
+                                let body_right = if let Some(prev) = prev_entry {
+                                    current_x + prev.hitbox_x + prev.hitbox_w
+                                } else {
+                                    current_x + current_w
+                                };
+                                let body_bottom = if let Some(prev) = prev_entry {
+                                    current_y + current_h - (prev.hitbox_y + prev.hitbox_h)
+                                } else {
+                                    current_y
+                                };
+                                (body_right - (hx + hw), body_bottom - (ch - (hy + hh)))
+                            }
+                        };
+
+                        let new_frame = NSRect::new(NSPoint::new(new_x, new_y), NSSize::new(cw, ch));
+                        unsafe {
+                            let _: () = msg_send![obj, setFrame: new_frame, display: true, animate: false];
+                        }
+                        if target_c == "mini" {
+                            if let Ok(mut f) = MINI_WINDOW_FRAME.lock() {
+                                *f = Some((new_x, new_y, cw, ch));
+                            }
+                        }
+                        set_mascot_hitbox_entry(target_c, MascotHitboxEntry {
+                            canvas_w: cw,
+                            canvas_h: ch,
+                            hitbox_x: hx,
+                            hitbox_y: hy,
+                            hitbox_w: hw,
+                            hitbox_h: hh,
+                        });
+                    } else {
+                        remove_mascot_hitbox_entry(&target_c);
+                    }
+                }
+            });
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(win) = app.get_webview_window(&target_label) {
+            if let (Some(cw), Some(ch), Some(hx), Some(hy), Some(hw), Some(hh)) =
+                (canvas_w, canvas_h, hitbox_x, hitbox_y, hitbox_w, hitbox_h)
+            {
+                if let Ok(Some(monitor)) = win.current_monitor() {
+                    let scale = monitor.scale_factor();
+                    if let (Ok(pos), Ok(size)) = (win.outer_position(), win.outer_size()) {
+                        let current_x = pos.x as f64 / scale;
+                        let current_y = pos.y as f64 / scale;
+                        let current_w = size.width as f64 / scale;
+                        let current_h = size.height as f64 / scale;
+
+                        let prev_entry = get_mascot_hitbox_entry(&target_label);
+
+                        let mode = anchor_mode.as_deref().unwrap_or(if target_label == "mini" { "bottom-right" } else { "top-left" });
+                        let (new_x, new_y) = match mode {
+                            "top-left" => {
+                                let body_left = if let Some(prev) = prev_entry {
+                                    current_x + prev.hitbox_x
+                                } else {
+                                    current_x
+                                };
+                                let body_top = if let Some(prev) = prev_entry {
+                                    current_y + prev.hitbox_y
+                                } else {
+                                    current_y
+                                };
+                                (body_left - hx, body_top - hy)
+                            }
+                            _ => {
+                                // "bottom-right"
+                                let body_right = if let Some(prev) = prev_entry {
+                                    current_x + prev.hitbox_x + prev.hitbox_w
+                                } else {
+                                    current_x + current_w
+                                };
+                                let body_bottom = if let Some(prev) = prev_entry {
+                                    current_y + prev.hitbox_y + prev.hitbox_h
+                                } else {
+                                    current_y + current_h
+                                };
+                                (body_right - (hx + hw), body_bottom - (hy + hh))
+                            }
+                        };
+
+                        let _ = win.set_size(tauri::LogicalSize::new(cw, ch));
+                        let _ = win.set_position(tauri::LogicalPosition::new(new_x, new_y));
+                    }
+                }
+
+                set_mascot_hitbox_entry(target_label.clone(), MascotHitboxEntry {
+                    canvas_w: cw,
+                    canvas_h: ch,
+                    hitbox_x: hx,
+                    hitbox_y: hy,
+                    hitbox_w: hw,
+                    hitbox_h: hh,
+                });
+            } else {
+                remove_mascot_hitbox_entry(&target_label);
+            }
+        }
+    }
+
+    if has_bounds {
+        ensure_mascot_passthrough_poll(app);
+    }
+
     Ok(())
 }
 
@@ -5577,249 +5836,428 @@ async fn set_pet_context_menu(app: tauri::AppHandle, open: bool, side: Option<St
 }
 
 /// Polling loop for pet-mode click pass-through. Checks cursor position every
-/// 20ms. When the cursor is over the mascot (bottom-right of the expanded
-/// window) or the context menu is open, `setIgnoresMouseEvents: false` so the
-/// webview receives events. Otherwise `setIgnoresMouseEvents: true` so clicks
-/// pass through to whatever is behind.
 #[cfg(target_os = "macos")]
-fn pet_passthrough_poll(app: tauri::AppHandle, mascot_scale: f64, large_mascot_scale: f64) {
-    use std::time::Duration;
-    PET_PASSTHROUGH_THREAD_ALIVE.store(true, Ordering::SeqCst);
-    let mut was_interactive = false;
-    // Keep these ratios aligned with frontend `Mini.tsx` so hover cursor and
-    // native pass-through behavior remain consistent around mascot edges.
-    let edge_threshold = 30.0;
-    // Get screen bounds once at startup so we can detect edge proximity.
-    let screen_bounds: Option<(f64, f64, f64, f64)> = {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let app_c = app.clone();
-        let _ = app_c.run_on_main_thread(move || {
-            use objc2::runtime::{AnyClass, AnyObject};
+fn set_window_ignores_mouse_events(app: &tauri::AppHandle, label: &str, ignore: bool) {
+    if let Some(win) = app.get_webview_window(label) {
+        let _ = app.run_on_main_thread(move || {
             use objc2::msg_send;
-            use objc2_foundation::NSRect;
-            let result: Option<(f64, f64, f64, f64)> = unsafe {
-                AnyClass::get(c"NSScreen").and_then(|cls| {
-                    let ms: *mut AnyObject = msg_send![cls, mainScreen];
-                    if ms.is_null() { None } else {
-                        let sf: NSRect = msg_send![&*ms, frame];
-                        Some((sf.origin.x, sf.origin.y, sf.size.width, sf.size.height))
-                    }
-                })
-            };
-            let _ = tx.send(result);
+            if let Ok(ns_win) = win.ns_window() {
+                let obj = unsafe { &*(ns_win as *mut objc2::runtime::AnyObject) };
+                unsafe {
+                    let _: () = msg_send![obj, setIgnoresMouseEvents: ignore];
+                }
+            }
         });
-        rx.recv().ok().flatten()
+    }
+}
+
+/// Native Cocoa cursor hit-test helper for mascot windows on macOS.
+/// Operates entirely in Cocoa screen points (bottom-left origin), eliminating multi-monitor height inversion errors.
+#[cfg(target_os = "macos")]
+fn hit_test_mascot_window_macos(
+    win: &tauri::WebviewWindow,
+    cursor: (f64, f64),
+    custom_entry: Option<MascotHitboxEntry>,
+    is_pet_mode: bool,
+) -> bool {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::NSRect;
+
+    let (fx, fy, fw, fh) = if let Ok(ns_win) = win.ns_window() {
+        let obj = unsafe { &*(ns_win as *mut AnyObject) };
+        let frame: NSRect = unsafe { msg_send![obj, frame] };
+        (frame.origin.x, frame.origin.y, frame.size.width, frame.size.height)
+    } else {
+        return true;
     };
 
-    while PET_PASSTHROUGH_ACTIVE.load(Ordering::SeqCst) {
-        let menu_open = PET_CONTEXT_MENU_OPEN.load(Ordering::SeqCst);
-        let pomodoro_active = PET_POMODORO_ACTIVE.load(Ordering::SeqCst);
-        let frame = MINI_WINDOW_FRAME.lock().ok().and_then(|g| *g);
+    let (cx, cy) = cursor;
+
+    if let Some(entry) = custom_entry {
+        // If window is significantly larger than declared canvas, it is in expanded/modal/settings mode.
+        if fw > entry.canvas_w + 30.0 || fh > entry.canvas_h + 30.0 {
+            return true;
+        }
+
+        let resize_handle = 34.0_f64;
+        let hit_left = fx + entry.hitbox_x;
+        let hit_right = hit_left + entry.hitbox_w;
+        let hit_bottom = fy + fh - (entry.hitbox_y + entry.hitbox_h);
+        let hit_top = fy + fh - entry.hitbox_y;
+
+        let over_body = cx >= hit_left && cx <= hit_right && cy >= hit_bottom && cy <= hit_top;
+        let over_resize = cx >= hit_right - resize_handle && cx <= hit_right
+            && cy >= hit_bottom && cy <= hit_bottom + resize_handle;
+        over_body || over_resize
+    } else if is_pet_mode {
+        // Legacy Xiang-qi-e pet mode hit-testing in Cocoa coordinates
         let (current_mascot_scale, current_large_scale) = PET_MASCOT_SCALES
             .lock()
             .map(|g| *g)
-            .unwrap_or((mascot_scale, large_mascot_scale));
+            .unwrap_or((1.0, LARGE_MASCOT_SIZE_MULTIPLIER));
         let (mascot_w, mascot_h) = large_collapsed_mascot_window_size(current_mascot_scale, current_large_scale);
         let resize_handle = 34.0_f64.min(mascot_w).min(mascot_h);
-        let hit_w = mascot_w * (2.4 / 3.0);
-        let hit_h = mascot_h * (2.8 / 3.0);
-        let inset_x = (mascot_w - hit_w) / 2.0;
-        let inset_y = (mascot_h - hit_h) / 2.0;
+        let edge_threshold = 30.0_f64;
 
-        let should_be_interactive = if menu_open || pomodoro_active {
-            true
-        } else if let Some((fx, fy, fw, _fh)) = frame {
-            let cursor = macos_cursor_position();
-            let mascot_left = fx + fw - mascot_w;
-            let mascot_right = mascot_left + mascot_w;
-            let mascot_bottom = fy;
-            // Drop hitbox insets when the mascot extends near/past a screen
-            // edge so the visible portion stays fully clickable.
-            let near_edge = if let Some((sx, _sy, sw, _sh)) = screen_bounds {
-                mascot_left < sx + edge_threshold || mascot_right > sx + sw - edge_threshold
-            } else {
-                mascot_left < edge_threshold
-            };
-            // Near screen edge, keep hitbox reasonably generous but never full-rect.
-            // Full-rect near-edge hitboxes make peek feel "too clickable" and steal
-            // hover/clicks away from nearby desktop content.
-            let ix = if near_edge { inset_x * 0.5 } else { inset_x };
-            let iy = inset_y;
-            let hit_left = mascot_left + ix;
-            let hit_right = mascot_right - ix;
-            let hit_bottom = mascot_bottom + iy;
-            let hit_top = mascot_bottom + mascot_h - iy;
-            let over_body = cursor.0 >= hit_left && cursor.0 <= hit_right
-                && cursor.1 >= hit_bottom && cursor.1 <= hit_top;
-            let over_resize = cursor.0 >= mascot_right - resize_handle
-                && cursor.0 <= mascot_right
-                && cursor.1 >= mascot_bottom
-                && cursor.1 <= mascot_bottom + resize_handle;
-            over_body || over_resize
+        let mascot_left = fx + fw - mascot_w;
+        let mascot_right = mascot_left + mascot_w;
+        let mascot_bottom = fy;
+        let mascot_top = mascot_bottom + mascot_h;
+
+        let near_edge = if let Ok(ns_win) = win.ns_window() {
+            unsafe {
+                let obj = &*(ns_win as *mut AnyObject);
+                let screen: *mut AnyObject = msg_send![obj, screen];
+                if !screen.is_null() {
+                    let sf: NSRect = msg_send![&*screen, frame];
+                    mascot_left < sf.origin.x + edge_threshold || mascot_right > sf.origin.x + sf.size.width - edge_threshold
+                } else {
+                    false
+                }
+            }
         } else {
             false
         };
 
-        if should_be_interactive != was_interactive {
-            let app1 = app.clone();
-            let app2 = app.clone();
-            let val = should_be_interactive;
-            let _ = app1.run_on_main_thread(move || {
-                if let Some(win) = app2.get_webview_window("mini") {
-                    if let Ok(ns_win) = win.ns_window() {
-                        use objc2::msg_send;
-                        let obj = unsafe { &*(ns_win as *mut objc2::runtime::AnyObject) };
-                        unsafe {
-                            let _: () = msg_send![obj, setIgnoresMouseEvents: !val];
-                        }
-                    }
-                }
-            });
-            was_interactive = should_be_interactive;
-        }
+        let hit_w = mascot_w * (1.8 / 3.0);
+        let hit_h = mascot_h * (2.5 / 3.0);
+        let inset_x = (mascot_w - hit_w) / 2.0;
+        let inset_y = (mascot_h - hit_h) / 2.0;
+        let ix = if near_edge { inset_x * 0.5 } else { inset_x };
+        let iy = inset_y;
+        let hit_left = mascot_left + ix;
+        let hit_right = mascot_right - ix;
+        let hit_bottom = mascot_bottom + iy;
+        let hit_top = mascot_top - iy;
 
-        std::thread::sleep(Duration::from_millis(20));
+        let over_body = cx >= hit_left && cx <= hit_right && cy >= hit_bottom && cy <= hit_top;
+        let over_resize = cx >= mascot_right - resize_handle && cx <= mascot_right
+            && cy >= mascot_bottom && cy <= mascot_bottom + resize_handle;
+        over_body || over_resize
+    } else {
+        true
     }
-
-    // Ensure events are re-enabled when the thread exits.
-    let app_exit = app.clone();
-    let _ = app.run_on_main_thread(move || {
-        if let Some(win) = app_exit.get_webview_window("mini") {
-            if let Ok(ns_win) = win.ns_window() {
-                use objc2::msg_send;
-                let obj = unsafe { &*(ns_win as *mut objc2::runtime::AnyObject) };
-                unsafe {
-                    let _: () = msg_send![obj, setIgnoresMouseEvents: false];
-                }
-            }
-        }
-    });
-    PET_PASSTHROUGH_THREAD_ALIVE.store(false, Ordering::SeqCst);
 }
 
-/// Windows equivalent of `pet_passthrough_poll`. Polls the global cursor
-/// position (via Win32 `GetCursorPos`) every 20 ms and toggles the mini
-/// webview's `set_ignore_cursor_events` so clicks outside the mascot
-/// hit-box pass through to whatever is behind, while clicks on the mascot
-/// itself reach the webview. When the pet context menu is open the entire
-/// window is interactive so menu buttons receive clicks.
+/// Windows cursor hit-test helper for mascot windows.
+/// Compares cursor coordinates against character body hitbox or bottom-right resize handle in logical pixels.
 #[cfg(target_os = "windows")]
-fn pet_passthrough_poll_windows(app: tauri::AppHandle, mascot_scale: f64, large_mascot_scale: f64) {
-    use std::time::Duration;
-    use windows::Win32::Foundation::POINT;
-    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+fn hit_test_mascot_window(
+    win: &tauri::WebviewWindow,
+    cursor_logical: Option<(f64, f64)>,
+    custom_entry: Option<MascotHitboxEntry>,
+    is_pet_mode: bool,
+) -> bool {
+    let Some((cx, cy)) = cursor_logical else { return true };
+    let (Ok(pos), Ok(size)) = (win.outer_position(), win.outer_size()) else { return true };
+    let scale = win.scale_factor().unwrap_or(1.0);
+    let fx = pos.x as f64 / scale;
+    let fy = pos.y as f64 / scale;
+    let fw = size.width as f64 / scale;
+    let fh = size.height as f64 / scale;
 
-    PET_PASSTHROUGH_THREAD_ALIVE.store(true, Ordering::SeqCst);
-    let edge_threshold_logical = 30.0_f64;
+    if let Some(entry) = custom_entry {
+        // If window is significantly larger than declared canvas, it is in expanded/modal/settings mode.
+        if fw > entry.canvas_w + 30.0 || fh > entry.canvas_h + 30.0 {
+            return true;
+        }
 
-    let mut last_state: Option<bool> = None;
+        let resize_handle = 34.0_f64;
+        let hit_left = fx + entry.hitbox_x;
+        let hit_right = hit_left + entry.hitbox_w;
+        let hit_top = fy + entry.hitbox_y;
+        let hit_bottom = hit_top + entry.hitbox_h;
 
-    while PET_PASSTHROUGH_ACTIVE.load(Ordering::SeqCst) {
-        let menu_open = PET_CONTEXT_MENU_OPEN.load(Ordering::SeqCst);
-        let pomodoro_active = PET_POMODORO_ACTIVE.load(Ordering::SeqCst);
+        let over_body = cx >= hit_left && cx <= hit_right && cy >= hit_top && cy <= hit_bottom;
+        let over_resize = cx >= hit_right - resize_handle && cx <= hit_right
+            && cy >= hit_bottom - resize_handle && cy <= hit_bottom;
+        over_body || over_resize
+    } else if is_pet_mode {
+        // Legacy Xiang-qi-e pet mode hit-testing in logical pixels
         let (current_mascot_scale, current_large_scale) = PET_MASCOT_SCALES
             .lock()
             .map(|g| *g)
-            .unwrap_or((mascot_scale, large_mascot_scale));
-        // mascot dimensions in logical pixels (matches CSS px on Windows WebView2).
-        let (mascot_w_logical, mascot_h_logical) = large_collapsed_mascot_window_size(current_mascot_scale, current_large_scale);
-        let resize_handle_logical = 34.0_f64.min(mascot_w_logical).min(mascot_h_logical);
-        let hit_w = mascot_w_logical * (1.8 / 3.0);
-        let hit_h = mascot_h_logical * (2.5 / 3.0);
-        let inset_x_logical = (mascot_w_logical - hit_w) / 2.0;
-        let inset_y_logical = (mascot_h_logical - hit_h) / 2.0;
+            .unwrap_or((1.0, LARGE_MASCOT_SIZE_MULTIPLIER));
+        let (mascot_w, mascot_h) = large_collapsed_mascot_window_size(current_mascot_scale, current_large_scale);
+        let resize_handle = 34.0_f64.min(mascot_w).min(mascot_h);
+        let edge_threshold = 30.0_f64;
 
-        let should_be_interactive = if menu_open || pomodoro_active {
-            true
+        let mascot_right = fx + fw;
+        let mascot_left = mascot_right - mascot_w;
+        let mascot_bottom = fy + fh;
+        let mascot_top = mascot_bottom - mascot_h;
+
+        let near_edge = if let Ok(Some(monitor)) = win.current_monitor() {
+            let mp = monitor.position();
+            let ms = monitor.size();
+            let mon_scale = monitor.scale_factor();
+            let monitor_left = mp.x as f64 / mon_scale;
+            let monitor_right = monitor_left + ms.width as f64 / mon_scale;
+            mascot_left < monitor_left + edge_threshold || mascot_right > monitor_right - edge_threshold
         } else {
-            // Read cursor position and window geometry in physical pixels.
-            let cursor = unsafe {
-                let mut pt = POINT::default();
-                if GetCursorPos(&mut pt).is_ok() {
-                    Some((pt.x as f64, pt.y as f64))
-                } else {
-                    None
-                }
-            };
-            let win = app.get_webview_window("mini");
-            match (win, cursor) {
-                (Some(win), Some((cx, cy))) => {
-                    let pos = win.outer_position().ok();
-                    let size = win.outer_size().ok();
-                    let scale = win.scale_factor().unwrap_or(1.0);
-                    let monitor = win.current_monitor().ok().flatten();
-                    if let (Some(pos), Some(size)) = (pos, size) {
-                        let fx = pos.x as f64;
-                        let fy = pos.y as f64;
-                        let fw = size.width as f64;
-                        let fh = size.height as f64;
+            false
+        };
 
-                        // Mascot is anchored at `left: petBaseWinW - mascotW` and `bottom: 0`,
-                        // i.e. the right-bottom corner of the no-menu window. When the menu
-                        // is closed, fw == petBaseWinW so the mascot's right edge in screen
-                        // physical px is fx + fw and its bottom is fy + fh.
-                        let mascot_w = mascot_w_logical * scale;
-                        let mascot_h = mascot_h_logical * scale;
-                        let resize_handle = resize_handle_logical * scale;
-                        let inset_x = inset_x_logical * scale;
-                        let inset_y = inset_y_logical * scale;
-                        let edge_threshold = edge_threshold_logical * scale;
+        let hit_w = mascot_w * (1.8 / 3.0);
+        let hit_h = mascot_h * (2.5 / 3.0);
+        let inset_x = (mascot_w - hit_w) / 2.0;
+        let inset_y = (mascot_h - hit_h) / 2.0;
+        let ix = if near_edge { inset_x * 0.5 } else { inset_x };
+        let iy = inset_y;
+        let hit_left = mascot_left + ix;
+        let hit_right = mascot_right - ix;
+        let hit_top = mascot_top + iy;
+        let hit_bottom = mascot_bottom - iy;
 
-                        let mascot_right = fx + fw;
-                        let mascot_left = mascot_right - mascot_w;
-                        let mascot_bottom = fy + fh;
-                        let mascot_top = mascot_bottom - mascot_h;
+        let over_body = cx >= hit_left && cx <= hit_right && cy >= hit_top && cy <= hit_bottom;
+        let over_resize = cx >= mascot_right - resize_handle && cx <= mascot_right
+            && cy >= mascot_bottom - resize_handle && cy <= mascot_bottom;
+        over_body || over_resize
+    } else {
+        true
+    }
+}
 
-                        let near_edge = if let Some(monitor) = monitor {
-                            let mp = monitor.position();
-                            let ms = monitor.size();
-                            let monitor_left = mp.x as f64;
-                            let monitor_right = monitor_left + ms.width as f64;
-                            mascot_left < monitor_left + edge_threshold
-                                || mascot_right > monitor_right - edge_threshold
-                        } else {
-                            false
-                        };
+/// Atomically ensures the single unified mascot pass-through polling thread is running.
+fn ensure_mascot_passthrough_poll(app: tauri::AppHandle) {
+    if PASSTHROUGH_THREAD_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        #[cfg(target_os = "windows")]
+        std::thread::spawn(move || mascot_passthrough_poll_windows(app));
+        #[cfg(target_os = "macos")]
+        std::thread::spawn(move || mascot_passthrough_poll_macos(app));
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let _ = app;
+    }
+}
 
-                        // Keep edge hitbox slightly relaxed on X only; do not use
-                        // full-rect hitboxes, which feel too large during peek.
-                        let ix = if near_edge { inset_x * 0.5 } else { inset_x };
-                        let iy = inset_y;
-                        let hit_left = mascot_left + ix;
-                        let hit_right = mascot_right - ix;
-                        let hit_top = mascot_top + iy;
-                        let hit_bottom = mascot_bottom - iy;
+/// Unified Windows pass-through polling loop for all mascot windows (primary "mini" and extra/demo mascots).
+/// Single owner of set_ignore_cursor_events on Windows, eliminating race conditions and thread collisions.
+#[cfg(target_os = "windows")]
+fn mascot_passthrough_poll_windows(app: tauri::AppHandle) {
+    use std::time::Duration;
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    const VK_LBUTTON: i32 = 0x01;
+    const VK_RBUTTON: i32 = 0x02;
 
-                        let over_body = cx >= hit_left && cx <= hit_right
-                            && cy >= hit_top && cy <= hit_bottom;
-                        let over_resize = cx >= mascot_right - resize_handle
-                            && cx <= mascot_right
-                            && cy >= mascot_bottom - resize_handle
-                            && cy <= mascot_bottom;
-                        over_body || over_resize
-                    } else {
-                        false
-                    }
-                }
-                _ => false,
+    let mut last_states: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+
+    loop {
+        let pet_mode_active = PET_PASSTHROUGH_ACTIVE.load(Ordering::SeqCst);
+        let registered_hitboxes: Vec<(String, MascotHitboxEntry)> = {
+            if let Ok(reg) = REGISTERED_MASCOT_HITBOXES.lock() {
+                reg.iter().map(|(k, v)| (k.clone(), *v)).collect()
+            } else {
+                Vec::new()
             }
         };
 
-        if last_state != Some(should_be_interactive) {
-            if let Some(win) = app.get_webview_window("mini") {
-                let _ = win.set_ignore_cursor_events(!should_be_interactive);
+        if !pet_mode_active && registered_hitboxes.is_empty() {
+            for (label, was_ignoring) in last_states.drain() {
+                if was_ignoring {
+                    if let Some(w) = app.get_webview_window(&label) {
+                        let _ = w.set_ignore_cursor_events(false);
+                    }
+                }
             }
-            last_state = Some(should_be_interactive);
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
         }
+
+        let mouse_held = unsafe {
+            ((GetAsyncKeyState(VK_LBUTTON) as u16) & 0x8000) != 0
+                || ((GetAsyncKeyState(VK_RBUTTON) as u16) & 0x8000) != 0
+        };
+
+        let cursor_phys = unsafe {
+            let mut pt = POINT::default();
+            if GetCursorPos(&mut pt).is_ok() {
+                Some((pt.x as f64, pt.y as f64))
+            } else {
+                None
+            }
+        };
+
+        // 1. Primary "mini" window
+        if let Some(mini_win) = app.get_webview_window("mini") {
+            let is_expanded = MINI_IS_EXPANDED.load(Ordering::SeqCst);
+            let mini_custom = registered_hitboxes.iter().find(|(l, _)| l == "mini").map(|(_, e)| *e);
+            let scale = mini_win.scale_factor().unwrap_or(1.0);
+            let cursor_logical = cursor_phys.map(|(cx, cy)| (cx / scale, cy / scale));
+
+            let should_be_interactive = if is_expanded || mouse_held {
+                true
+            } else if pet_mode_active {
+                let menu_open = PET_CONTEXT_MENU_OPEN.load(Ordering::SeqCst);
+                let pomodoro_active = PET_POMODORO_ACTIVE.load(Ordering::SeqCst);
+                if menu_open || pomodoro_active {
+                    true
+                } else {
+                    hit_test_mascot_window(&mini_win, cursor_logical, mini_custom, true)
+                }
+            } else {
+                // Coding mode:
+                if mini_custom.is_some() {
+                    hit_test_mascot_window(&mini_win, cursor_logical, mini_custom, false)
+                } else {
+                    // Codex pet or default: keep fully interactive!
+                    true
+                }
+            };
+
+            let want_ignore = !should_be_interactive;
+            if last_states.get("mini").copied() != Some(want_ignore) {
+                let _ = mini_win.set_ignore_cursor_events(want_ignore);
+                last_states.insert("mini".to_string(), want_ignore);
+            }
+        }
+
+        // 2. Extra / demo mascot windows
+        for (label, entry) in &registered_hitboxes {
+            if label == "mini" {
+                continue;
+            }
+            if let Some(extra_win) = app.get_webview_window(label) {
+                let scale = extra_win.scale_factor().unwrap_or(1.0);
+                let cursor_logical = cursor_phys.map(|(cx, cy)| (cx / scale, cy / scale));
+                let should_be_interactive = if mouse_held {
+                    true
+                } else {
+                    hit_test_mascot_window(&extra_win, cursor_logical, Some(*entry), false)
+                };
+                let want_ignore = !should_be_interactive;
+                if last_states.get(label).copied() != Some(want_ignore) {
+                    let _ = extra_win.set_ignore_cursor_events(want_ignore);
+                    last_states.insert(label.clone(), want_ignore);
+                }
+            }
+        }
+
+        // Clean up unmounted extra windows from last_states
+        last_states.retain(|label, was_ignoring| {
+            if label == "mini" {
+                return true;
+            }
+            let still_registered = registered_hitboxes.iter().any(|(l, _)| l == label);
+            if !still_registered {
+                if *was_ignoring {
+                    if let Some(w) = app.get_webview_window(label) {
+                        let _ = w.set_ignore_cursor_events(false);
+                    }
+                }
+                false
+            } else {
+                true
+            }
+        });
 
         std::thread::sleep(Duration::from_millis(20));
     }
+}
 
-    // Re-enable click events on exit so the window stays usable when leaving pet mode.
-    if let Some(win) = app.get_webview_window("mini") {
-        let _ = win.set_ignore_cursor_events(false);
+/// Unified macOS pass-through polling loop for all mascot windows (primary "mini" and extra/demo mascots).
+/// Single owner of setIgnoresMouseEvents on macOS, managing click-through for transparent canvas areas.
+#[cfg(target_os = "macos")]
+fn mascot_passthrough_poll_macos(app: tauri::AppHandle) {
+    use std::time::Duration;
+    let mut last_states: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+
+    loop {
+        let pet_mode_active = PET_PASSTHROUGH_ACTIVE.load(Ordering::SeqCst);
+        let registered_hitboxes: Vec<(String, MascotHitboxEntry)> = {
+            if let Ok(reg) = REGISTERED_MASCOT_HITBOXES.lock() {
+                reg.iter().map(|(k, v)| (k.clone(), *v)).collect()
+            } else {
+                Vec::new()
+            }
+        };
+
+        if !pet_mode_active && registered_hitboxes.is_empty() {
+            for (label, was_ignoring) in last_states.drain() {
+                if was_ignoring {
+                    set_window_ignores_mouse_events(&app, &label, false);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+
+        let mouse_held = (macos_pressed_mouse_buttons() & 1) != 0;
+        let cursor_cocoa = macos_cursor_position();
+
+        // 1. Primary "mini" window
+        if let Some(mini_win) = app.get_webview_window("mini") {
+            let is_expanded = MINI_IS_EXPANDED.load(Ordering::SeqCst);
+            let mini_custom = registered_hitboxes.iter().find(|(l, _)| l == "mini").map(|(_, e)| *e);
+            let should_be_interactive = if is_expanded || mouse_held {
+                true
+            } else if pet_mode_active {
+                let menu_open = PET_CONTEXT_MENU_OPEN.load(Ordering::SeqCst);
+                let pomodoro_active = PET_POMODORO_ACTIVE.load(Ordering::SeqCst);
+                if menu_open || pomodoro_active {
+                    true
+                } else {
+                    hit_test_mascot_window_macos(&mini_win, cursor_cocoa, mini_custom, true)
+                }
+            } else {
+                // Coding mode:
+                if mini_custom.is_some() {
+                    hit_test_mascot_window_macos(&mini_win, cursor_cocoa, mini_custom, false)
+                } else {
+                    // Codex pet or default: keep fully interactive!
+                    true
+                }
+            };
+
+            let want_ignore = !should_be_interactive;
+            if last_states.get("mini").copied() != Some(want_ignore) {
+                set_window_ignores_mouse_events(&app, "mini", want_ignore);
+                last_states.insert("mini".to_string(), want_ignore);
+            }
+        }
+
+        // 2. Extra / demo mascot windows
+        for (label, entry) in &registered_hitboxes {
+            if label == "mini" {
+                continue;
+            }
+            if let Some(extra_win) = app.get_webview_window(label) {
+                let should_be_interactive = if mouse_held {
+                    true
+                } else {
+                    hit_test_mascot_window_macos(&extra_win, cursor_cocoa, Some(*entry), false)
+                };
+                let want_ignore = !should_be_interactive;
+                if last_states.get(label).copied() != Some(want_ignore) {
+                    set_window_ignores_mouse_events(&app, label, want_ignore);
+                    last_states.insert(label.clone(), want_ignore);
+                }
+            }
+        }
+
+        // Clean up unmounted extra windows from last_states
+        last_states.retain(|label, was_ignoring| {
+            if label == "mini" {
+                return true;
+            }
+            let still_registered = registered_hitboxes.iter().any(|(l, _)| l == label);
+            if !still_registered {
+                if *was_ignoring {
+                    set_window_ignores_mouse_events(&app, label, false);
+                }
+                false
+            } else {
+                true
+            }
+        });
+
+        std::thread::sleep(Duration::from_millis(20));
     }
-    PET_PASSTHROUGH_THREAD_ALIVE.store(false, Ordering::SeqCst);
 }
 
 /// Resize the mini window to 3/4 of screen, centered, with normal window level.
@@ -22916,6 +23354,9 @@ pub fn run() {
             build_asset_response(&req, path.as_ref(), &file_path, cfg!(target_os = "windows"), "codexpet")
         })
         .setup(|app| {
+            // Start unified mascot pass-through arbiter daemon
+            ensure_mascot_passthrough_poll(app.handle().clone());
+
             // Fix PATH so openclaw (Node.js script) and node are both reachable
             fix_path();
 
@@ -23286,7 +23727,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_antigravity_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, resolve_codex_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, get_build_info, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, sync_mascot_bubble, ensure_mascot_bubble, set_mascot_bubble_visible, get_mascot_presentation_suppressed, trace_bubble_event, set_bubble_runtime_trace, get_bubble_runtime_trace, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs, fetch_petdex_manifest, download_codex_pet, delete_custom_codex_pet, get_hermes_remote_conversation, get_harness_quota])
+        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_antigravity_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, resolve_codex_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, get_build_info, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, sync_mascot_bubble, ensure_mascot_bubble, set_mascot_bubble_visible, get_mascot_presentation_suppressed, trace_bubble_event, set_bubble_runtime_trace, get_bubble_runtime_trace, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, set_pet_canvas_bounds, get_now_playing, get_system_idle_time, get_keyboard_idle_secs, fetch_petdex_manifest, download_codex_pet, delete_custom_codex_pet, get_hermes_remote_conversation, get_harness_quota])
         .manage(ActiveAgentPid { pid: Mutex::new(None) })
         .manage(ClaudeState {
             sessions: Arc::new(Mutex::new(HashMap::new())),

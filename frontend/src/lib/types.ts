@@ -148,6 +148,7 @@ export interface CharacterMeta {
   shyGifs?: string[]
   miniActions?: Record<string, string[]>
   largeActions?: Record<string, string>
+  largeTransparency?: 'native' | 'windows-chroma-key' | 'auto'
 }
 
 export interface AgentInfo {

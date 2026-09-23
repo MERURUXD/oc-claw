@@ -24,7 +24,7 @@ import {
   User,
   X,
 } from 'lucide-react'
-import { SpritePet } from './SpritePet'
+import { PetRenderer } from './PetRenderer'
 import {
   type CodexPet,
   type CodexPetState,
@@ -36,11 +36,12 @@ import {
   loadPetdexManifest,
   clearCodexPetCache,
 } from '../lib/codexPet'
+import { isCodexPet, getPetRenderMetrics, type PetAsset } from '../lib/petAsset'
 import { loadPetFavorites, savePetFavorites } from '../lib/petStore'
 
 interface PetGalleryProps {
   miniPetId: string | null
-  onEquip: (pet: CodexPet) => void
+  onEquip: (pet: PetAsset) => void
   onAddToQueue: (id: string) => void
   queueIds?: string[]
   onChangeQueue?: (next: string[]) => void
@@ -79,10 +80,10 @@ function petdexPetToCodexPet(p: PetdexPet): CodexPet {
   }
 }
 
-// Error boundary around each SpritePet preview so a single broken skin
+// Error boundary around each PetRenderer preview so a single broken skin
 // degrades to a placeholder instead of crashing the whole section.
 interface SpritePreviewProps {
-  pet: CodexPet
+  pet: PetAsset
   size: number
   state?: CodexPetState
   loop?: boolean
@@ -112,7 +113,7 @@ class SpritePreview extends Component<SpritePreviewProps, { failed: boolean }> {
         <div
           style={{
             width: this.props.size,
-            height: Math.round(this.props.size * (208 / 192)),
+            height: getPetRenderMetrics(this.props.pet, this.props.size).height,
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
@@ -127,7 +128,7 @@ class SpritePreview extends Component<SpritePreviewProps, { failed: boolean }> {
       )
     }
     return (
-      <SpritePet
+      <PetRenderer
         pet={this.props.pet}
         state={this.props.state ?? 'idle'}
         size={this.props.size}
@@ -146,7 +147,7 @@ interface LocalSource {
 
 type DetailItem =
   | { kind: 'market'; pet: PetdexPet }
-  | { kind: 'local'; pet: CodexPet; isBuiltin: boolean; source: LocalSource | null }
+  | { kind: 'local'; pet: PetAsset; isBuiltin: boolean; source: LocalSource | null }
 
 export function PetGallery({
   miniPetId,
@@ -174,8 +175,8 @@ export function PetGallery({
   const [downloading, setDownloading] = useState<Set<string>>(new Set())
 
   // Local skins + favorites
-  const [customs, setCustoms] = useState<CodexPet[]>([])
-  const [builtins, setBuiltins] = useState<CodexPet[]>([])
+  const [customs, setCustoms] = useState<PetAsset[]>([])
+  const [builtins, setBuiltins] = useState<PetAsset[]>([])
   const [favorites, setFavorites] = useState<string[]>([])
   const [detail, setDetail] = useState<DetailItem | null>(null)
   const [detailAnimState, setDetailAnimState] = useState<CodexPetState>('idle')
@@ -304,14 +305,20 @@ export function PetGallery({
   )
 
   const openLocalDetail = useCallback(
-    async (pet: CodexPet, isBuiltin: boolean) => {
+    async (pet: PetAsset, isBuiltin: boolean) => {
       setDetail({ kind: 'local', pet, isBuiltin, source: localSources[pet.id] ?? null })
       if (isBuiltin || localSources[pet.id] !== undefined) return
       let source: LocalSource | null = null
       try {
-        const srcUrl = pet.spritesheetUrl.replace(/\/[^/]*$/, '/source.json')
-        const res = await fetch(srcUrl)
-        if (res.ok) source = (await res.json()) as LocalSource
+        const srcUrl = isCodexPet(pet)
+          ? pet.spritesheetUrl.replace(/\/[^/]*$/, '/source.json')
+          : pet.baseDir
+            ? `${pet.baseDir}/source.json`
+            : ''
+        if (srcUrl) {
+          const res = await fetch(srcUrl)
+          if (res.ok) source = (await res.json()) as LocalSource
+        }
       } catch {
         source = null
       }

@@ -1,17 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { invoke } from '@tauri-apps/api/core'
 import { emit, listen } from '@tauri-apps/api/event'
 import { load } from '@tauri-apps/plugin-store'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { LogicalPosition, LogicalSize } from '@tauri-apps/api/dpi'
 import { Maximize2 } from 'lucide-react'
 import { MiniPetMascot, type MascotReaction } from './components/MiniPetMascot'
-import { loadCodexPetById, loadDefaultCodexPet, type CodexPet, type CodexPetState } from './lib/codexPet'
+import { loadCodexPetById, loadDefaultCodexPet, type CodexPetState } from './lib/codexPet'
+import { getPetAspectRatio, getPetRenderMetrics, isVideoPet, type PetAsset } from './lib/petAsset'
 
 const isWindowsPlatform =
   typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows')
 
 // Matches Mini.tsx: the collapsed small mascot's visual size is
-// round(MASCOT_BASE_SIZE * mascotScale) * largeMascotScale, driven by the
+// round(MASCOT_BASE_SIZE * mascotScale) * large_mascot_scale, driven by the
 // "Mascot Size" slider (large_mascot_scale). Mirror that here so extra mascots
 // scale together with the primary one.
 function computeMascotSize(mascotScale: number, largeMascotScale: number): number {
@@ -34,19 +36,19 @@ const MASCOT_RESIZE_CURSOR = 'nwse-resize'
 // defaults (mascot_scale 1 × large_mascot_scale 5).
 const DEFAULT_MASCOT_SIZE = computeMascotSize(1, 5)
 
-function clampLargeMascotScale(value: number): number {
-  if (!Number.isFinite(value)) return 5
-  return Math.min(LARGE_MASCOT_SCALE_MAX, Math.max(LARGE_MASCOT_SCALE_MIN, value))
+function clampLargeMascotScale(s: number): number {
+  if (!Number.isFinite(s)) return 5
+  return Math.min(LARGE_MASCOT_SCALE_MAX, Math.max(LARGE_MASCOT_SCALE_MIN, Math.round(s * 10) / 10))
 }
 
 // `functional` mascots (coding-mode multi-mascot feature) emit
 // `extra-mascot-activate` to the main mini window on a click (no drag) so the
 // main panel expands — making each extra mascot equivalent to the primary one.
 // Demo mascots leave `functional` false and stay decorative.
-export function DemoMascot({ functional = false }: { functional?: boolean }) {
-  const params = new URLSearchParams(window.location.hash.split('?')[1] ?? '')
-  const petIdFromUrl = params.get('pet') ?? ''
-  const [pet, setPet] = useState<CodexPet | null>(null)
+export function DemoMascot({ functional = false }: { functional?: boolean } = {}) {
+  const [pet, setPet] = useState<PetAsset | null>(null)
+  const petRef = useRef<PetAsset | null>(null)
+  petRef.current = pet
   const [working, setWorking] = useState(false)
   const [waiting, setWaiting] = useState(false)
   const [isReview, setIsReview] = useState(false)
@@ -63,21 +65,82 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
     })
   }, [])
   const [resizeHandleHovered, setResizeHandleHovered] = useState(false)
+  const [hitboxHovered, setHitboxHovered] = useState(false)
   const [size, setSize] = useState(DEFAULT_MASCOT_SIZE)
   const dragActiveRef = useRef(false)
   const baseSizeRef = useRef(MASCOT_BASE_SIZE)
   const largeScaleRef = useRef(5)
 
+  // Parse pet ID from query string or hash
+  const params = new URLSearchParams(typeof window !== 'undefined' ? (window.location.search || (window.location.hash.split('?')[1] ?? '')) : '')
+  const petIdFromUrl = params.get('pet') ?? ''
+
   useEffect(() => {
     let cancelled = false
-    ;(async () => {
-      const found = (petIdFromUrl ? await loadCodexPetById(petIdFromUrl) : null) ?? (await loadDefaultCodexPet())
-      if (!cancelled) setPet(found)
-    })()
+    const id = petIdFromUrl?.trim()
+    if (id) {
+      loadCodexPetById(id).then((p) => {
+        if (!cancelled && p) setPet(p)
+      }).catch(() => {})
+    } else {
+      loadDefaultCodexPet().then((p) => {
+        if (!cancelled && p) setPet(p)
+      }).catch(() => {})
+    }
     return () => {
       cancelled = true
     }
   }, [petIdFromUrl])
+
+  const syncMascotWindowLayout = useCallback((currentPet: PetAsset | null, newSize: number) => {
+    if (!currentPet || newSize <= 0) return
+    const win = getCurrentWebviewWindow()
+    const metrics = getPetRenderMetrics(currentPet, newSize)
+    if (isVideoPet(currentPet)) {
+      invoke('set_pet_canvas_bounds', {
+        windowLabel: win.label,
+        canvasW: metrics.canvas.width,
+        canvasH: metrics.canvas.height,
+        hitboxX: metrics.hitbox.left,
+        hitboxY: metrics.hitbox.top,
+        hitboxW: metrics.hitbox.width,
+        hitboxH: metrics.hitbox.height,
+        anchorMode: 'top-left',
+      }).catch(() => {})
+    } else {
+      win.setSize(new LogicalSize(metrics.canvas.width, metrics.canvas.height)).catch(() => {})
+    }
+  }, [])
+
+  // Sync window size with pet canvas bounds when pet loads or size changes.
+  // We explicitly DO NOT unregister in this effect's cleanup so that size changes (e.g. slider, drag)
+  // maintain body-anchor continuity in Rust's prev_entry registry.
+  useEffect(() => {
+    if (size > 0 && pet) {
+      syncMascotWindowLayout(pet, size)
+    }
+  }, [pet, size, syncMascotWindowLayout])
+
+  // Unregister canvas bounds ONLY when component unmounts or pet identity changes
+  const petId = pet?.id
+  const isVideo = pet ? isVideoPet(pet) : false
+  useEffect(() => {
+    return () => {
+      if (isVideo) {
+        const win = getCurrentWebviewWindow()
+        invoke('set_pet_canvas_bounds', {
+          windowLabel: win.label,
+          canvasW: null,
+          canvasH: null,
+          hitboxX: null,
+          hitboxY: null,
+          hitboxW: null,
+          hitboxH: null,
+          anchorMode: 'top-left',
+        }).catch(() => {})
+      }
+    }
+  }, [petId, isVideo])
 
   // Match the primary mascot's size. Read the persisted scale on mount and keep
   // in sync with live slider changes broadcast by the main window. The owning
@@ -89,10 +152,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
       if (cancelled || !Number.isFinite(next) || next <= 0) return
       setSize(next)
       largeScaleRef.current = clampLargeMascotScale(next / Math.max(1, baseSizeRef.current))
-      const win = getCurrentWebviewWindow()
-      const boxW = Math.ceil(next)
-      const boxH = Math.ceil(next * (208 / 192))
-      win.setSize(new LogicalSize(boxW, boxH)).catch(() => {})
+      syncMascotWindowLayout(petRef.current, next)
     }
     ;(async () => {
       try {
@@ -119,7 +179,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
       cancelled = true
       unlisten.then((fn) => fn())
     }
-  }, [])
+  }, [syncMascotWindowLayout])
 
   const handleResizePointerDown = useCallback((e: React.PointerEvent) => {
     if (e.button !== 0 || e.ctrlKey) return
@@ -129,7 +189,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
     const startY = e.screenY
     const startSize = size
     const baseSize = Math.max(1, baseSizeRef.current)
-    const aspect = 208 / 192
+    const aspect = getPetAspectRatio(petRef.current)
     const pid = e.pointerId
     let latestScale = largeScaleRef.current
     let rafId: number | null = null
@@ -140,8 +200,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
       largeScaleRef.current = clamped
       const nextSize = baseSize * clamped
       setSize(nextSize)
-      const win = getCurrentWebviewWindow()
-      win.setSize(new LogicalSize(Math.ceil(nextSize), Math.ceil(nextSize * aspect))).catch(() => {})
+      syncMascotWindowLayout(petRef.current, nextSize)
       emit('mascot-scale-change', { scale: clamped }).catch(() => {})
       emit('mascot-visual-size', { size: nextSize }).catch(() => {})
     }
@@ -388,29 +447,58 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
 
   if (!pet) return null
 
+  const metrics = getPetRenderMetrics(pet, size)
+
   return (
     <div
-      onPointerDown={handlePointerDown}
       style={{
         position: 'relative',
-        width: '100%',
-        height: '100%',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
+        width: metrics.canvas.width,
+        height: metrics.canvas.height,
         background: 'transparent',
-        cursor: 'grab',
+        pointerEvents: 'none',
+        userSelect: 'none',
       }}
     >
-      <MiniPetMascot
-        pet={pet}
-        baseState={baseState}
-        reaction={mascotReaction}
-        onReactionEnd={clearReaction}
-        size={size}
-        enableHoverJump
-        suppressHover={dragging}
+      <div
+        style={{
+          position: 'absolute',
+          inset: 0,
+          pointerEvents: 'none',
+        }}
+      >
+        <MiniPetMascot
+          pet={pet}
+          baseState={baseState}
+          reaction={mascotReaction}
+          onReactionEnd={clearReaction}
+          size={size}
+          layoutMode="canvas"
+          enableHoverJump
+          externalHover={hitboxHovered}
+          useExternalHover
+          suppressHover={dragging}
+        />
+      </div>
+
+      {/* Interactive hitbox overlay for character body */}
+      <div
+        onPointerDown={handlePointerDown}
+        onPointerEnter={() => setHitboxHovered(true)}
+        onPointerLeave={() => setHitboxHovered(false)}
+        style={{
+          position: 'absolute',
+          left: metrics.hitbox.left,
+          top: metrics.hitbox.top,
+          width: metrics.hitbox.width,
+          height: metrics.hitbox.height,
+          cursor: 'grab',
+          pointerEvents: 'auto',
+          background: 'transparent',
+          zIndex: 10,
+        }}
       />
+
       <div
         data-no-drag
         onPointerEnter={() => setResizeHandleHovered(true)}
@@ -418,8 +506,8 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
         onPointerDown={handleResizePointerDown}
         style={{
           position: 'absolute',
-          right: 0,
-          bottom: 0,
+          left: metrics.hitbox.left + metrics.hitbox.width - MASCOT_RESIZE_HANDLE_SIZE,
+          top: metrics.hitbox.top + metrics.hitbox.height - MASCOT_RESIZE_HANDLE_SIZE,
           width: MASCOT_RESIZE_HANDLE_SIZE,
           height: MASCOT_RESIZE_HANDLE_SIZE,
           cursor: MASCOT_RESIZE_CURSOR,
@@ -461,14 +549,15 @@ export function DemoMascot({ functional = false }: { functional?: boolean }) {
         <div
           style={{
             position: 'absolute',
-            bottom: 8,
-            right: 10,
+            left: metrics.hitbox.left + metrics.hitbox.width - 15,
+            top: metrics.hitbox.top + metrics.hitbox.height - 13,
             width: 5,
             height: 5,
             borderRadius: '50%',
             background: isReview ? '#c084fc' : waiting ? '#f59e0b' : working ? '#2ecc71' : '#777',
             border: '1.1px solid rgba(0,0,0,0.3)',
             pointerEvents: 'none',
+            zIndex: 11,
           }}
         />
       )}
