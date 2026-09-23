@@ -14,6 +14,7 @@ export interface BufferedVideoProps {
   onEnded?: (completedRequestId?: string | null) => void
   // Semantic one-shot owner. This is independent of the load/swap generation.
   oneShotRequestId?: string | null
+  onPlaybackProgress?: (requestId: string | null, currentTime: number, duration: number) => void
   onError?: (error: unknown) => void
   transparency?: VideoTransparencyMode
   chromaKeyOptions?: ChromaKeyOptions
@@ -51,6 +52,7 @@ export function BufferedVideo({
   onPlaying,
   onEnded,
   oneShotRequestId,
+  onPlaybackProgress,
   onError,
   transparency = 'native',
   chromaKeyOptions,
@@ -79,6 +81,8 @@ export function BufferedVideo({
   onPlayingRef.current = onPlaying
   const onEndedRef = useRef(onEnded)
   onEndedRef.current = onEnded
+  const onPlaybackProgressRef = useRef(onPlaybackProgress)
+  onPlaybackProgressRef.current = onPlaybackProgress
   const onErrorRef = useRef(onError)
   onErrorRef.current = onError
   const getAlternateSrcRef = useRef(getAlternateSrc)
@@ -362,6 +366,15 @@ export function BufferedVideo({
               if (isFront) {
                 onEndedRef.current?.(oneShotRequestIdByBufferRef.current[idx])
               }
+            }}
+            onTimeUpdate={(event) => {
+              if (activeBufferRef.current !== idx) return
+              const video = event.currentTarget
+              onPlaybackProgressRef.current?.(
+                oneShotRequestIdByBufferRef.current[idx],
+                video.currentTime,
+                Number.isFinite(video.duration) ? video.duration : 0,
+              )
             }}
             style={{
               position: 'absolute',

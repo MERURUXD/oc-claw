@@ -15,7 +15,7 @@ import { QuotaSideRail } from './components/QuotaCapsule'
 import { ChatList } from './components/ChatList'
 import { getStore, DEFAULT_CHAR, DEFAULT_CHAR_NAME, loadCharacters, loadOcConnections, saveOcConnections } from './lib/store'
 import type { AgentMetrics, BubbleSessionDetail, BubbleStyle, BubbleTransitionEvent, HarnessQuotaSummary, MascotBubblePayload, OcConnection, SubagentDetail } from './lib/types'
-import { createQuotaRecoveryStateMachine, computeResetCheckDelay, fetchHarnessQuota, subscribeHarnessQuota, type QuotaRecoveryStateMachine, type WindowRecord } from './lib/quotaRecovery'
+import { calculateRemainingPercent, createQuotaRecoveryStateMachine, computeResetCheckDelay, extractQuotaWindows, fetchHarnessQuota, subscribeHarnessQuota, type QuotaRecoveryStateMachine, type WindowRecord } from './lib/quotaRecovery'
 import { deriveSessionActivity, isSameBubblePayload } from './lib/sessionActivity'
 import {
   beginPanelUiTransition,
@@ -41,7 +41,7 @@ import {
   handleBubbleVisible,
 } from './lib/bubbleSuppression'
 import { traceBubbleEvent } from './lib/bubbleTrace'
-import { canExpandMascotPanel, canStartMascotPointerInteraction } from './lib/mascotInteraction'
+import { canExpandMascotPanel, canStartMascotPointerInteraction, classifyMascotPointerOutcome } from './lib/mascotInteraction'
 import { OnboardingModal } from './components/OnboardingModal'
 import { PetContextMenu, PomodoroOverlay } from './components/PetContextMenu'
 import {
@@ -68,6 +68,25 @@ import { MiniPetMascot, type MascotLifecycleState, type MascotReaction } from '.
 import { BufferedVideo } from './components/BufferedVideo'
 import { PetRenderer } from './components/PetRenderer'
 import { clearReactionIfCurrent } from './lib/videoPet'
+import {
+  advanceShenshenLifecyclePlayback,
+  advanceShenshenMovementPlayback,
+  createShenshenAnimationScheduler,
+  createShenshenQuotaBandTracker,
+  getShenshenCalendarContext,
+  getNextShenshenWalkDirection,
+  getShenshenQuotaBand,
+  isCurrentShenshenLifecycleRequest,
+  isShenshenTerminalReactionState,
+  resolveFreshShenshenQuota,
+  resolveShenshenLifecycleState,
+  inspectShenshenCandidates,
+  type ShenshenAnimationRequest,
+  type ShenshenIntent,
+  type ShenshenLifecyclePlaybackState,
+  type ShenshenMovementPlaybackState,
+  type ShenshenSelectionContext,
+} from './lib/shenshenAnimationScheduler'
 import { getPetAspectRatio, getPetRenderMetrics, isVideoPet, type PetAsset } from './lib/petAsset'
 import { canApplyCollapsedMascotGeometry, createLatestWinsSerialQueue, type LatestWinsSerialQueue } from './lib/miniPetGeometry'
 import { PetPicker } from './components/PetPicker'
@@ -737,10 +756,37 @@ export default function Mini() {
   const [petData, setPetData] = useState<PetData>(defaultPetData())
   const petDataRef = useRef<PetData>(defaultPetData())
   petDataRef.current = petData
+  const [shenshenAnimationRequest, setShenshenAnimationRequest] = useState<ShenshenAnimationRequest | null>(null)
+  const shenshenAnimationRequestRef = useRef<ShenshenAnimationRequest | null>(null)
+  const shenshenSchedulerRef = useRef<ReturnType<typeof createShenshenAnimationScheduler> | null>(null)
+  if (shenshenSchedulerRef.current == null) shenshenSchedulerRef.current = createShenshenAnimationScheduler()
+  const shenshenDebugClockRef = useRef<number | null>(null)
+  const shenshenQuotaBandTrackerRef = useRef(createShenshenQuotaBandTracker())
+  const shenshenQuotaSummariesRef = useRef(new Map<string, HarnessQuotaSummary>())
+  const shenshenAmbientSinceRef = useRef(0)
+  const shenshenLastAmbientAtRef = useRef(0)
+  const shenshenLastClickAtRef = useRef(0)
+  const shenshenWalkDirectionRef = useRef<-1 | 1>(-1)
+  const shenshenWalkDistanceFractionRef = useRef(0.5)
+  const shenshenWalkProgressRef = useRef<ShenshenMovementPlaybackState | null>(null)
+  const shenshenLifecycleProgressRef = useRef<ShenshenLifecyclePlaybackState | null>(null)
+  const shenshenWorkTurnIdRef = useRef(0)
+  const previousWorkTurnPetStateRef = useRef<PetState>('idle')
+  const effectiveShenshenAgentStateRef = useRef<PetState | 'success' | 'failure'>('idle')
+  const mainPetStateRef = useRef<PetState>('idle')
   const [currentPetAction, setCurrentPetAction] = useState<PetAction>('idle')
   const currentPetActionRef = useRef<PetAction>('idle')
   currentPetActionRef.current = currentPetAction
   const [walkFlipped, setWalkFlipped] = useState(false)
+  const faceMascotInDragDirection = useCallback((dx: number) => {
+    if (dx === 0) return
+    const direction: -1 | 1 = dx > 0 ? 1 : -1
+    updateWalkDir(direction)
+    if (miniPetRef.current?.id === 'shenshen') {
+      shenshenWalkDirectionRef.current = direction
+      setWalkFlipped(direction === 1)
+    }
+  }, [updateWalkDir])
   const walkTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const walkAutoRef = useRef(false)
   // When true, auto-walk heads straight to a screen edge (no flipping)
@@ -809,6 +855,7 @@ export default function Mini() {
   const [moveMode, _setMoveMode] = useState(false)
   const moveModeRef = useRef(false)
   const moveModeActivatedAtRef = useRef(0)
+  const shenshenWalkingToEdgeRef = useRef(false)
   const mascotDragActiveRef = useRef(false)
   // Mirror of mascotDragActiveRef for React-driven UI (e.g. suppressing the
   // sprite's hover-jump while dragging so walkDir → run-left/run-right
@@ -841,6 +888,215 @@ export default function Mini() {
     if (v) moveModeActivatedAtRef.current = Date.now()
     _setMoveMode(v)
   }
+
+  const setActiveShenshenRequest = useCallback((request: ShenshenAnimationRequest | null) => {
+    shenshenAnimationRequestRef.current = request
+    setShenshenAnimationRequest(request)
+  }, [])
+
+  const getShenshenSelectionContext = useCallback((
+    overrides: Partial<ShenshenSelectionContext> = {},
+    eventId?: string,
+  ): ShenshenSelectionContext => {
+    const nowMs = shenshenDebugClockRef.current ?? Date.now()
+    const calendar = getShenshenCalendarContext(nowMs)
+    const eventIds = eventId ? [eventId, ...(['spring', 'summer', 'autumn', 'winter'].includes(eventId) ? [`season:${eventId}`] : [])] : []
+    const inPetIdle = appModeRef.current !== 'pet' || currentPetActionRef.current === 'idle'
+    const appReady = appModeRef.current === 'coding' || appModeRef.current === 'pet'
+    const isFree = appReady && mainPetStateRef.current === 'idle' && inPetIdle && !expandedRef.current && !settingsModeRef.current
+    const affection = getAffectionTier(petDataRef.current.affection)
+    return {
+      ...calendar,
+      ...overrides,
+      nowMs: overrides.nowMs ?? nowMs,
+      activeEvents: [...new Set([...(calendar.activeEvents ?? []), ...eventIds, ...(overrides.activeEvents ?? [])])],
+      isFree: overrides.isFree ?? isFree,
+      visible: overrides.visible ?? (typeof document === 'undefined' || document.visibilityState === 'visible'),
+      isDragging: overrides.isDragging ?? (mascotIsDraggingRef.current || mascotDragActiveRef.current),
+      isMoving: overrides.isMoving ?? (walkDirRef.current !== 0 || moveModeRef.current),
+      interactionActive: overrides.interactionActive ?? (currentPetActionRef.current !== 'idle' || !!mascotReactionRef.current),
+      idleDurationMs: overrides.idleDurationMs ?? (shenshenAmbientSinceRef.current ? Date.now() - shenshenAmbientSinceRef.current : 0),
+      affectionTier: overrides.affectionTier ?? (affection === 'angry' || affection === 'shy' ? affection : 'friendly'),
+    }
+  }, [])
+
+  const requestShenshenAnimation = useCallback((
+    intent: ShenshenIntent,
+    overrides: Partial<ShenshenSelectionContext> = {},
+    options: { eventId?: string } = {},
+  ): ShenshenAnimationRequest | null => {
+    const pet = miniPetRef.current
+    if (!pet || !isVideoPet(pet) || pet.id !== 'shenshen') return null
+    const context = getShenshenSelectionContext(overrides, options.eventId)
+    if ((intent === 'festival' || intent === 'turn') && !context.isFree) return null
+    const selectionContext = intent === 'agent-state' && context.agentState === 'working'
+      ? {
+          ...context,
+          ...(() => {
+            const quota = resolveFreshShenshenQuota(
+              [...shenshenQuotaSummariesRef.current.values()],
+              context.nowMs,
+            )
+            return {
+              quotaBand: quota?.band,
+              quotaFresh: quota !== null,
+              workTurnId: shenshenWorkTurnIdRef.current,
+            }
+          })(),
+        }
+      : context
+    const request = shenshenSchedulerRef.current?.select(
+      intent,
+      selectionContext,
+      pet.baseDir ?? '/assets/builtin/shenshen',
+      options,
+    ) ?? null
+    if (request) {
+      setActiveShenshenRequest(request)
+      if (intent === 'ambient' || intent === 'festival') shenshenLastAmbientAtRef.current = Date.now()
+      if (intent === 'click') shenshenLastClickAtRef.current = Date.now()
+    }
+    return request
+  }, [getShenshenSelectionContext, setActiveShenshenRequest])
+
+  const forceShenshenAnimation = useCallback((animationId: string) => {
+    const pet = miniPetRef.current
+    if (!pet || !isVideoPet(pet) || pet.id !== 'shenshen') return null
+    const request = shenshenSchedulerRef.current?.force(
+      animationId,
+      getShenshenSelectionContext(),
+      pet.baseDir ?? '/assets/builtin/shenshen',
+    ) ?? null
+    if (request) setActiveShenshenRequest(request)
+    return request
+  }, [getShenshenSelectionContext, setActiveShenshenRequest])
+
+  const resumeShenshenLifecycleAnimation = useCallback((state: PetState | 'success' | 'failure') => {
+    if (
+      state === 'idle'
+      || appModeRef.current !== 'coding'
+      || miniPetRef.current?.id !== 'shenshen'
+      || document.visibilityState !== 'visible'
+      || mascotIsDraggingRef.current
+      || mascotDragActiveRef.current
+    ) return false
+    return requestShenshenAnimation('agent-state', { agentState: state }) !== null
+  }, [requestShenshenAnimation])
+
+  const handleShenshenAnimationEnd = useCallback((requestId: string) => {
+    const active = shenshenAnimationRequestRef.current
+    if (!active || active.id !== requestId) return
+    if (active.intent === 'agent-state') {
+      const state = effectiveShenshenAgentStateRef.current
+      if (!isCurrentShenshenLifecycleRequest(active, requestId, state)) return
+      if (isShenshenTerminalReactionState(state)) {
+        const reactionId = mascotReactionRef.current?.id
+        if (reactionId !== undefined) clearReaction(reactionId)
+        setActiveShenshenRequest(null)
+        return
+      }
+      if (resumeShenshenLifecycleAnimation(state)) return
+      setActiveShenshenRequest(null)
+      return
+    }
+    if (active.intent === 'pet-action' && appModeRef.current === 'pet' && active.entry.petActions.includes(currentPetActionRef.current)) {
+      if (active.entry.move) {
+        // Each walk clip is one segment. Alternate direction at its end, then
+        // let the scheduler choose a fresh movement clip for the next segment.
+        // Walk-to-edge keeps the selected heading until it reaches the edge.
+        shenshenWalkDirectionRef.current = getNextShenshenWalkDirection(
+          shenshenWalkDirectionRef.current,
+          shenshenWalkingToEdgeRef.current,
+        )
+      }
+      if (requestShenshenAnimation('pet-action', { petAction: currentPetActionRef.current })) return
+    }
+    if (resumeShenshenLifecycleAnimation(effectiveShenshenAgentStateRef.current)) return
+    setActiveShenshenRequest(null)
+  }, [clearReaction, requestShenshenAnimation, resumeShenshenLifecycleAnimation, setActiveShenshenRequest])
+
+  const handleShenshenPlaybackProgress = useCallback((requestId: string | null, currentTime: number, duration: number) => {
+    const active = shenshenAnimationRequestRef.current
+    if (!requestId || active?.id !== requestId) return
+    if (active.intent === 'agent-state') {
+      const state = effectiveShenshenAgentStateRef.current
+      if (
+        !isCurrentShenshenLifecycleRequest(active, requestId, state)
+        || state === 'idle'
+        || isShenshenTerminalReactionState(state)
+        || appModeRef.current !== 'coding'
+        || document.visibilityState !== 'visible'
+        || mascotIsDraggingRef.current
+        || mascotDragActiveRef.current
+      ) return
+      const step = advanceShenshenLifecyclePlayback(
+        shenshenLifecycleProgressRef.current,
+        requestId,
+        state,
+        currentTime,
+        Date.now(),
+        active.meta.loop,
+      )
+      shenshenLifecycleProgressRef.current = step.state
+      if (step.shouldRotate) resumeShenshenLifecycleAnimation(state)
+      return
+    }
+    if (!active.entry.move || !['walk', 'walkout'].includes(currentPetActionRef.current)) return
+    if (shenshenWalkProgressRef.current?.requestId !== requestId) {
+      shenshenWalkDistanceFractionRef.current = Math.random()
+    }
+    const direction = shenshenWalkDirectionRef.current
+    const visualWidth = Math.round(MASCOT_BASE_SIZE * mascotScaleRef.current) * largeMascotScaleRef.current
+    const step = advanceShenshenMovementPlayback(
+      shenshenWalkProgressRef.current,
+      requestId,
+      active.entry,
+      currentTime,
+      duration,
+      visualWidth,
+      direction,
+      shenshenWalkDistanceFractionRef.current,
+    )
+    shenshenWalkProgressRef.current = step.state
+    updateWalkDir(direction)
+    setWalkFlipped(direction === 1)
+    if (Math.abs(step.delta) >= 0.5) invoke('move_mini_by', { dx: Math.round(step.delta), dy: 0 }).catch(() => {})
+    // If a browser reports a loop despite this segment's one-shot playback
+    // override, retain the cycle offset and rotate immediately at the boundary.
+    if (step.looped) handleShenshenAnimationEnd(requestId)
+  }, [handleShenshenAnimationEnd, resumeShenshenLifecycleAnimation, updateWalkDir])
+
+  const trackMascotTap = useCallback((e: React.PointerEvent, onClick: () => void) => {
+    e.preventDefault()
+    const pid = e.pointerId
+    const startX = e.screenX
+    const startY = e.screenY
+    let wasDragging = false
+    const cleanup = () => {
+      if (wasDragging) setMascotIsDragging(false)
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onCancel)
+    }
+    const onMove = (ev: PointerEvent) => {
+      if (ev.pointerId !== pid || wasDragging) return
+      if (Math.abs(ev.screenX - startX) + Math.abs(ev.screenY - startY) >= 3) {
+        wasDragging = true
+        setMascotIsDragging(true)
+      }
+    }
+    const onCancel = (ev: PointerEvent) => {
+      if (ev.pointerId === pid) cleanup()
+    }
+    const onUp = (ev: PointerEvent) => {
+      if (ev.pointerId !== pid) return
+      cleanup()
+      if (classifyMascotPointerOutcome({ button: e.button, ctrlKey: e.ctrlKey, wasDragging }) === 'left-click') onClick()
+    }
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp, { once: true })
+    window.addEventListener('pointercancel', onCancel, { once: true })
+  }, [setMascotIsDragging])
 
   const { t, i18n } = useTranslation()
   const [updateModalOpen, setUpdateModalOpen] = useState(false)
@@ -1263,6 +1519,7 @@ export default function Mini() {
     const isToEdge = walkToEdgeRef.current
     walkAutoRef.current = false
     walkToEdgeRef.current = false
+    shenshenWalkingToEdgeRef.current = isToEdge
     let elapsed = 0
     let totalElapsed = 0
     let direction = -1
@@ -1289,6 +1546,7 @@ export default function Mini() {
         const distLeft = mascotLeft - monitorLeft
         const distRight = monitorRight - mascotRight
         edgeDirection = distLeft <= distRight ? -1 : 1
+        if (miniPetRef.current?.id === 'shenshen') shenshenWalkDirectionRef.current = edgeDirection as -1 | 1
         setWalkFlipped(edgeDirection === 1)
       }).catch(() => {})
     }
@@ -1301,7 +1559,7 @@ export default function Mini() {
         // Walk straight toward the edge without flipping
         const dir = (edgeDirection || -1) as -1 | 1
         updateWalkDir(dir)
-        invoke('move_mini_by', { dx: dir * WALK_SPEED, dy: 0 }).catch(() => {})
+        if (miniPetRef.current?.id !== 'shenshen') invoke('move_mini_by', { dx: dir * WALK_SPEED, dy: 0 }).catch(() => {})
       } else {
         // Normal oscillating walk
         if (isAuto && totalElapsed >= AUTO_WALK_DURATION) {
@@ -1314,13 +1572,16 @@ export default function Mini() {
           currentPetActionRef.current = next
           return
         }
-        if (elapsed >= FLIP_AFTER) {
+        if (miniPetRef.current?.id === 'shenshen') {
+          direction = shenshenWalkDirectionRef.current
+          setWalkFlipped(direction === 1)
+        } else if (elapsed >= FLIP_AFTER) {
           elapsed = 0
           direction *= -1
           setWalkFlipped(prev => !prev)
         }
         updateWalkDir(direction as -1 | 1)
-        invoke('move_mini_by', { dx: direction * WALK_SPEED, dy: 0 }).catch(() => {})
+        if (miniPetRef.current?.id !== 'shenshen') invoke('move_mini_by', { dx: direction * WALK_SPEED, dy: 0 }).catch(() => {})
       }
 
       // Check screen edge every ~300ms
@@ -1363,6 +1624,7 @@ export default function Mini() {
     }, WALK_INTERVAL)
     return () => {
       if (walkTimerRef.current) clearInterval(walkTimerRef.current)
+      shenshenWalkingToEdgeRef.current = false
       updateWalkDir(0)
     }
   }, [
@@ -1501,6 +1763,21 @@ export default function Mini() {
     setCurrentPetAction(action)
     currentPetActionRef.current = action
   }, [])
+
+  useEffect(() => {
+    if (miniPet?.id !== 'shenshen' || appMode !== 'pet') return
+    const active = shenshenAnimationRequestRef.current
+    if (active?.intent === 'click' && Date.now() - shenshenLastClickAtRef.current < 750) return
+    if (currentPetAction === 'idle') {
+      if (active?.intent === 'pet-action') setActiveShenshenRequest(null)
+      return
+    }
+    if (currentPetAction === 'peek') {
+      requestShenshenAnimation('turn')
+      return
+    }
+    requestShenshenAnimation('pet-action', { petAction: currentPetAction })
+  }, [miniPet?.id, appMode, currentPetAction, requestShenshenAnimation, setActiveShenshenRequest])
 
   // Check if the mascot is at a screen edge and switch to peek if so.
   // Snaps window to a fixed position so the character protrudes by a
@@ -3286,13 +3563,16 @@ export default function Mini() {
     }
   }, [])
 
-  // Coding-mode multi-mascot & status bubble: a tap on any extra mascot window
-  // or the status bubble broadcasts an activation event; mirror the primary
-  // mascot's click by expanding the main session panel. No-op in pet mode
-  // (no panel) or when already expanded.
+  // Extra mascot clicks preserve their existing activation behavior. A right-
+  // click carries `toggle: true` so Shenshen can open or collapse the panel.
   useEffect(() => {
-    const unlistenExtra = listen('extra-mascot-activate', () => {
+    const unlistenExtra = listen<{ toggle?: boolean }>('extra-mascot-activate', (event) => {
       if (appModeRef.current === 'pet') return
+      if (event.payload?.toggle) {
+        if (expandedRef.current) collapseFnRef.current?.()
+        else if (!expandingRef.current) void expandFnRef.current?.()
+        return
+      }
       if (expandedRef.current || expandingRef.current) return
       void expandFnRef.current?.()
     })
@@ -3745,7 +4025,34 @@ export default function Mini() {
 
   const handleMascotContextMenu = useCallback((e: React.MouseEvent) => {
     e.preventDefault()
-  }, [])
+    const isRightClick = e.button === 2 || (appModeRef.current === 'pet' && e.ctrlKey)
+    if (!isRightClick) return
+
+    if (appModeRef.current === 'pet') {
+      if (petContextMenuTransitionRef.current) return
+      if (petContextMenuOpenRef.current) {
+        void closePetContextMenu()
+        return
+      }
+      petContextMenuTransitionRef.current = true
+      invoke<number[]>('get_mini_monitor_rect').then(async (rect) => {
+        const [monitorX, , monitorW] = rect
+        const side = e.screenX < monitorX + monitorW / 2 ? 'right' : 'left'
+        setPetMenuSide(side)
+        setPetContextMenuOpen(true)
+        petContextMenuOpenRef.current = true
+        await invoke('set_pet_context_menu', { open: true, side }).catch(() => {})
+      }).catch(() => {}).finally(() => {
+        petContextMenuTransitionRef.current = false
+      })
+      return
+    }
+
+    if (appModeRef.current === 'coding' && miniPetRef.current?.id === 'shenshen') {
+      if (expandedRef.current) collapseFnRef.current?.()
+      else if (!expandingRef.current && !collapsingRef.current) expandFnRef.current?.()
+    }
+  }, [closePetContextMenu])
 
   const applyLargeMascotScale = useCallback(async (value: number, persist = true) => {
     const clamped = clampLargeMascotScale(value)
@@ -3890,35 +4197,12 @@ export default function Mini() {
       // against the resized panel frame. Conversely, expand() refuses to
       // start while this pointer interaction is active.
       if (!canStartMascotPointerInteraction(expandingRef.current)) return
-      // Pet mode: right-click / ctrl+click toggles context menu
+      // Right-click handling lives on contextmenu so pointerdown cannot open
+      // and close the pet menu twice for a single native gesture.
       const isRightClick = e.button === 2 || (e.button === 0 && e.ctrlKey)
-      if (isRightClick && appModeRef.current === 'pet' && largeMascotRef.current) {
+      if (isRightClick && appModeRef.current === 'pet') {
         e.preventDefault()
         e.stopPropagation()
-        if (petContextMenuTransitionRef.current) return
-        if (!petContextMenuOpenRef.current) {
-          petContextMenuTransitionRef.current = true
-          const winW = petBaseWinWRef.current ?? window.innerWidth ?? 300
-          const mascotW = MASCOT_BASE_SIZE * mascotScaleRef.current * largeMascotScaleRef.current
-          Promise.all([
-            invoke('get_mini_origin'),
-            invoke('get_mini_monitor_rect'),
-          ]).then(async ([pos, rect]) => {
-            const [x] = pos as [number, number]
-            const [monitorX, , monitorW] = rect as [number, number, number, number]
-            const monitorMid = monitorX + monitorW / 2
-            const mascotLeft = x + winW - mascotW
-            const side = mascotLeft < monitorMid ? 'right' : 'left'
-            setPetMenuSide(side)
-            setPetContextMenuOpen(true)
-            petContextMenuOpenRef.current = true
-            await invoke('set_pet_context_menu', { open: true, side }).catch(() => {})
-          }).catch(() => {}).finally(() => {
-            petContextMenuTransitionRef.current = false
-          })
-        } else {
-          void closePetContextMenu()
-        }
         return
       }
       // Coding mode collapsed mascot: drag to reposition, click (no movement)
@@ -3948,6 +4232,9 @@ export default function Mini() {
         // poll for translation + walk-dir + persistence.
         if (!isWindowsPlatform) {
           e.preventDefault()
+          if (miniPetRef.current?.id === 'shenshen') {
+            trackMascotTap(e, () => { requestShenshenAnimation('click') })
+          }
           return
         }
         // The window-focus auto-expand fires slightly before pointerdown
@@ -4023,10 +4310,12 @@ export default function Mini() {
           if (ev.pointerId !== pid) return
           cleanup()
           if (!dragging) {
-            // macOS opens the panel via notch hover (efficiency_hover_poll),
-            // so a tap on the mascot stays a no-op there. Windows has no
-            // notch detection, so a tap is the only way to open the panel.
-            if (isWindowsPlatform) {
+            const outcome = classifyMascotPointerOutcome({ button: e.button, ctrlKey: e.ctrlKey, wasDragging: false })
+            if (outcome === 'left-click' && miniPetRef.current?.id === 'shenshen') {
+              requestShenshenAnimation('click')
+            } else if (outcome === 'left-click' && isWindowsPlatform) {
+              // Windows has no notch-hover panel entry, so non-Shenshen pets
+              // keep their existing tap-to-open behavior.
               hoverExpandedRef.current = false
               setCompletionSessionId(null)
               expand()
@@ -4116,11 +4405,13 @@ export default function Mini() {
           lastX = ev.screenX
           lastY = ev.screenY
           if (dx !== 0 || dy !== 0) invoke('move_mini_by', { dx, dy })
+          if (dx !== 0) faceMascotInDragDirection(dx)
         }
 
         const cleanup = () => {
           setMascotDragActive(false)
           setMascotIsDragging(false)
+          updateWalkDir(0)
           if (largePetActionRef.current === 'grasp') {
             setLargePetAction(null)
             largePetActionRef.current = null
@@ -4172,12 +4463,19 @@ export default function Mini() {
                   playPetAudio('headpat')
                 }
               }
+              if (currentPetActionRef.current !== 'walkout' && miniPetRef.current?.id === 'shenshen') {
+                requestShenshenAnimation('click')
+              }
             } else if (isWindowsPlatform) {
-              // Coding mode: tap-to-open is Windows-only. macOS uses the
-              // notch-hover poll instead so the click stays a no-op.
-              hoverExpandedRef.current = false
-              setCompletionSessionId(null)
-              expand()
+              if (miniPetRef.current?.id === 'shenshen') {
+                requestShenshenAnimation('click')
+              } else {
+                // Coding mode: tap-to-open is Windows-only. macOS uses the
+                // notch-hover poll instead so other pets keep the old behavior.
+                hoverExpandedRef.current = false
+                setCompletionSessionId(null)
+                expand()
+              }
             }
           }
         }
@@ -4190,7 +4488,12 @@ export default function Mini() {
 
       // Normal mode (small mascot): click to expand (coding mode only)
       if (!isMoveMode) {
-        if (appModeRef.current === 'pet') return // no panel in pet mode
+        if (appModeRef.current === 'pet') {
+          if (miniPetRef.current?.id === 'shenshen') {
+            trackMascotTap(e, () => { requestShenshenAnimation('click') })
+          }
+          return // no panel in pet mode
+        }
         hoverExpandedRef.current = false
         setCompletionSessionId(null)
         expand()
@@ -4232,7 +4535,7 @@ export default function Mini() {
         lastY = ev.screenY
         if (dx !== 0 || dy !== 0) {
           invoke('move_mini_by', { dx, dy })
-          if (dx !== 0) updateWalkDir(dx > 0 ? 1 : -1)
+          if (dx !== 0) faceMascotInDragDirection(dx)
         }
       }
 
@@ -4283,7 +4586,7 @@ export default function Mini() {
       window.addEventListener('pointerup', onUp)
       window.addEventListener('pointercancel', onCancel)
     },
-    [expand, updateWalkDir, cancelFocusExpand, setMascotIsDragging],
+    [expand, updateWalkDir, faceMascotInDragDirection, cancelFocusExpand, setMascotIsDragging, trackMascotTap, requestShenshenAnimation],
   )
 
   const collapse = useCallback(async () => {
@@ -4940,9 +5243,33 @@ export default function Mini() {
       resetTimersRef.current.set(timerKey, timer)
     }
 
-    function onQuotaSummary(summary: HarnessQuotaSummary | null | undefined) {
-      if (!mounted || !summary) return
-      const event = quotaRecoveryRef.current.processQuotaSummary(summary)
+    function onQuotaSummary(
+      summary: HarnessQuotaSummary | null | undefined,
+      expectedHarness?: 'codex' | 'antigravity',
+    ) {
+      if (!mounted) return
+      if (!summary) {
+        if (expectedHarness) shenshenQuotaSummariesRef.current.delete(expectedHarness)
+        return
+      }
+      shenshenQuotaSummariesRef.current.set(summary.harness, summary)
+      const freshQuota = resolveFreshShenshenQuota([summary], Date.now())
+      const event = freshQuota ? quotaRecoveryRef.current.processQuotaSummary(summary) : null
+
+      const quotaWindows = extractQuotaWindows(summary)
+      if (summary.connected && freshQuota && quotaWindows.length > 0) {
+        const eventWindows = event
+          ? quotaWindows.filter((window) => event.recoveredWindows.includes(window.label))
+          : []
+        const currentWindows = eventWindows.length > 0 ? eventWindows : quotaWindows
+        const overallBand = getShenshenQuotaBand(Math.min(...quotaWindows.map((window) => calculateRemainingPercent(window.percent))))
+        const recoveredBand = event
+          ? getShenshenQuotaBand(Math.min(...currentWindows.map((window) => calculateRemainingPercent(window.percent))))
+          : undefined
+        const transition = shenshenQuotaBandTrackerRef.current.observe(summary.harness, overallBand, recoveredBand)
+        if (transition) requestShenshenAnimation(transition.intent, { quotaBand: transition.band })
+      }
+
       if (event) {
         void handleQuotaRecovered(event.harness, false)
       }
@@ -4971,17 +5298,17 @@ export default function Mini() {
       }
     }
 
-    const unsubCodex = subscribeHarnessQuota('codex', onQuotaSummary)
-    const unsubAntigravity = subscribeHarnessQuota('antigravity', onQuotaSummary)
+    const unsubCodex = subscribeHarnessQuota('codex', (summary) => onQuotaSummary(summary, 'codex'))
+    const unsubAntigravity = subscribeHarnessQuota('antigravity', (summary) => onQuotaSummary(summary, 'antigravity'))
 
     // Initial background fetch
-    fetchHarnessQuota('codex', false).then(onQuotaSummary).catch(() => {})
-    fetchHarnessQuota('antigravity', false).then(onQuotaSummary).catch(() => {})
+    fetchHarnessQuota('codex', false).then((summary) => onQuotaSummary(summary, 'codex')).catch(() => {})
+    fetchHarnessQuota('antigravity', false).then((summary) => onQuotaSummary(summary, 'antigravity')).catch(() => {})
 
     // Routine 5-minute background polling
     const pollInterval = setInterval(() => {
-      fetchHarnessQuota('codex', false).then(onQuotaSummary).catch(() => {})
-      fetchHarnessQuota('antigravity', false).then(onQuotaSummary).catch(() => {})
+      fetchHarnessQuota('codex', false).then((summary) => onQuotaSummary(summary, 'codex')).catch(() => {})
+      fetchHarnessQuota('antigravity', false).then((summary) => onQuotaSummary(summary, 'antigravity')).catch(() => {})
     }, 300_000)
 
     return () => {
@@ -4995,7 +5322,7 @@ export default function Mini() {
       resetTimers.clear()
       resetRetryState.clear()
     }
-  }, [handleQuotaRecovered])
+  }, [handleQuotaRecovered, requestShenshenAnimation])
 
   // Click outside to collapse (only when not pinned)
   useEffect(() => {
@@ -5180,8 +5507,136 @@ export default function Mini() {
   const claudeCompacting = visibleClaudeSessions.some((cs) => cs.status === 'compacting')
   const claudeWorking = visibleClaudeSessions.some((cs) => cs.status === 'processing' || cs.status === 'tool_running')
   const hasWorking = anySessionActive || Object.values(healthMap).some(Boolean) || claudeWorking || claudeCompacting || claudeWaiting || claudeReview
-  // Priority: review > waiting > compacting > working > idle
-  const mainPetState: PetState = claudeReview ? 'review' : claudeWaiting ? 'waiting' : claudeCompacting ? 'compacting' : hasWorking ? 'working' : 'idle'
+  const mainPetState: PetState = resolveShenshenLifecycleState({
+    review: claudeReview,
+    waiting: claudeWaiting,
+    compacting: claudeCompacting,
+    working: hasWorking,
+  })
+  const shenshenIsSelected = miniPet?.id === 'shenshen'
+  mainPetStateRef.current = mainPetState
+  if (previousWorkTurnPetStateRef.current === 'idle' && mainPetState !== 'idle') {
+    shenshenWorkTurnIdRef.current += 1
+  }
+  previousWorkTurnPetStateRef.current = mainPetState
+
+  const effectiveShenshenAgentState = mascotReaction?.state === 'waving'
+    ? 'success'
+    : mascotReaction?.state === 'failed'
+      ? 'failure'
+      : mainPetState
+  effectiveShenshenAgentStateRef.current = effectiveShenshenAgentState
+  useEffect(() => {
+    if (!shenshenIsSelected || appMode !== 'coding') {
+      if (shenshenAnimationRequestRef.current?.intent === 'agent-state') setActiveShenshenRequest(null)
+      return
+    }
+    if (effectiveShenshenAgentState === 'idle') {
+      if (shenshenAnimationRequestRef.current?.intent === 'agent-state') setActiveShenshenRequest(null)
+      return
+    }
+    const request = requestShenshenAnimation('agent-state', { agentState: effectiveShenshenAgentState })
+    if (!request && shenshenAnimationRequestRef.current?.intent === 'agent-state') setActiveShenshenRequest(null)
+  }, [shenshenIsSelected, appMode, effectiveShenshenAgentState, requestShenshenAnimation, setActiveShenshenRequest])
+
+  useEffect(() => {
+    if (!shenshenIsSelected) {
+      shenshenAmbientSinceRef.current = 0
+      if (shenshenAnimationRequestRef.current) setActiveShenshenRequest(null)
+      shenshenSchedulerRef.current?.clear()
+      return
+    }
+
+    const checkAmbient = () => {
+      const context = getShenshenSelectionContext()
+      const active = shenshenAnimationRequestRef.current
+      const canPlayAmbient = context.visible
+        && context.isFree
+        && !context.isDragging
+        && !context.isMoving
+        && !context.interactionActive
+        && (appModeRef.current === 'coding' || appModeRef.current === 'pet')
+      if (!canPlayAmbient) {
+        shenshenAmbientSinceRef.current = 0
+        if (active?.intent === 'ambient') setActiveShenshenRequest(null)
+        return
+      }
+
+      if (!shenshenAmbientSinceRef.current) shenshenAmbientSinceRef.current = Date.now()
+      const idleDurationMs = Date.now() - shenshenAmbientSinceRef.current
+      const hasHigherPriorityRequest = !!active && active.intent !== 'ambient'
+      if (
+        !hasHigherPriorityRequest
+        && active?.intent !== 'ambient'
+        && idleDurationMs >= 90_000
+        && Date.now() - shenshenLastAmbientAtRef.current >= 120_000
+      ) {
+        const calendarEvent = context.activeEvents?.find((eventId) => !eventId.startsWith('season:'))
+        const eventId = calendarEvent ?? context.season
+        const useFestivalPool = Math.random() < (calendarEvent ? 0.35 : 0.12)
+        if (useFestivalPool && eventId) requestShenshenAnimation('festival', { idleDurationMs }, { eventId })
+        else requestShenshenAnimation('ambient', { idleDurationMs })
+      }
+    }
+
+    const onVisibilityChange = () => checkAmbient()
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    const timer = setInterval(checkAmbient, 5_000)
+    checkAmbient()
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+      clearInterval(timer)
+    }
+  }, [shenshenIsSelected, getShenshenSelectionContext, requestShenshenAnimation, setActiveShenshenRequest])
+
+  useEffect(() => {
+    if (!import.meta.env.DEV || !shenshenIsSelected) return
+    type ShenshenDebugApi = {
+      forceAnimation: (id: string) => ShenshenAnimationRequest | null
+      forceIntent: (intent: ShenshenIntent, context?: Partial<ShenshenSelectionContext>, eventId?: string) => ShenshenAnimationRequest | null
+      forcePetAction: (action: PetAction) => ShenshenAnimationRequest | null
+      forceQuotaBand: (band: number) => ShenshenAnimationRequest | null
+      overrideClock: (value: string | number | null) => ShenshenSelectionContext
+      runAmbientNow: () => ShenshenAnimationRequest | null
+      inspect: (intent: ShenshenIntent, context?: Partial<ShenshenSelectionContext>, eventId?: string) => ReturnType<typeof inspectShenshenCandidates>
+      clear: () => void
+    }
+    const target = window as Window & { __ocClawShenshen?: ShenshenDebugApi }
+    target.__ocClawShenshen = {
+      forceAnimation: forceShenshenAnimation,
+      forceIntent: (intent, context = {}, eventId) => requestShenshenAnimation(intent, context, { eventId }),
+      forcePetAction: (action) => requestShenshenAnimation('pet-action', { petAction: action }),
+      forceQuotaBand: (band) => requestShenshenAnimation('quota-band', { quotaBand: Math.max(0, Math.min(5, Math.trunc(band))) }),
+      overrideClock: (value) => {
+        const parsed = value === null ? null : (typeof value === 'number' ? value : new Date(value).getTime())
+        shenshenDebugClockRef.current = parsed !== null && Number.isFinite(parsed) ? parsed : null
+        return getShenshenSelectionContext()
+      },
+      runAmbientNow: () => requestShenshenAnimation('ambient', {
+        visible: true,
+        isFree: true,
+        isDragging: false,
+        isMoving: false,
+        interactionActive: false,
+        idleDurationMs: 600_000,
+      }),
+      inspect: (intent, context = {}, eventId) => inspectShenshenCandidates(
+        intent,
+        getShenshenSelectionContext(context, eventId),
+        { eventId, lastPlayedAt: shenshenSchedulerRef.current?.getLastPlayedAt() },
+      ),
+      clear: () => {
+        shenshenDebugClockRef.current = null
+        shenshenSchedulerRef.current?.clear()
+        shenshenAmbientSinceRef.current = 0
+        shenshenLastAmbientAtRef.current = 0
+        setActiveShenshenRequest(null)
+      },
+    }
+    return () => {
+      delete target.__ocClawShenshen
+    }
+  }, [shenshenIsSelected, forceShenshenAnimation, getShenshenSelectionContext, requestShenshenAnimation, setActiveShenshenRequest])
   // Sprite resting state for the main mascot. Walking direction (set by
   // the walk timer) overrides the working/waiting/idle mapping so the pet
   // visibly runs left/right while the native window is moving.
@@ -5197,8 +5652,6 @@ export default function Mini() {
   // those polls. Emit on every change for low-latency mirroring, plus
   // a 2s periodic re-emit so a freshly-spawned demo window catches
   // the current state without waiting for the next change.
-  const mainPetStateRef = useRef<PetState>(mainPetState)
-  mainPetStateRef.current = mainPetState
   // Diagnostic (dev only): emit a backend log line whenever the mascot state
   // changes, including which claude sessions (and other inputs) are pinning
   // it. Helps pinpoint stuck-mascot bugs without opening webview DevTools.
@@ -5217,21 +5670,29 @@ export default function Mini() {
   }, [mainPetState, mainSpriteState, claudeReview, mascotReaction, hasWorking, anySessionActive, healthMap, claudeWorking, claudeWaiting, claudeCompacting, visibleClaudeSessions])
   useEffect(() => {
     if (appMode !== 'coding') return
+    const quota = resolveFreshShenshenQuota([...shenshenQuotaSummariesRef.current.values()], Date.now())
     emit('mini-pet-state', {
       state: mainPetState,
       baseState: mainSpriteState,
       reaction: mascotReaction?.state ?? null,
       reactionId: mascotReaction?.id ?? null,
+      quotaBand: quota?.band ?? null,
+      quotaUpdatedAtMs: quota?.updatedAtMs ?? null,
+      workTurnId: shenshenWorkTurnIdRef.current,
     }).catch(() => {})
   }, [mainPetState, mainSpriteState, mascotReaction, appMode])
   useEffect(() => {
     if (appMode !== 'coding') return
     const t = setInterval(() => {
+      const quota = resolveFreshShenshenQuota([...shenshenQuotaSummariesRef.current.values()], Date.now())
       emit('mini-pet-state', {
         state: mainPetStateRef.current,
         baseState: mainSpriteState,
         reaction: mascotReactionRef.current?.state ?? null,
         reactionId: mascotReactionRef.current?.id ?? null,
+        quotaBand: quota?.band ?? null,
+        quotaUpdatedAtMs: quota?.updatedAtMs ?? null,
+        workTurnId: shenshenWorkTurnIdRef.current,
       }).catch(() => {})
     }, 2000)
     return () => clearInterval(t)
@@ -5616,6 +6077,9 @@ export default function Mini() {
                   lifecycleState={mainPetState}
                   reaction={mascotReaction}
                   onReactionEnd={clearReaction}
+                  animationRequest={shenshenAnimationRequest}
+                  onAnimationRequestEnd={handleShenshenAnimationEnd}
+                  onPlaybackProgress={handleShenshenPlaybackProgress}
                   size={largeMascotVisualSize}
                   layoutMode="canvas"
                   enableHoverJump
@@ -5718,13 +6182,13 @@ export default function Mini() {
               />
             )}
             {/* Pet mode context menu: status bar above + buttons on left */}
-            {appMode === 'pet' && largeMascot && (
+            {appMode === 'pet' && (largeMascot || !!miniPet) && (
               <PetContextMenu
                 open={petContextMenuOpen}
                 petData={petData}
                 currentAction={currentPetAction}
                 pomodoro={pomodoro}
-                mascotSize={largeMascotVisualSize}
+                mascotSize={largeMascot ? largeMascotVisualSize : collapsedMascotSize}
                 side={petMenuSide}
                 onClose={closePetContextMenu}
                 onUpdatePetData={handleUpdatePetData}
@@ -5750,6 +6214,10 @@ export default function Mini() {
                 }}
                 onFoodRain={triggerFoodRain}
                 onPlayAudio={playPetAudio}
+                showShenshenEvents={miniPet?.id === 'shenshen'}
+                onPlayShenshenEvent={(eventId) => {
+                  requestShenshenAnimation('festival', {}, { eventId })
+                }}
                 onQuit={() => {
                   closePetContextMenu()
                   handleSetPetAction('farewell')

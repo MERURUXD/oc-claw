@@ -219,7 +219,12 @@ export function mapSemanticStateToVideoCandidates(state: string): string[] {
 export function resolveSemanticVideoAnimation(
   pet: VideoPet,
   state: string,
+  animationOverride?: VideoPetAnimationMeta | null,
 ): { key: string; meta: VideoPetAnimationMeta } | null {
+  if (animationOverride?.src) {
+    return { key: state, meta: animationOverride }
+  }
+
   for (const key of mapSemanticStateToVideoCandidates(state)) {
     const entry = pet.animations[key]
     if (!entry) continue
@@ -285,8 +290,38 @@ export function resolveVideoPetPresentationState(input: {
   reactionState: string | null
   isJumping: boolean
   lifecycleState: string
+  animationRequest?: { id: string; priority: number } | null
 }): string {
   if (input.isDragging) return 'dragging'
+
+  const lifecyclePriority: Record<string, number> = {
+    idle: 0,
+    turn: 10,
+    ambient: 20,
+    working: 30,
+    running: 30,
+    work: 30,
+    compacting: 40,
+    waiting: 50,
+    question: 50,
+    review: 60,
+    'agent-review': 60,
+    success: 70,
+    failed: 70,
+    movement: 80,
+    'run-left': 80,
+    'run-right': 80,
+  }
+  const currentPriority = Math.max(
+    lifecyclePriority[input.lifecycleState] ?? 0,
+    input.movementState ? lifecyclePriority[input.movementState] ?? 80 : 0,
+    input.reactionState ? lifecyclePriority[input.reactionState] ?? 70 : 0,
+    input.isJumping ? 25 : 0,
+  )
+  if (input.animationRequest && input.animationRequest.priority > currentPriority) {
+    return `catalog:${input.animationRequest.id}`
+  }
+
   if (input.movementState) return input.movementState
   if (input.reactionState) return input.reactionState
   if (input.isJumping) return 'jumping'

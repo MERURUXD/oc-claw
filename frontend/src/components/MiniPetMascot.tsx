@@ -3,6 +3,7 @@ import { PetRenderer } from './PetRenderer'
 import { ANIMATION_ROWS, fpsFor } from '../lib/codexPet'
 import type { CodexPetState } from '../lib/codexPet'
 import { isCodexPet, type PetAsset } from '../lib/petAsset'
+import type { ShenshenAnimationRequest } from '../lib/shenshenAnimationScheduler'
 import {
   getVideoReactionIdToConsume,
   isCurrentOneShotRequest,
@@ -32,6 +33,9 @@ interface MiniPetMascotProps {
   reaction?: MascotReaction | null
   // Fired when the one-shot reaction reaches its last frame so the parent can clear it.
   onReactionEnd?: (reactionId: number) => void
+  animationRequest?: ShenshenAnimationRequest | null
+  onAnimationRequestEnd?: (requestId: string) => void
+  onPlaybackProgress?: (requestId: string | null, currentTime: number, duration: number) => void
   // When true, the wrapper plays a one-shot jump while hovered, then waits
   // before triggering the next jump.
   enableHoverJump?: boolean
@@ -67,6 +71,7 @@ const JUMP_REST_MS = 400
 type VideoOneShotRequest =
   | { id: string; kind: 'reaction'; reactionId: number }
   | { id: string; kind: 'jump' }
+  | { id: string; kind: 'catalog'; animationRequestId: string }
 
 export function MiniPetMascot({
   pet,
@@ -75,6 +80,9 @@ export function MiniPetMascot({
   size,
   reaction = null,
   onReactionEnd,
+  animationRequest = null,
+  onAnimationRequestEnd,
+  onPlaybackProgress,
   enableHoverJump = false,
   externalHover = false,
   useExternalHover = false,
@@ -96,9 +104,13 @@ export function MiniPetMascot({
   const isDraggingRef = useRef(isDragging)
   const restTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const onReactionEndRef = useRef(onReactionEnd)
+  const onAnimationRequestEndRef = useRef(onAnimationRequestEnd)
   useLayoutEffect(() => {
     onReactionEndRef.current = onReactionEnd
   }, [onReactionEnd])
+  useLayoutEffect(() => {
+    onAnimationRequestEndRef.current = onAnimationRequestEnd
+  }, [onAnimationRequestEnd])
 
   const isVideo = !isCodexPet(pet)
   const isMovement = baseState === 'run-left' || baseState === 'run-right'
@@ -167,19 +179,36 @@ export function MiniPetMascot({
     }, JUMP_REST_MS)
   }, [])
 
+  const videoLifecycleState = lifecycleState === 'review'
+    ? 'agent-review'
+    : lifecycleState ?? baseState
+  const videoState = resolveVideoPetPresentationState({
+    isDragging,
+    movementState: isMovement ? baseState : null,
+    reactionState: videoReactionActive && reaction
+      ? reaction.state === 'waving' ? 'success' : 'failed'
+      : null,
+    isJumping: showJump,
+    lifecycleState: videoLifecycleState,
+    animationRequest: animationRequest ? { id: animationRequest.id, priority: animationRequest.priority } : null,
+  })
+  const catalogRequestActive = isVideo && !!animationRequest && videoState === `catalog:${animationRequest.id}`
+
   const videoOneShotRequest: VideoOneShotRequest | null = useMemo(
-    () => videoReactionActive && reaction
-      ? { id: `reaction:${reaction.id}`, kind: 'reaction', reactionId: reaction.id }
-      : isVideo && !isDragging && showJump
-        ? { id: `jump:${jumpKey}`, kind: 'jump' }
-        : null,
-    [videoReactionActive, reaction, showJump, jumpKey, isVideo, isDragging],
+    () => catalogRequestActive && animationRequest
+      ? { id: animationRequest.id, kind: 'catalog', animationRequestId: animationRequest.id }
+      : videoReactionActive && reaction
+        ? { id: `reaction:${reaction.id}`, kind: 'reaction', reactionId: reaction.id }
+        : isVideo && !isDragging && showJump
+          ? { id: `jump:${jumpKey}`, kind: 'jump' }
+          : null,
+    [catalogRequestActive, animationRequest, videoReactionActive, reaction, showJump, jumpKey, isVideo, isDragging],
   )
   const currentVideoRequestRef = useRef<VideoOneShotRequest | null>(null)
   const videoOneShotRequestId = videoOneShotRequest?.id ?? null
   useLayoutEffect(() => {
     currentVideoRequestRef.current = videoOneShotRequest
-  }, [videoOneShotRequest, videoOneShotRequestId, reaction?.id])
+  }, [videoOneShotRequest, videoOneShotRequestId, reaction?.id, animationRequest?.id])
 
   const handleVideoOneShotEnd = useCallback((completedRequestId?: string | null) => {
     const currentRequest = currentVideoRequestRef.current
@@ -190,10 +219,19 @@ export function MiniPetMascot({
 
     if (currentRequest.kind === 'reaction') {
       onReactionEndRef.current?.(currentRequest.reactionId)
+    } else if (currentRequest.kind === 'catalog') {
+      onAnimationRequestEndRef.current?.(currentRequest.animationRequestId)
     } else {
       handleJumpEnd()
     }
   }, [handleJumpEnd])
+
+  useEffect(() => {
+    if (!catalogRequestActive || !animationRequest || animationRequest.meta.loop) return
+    const requestId = animationRequest.id
+    const fallback = setTimeout(() => handleVideoOneShotEnd(requestId), 15_250)
+    return () => clearTimeout(fallback)
+  }, [catalogRequestActive, animationRequest, handleVideoOneShotEnd])
 
   // Safety net for jumping: if PetRenderer's onOneShotEnd somehow doesn't fire (e.g.
   // tab throttling), schedule the rest cycle by the animation's nominal
@@ -222,6 +260,7 @@ export function MiniPetMascot({
   // ensure we clear the reaction after nominal duration + buffer.
   useEffect(() => {
     if (!isReactionActive || !reaction) return
+    if (catalogRequestActive && animationRequest && animationRequest.priority > 70) return
     if (isVideo && videoOneShotRequest?.kind !== 'reaction') {
       const interruptedId = getVideoReactionIdToConsume(
         isVideo,
@@ -240,10 +279,11 @@ export function MiniPetMascot({
       else handleReactionEnd()
     }, expected + 250)
     return () => clearTimeout(fallback)
-  }, [isReactionActive, reaction, handleReactionEnd, handleVideoOneShotEnd, isVideo, isDragging, interruptedReactionId, pet, videoOneShotRequest?.kind, videoOneShotRequestId])
+  }, [isReactionActive, reaction, handleReactionEnd, handleVideoOneShotEnd, isVideo, isDragging, interruptedReactionId, pet, videoOneShotRequest?.kind, videoOneShotRequestId, catalogRequestActive, animationRequest])
 
-  // Unified priority:
-  // movement > failed > waving > review > jumping > baseState
+  // Unified sprite priority:
+  // movement > failed > waving > review > jumping > baseState.
+  // VideoPet catalog overrides use the lifecycle priority resolver above.
   const renderState: CodexPetState = isMovement
     ? baseState
     : reaction?.state === 'failed'
@@ -289,18 +329,10 @@ export function MiniPetMascot({
         ? handleReactionEnd
         : undefined
 
-  const videoLifecycleState = lifecycleState === 'review'
-    ? 'agent-review'
-    : lifecycleState ?? baseState
-  const videoState = resolveVideoPetPresentationState({
-    isDragging,
-    movementState: isMovement ? baseState : null,
-    reactionState: videoReactionActive && reaction
-      ? reaction.state === 'waving' ? 'success' : 'failed'
-      : null,
-    isJumping: showJump,
-    lifecycleState: videoLifecycleState,
-  })
+  const videoAnimationOverride = catalogRequestActive ? animationRequest?.meta ?? null : null
+  // Catalog playback replaces the semantic state with its request ID, so
+  // preserve left/right movement facing explicitly during video rendering.
+  const movementFlipHorizontal = isMovement ? baseState === 'run-right' : undefined
 
   return (
     <div
@@ -314,9 +346,12 @@ export function MiniPetMascot({
         pet={pet}
         state={isVideo ? videoState : renderState}
         size={size}
+        flipHorizontal={movementFlipHorizontal}
         replayToken={replayToken}
         onOneShotEnd={onOneShotEnd}
         oneShotRequestId={videoOneShotRequestId}
+        animationOverride={videoAnimationOverride}
+        onPlaybackProgress={onPlaybackProgress}
         layoutMode={layoutMode}
       />
     </div>

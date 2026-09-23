@@ -5,6 +5,7 @@ import { SpritePet } from './SpritePet'
 import { VideoPetRenderer } from './VideoPetRenderer'
 import type { CodexPetState } from '../lib/codexPet'
 import type { VideoTransparencyMode, ChromaKeyOptions } from './BufferedVideo'
+import type { VideoPetAnimationMeta } from '../lib/videoPet'
 
 export interface PetRendererProps {
   pet: PetAsset
@@ -12,6 +13,8 @@ export interface PetRendererProps {
   size: number
   onOneShotEnd?: (completedRequestId?: string | null) => void
   oneShotRequestId?: string | null
+  animationOverride?: VideoPetAnimationMeta | null
+  onPlaybackProgress?: (requestId: string | null, currentTime: number, duration: number) => void
   loop?: boolean
   flipHorizontal?: boolean
   replayToken?: number | string
@@ -32,6 +35,8 @@ export function PetRenderer({
   size,
   onOneShotEnd,
   oneShotRequestId,
+  animationOverride,
+  onPlaybackProgress,
   loop,
   flipHorizontal,
   replayToken,
@@ -49,6 +54,8 @@ export function PetRenderer({
         size={size}
         onOneShotEnd={onOneShotEnd}
         oneShotRequestId={oneShotRequestId}
+        animationOverride={animationOverride}
+        onPlaybackProgress={onPlaybackProgress}
         loop={loop}
         flipHorizontal={flipHorizontal}
         replayToken={replayToken}

@@ -20,6 +20,8 @@ export interface VideoPetRendererProps {
   onOneShotEnd?: (completedRequestId?: string | null) => void
   // Semantic one-shot identity, separate from BufferedVideo's media-load generation.
   oneShotRequestId?: string | null
+  animationOverride?: VideoPetAnimationMeta | null
+  onPlaybackProgress?: (requestId: string | null, currentTime: number, duration: number) => void
   // Loop override. When true, treats even one-shot clips as looping (e.g. during continuous hover).
   loop?: boolean
   playbackRate?: number
@@ -47,6 +49,8 @@ export function VideoPetRenderer({
   size,
   onOneShotEnd,
   oneShotRequestId,
+  animationOverride,
+  onPlaybackProgress,
   loop,
   flipHorizontal,
   transparency,
@@ -61,7 +65,7 @@ export function VideoPetRenderer({
   const geo = computeVideoPetGeometry(pet.canvas, size)
 
   // Resolve best matching animation
-  const resolvedAnimation = resolveSemanticVideoAnimation(pet, state)
+  const resolvedAnimation = resolveSemanticVideoAnimation(pet, state, animationOverride)
   const animKey = resolvedAnimation?.key ?? 'idle'
   const animMeta: VideoPetAnimationMeta | null = resolvedAnimation?.meta ?? null
 
@@ -112,6 +116,7 @@ export function VideoPetRenderer({
           playbackRate={effectivePlaybackRate}
           replayToken={replayToken}
           oneShotRequestId={oneShotRequestId}
+          onPlaybackProgress={onPlaybackProgress}
           onEnded={isLooping ? undefined : onOneShotEnd}
           transparency={transparency ?? pet.transparency ?? 'native'}
           chromaKeyOptions={chromaKeyOptions ?? pet.chromaKeyOptions}
