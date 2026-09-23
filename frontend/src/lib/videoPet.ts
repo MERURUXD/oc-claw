@@ -150,11 +150,12 @@ export function computeVideoPetGeometry(
   const bodyWidth = Math.round(visualSize)
   const bodyHeight = Math.round(visualSize * (bodyH / bodyW))
 
-  const canvasWidth = Math.round(canvas.width * scale)
-  const canvasHeight = Math.round(canvas.height * scale)
-
   const hitboxLeft = Math.round(canvas.bodyBox[0] * scale) || 0
   const hitboxTop = Math.round(canvas.bodyBox[1] * scale) || 0
+  // Round the canvas outward when independently rounded body bounds would
+  // otherwise extend one pixel beyond it (for example 22 + 215 > 236).
+  const canvasWidth = Math.max(Math.round(canvas.width * scale), hitboxLeft + bodyWidth)
+  const canvasHeight = Math.max(Math.round(canvas.height * scale), hitboxTop + bodyHeight)
 
   const canvasLeft = -hitboxLeft || 0
   const canvasTop = -hitboxTop || 0
