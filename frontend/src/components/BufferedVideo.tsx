@@ -11,7 +11,9 @@ export interface BufferedVideoProps {
   playbackRate?: number
   replayToken?: number | string
   onPlaying?: () => void
-  onEnded?: () => void
+  onEnded?: (completedRequestId?: string | null) => void
+  // Semantic one-shot owner. This is independent of the load/swap generation.
+  oneShotRequestId?: string | null
   onError?: (error: unknown) => void
   transparency?: VideoTransparencyMode
   chromaKeyOptions?: ChromaKeyOptions
@@ -48,6 +50,7 @@ export function BufferedVideo({
   replayToken,
   onPlaying,
   onEnded,
+  oneShotRequestId,
   onError,
   transparency = 'native',
   chromaKeyOptions,
@@ -68,6 +71,8 @@ export function BufferedVideo({
   const [activeBuffer, setActiveBuffer] = useState<0 | 1>(0)
   const prevSrcRef = useRef<string | undefined>(undefined)
   const prevReplayTokenRef = useRef<number | string | undefined>(undefined)
+  const prevOneShotRequestIdRef = useRef<string | null | undefined>(undefined)
+  const oneShotRequestIdByBufferRef = useRef<[string | null, string | null]>([null, null])
   const generationRef = useRef(0)
 
   const onPlayingRef = useRef(onPlaying)
@@ -98,6 +103,8 @@ export function BufferedVideo({
     if (!src) {
       prevSrcRef.current = undefined
       prevReplayTokenRef.current = undefined
+      prevOneShotRequestIdRef.current = undefined
+      oneShotRequestIdByBufferRef.current = [null, null]
       return
     }
 
@@ -109,6 +116,7 @@ export function BufferedVideo({
     if (!front || !back) {
       prevSrcRef.current = undefined
       prevReplayTokenRef.current = undefined
+      prevOneShotRequestIdRef.current = undefined
       return
     }
 
@@ -117,15 +125,21 @@ export function BufferedVideo({
       replayToken !== undefined &&
       prevReplayTokenRef.current !== undefined &&
       prevReplayTokenRef.current !== replayToken
+    const normalizedRequestId = oneShotRequestId ?? null
+    const isRequestChange =
+      prevOneShotRequestIdRef.current !== undefined &&
+      prevOneShotRequestIdRef.current !== normalizedRequestId
 
-    if (!isSrcChange && !isReplayChange) {
+    if (!isSrcChange && !isReplayChange && !isRequestChange) {
       prevReplayTokenRef.current = replayToken
+      prevOneShotRequestIdRef.current = normalizedRequestId
       return
     }
 
     const isFirstLoad = prevSrcRef.current === undefined
     prevSrcRef.current = src
     prevReplayTokenRef.current = replayToken
+    prevOneShotRequestIdRef.current = normalizedRequestId
     const generation = ++generationRef.current
 
     let cancelled = false
@@ -199,6 +213,7 @@ export function BufferedVideo({
     }
 
     if (isFirstLoad) {
+      oneShotRequestIdByBufferRef.current[frontIdx] = normalizedRequestId
       loadWithFallback(
         front,
         src,
@@ -221,6 +236,7 @@ export function BufferedVideo({
     }
 
     // Preload next animation on the hidden back buffer and swap only when playing
+    oneShotRequestIdByBufferRef.current[backIdx] = normalizedRequestId
     loadWithFallback(
       back,
       src,
@@ -237,7 +253,7 @@ export function BufferedVideo({
       cancelled = true
       clearListeners()
     }
-  }, [src, replayToken])
+  }, [src, replayToken, oneShotRequestId])
 
   // Update playbackRate on existing video elements if changed mid-playback
   useEffect(() => {
@@ -344,7 +360,7 @@ export function BufferedVideo({
             }}
             onEnded={() => {
               if (isFront) {
-                onEndedRef.current?.()
+                onEndedRef.current?.(oneShotRequestIdByBufferRef.current[idx])
               }
             }}
             style={{

@@ -4479,6 +4479,7 @@ fn efficiency_hover_poll(app: tauri::AppHandle) {
                         // Drag finished. Clear anchor + walk dir and notify
                         // the frontend so it can persist the new origin.
                         drag_active = false;
+                        let _ = app.emit("mini-mascot-drag-state", false);
                         if let Ok(mut a) = drag_anchor().lock() {
                             *a = None;
                         }
@@ -4490,6 +4491,7 @@ fn efficiency_hover_poll(app: tauri::AppHandle) {
                     }
                 } else if over_mascot && left_pressed && !was_pressed {
                     drag_active = true;
+                    let _ = app.emit("mini-mascot-drag-state", true);
                     last_cursor = cursor;
                     // Capture the cursor-to-origin offset at drag start so
                     // the main-thread task can place the window absolutely
@@ -4509,6 +4511,7 @@ fn efficiency_hover_poll(app: tauri::AppHandle) {
                 }
             } else if drag_active {
                 drag_active = false;
+                let _ = app.emit("mini-mascot-drag-state", false);
                 if let Ok(mut a) = drag_anchor().lock() {
                     *a = None;
                 }

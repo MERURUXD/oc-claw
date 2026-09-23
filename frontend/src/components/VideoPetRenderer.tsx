@@ -3,8 +3,7 @@ import { BufferedVideo, type ChromaKeyOptions, type VideoTransparencyMode } from
 import {
   computeVideoPetGeometry,
   isMirrorForbidden,
-  mapSemanticStateToVideoCandidates,
-  normalizeVideoAnimation,
+  resolveSemanticVideoAnimation,
   type VideoPet,
   type VideoPetAnimationMeta,
 } from '../lib/videoPet'
@@ -18,7 +17,9 @@ export interface VideoPetRendererProps {
   // Manual horizontal flip override (e.g. facing right)
   flipHorizontal?: boolean
   // Fired when a one-shot animation finishes playing
-  onOneShotEnd?: () => void
+  onOneShotEnd?: (completedRequestId?: string | null) => void
+  // Semantic one-shot identity, separate from BufferedVideo's media-load generation.
+  oneShotRequestId?: string | null
   // Loop override. When true, treats even one-shot clips as looping (e.g. during continuous hover).
   loop?: boolean
   playbackRate?: number
@@ -30,29 +31,6 @@ export interface VideoPetRendererProps {
   layoutMode?: 'body' | 'canvas'
   className?: string
   style?: React.CSSProperties
-}
-
-function resolveVideoPetAnimation(
-  pet: VideoPet,
-  state: string,
-): { animKey: string; animMeta: VideoPetAnimationMeta | null } {
-  const candidates = mapSemanticStateToVideoCandidates(state)
-  for (const key of candidates) {
-    const direct = pet.animations[key]
-    if (direct) {
-      const meta = normalizeVideoAnimation(direct)
-      if (meta) return { animKey: key, animMeta: meta }
-    }
-  }
-
-  // Fallback to first available animation
-  const firstKey = Object.keys(pet.animations)[0]
-  if (firstKey && pet.animations[firstKey]) {
-    const meta = normalizeVideoAnimation(pet.animations[firstKey])
-    if (meta) return { animKey: firstKey, animMeta: meta }
-  }
-
-  return { animKey: 'idle', animMeta: null }
 }
 
 /**
@@ -68,6 +46,7 @@ export function VideoPetRenderer({
   state = 'idle',
   size,
   onOneShotEnd,
+  oneShotRequestId,
   loop,
   flipHorizontal,
   transparency,
@@ -82,7 +61,9 @@ export function VideoPetRenderer({
   const geo = computeVideoPetGeometry(pet.canvas, size)
 
   // Resolve best matching animation
-  const { animKey, animMeta } = resolveVideoPetAnimation(pet, state)
+  const resolvedAnimation = resolveSemanticVideoAnimation(pet, state)
+  const animKey = resolvedAnimation?.key ?? 'idle'
+  const animMeta: VideoPetAnimationMeta | null = resolvedAnimation?.meta ?? null
 
   // Determine whether animation should loop or fire onEnded
   const isLooping = loop ?? (animMeta?.loop ?? true)
@@ -130,6 +111,7 @@ export function VideoPetRenderer({
           loop={isLooping}
           playbackRate={effectivePlaybackRate}
           replayToken={replayToken}
+          oneShotRequestId={oneShotRequestId}
           onEnded={isLooping ? undefined : onOneShotEnd}
           transparency={transparency ?? pet.transparency ?? 'native'}
           chromaKeyOptions={chromaKeyOptions ?? pet.chromaKeyOptions}
