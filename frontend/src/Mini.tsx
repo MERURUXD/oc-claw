@@ -64,9 +64,10 @@ import {
   petStateToCodexState,
   type CodexPetState,
 } from './lib/codexPet'
-import { MiniPetMascot, type MascotReaction } from './components/MiniPetMascot'
+import { MiniPetMascot, type MascotLifecycleState, type MascotReaction } from './components/MiniPetMascot'
 import { BufferedVideo } from './components/BufferedVideo'
 import { PetRenderer } from './components/PetRenderer'
+import { clearReactionIfCurrent } from './lib/videoPet'
 import { getPetAspectRatio, getPetRenderMetrics, isVideoPet, type PetAsset } from './lib/petAsset'
 import { canApplyCollapsedMascotGeometry, createLatestWinsSerialQueue, type LatestWinsSerialQueue } from './lib/miniPetGeometry'
 import { PetPicker } from './components/PetPicker'
@@ -147,7 +148,7 @@ const MASCOT_BASE_SIZE = 43
 // large-mode video sizing keeps working.
 const SESSION_SPRITE_DISPLAY_MULTIPLIER = 0.88
 
-type PetState = 'idle' | 'working' | 'compacting' | 'waiting' | 'review'
+type PetState = MascotLifecycleState
 
 function isSessionReview(cs: any): boolean {
   if (cs.status !== 'waiting') return false
@@ -446,20 +447,19 @@ export default function Mini() {
   const [mascotReaction, setMascotReaction] = useState<MascotReaction | null>(null)
   const mascotReactionRef = useRef<MascotReaction | null>(null)
   mascotReactionRef.current = mascotReaction
+  const [dragInterruptedReactionId, setDragInterruptedReactionId] = useState<number | null>(null)
+  const mascotIsDraggingRef = useRef(false)
   const reactionSeqRef = useRef(0)
 
   const triggerReaction = useCallback((state: 'waving' | 'failed') => {
     reactionSeqRef.current += 1
     const r: MascotReaction = { state, id: reactionSeqRef.current }
     setMascotReaction(r)
+    if (mascotIsDraggingRef.current) setDragInterruptedReactionId(r.id)
   }, [])
 
   const clearReaction = useCallback((reactionId?: number) => {
-    setMascotReaction((cur) => {
-      if (!cur) return null
-      if (reactionId !== undefined && cur.id !== reactionId) return cur
-      return null
-    })
+    setMascotReaction((cur) => clearReactionIfCurrent(cur, reactionId))
   }, [])
 
   // Session lifecycle tracking to prevent failed -> stopped from triggering waving
@@ -814,10 +814,16 @@ export default function Mini() {
   // sprite's hover-jump while dragging so walkDir → run-left/run-right
   // actually shows). Keep both in sync via setMascotDragActive below.
   const [mascotDragActive, _setMascotDragActive] = useState(false)
+  const [mascotIsDragging, _setMascotIsDragging] = useState(false)
   const [resizeHandleHovered, setResizeHandleHovered] = useState(false)
   const setMascotDragActive = useCallback((v: boolean) => {
     mascotDragActiveRef.current = v
     _setMascotDragActive(v)
+  }, [])
+  const setMascotIsDragging = useCallback((v: boolean) => {
+    mascotIsDraggingRef.current = v
+    if (v) setDragInterruptedReactionId(mascotReactionRef.current?.id ?? null)
+    _setMascotIsDragging(v)
   }, [])
   // Pending focus-driven auto-expand timer. The Windows window-focus
   // listener defers expand() into this timer so a click landing on the
@@ -3985,6 +3991,7 @@ export default function Mini() {
           if (!dragging) {
             if (Math.abs(dxTotal) + Math.abs(dyTotal) >= DRAG_THRESHOLD) {
               dragging = true
+              setMascotIsDragging(true)
             } else {
               return
             }
@@ -4000,6 +4007,7 @@ export default function Mini() {
 
         const cleanup = () => {
           setMascotDragActive(false)
+          setMascotIsDragging(false)
           updateWalkDir(0)
           window.removeEventListener('pointermove', onMove)
           window.removeEventListener('pointerup', onUp)
@@ -4093,6 +4101,7 @@ export default function Mini() {
           if (!dragging) {
             if (Math.abs(ev.screenX - lastX) + Math.abs(ev.screenY - lastY) >= 3) {
               dragging = true
+              setMascotIsDragging(true)
               setLargePetAction('grasp')
               largePetActionRef.current = 'grasp'
               playPetAudio('grasp')
@@ -4111,6 +4120,7 @@ export default function Mini() {
 
         const cleanup = () => {
           setMascotDragActive(false)
+          setMascotIsDragging(false)
           if (largePetActionRef.current === 'grasp') {
             setLargePetAction(null)
             largePetActionRef.current = null
@@ -4205,6 +4215,7 @@ export default function Mini() {
         if (!dragging) {
           if (Math.abs(ev.screenX - lastX) + Math.abs(ev.screenY - lastY) >= MOVE_DRAG_THRESHOLD) {
             dragging = true
+            setMascotIsDragging(true)
             if (largeMascotRef.current) {
               setLargePetAction('grasp')
               largePetActionRef.current = 'grasp'
@@ -4227,6 +4238,7 @@ export default function Mini() {
 
       const cleanup = () => {
         setMascotDragActive(false)
+        setMascotIsDragging(false)
         updateWalkDir(0)
         if (largeMascotRef.current && largePetActionRef.current === 'grasp') {
           setLargePetAction(null)
@@ -4271,7 +4283,7 @@ export default function Mini() {
       window.addEventListener('pointerup', onUp)
       window.addEventListener('pointercancel', onCancel)
     },
-    [expand, updateWalkDir, cancelFocusExpand],
+    [expand, updateWalkDir, cancelFocusExpand, setMascotIsDragging],
   )
 
   const collapse = useCallback(async () => {
@@ -4534,6 +4546,21 @@ export default function Mini() {
       unlisten.then((fn) => fn())
     }
   }, [appMode, updateWalkDir])
+
+  // The macOS native cursor poll owns pointerdown/up for the collapsed mascot.
+  // Mirror its lifecycle separately from hover suppression and walk direction.
+  useEffect(() => {
+    if (appMode === 'pet') {
+      setMascotIsDragging(false)
+      return
+    }
+    const unlisten = listen<boolean>('mini-mascot-drag-state', (event) => {
+      setMascotIsDragging(event.payload === true)
+    })
+    return () => {
+      unlisten.then((fn) => fn())
+    }
+  }, [appMode, setMascotIsDragging])
 
   // Persist the mascot's new origin after a Rust-driven drag finishes so
   // the position survives across collapsed/expanded mode switches.
@@ -5586,6 +5613,7 @@ export default function Mini() {
                 <MiniPetMascot
                   pet={miniPet}
                   baseState={mainSpriteState}
+                  lifecycleState={mainPetState}
                   reaction={mascotReaction}
                   onReactionEnd={clearReaction}
                   size={largeMascotVisualSize}
@@ -5594,6 +5622,8 @@ export default function Mini() {
                   externalHover={mascotHover}
                   useExternalHover={!isWindowsPlatform}
                   suppressHover={mascotDragActive}
+                  isDragging={mascotIsDragging}
+                  interruptedReactionId={dragInterruptedReactionId}
                 />
               </div>
             ) : (

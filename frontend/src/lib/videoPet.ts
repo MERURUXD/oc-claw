@@ -186,22 +186,121 @@ export function mapSemanticStateToVideoCandidates(state: string): string[] {
     case 'working':
     case 'running':
       return [state, 'work', 'working', 'running', 'idle']
+    // Agent lifecycle states use dedicated semantic keys so Shenshen can
+    // resolve them without changing the older generic `review`/`jumping`
+    // aliases used by existing VideoPets.
+    case 'compacting':
+      return ['compacting', 'idle']
+    case 'agent-review':
+      return ['agent-review', 'idle']
     case 'review':
       return ['review', 'code', 'thinking', 'work', 'idle']
     case 'waiting':
       return ['waiting', 'question', 'idle']
+    case 'success':
+      return ['success', 'waving', 'happy', 'idle']
     case 'jumping':
       return ['jumping', 'drag', 'jump', 'idle']
     case 'waving':
-      return ['waving', 'click', 'happy', 'idle']
+      return ['waving', 'success', 'click', 'happy', 'idle']
     case 'failed':
       return ['failed', 'angry', 'idle']
+    case 'dragging':
+      return ['dragging', 'drag', 'idle']
     case 'run-left':
     case 'run-right':
       return [state, 'move', 'walk', 'run', 'running', 'work', 'idle']
     default:
       return [state, 'idle']
   }
+}
+
+/** Resolve a semantic state through its ordered candidates, then idle. */
+export function resolveSemanticVideoAnimation(
+  pet: VideoPet,
+  state: string,
+): { key: string; meta: VideoPetAnimationMeta } | null {
+  for (const key of mapSemanticStateToVideoCandidates(state)) {
+    const entry = pet.animations[key]
+    if (!entry) continue
+    const meta = normalizeVideoAnimation(entry)
+    if (meta) return { key, meta }
+  }
+
+  // `idle` is present in every semantic fallback cascade. Keep this explicit
+  // fallback for callers that add a state without an idle candidate; the
+  // generic resolver only reaches another animation if the pet has no idle.
+  return resolveVideoAnimation(pet, 'idle')
+}
+
+/** True only when a one-shot completion still owns the active semantic request. */
+export function isCurrentOneShotRequest(
+  completedRequestId: string | null | undefined,
+  activeRequestId: string | null | undefined,
+  isDragging = false,
+): boolean {
+  return !isDragging && completedRequestId != null && completedRequestId === activeRequestId
+}
+
+/** A reaction interrupted by a drag stays suppressed until its identity changes. */
+export function isVideoReactionRequestActive(
+  reactionId: number,
+  interruptedReactionId: number | null,
+  isDragging: boolean,
+): boolean {
+  return !isDragging && reactionId !== interruptedReactionId
+}
+
+/** Return the VideoPet reaction identity that a drag/interruption must consume. */
+export function getVideoReactionIdToConsume(
+  isVideoPet: boolean,
+  reactionId: number | null | undefined,
+  isDragging: boolean,
+  interruptedReactionId: number | null,
+): number | null {
+  if (!isVideoPet || reactionId == null) return null
+  return isDragging || reactionId === interruptedReactionId ? reactionId : null
+}
+
+/** Clear only the reaction whose identity owns the completion/interruption callback. */
+export function clearReactionIfCurrent<T extends { id: number }>(
+  current: T | null | undefined,
+  reactionId?: number,
+): T | null {
+  if (!current) return null
+  if (reactionId !== undefined && current.id !== reactionId) return current
+  return null
+}
+
+export function isMascotReactionActive(
+  reaction: { state: string } | null | undefined,
+): boolean {
+  return !!reaction && (reaction.state === 'failed' || reaction.state === 'waving')
+}
+
+/** Resolve VideoPet presentation priority without allowing motion to mask an actual drag. */
+export function resolveVideoPetPresentationState(input: {
+  isDragging: boolean
+  movementState: string | null
+  reactionState: string | null
+  isJumping: boolean
+  lifecycleState: string
+}): string {
+  if (input.isDragging) return 'dragging'
+  if (input.movementState) return input.movementState
+  if (input.reactionState) return input.reactionState
+  if (input.isJumping) return 'jumping'
+  return input.lifecycleState
+}
+
+export function isMascotHoverJumpAllowed(
+  enabled: boolean,
+  suppressed: boolean,
+  isMovement: boolean,
+  isReactionActive: boolean,
+  isReview: boolean,
+): boolean {
+  return enabled && !suppressed && !isMovement && !isReactionActive && !isReview
 }
 
 /**

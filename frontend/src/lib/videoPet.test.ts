@@ -1,8 +1,19 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { existsSync, readFileSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   computeVideoPetGeometry,
   mapSemanticStateToVideoCandidates,
+  resolveSemanticVideoAnimation,
+  getVideoReactionIdToConsume,
+  isCurrentOneShotRequest,
+  clearReactionIfCurrent,
+  isMascotHoverJumpAllowed,
+  isMascotReactionActive,
+  isVideoReactionRequestActive,
+  resolveVideoPetPresentationState,
   normalizeVideoAnimation,
   isMirrorForbidden,
   DSH_GEOMETRY,
@@ -79,6 +90,190 @@ test('mapSemanticStateToVideoCandidates: generates correct candidate cascades', 
   assert.deepEqual(mapSemanticStateToVideoCandidates('jumping'), ['jumping', 'drag', 'jump', 'idle'])
   assert.deepEqual(mapSemanticStateToVideoCandidates('run-left'), ['run-left', 'move', 'walk', 'run', 'running', 'work', 'idle'])
   assert.deepEqual(mapSemanticStateToVideoCandidates('run-right'), ['run-right', 'move', 'walk', 'run', 'running', 'work', 'idle'])
+  assert.deepEqual(mapSemanticStateToVideoCandidates('compacting'), ['compacting', 'idle'])
+  assert.deepEqual(mapSemanticStateToVideoCandidates('waiting'), ['waiting', 'question', 'idle'])
+  assert.deepEqual(mapSemanticStateToVideoCandidates('agent-review'), ['agent-review', 'idle'])
+  assert.deepEqual(mapSemanticStateToVideoCandidates('success'), ['success', 'waving', 'happy', 'idle'])
+  assert.deepEqual(mapSemanticStateToVideoCandidates('failed'), ['failed', 'angry', 'idle'])
+  assert.deepEqual(mapSemanticStateToVideoCandidates('dragging'), ['dragging', 'drag', 'idle'])
+})
+
+test('builtin Shenshen manifest maps lifecycle and movement states to bundled clips', () => {
+  const shenshenDir = resolve(
+    dirname(fileURLToPath(import.meta.url)),
+    '../..',
+    'public/assets/builtin/shenshen',
+  )
+  const raw = JSON.parse(readFileSync(resolve(shenshenDir, 'pet.json'), 'utf8')) as {
+    id: string
+    renderer: string
+    canvas: { width: number; height: number; bodyBox: number[]; feetY: number }
+    noMirror?: string[]
+    animations: Record<string, string | { src: string; loop?: boolean } | (string | { src: string })[]>
+  }
+  assert.equal(raw.id, 'shenshen')
+  assert.equal(raw.renderer, 'video-clips')
+  assert.deepEqual(raw.canvas, {
+    width: 640,
+    height: 360,
+    bodyBox: [212, 60, 428, 330],
+    feetY: 330,
+  })
+
+  const referencedFiles = Object.values(raw.animations).flatMap((entry) => {
+    const entries = Array.isArray(entry) ? entry : [entry]
+    return entries.map((animation) => (typeof animation === 'string' ? animation : animation.src))
+  })
+  for (const src of referencedFiles) {
+    assert.ok(existsSync(resolve(shenshenDir, src)), `Missing bundled Shenshen clip: ${src}`)
+  }
+
+  const pet = parsePetManifest(raw, 'http://localhost/assets/builtin/shenshen')
+  assert.ok(pet && pet.renderer === 'video-clips')
+  const expected = {
+    idle: ['idle', '待机呼吸休闲.webm'],
+    working: ['working', '工作状态-忙碌点按.webm'],
+    compacting: ['compacting', '工作状态-清点归档.webm'],
+    waiting: ['waiting', '工作状态-思考冒泡.webm'],
+    'agent-review': ['agent-review', '工作状态-原地踱步张望.webm'],
+    success: ['success', '工作状态-雀跃庆祝.webm'],
+    failed: ['failed', '工作状态-垂头叹气冒汗.webm'],
+    dragging: ['dragging', '螃蟹走路.webm'],
+    'run-left': ['run-left', '原地左转奔跑.webm'],
+    'run-right': ['run-right', '原地左转奔跑.webm'],
+    move: ['move', '原地漂浮踏步.webm'],
+    walk: ['walk', '螃蟹走路.webm'],
+    review: ['review', '写代码.webm'],
+    fireworks: ['fireworks', '放烟花.webm'],
+  } as const
+
+  for (const [state, [key, filename]] of Object.entries(expected)) {
+    const resolved = resolveSemanticVideoAnimation(pet, state)
+    assert.equal(resolved?.key, key, `Unexpected Shenshen animation key for ${state}`)
+    assert.ok(
+      resolved?.meta.src.endsWith(filename),
+      `Unexpected Shenshen animation file for ${state}: ${resolved?.meta.src}`,
+    )
+  }
+  assert.equal(resolveSemanticVideoAnimation(pet, 'success')?.meta.loop, false)
+  assert.equal(resolveSemanticVideoAnimation(pet, 'failed')?.meta.loop, false)
+  assert.equal(isMirrorForbidden(pet, 'review', resolveSemanticVideoAnimation(pet, 'review')?.meta), true)
+  assert.equal(
+    isMirrorForbidden(pet, 'agent-review', resolveSemanticVideoAnimation(pet, 'agent-review')?.meta),
+    false,
+  )
+})
+
+test('resolveSemanticVideoAnimation: selects lifecycle clips and uses idle for missing primaries', () => {
+  const pet: VideoPet = {
+    renderer: 'video-clips',
+    id: 'shenshen-test',
+    displayName: '申申',
+    canvas: DSH_GEOMETRY,
+    animations: {
+      idle: 'idle.webm',
+      running: 'work.webm',
+      review: 'write-code.webm',
+      drag: 'drag.webm',
+    },
+  }
+
+  assert.deepEqual(resolveSemanticVideoAnimation(pet, 'working'), {
+    key: 'running',
+    meta: { src: 'work.webm', loop: true },
+  })
+  assert.deepEqual(resolveSemanticVideoAnimation(pet, 'compacting'), {
+    key: 'idle',
+    meta: { src: 'idle.webm', loop: true },
+  })
+  assert.deepEqual(resolveSemanticVideoAnimation(pet, 'agent-review'), {
+    key: 'idle',
+    meta: { src: 'idle.webm', loop: true },
+  })
+  assert.deepEqual(resolveSemanticVideoAnimation(pet, 'dragging'), {
+    key: 'drag',
+    meta: { src: 'drag.webm', loop: true },
+  })
+
+  const withoutIdle: VideoPet = { ...pet, animations: { running: 'work.webm' } }
+  assert.deepEqual(resolveSemanticVideoAnimation(withoutIdle, 'compacting'), {
+    key: 'running',
+    meta: { src: 'work.webm', loop: true },
+  })
+})
+
+test('isCurrentOneShotRequest: ignores missing and superseded completion identities', () => {
+  assert.equal(isCurrentOneShotRequest(undefined, 'reaction:2'), false)
+  assert.equal(isCurrentOneShotRequest('reaction:1', 'reaction:2'), false)
+  assert.equal(isCurrentOneShotRequest('reaction:2', 'reaction:2'), true)
+  assert.equal(isCurrentOneShotRequest('reaction:2', 'reaction:2', true), false)
+})
+
+test('VideoPet dragging overrides run direction and returns to movement after release', () => {
+  const currentState = {
+    movementState: 'run-left',
+    reactionState: 'success',
+    isJumping: false,
+    lifecycleState: 'working',
+  }
+
+  assert.equal(resolveVideoPetPresentationState({ ...currentState, isDragging: true }), 'dragging')
+  assert.equal(resolveVideoPetPresentationState({ ...currentState, isDragging: false }), 'run-left')
+})
+
+test('isVideoReactionRequestActive: drag suppresses the interrupted reaction until its ID changes', () => {
+  assert.equal(isVideoReactionRequestActive(7, null, true), false)
+  assert.equal(isVideoReactionRequestActive(7, 7, false), false)
+  assert.equal(isVideoReactionRequestActive(8, 7, false), true)
+})
+
+test('drag consumes the interrupted VideoPet reaction and stale callbacks preserve the next reaction', () => {
+  let parentReaction: { state: 'waving' | 'failed'; id: number } | null = { state: 'waving', id: 7 }
+  const interruptedReactionId = parentReaction.id
+
+  assert.equal(isVideoReactionRequestActive(parentReaction.id, null, false), true)
+  assert.equal(isVideoReactionRequestActive(parentReaction.id, interruptedReactionId, true), false)
+
+  // MiniPetMascot calls its existing ID-bearing onReactionEnd callback when
+  // the VideoPet one-shot disappears because dragging/interruption took over.
+  const consumedId = getVideoReactionIdToConsume(
+    true,
+    parentReaction.id,
+    true,
+    interruptedReactionId,
+  )
+  assert.equal(consumedId, parentReaction.id)
+  assert.equal(
+    getVideoReactionIdToConsume(true, parentReaction.id, false, interruptedReactionId),
+    parentReaction.id,
+  )
+  parentReaction = clearReactionIfCurrent(parentReaction, consumedId)
+  assert.equal(parentReaction, null)
+
+  // The primary's mini-pet-state heartbeat reads the cleared parent state,
+  // and after release the stale interrupted ID no longer blocks hover.
+  assert.deepEqual({
+    reaction: parentReaction?.state ?? null,
+    reactionId: parentReaction?.id ?? null,
+  }, { reaction: null, reactionId: null })
+  assert.equal(
+    isMascotHoverJumpAllowed(true, false, false, isMascotReactionActive(parentReaction), false),
+    true,
+  )
+
+  // A later reaction is a new request. Late ended and safety-timer callbacks
+  // for request 7 cannot clear it either through request ownership or parent state.
+  parentReaction = { state: 'failed', id: 8 }
+  const activeRequestId = isVideoReactionRequestActive(8, interruptedReactionId, false)
+    ? 'reaction:8'
+    : null
+  assert.equal(activeRequestId, 'reaction:8')
+  for (const staleCallback of ['ended', 'safety timer']) {
+    assert.equal(isCurrentOneShotRequest('reaction:7', activeRequestId, false), false, staleCallback)
+    parentReaction = clearReactionIfCurrent(parentReaction, 7)
+    assert.equal(parentReaction.id, 8, staleCallback)
+  }
+  assert.equal(getVideoReactionIdToConsume(false, 8, true, 8), null)
 })
 
 test('computeVideoPetGeometry: feetY baseline anchors feet directly to container bottom', () => {

@@ -10,7 +10,8 @@ export interface PetRendererProps {
   pet: PetAsset
   state?: CodexPetState | string
   size: number
-  onOneShotEnd?: () => void
+  onOneShotEnd?: (completedRequestId?: string | null) => void
+  oneShotRequestId?: string | null
   loop?: boolean
   flipHorizontal?: boolean
   replayToken?: number | string
@@ -30,6 +31,7 @@ export function PetRenderer({
   state = 'idle',
   size,
   onOneShotEnd,
+  oneShotRequestId,
   loop,
   flipHorizontal,
   replayToken,
@@ -46,6 +48,7 @@ export function PetRenderer({
         state={state}
         size={size}
         onOneShotEnd={onOneShotEnd}
+        oneShotRequestId={oneShotRequestId}
         loop={loop}
         flipHorizontal={flipHorizontal}
         replayToken={replayToken}

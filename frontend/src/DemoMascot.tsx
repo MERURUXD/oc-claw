@@ -5,9 +5,10 @@ import { load } from '@tauri-apps/plugin-store'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { LogicalPosition, LogicalSize } from '@tauri-apps/api/dpi'
 import { Maximize2 } from 'lucide-react'
-import { MiniPetMascot, type MascotReaction } from './components/MiniPetMascot'
+import { MiniPetMascot, type MascotLifecycleState, type MascotReaction } from './components/MiniPetMascot'
 import { loadCodexPetById, loadDefaultCodexPet, type CodexPetState } from './lib/codexPet'
 import { getPetAspectRatio, getPetRenderMetrics, isVideoPet, type PetAsset } from './lib/petAsset'
+import { clearReactionIfCurrent } from './lib/videoPet'
 
 const isWindowsPlatform =
   typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows')
@@ -52,22 +53,21 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
   const [working, setWorking] = useState(false)
   const [waiting, setWaiting] = useState(false)
   const [isReview, setIsReview] = useState(false)
+  const [syncedLifecycleState, setSyncedLifecycleState] = useState<MascotLifecycleState | null>(null)
   const [syncedBaseState, setSyncedBaseState] = useState<CodexPetState | null>(null)
   const [mascotReaction, setMascotReaction] = useState<MascotReaction | null>(null)
   const [walkDir, setWalkDir] = useState<-1 | 0 | 1>(0)
   const [dragging, setDragging] = useState(false)
+  const [dragInterruptedReactionId, setDragInterruptedReactionId] = useState<number | null>(null)
 
   const clearReaction = useCallback((reactionId?: number) => {
-    setMascotReaction((cur) => {
-      if (!cur) return null
-      if (reactionId !== undefined && cur.id !== reactionId) return cur
-      return null
-    })
+    setMascotReaction((cur) => clearReactionIfCurrent(cur, reactionId))
   }, [])
   const [resizeHandleHovered, setResizeHandleHovered] = useState(false)
   const [hitboxHovered, setHitboxHovered] = useState(false)
   const [size, setSize] = useState(DEFAULT_MASCOT_SIZE)
   const dragActiveRef = useRef(false)
+  const actualDraggingRef = useRef(false)
   const baseSizeRef = useRef(MASCOT_BASE_SIZE)
   const largeScaleRef = useRef(5)
 
@@ -264,7 +264,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
   // any poll loops on our side.
   useEffect(() => {
     const unlisten = listen<{
-      state?: string
+      state?: MascotLifecycleState
       baseState?: CodexPetState
       reaction?: 'waving' | 'failed' | null
       reactionId?: number | null
@@ -274,6 +274,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
         setSyncedBaseState(p.baseState)
       }
       const s = p?.state
+      if (s) setSyncedLifecycleState(s)
       if (s === 'review') {
         setIsReview(true)
         setWaiting(false)
@@ -294,6 +295,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
 
       if (p?.reaction && typeof p.reactionId === 'number') {
         const nextReaction: MascotReaction = { state: p.reaction, id: p.reactionId }
+        if (actualDraggingRef.current) setDragInterruptedReactionId(nextReaction.id)
         setMascotReaction((cur) => (cur?.id === nextReaction.id ? cur : nextReaction))
       } else if (p?.reaction === null) {
         setMascotReaction(null)
@@ -374,9 +376,11 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
       if (!dragging) {
         if (Math.abs(dxTotal) + Math.abs(dyTotal) >= 3) {
           dragging = true
+          actualDraggingRef.current = true
           // Force the hover/jump animation off so walkDir → run-left/run-right
           // is visible while dragging (otherwise the pointer stays over the
           // mascot and the jump cycle hides the walk frames).
+          setDragInterruptedReactionId(mascotReaction?.id ?? null)
           setDragging(true)
         } else {
           return
@@ -396,6 +400,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
 
     const cleanup = () => {
       dragActiveRef.current = false
+      actualDraggingRef.current = false
       if (rafId !== null) {
         cancelAnimationFrame(rafId)
         rafId = null
@@ -429,7 +434,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
     window.addEventListener('pointermove', onMove)
     window.addEventListener('pointerup', onUp, { once: true })
     window.addEventListener('pointercancel', onCancel, { once: true })
-  }, [functional])
+  }, [functional, mascotReaction])
 
   const baseState: CodexPetState = walkDir === 1
     ? 'run-right'
@@ -444,6 +449,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
             : working
               ? 'running'
               : 'idle'
+  const lifecycleState = syncedLifecycleState ?? (isReview ? 'review' : waiting ? 'waiting' : working ? 'working' : 'idle')
 
   if (!pet) return null
 
@@ -470,6 +476,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
         <MiniPetMascot
           pet={pet}
           baseState={baseState}
+          lifecycleState={lifecycleState}
           reaction={mascotReaction}
           onReactionEnd={clearReaction}
           size={size}
@@ -478,6 +485,8 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
           externalHover={hitboxHovered}
           useExternalHover
           suppressHover={dragging}
+          isDragging={dragging}
+          interruptedReactionId={dragInterruptedReactionId}
         />
       </div>
 

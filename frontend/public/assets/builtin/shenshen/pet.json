@@ -28,9 +28,33 @@
       "src": "videos/工作状态-忙碌点按.webm",
       "loop": true
     },
+    "working": {
+      "src": "videos/工作状态-忙碌点按.webm",
+      "loop": true
+    },
     "running": {
       "src": "videos/工作状态-忙碌点按.webm",
       "loop": true
+    },
+    "compacting": {
+      "src": "videos/工作状态-清点归档.webm",
+      "loop": true
+    },
+    "waiting": {
+      "src": "videos/工作状态-思考冒泡.webm",
+      "loop": true
+    },
+    "agent-review": {
+      "src": "videos/工作状态-原地踱步张望.webm",
+      "loop": true
+    },
+    "success": {
+      "src": "videos/工作状态-雀跃庆祝.webm",
+      "loop": false
+    },
+    "failed": {
+      "src": "videos/工作状态-垂头叹气冒汗.webm",
+      "loop": false
     },
     "review": {
       "src": "videos/写代码.webm",
@@ -41,8 +65,28 @@
       "src": "videos/被鼠标拖拽悬空反馈.webm",
       "loop": true
     },
+    "dragging": {
+      "src": "videos/螃蟹走路.webm",
+      "loop": true
+    },
     "jumping": {
       "src": "videos/被鼠标拖拽悬空反馈.webm",
+      "loop": true
+    },
+    "run-left": {
+      "src": "videos/原地左转奔跑.webm",
+      "loop": true
+    },
+    "run-right": {
+      "src": "videos/原地左转奔跑.webm",
+      "loop": true
+    },
+    "move": {
+      "src": "videos/原地漂浮踏步.webm",
+      "loop": true
+    },
+    "walk": {
+      "src": "videos/螃蟹走路.webm",
       "loop": true
     },
     "fireworks": {
