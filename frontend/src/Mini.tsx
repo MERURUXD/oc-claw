@@ -41,6 +41,7 @@ import {
   handleBubbleVisible,
 } from './lib/bubbleSuppression'
 import { traceBubbleEvent } from './lib/bubbleTrace'
+import { canExpandMascotPanel, canStartMascotPointerInteraction } from './lib/mascotInteraction'
 import { OnboardingModal } from './components/OnboardingModal'
 import { PetContextMenu, PomodoroOverlay } from './components/PetContextMenu'
 import {
@@ -67,6 +68,7 @@ import { MiniPetMascot, type MascotReaction } from './components/MiniPetMascot'
 import { BufferedVideo } from './components/BufferedVideo'
 import { PetRenderer } from './components/PetRenderer'
 import { getPetAspectRatio, getPetRenderMetrics, isVideoPet, type PetAsset } from './lib/petAsset'
+import { canApplyCollapsedMascotGeometry, createLatestWinsSerialQueue, type LatestWinsSerialQueue } from './lib/miniPetGeometry'
 import { PetPicker } from './components/PetPicker'
 import { PetGallery } from './components/PetGallery'
 
@@ -364,6 +366,13 @@ export default function Mini() {
   const [miniPet, setMiniPet] = useState<PetAsset | null>(null)
   const miniPetRef = useRef<PetAsset | null>(null)
   useEffect(() => { miniPetRef.current = miniPet }, [miniPet])
+  type MiniPetRenderMetrics = ReturnType<typeof getPetRenderMetrics>
+  const miniPetCanvasQueueRef = useRef<LatestWinsSerialQueue<MiniPetRenderMetrics | null> | null>(null)
+  const miniPetCanvasLayoutAppliedRef = useRef(false)
+  const syncMiniPetCanvasBoundsRef = useRef<(metrics: MiniPetRenderMetrics | null) => Promise<void>>(async () => {})
+  const drainMiniPetCanvasQueueRef = useRef<() => Promise<void>>(() => Promise.resolve())
+  const invalidateMiniPetCanvasQueueRef = useRef<() => void>(() => {})
+  const restoreCollapsedPetLayoutRef = useRef<() => Promise<void>>(async () => {})
   const [walkDir, setWalkDir] = useState<-1 | 0 | 1>(0)
   const walkDirRef = useRef<-1 | 0 | 1>(0)
   const updateWalkDir = useCallback((dir: -1 | 0 | 1) => {
@@ -3194,6 +3203,8 @@ export default function Mini() {
   const hoverCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const hoverOpenTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const syncExpandedWindowLayout = useCallback(async (mode: 'island' | 'efficiency' = viewModeRef.current) => {
+    invalidateMiniPetCanvasQueueRef.current()
+    await drainMiniPetCanvasQueueRef.current()
     await invoke('set_mini_expanded', {
       expanded: true,
       position: mascotPositionRef.current,
@@ -3204,8 +3215,13 @@ export default function Mini() {
     expandedWindowModeRef.current = mode
   }, [])
   const expand = useCallback(async () => {
-    if (collapsingRef.current || expandingRef.current) return
+    if (!canExpandMascotPanel({
+      dragging: mascotDragActiveRef.current,
+      expanding: expandingRef.current,
+      collapsing: collapsingRef.current,
+    })) return
     expandingRef.current = true
+    invalidateMiniPetCanvasQueueRef.current()
     setHiding(true)
     // The native window has to be resized + repositioned before the
     // expanded panel can render correctly. During that transition both
@@ -3477,6 +3493,8 @@ export default function Mini() {
     updateModalPrevExpandedRef.current = expandedRef.current
     expandedWindowModeRef.current = null
     try {
+      invalidateMiniPetCanvasQueueRef.current()
+      await drainMiniPetCanvasQueueRef.current()
       await invoke('set_mini_size', { restore: false, position: mascotPositionRef.current, keepOnTop: true, mascotScale: mascotScaleRef.current })
       await new Promise<void>((r) => setTimeout(r, 80))
     } catch {
@@ -3515,8 +3533,10 @@ export default function Mini() {
   const restoreWindowAfterUpdateModal = useCallback(async () => {
     if (!updateModalWindowAdjustedRef.current) return
     const wasExpanded = updateModalPrevExpandedRef.current
-    updateModalWindowAdjustedRef.current = false
-    if (settingsModeRef.current) return
+    if (settingsModeRef.current) {
+      updateModalWindowAdjustedRef.current = false
+      return
+    }
     updateModalRestoringRef.current = true
     try {
       if (wasExpanded) {
@@ -3527,12 +3547,14 @@ export default function Mini() {
       } else {
         await invoke('set_mini_size', { restore: true, position: mascotPositionRef.current, mascotScale: mascotScaleRef.current, largeMascot: true, largeMascotScale: largeMascotScaleRef.current })
         await restoreCollapsedMascotPosition()
+        await restoreCollapsedPetLayoutRef.current()
         setExpanded(false)
         expandedRef.current = false
         expandedWindowModeRef.current = null
         setShowPanel(false)
       }
     } catch {} finally {
+      updateModalWindowAdjustedRef.current = false
       updateModalRestoringRef.current = false
     }
   }, [restoreCollapsedMascotPosition, syncExpandedWindowLayout])
@@ -3728,34 +3750,24 @@ export default function Mini() {
       size: nextVisualSize,
     }).catch(() => {})
 
-    if (!largeMascotRef.current && miniPetRef.current && isVideoPet(miniPetRef.current)) {
-      const m = getPetRenderMetrics(miniPetRef.current, nextVisualSize)
-      await invoke('set_pet_canvas_bounds', {
-        windowLabel: 'mini',
-        canvasW: m.canvas.width,
-        canvasH: m.canvas.height,
-        hitboxX: m.hitbox.left,
-        hitboxY: m.hitbox.top,
-        hitboxW: m.hitbox.width,
-        hitboxH: m.hitbox.height,
-        anchorMode: 'bottom-right',
-      }).catch(() => {})
-    } else if (appModeRef.current === 'pet') {
-      await invoke('set_pet_mode_window', {
-        active: true,
-        mascotScale: mascotScaleRef.current,
-        largeMascotScale: clamped,
-      }).catch(() => {})
-    } else {
-      await invoke('set_mini_expanded', {
-        expanded: false,
-        position: mascotPositionRef.current,
-        efficiency: true,
-        keepPosition: true,
-        mascotScale: mascotScaleRef.current,
-        largeMascot: true,
-        largeMascotScale: clamped,
-      }).catch(() => {})
+    if (largeMascotRef.current || !miniPetRef.current || !isVideoPet(miniPetRef.current)) {
+      if (appModeRef.current === 'pet') {
+        await invoke('set_pet_mode_window', {
+          active: true,
+          mascotScale: mascotScaleRef.current,
+          largeMascotScale: clamped,
+        }).catch(() => {})
+      } else {
+        await invoke('set_mini_expanded', {
+          expanded: false,
+          position: mascotPositionRef.current,
+          efficiency: true,
+          keepPosition: true,
+          mascotScale: mascotScaleRef.current,
+          largeMascot: true,
+          largeMascotScale: clamped,
+        }).catch(() => {})
+      }
     }
 
     if (persist) {
@@ -3840,6 +3852,14 @@ export default function Mini() {
       window.removeEventListener('pointerup', onUp)
       window.removeEventListener('pointercancel', onCancel)
       await applyLargeMascotScale(latestScale, true)
+      const pet = miniPetRef.current
+      if (!largeMascotRef.current && pet && isVideoPet(pet)) {
+        const finalMetrics = getPetRenderMetrics(
+          pet,
+          Math.round(MASCOT_BASE_SIZE * mascotScaleRef.current) * latestScale,
+        )
+        await syncMiniPetCanvasBoundsRef.current(finalMetrics).catch(() => {})
+      }
     }
 
     const onUp = (ev: PointerEvent) => {
@@ -3860,6 +3880,10 @@ export default function Mini() {
 
   const handleMascotPointerDown = useCallback(
     (e: React.PointerEvent) => {
+      // Once expansion owns the native window geometry, don't start a drag
+      // against the resized panel frame. Conversely, expand() refuses to
+      // start while this pointer interaction is active.
+      if (!canStartMascotPointerInteraction(expandingRef.current)) return
       // Pet mode: right-click / ctrl+click toggles context menu
       const isRightClick = e.button === 2 || (e.button === 0 && e.ctrlKey)
       if (isRightClick && appModeRef.current === 'pet' && largeMascotRef.current) {
@@ -4270,6 +4294,7 @@ export default function Mini() {
     panelUiTransitionRef.current = beginPanelUiTransition(panelUiTransitionRef.current, 'collapse')
     const myGen = capturePanelUiGeneration(panelUiTransitionRef.current)
     collapsingRef.current = true
+    invalidateMiniPetCanvasQueueRef.current()
     hoverExpandedRef.current = false
     traceBubbleEvent('panel-collapse-begin', {
       transitionId: bubbleTransitionIdRef.current,
@@ -4374,6 +4399,8 @@ export default function Mini() {
           // Newer transition won during rAF; leave opacity/hiding to it.
           return
         }
+        await drainMiniPetCanvasQueueRef.current()
+        if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
         if (wasSettings && appModeRef.current === 'pet' && largeMascotRef.current) {
           traceBubbleEvent('mini-native-collapse-request', {
             transitionId: bubbleTransitionIdRef.current,
@@ -4424,6 +4451,8 @@ export default function Mini() {
           if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
           await restoreCollapsedMascotPosition()
         }
+        if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
+        await restoreCollapsedPetLayoutRef.current()
       } catch {
         /* ensure hiding is always cleared when we still own the transition */
       }
@@ -4630,6 +4659,7 @@ export default function Mini() {
     settingsPickerOpenRef.current = false
     hoverExpandedRef.current = false
     settingsTransitioningRef.current = true
+    invalidateMiniPetCanvasQueueRef.current()
     setSelectedAgentId(null)
     setSelectedClaudeSession(null)
     setSelectedSessionKey(null)
@@ -4646,6 +4676,8 @@ export default function Mini() {
     if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
     setShowSettingsOverlay(false)
     setSettingsTransitioning(true)
+    await drainMiniPetCanvasQueueRef.current()
+    if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
     // Stop pet passthrough poll before resizing to settings mode
     if (appModeRef.current === 'pet') {
       await invoke('set_pet_mode_window', { active: false, mascotScale: mascotScaleRef.current, largeMascotScale: largeMascotScaleRef.current }).catch(() => {})
@@ -4706,8 +4738,11 @@ export default function Mini() {
     }
     setIsCreateModalOpen(false)
     settingsTransitioningRef.current = true
+    invalidateMiniPetCanvasQueueRef.current()
     setShowSettingsOverlay(false)
     try {
+      await drainMiniPetCanvasQueueRef.current()
+      if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
       await new Promise<void>((r) => setTimeout(r, 220))
       if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
       setSettingsTransitioning(true)
@@ -4780,6 +4815,8 @@ export default function Mini() {
           await restoreCollapsedMascotPosition()
         } catch {}
       }
+      if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
+      await restoreCollapsedPetLayoutRef.current()
     } finally {
       // Only clear transition/hiding guards if we still own the transition;
       // a newer owner (e.g. re-enter settings) must keep its own flags.
@@ -5325,59 +5362,68 @@ export default function Mini() {
       : null
   }, [largeMascot, miniPet, largeMascotVisualSize])
 
-  const prevActiveMiniPetMetricsRef = useRef(activeMiniPetMetrics)
-  // Sync canvas and hitbox bounds to Tauri for native window sizing and cursor pass-through
-  useEffect(() => {
-    const wasVideoPet = !!prevActiveMiniPetMetricsRef.current
-    prevActiveMiniPetMetricsRef.current = activeMiniPetMetrics
-
-    if (!activeMiniPetMetrics) {
-      invoke('set_pet_canvas_bounds', {
+  if (!miniPetCanvasQueueRef.current) {
+    miniPetCanvasQueueRef.current = createLatestWinsSerialQueue<MiniPetRenderMetrics | null>(async (metrics) => {
+      const bounds = metrics
+        ? {
+            canvasW: metrics.canvas.width,
+            canvasH: metrics.canvas.height,
+            hitboxX: metrics.hitbox.left,
+            hitboxY: metrics.hitbox.top,
+            hitboxW: metrics.hitbox.width,
+            hitboxH: metrics.hitbox.height,
+          }
+        : {
+            canvasW: null,
+            canvasH: null,
+            hitboxX: null,
+            hitboxY: null,
+            hitboxW: null,
+            hitboxH: null,
+          }
+      await invoke('set_pet_canvas_bounds', {
         windowLabel: 'mini',
-        canvasW: null,
-        canvasH: null,
-        hitboxX: null,
-        hitboxY: null,
-        hitboxW: null,
-        hitboxH: null,
+        ...bounds,
         anchorMode: 'bottom-right',
-      }).catch(() => {})
+      })
+      miniPetCanvasLayoutAppliedRef.current = !!metrics
+    })
+  }
+  const syncMiniPetCanvasBounds = useCallback((metrics: MiniPetRenderMetrics | null) => {
+    return miniPetCanvasQueueRef.current!.enqueue(metrics)
+  }, [])
+  syncMiniPetCanvasBoundsRef.current = syncMiniPetCanvasBounds
+  drainMiniPetCanvasQueueRef.current = () => miniPetCanvasQueueRef.current!.drain()
+  invalidateMiniPetCanvasQueueRef.current = () => miniPetCanvasQueueRef.current!.invalidate()
 
-      // If we transitioned from VideoPet to null while in collapsed mode
-      // (not expanded, not in settings, not transitioning), restore native window layout
-      // using the authoritative layout commands that know the current mode and scale.
-      if (wasVideoPet && !expandedRef.current && !settingsModeRef.current && !settingsTransitioningRef.current) {
-        if (appModeRef.current === 'pet') {
-          invoke('set_pet_mode_window', {
-            active: true,
-            mascotScale: mascotScaleRef.current,
-            largeMascotScale: largeMascotScaleRef.current,
-          }).catch(() => {})
-        } else {
-          invoke('set_mini_expanded', {
-            expanded: false,
-            position: mascotPositionRef.current,
-            efficiency: true,
-            mascotScale: mascotScaleRef.current,
-            largeMascot: true,
-            largeMascotScale: largeMascotScaleRef.current,
-          }).catch(() => {})
-        }
-      }
+  useEffect(() => {
+    const canApplyGeometry = canApplyCollapsedMascotGeometry({
+      expanded: expanded || expandedRef.current,
+      settingsMode: settingsMode || settingsModeRef.current,
+      settingsTransitioning: settingsTransitioning || settingsTransitioningRef.current,
+      updateModalOpen: updateModalOpen || updateModalOpenRef.current || updateModalWindowAdjustedRef.current,
+      onboardingOpen: showOnboarding,
+      hiding: hiding || collapsingRef.current || expandingRef.current,
+    })
+    if (!canApplyGeometry) {
+      miniPetCanvasQueueRef.current?.invalidate()
       return
     }
+    if (!activeMiniPetMetrics && !miniPetCanvasLayoutAppliedRef.current) return
+    syncMiniPetCanvasBounds(activeMiniPetMetrics).catch((error) => {
+      console.warn('[mini] sync VideoPet canvas bounds failed:', error)
+    })
+  }, [activeMiniPetMetrics, expanded, hiding, settingsMode, settingsTransitioning, showOnboarding, syncMiniPetCanvasBounds, updateModalOpen])
 
-    invoke('set_pet_canvas_bounds', {
-      windowLabel: 'mini',
-      canvasW: activeMiniPetMetrics.canvas.width,
-      canvasH: activeMiniPetMetrics.canvas.height,
-      hitboxX: activeMiniPetMetrics.hitbox.left,
-      hitboxY: activeMiniPetMetrics.hitbox.top,
-      hitboxW: activeMiniPetMetrics.hitbox.width,
-      hitboxH: activeMiniPetMetrics.hitbox.height,
-      anchorMode: 'bottom-right',
-    }).catch(() => {})
-  }, [activeMiniPetMetrics])
+  restoreCollapsedPetLayoutRef.current = async () => {
+    if (expandedRef.current || settingsModeRef.current || updateModalOpenRef.current) return
+    const pet = miniPetRef.current
+    const metrics = !largeMascotRef.current && pet && isVideoPet(pet)
+      ? getPetRenderMetrics(pet, Math.round(MASCOT_BASE_SIZE * mascotScaleRef.current) * largeMascotScaleRef.current)
+      : null
+    if (!metrics && !miniPetCanvasLayoutAppliedRef.current) return
+    await syncMiniPetCanvasBoundsRef.current(metrics)
+  }
 
 
 

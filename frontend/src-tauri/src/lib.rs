@@ -75,7 +75,12 @@ static PET_CANVAS_BOUNDS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 /// pet_passthrough_poll_windows so clicks on transparent canvas areas outside the character body
 /// pass through to underlying windows.
 static PET_HITBOX_BOUNDS: Mutex<Option<(f64, f64, f64, f64)>> = Mutex::new(None);
-#[derive(Clone, Copy, Debug)]
+/// Visible VideoPet body right/bottom anchor for the mini window. It remains
+/// stable while a panel or settings layout temporarily owns the native frame.
+static PET_BODY_ANCHOR: Mutex<Option<(f64, f64)>> = Mutex::new(None);
+/// Keeps pass-through hit testing on one coherent live frame and hitbox.
+static PET_GEOMETRY_UPDATE_LOCK: Mutex<()> = Mutex::new(());
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MascotHitboxEntry {
     pub canvas_w: f64,
     pub canvas_h: f64,
@@ -83,6 +88,153 @@ pub struct MascotHitboxEntry {
     pub hitbox_y: f64,
     pub hitbox_w: f64,
     pub hitbox_h: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum WindowCoordinateOrigin {
+    TopLeft,
+    #[allow(dead_code)] // Used by macOS Cocoa geometry; also exercised in Windows unit tests.
+    BottomLeft,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MascotBodyBounds {
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+}
+
+fn mascot_body_bounds(
+    frame: (f64, f64, f64, f64),
+    entry: MascotHitboxEntry,
+    origin: WindowCoordinateOrigin,
+) -> MascotBodyBounds {
+    let (x, y, _w, h) = frame;
+    let left = x + entry.hitbox_x;
+    let right = left + entry.hitbox_w;
+    match origin {
+        WindowCoordinateOrigin::TopLeft => {
+            let top = y + entry.hitbox_y;
+            MascotBodyBounds { left, top, right, bottom: top + entry.hitbox_h }
+        }
+        WindowCoordinateOrigin::BottomLeft => {
+            let top = y + h - entry.hitbox_y;
+            MascotBodyBounds { left, top, right, bottom: top - entry.hitbox_h }
+        }
+    }
+}
+
+fn bubble_mascot_bounds(
+    frame: (f64, f64, f64, f64),
+    custom_hitbox: Option<MascotHitboxEntry>,
+    origin: WindowCoordinateOrigin,
+) -> MascotBodyBounds {
+    if let Some(entry) = custom_hitbox {
+        return mascot_body_bounds(frame, entry, origin);
+    }
+    let (x, y, w, h) = frame;
+    match origin {
+        WindowCoordinateOrigin::TopLeft => MascotBodyBounds { left: x, top: y, right: x + w, bottom: y + h },
+        WindowCoordinateOrigin::BottomLeft => MascotBodyBounds { left: x, top: y + h, right: x + w, bottom: y },
+    }
+}
+
+fn hit_test_mascot_body_or_resize(
+    frame: (f64, f64, f64, f64),
+    entry: MascotHitboxEntry,
+    cursor: (f64, f64),
+    origin: WindowCoordinateOrigin,
+    resize_handle: f64,
+) -> bool {
+    let body = mascot_body_bounds(frame, entry, origin);
+    let (cx, cy) = cursor;
+    let over_body = cx >= body.left
+        && cx <= body.right
+        && match origin {
+            WindowCoordinateOrigin::TopLeft => cy >= body.top && cy <= body.bottom,
+            WindowCoordinateOrigin::BottomLeft => cy >= body.bottom && cy <= body.top,
+        };
+    let over_resize = cx >= body.right - resize_handle
+        && cx <= body.right
+        && match origin {
+            WindowCoordinateOrigin::TopLeft => cy >= body.bottom - resize_handle && cy <= body.bottom,
+            WindowCoordinateOrigin::BottomLeft => cy >= body.bottom && cy <= body.bottom + resize_handle,
+        };
+    over_body || over_resize
+}
+
+fn mini_pet_canvas_origin_for_body_anchor(
+    canvas_h: f64,
+    hitbox: (f64, f64, f64, f64),
+    body_right: f64,
+    body_bottom: f64,
+    origin: WindowCoordinateOrigin,
+) -> (f64, f64) {
+    let (hitbox_x, hitbox_y, hitbox_w, hitbox_h) = hitbox;
+    let x = body_right - (hitbox_x + hitbox_w);
+    let y = match origin {
+        WindowCoordinateOrigin::TopLeft => body_bottom - (hitbox_y + hitbox_h),
+        WindowCoordinateOrigin::BottomLeft => body_bottom + (hitbox_y + hitbox_h) - canvas_h,
+    };
+    (x, y)
+}
+
+fn set_mini_window_frame(frame: (f64, f64, f64, f64)) {
+    if let Ok(mut cached) = MINI_WINDOW_FRAME.lock() {
+        *cached = Some(frame);
+    }
+}
+
+fn valid_pet_canvas_bounds(
+    canvas_w: f64,
+    canvas_h: f64,
+    hitbox_x: f64,
+    hitbox_y: f64,
+    hitbox_w: f64,
+    hitbox_h: f64,
+) -> bool {
+    const MAX_CANVAS_DIMENSION: f64 = 16_384.0;
+    [canvas_w, canvas_h, hitbox_x, hitbox_y, hitbox_w, hitbox_h]
+        .into_iter()
+        .all(f64::is_finite)
+        && canvas_w > 0.0
+        && canvas_h > 0.0
+        && canvas_w <= MAX_CANVAS_DIMENSION
+        && canvas_h <= MAX_CANVAS_DIMENSION
+        && hitbox_x >= 0.0
+        && hitbox_y >= 0.0
+        && hitbox_w > 0.0
+        && hitbox_h > 0.0
+        && hitbox_x + hitbox_w <= canvas_w
+        && hitbox_y + hitbox_h <= canvas_h
+}
+
+fn registered_entry_matches_frame(frame_w: f64, frame_h: f64, entry: MascotHitboxEntry) -> bool {
+    (frame_w - entry.canvas_w).abs() <= 2.0 && (frame_h - entry.canvas_h).abs() <= 2.0
+}
+
+fn collapsed_video_pet_hitbox(
+    frame_w: f64,
+    frame_h: f64,
+    is_expanded: bool,
+    entry: Option<MascotHitboxEntry>,
+) -> Option<MascotHitboxEntry> {
+    if is_expanded {
+        return None;
+    }
+    entry.filter(|entry| registered_entry_matches_frame(frame_w, frame_h, *entry))
+}
+
+fn translate_mini_video_pet_body_anchor(dx: f64, dy: f64) {
+    if MINI_IS_EXPANDED.load(Ordering::SeqCst) || get_mascot_hitbox_entry("mini").is_none() {
+        return;
+    }
+    if let Ok(mut anchor) = PET_BODY_ANCHOR.lock() {
+        if let Some((right, bottom)) = *anchor {
+            *anchor = Some((right + dx, bottom + dy));
+        }
+    }
 }
 
 static REGISTERED_MASCOT_HITBOXES: Mutex<Vec<(String, MascotHitboxEntry)>> = Mutex::new(Vec::new());
@@ -143,6 +295,36 @@ static BUBBLE_GEOMETRY: Mutex<BubbleGeometryState> = Mutex::new(BubbleGeometrySt
     reserve_y: 115.0,
     anchor: None,
 });
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BubbleResyncRequest {
+    width: f64,
+    height: f64,
+    reserve_x: f64,
+    reserve_y: f64,
+    preserve_anchor: bool,
+}
+
+fn visible_mascot_bubble_reanchor_request(
+    window_label: &str,
+    is_expanded: bool,
+    bubble_is_visible: bool,
+    geometry: BubbleGeometryState,
+) -> Option<BubbleResyncRequest> {
+    if window_label != "mini" || is_expanded || !bubble_is_visible {
+        return None;
+    }
+    Some(BubbleResyncRequest {
+        width: geometry.width,
+        height: geometry.height,
+        reserve_x: geometry.reserve_x,
+        reserve_y: geometry.reserve_y,
+        // A canvas change must resolve against the new body bounds, not the
+        // bubble's previous resting anchor.
+        preserve_anchor: false,
+    })
+}
+
 /// Tracks whether the mini window is currently expanded into the message/settings panel.
 static MINI_IS_EXPANDED: AtomicBool = AtomicBool::new(false);
 /// Controls the cursor hit-test passthrough thread for the mascot status bubble window.
@@ -3503,6 +3685,9 @@ async fn move_mini_by(app: tauri::AppHandle, dx: f64, dy: f64) -> Result<(), Str
             use objc2::runtime::AnyObject;
             use objc2::msg_send;
             use objc2_foundation::{NSRect, NSPoint, NSSize};
+            let _geometry_update_guard = PET_GEOMETRY_UPDATE_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             if let Ok(ns_win) = win_clone.ns_window() {
                 let obj = unsafe { &*(ns_win as *mut AnyObject) };
                 let frame: NSRect = unsafe { msg_send![obj, frame] };
@@ -3513,9 +3698,12 @@ async fn move_mini_by(app: tauri::AppHandle, dx: f64, dy: f64) -> Result<(), Str
                 unsafe {
                     let _: () = msg_send![obj, setFrame: new_frame, display: true, animate: false];
                 }
-                if let Ok(mut f) = MINI_WINDOW_FRAME.lock() {
-                    *f = Some((new_frame.origin.x, new_frame.origin.y, new_frame.size.width, new_frame.size.height));
-                }
+                let applied: NSRect = unsafe { msg_send![obj, frame] };
+                set_mini_window_frame((applied.origin.x, applied.origin.y, applied.size.width, applied.size.height));
+                translate_mini_video_pet_body_anchor(
+                    applied.origin.x - frame.origin.x,
+                    applied.origin.y - frame.origin.y,
+                );
                 // Keep the pet-context restore frame in sync when dragging
                 // while the context menu is open, so closing restores to the
                 // new position instead of the stale pre-drag position.
@@ -3532,11 +3720,26 @@ async fn move_mini_by(app: tauri::AppHandle, dx: f64, dy: f64) -> Result<(), Str
     {
         // outer_position() returns PhysicalPosition; dx/dy are in logical (CSS) pixels.
         // Convert physical → logical before adding the delta.
+        let _geometry_update_guard = PET_GEOMETRY_UPDATE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if let Ok(pos) = win.outer_position() {
             let scale = win.scale_factor().unwrap_or(1.0);
             let logical_x = pos.x as f64 / scale;
             let logical_y = pos.y as f64 / scale;
-            let _ = win.set_position(tauri::LogicalPosition::new(logical_x + dx, logical_y + dy));
+            win.set_position(tauri::LogicalPosition::new(logical_x + dx, logical_y + dy))
+                .map_err(|e| e.to_string())?;
+            if let (Ok(new_pos), Ok(size)) = (win.outer_position(), win.outer_size()) {
+                let actual_scale = win.scale_factor().unwrap_or(scale);
+                let frame = (
+                    new_pos.x as f64 / actual_scale,
+                    new_pos.y as f64 / actual_scale,
+                    size.width as f64 / actual_scale,
+                    size.height as f64 / actual_scale,
+                );
+                set_mini_window_frame(frame);
+                translate_mini_video_pet_body_anchor(frame.0 - logical_x, frame.1 - logical_y);
+            }
         }
     }
     let geom = *BUBBLE_GEOMETRY.lock().unwrap();
@@ -3666,6 +3869,9 @@ async fn set_mini_origin(
             use objc2::runtime::{AnyClass, AnyObject};
             use objc2::msg_send;
             use objc2_foundation::{NSRect, NSPoint, NSSize};
+            let _geometry_update_guard = PET_GEOMETRY_UPDATE_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             if let Ok(ns_win) = win_clone.ns_window() {
                 let obj = unsafe { &*(ns_win as *mut AnyObject) };
                 let frame: NSRect = unsafe { msg_send![obj, frame] };
@@ -3714,8 +3920,13 @@ async fn set_mini_origin(
                 unsafe {
                     let _: () = msg_send![obj, setFrame: new_frame, display: true, animate: false];
                 }
-                if let Ok(mut f) = MINI_WINDOW_FRAME.lock() {
-                    *f = Some((new_frame.origin.x, new_frame.origin.y, new_frame.size.width, new_frame.size.height));
+                let applied: NSRect = unsafe { msg_send![obj, frame] };
+                set_mini_window_frame((applied.origin.x, applied.origin.y, applied.size.width, applied.size.height));
+                if !confine {
+                    translate_mini_video_pet_body_anchor(
+                        applied.origin.x - frame.origin.x,
+                        applied.origin.y - frame.origin.y,
+                    );
                 }
             }
         }).map_err(|e| e.to_string())?;
@@ -3723,16 +3934,39 @@ async fn set_mini_origin(
     #[cfg(target_os = "windows")]
     {
         if !confine {
+            let _geometry_update_guard = PET_GEOMETRY_UPDATE_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             log::debug!(
                 "[mini-pos] set_mini_origin(win) unconfined x={:.1} y={:.1}",
                 x, y
             );
-            let _ = win.set_position(tauri::LogicalPosition::new(x, y));
+            let old = (win.outer_position(), win.outer_size());
+            let old_scale = win.scale_factor().unwrap_or(1.0);
+            win.set_position(tauri::LogicalPosition::new(x, y))
+                .map_err(|e| e.to_string())?;
+            if let (Ok(old_pos), Ok(new_pos), Ok(size)) = (old.0, win.outer_position(), win.outer_size()) {
+                let new_scale = win.scale_factor().unwrap_or(old_scale);
+                let old_x = old_pos.x as f64 / old_scale;
+                let old_y = old_pos.y as f64 / old_scale;
+                let frame = (
+                    new_pos.x as f64 / new_scale,
+                    new_pos.y as f64 / new_scale,
+                    size.width as f64 / new_scale,
+                    size.height as f64 / new_scale,
+                );
+                set_mini_window_frame(frame);
+                translate_mini_video_pet_body_anchor(frame.0 - old_x, frame.1 - old_y);
+            }
+            drop(_geometry_update_guard);
             let geom = *BUBBLE_GEOMETRY.lock().unwrap();
             let _ = sync_mascot_bubble(app.clone(), geom.width, geom.height, Some(geom.reserve_x), Some(geom.reserve_y), Some(false), None, Some("internal-origin-unconfined".into())).await;
             return Ok(());
         }
         if let Ok(Some(monitor)) = win.current_monitor() {
+            let _geometry_update_guard = PET_GEOMETRY_UPDATE_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             let scale = monitor.scale_factor();
             let mp = monitor.position();
             let mx = mp.x as f64 / scale;
@@ -3754,13 +3988,36 @@ async fn set_mini_origin(
                 "[mini-pos] set_mini_origin(win) clamped x={:.1}->{:.1} y={:.1}->{:.1} bounds x[{:.1},{:.1}] y[{:.1},{:.1}]",
                 x, clamped_x, y, clamped_y, min_x, max_x, min_y, max_y
             );
-            let _ = win.set_position(tauri::LogicalPosition::new(clamped_x, clamped_y));
+            win.set_position(tauri::LogicalPosition::new(clamped_x, clamped_y))
+                .map_err(|e| e.to_string())?;
+            if let (Ok(pos), Ok(size)) = (win.outer_position(), win.outer_size()) {
+                let actual_scale = win.scale_factor().unwrap_or(scale);
+                set_mini_window_frame((
+                    pos.x as f64 / actual_scale,
+                    pos.y as f64 / actual_scale,
+                    size.width as f64 / actual_scale,
+                    size.height as f64 / actual_scale,
+                ));
+            }
         } else {
+            let _geometry_update_guard = PET_GEOMETRY_UPDATE_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             log::debug!(
                 "[mini-pos] set_mini_origin(win,fallback) apply x={:.1} y={:.1} (with inset)",
                 x, y + MASCOT_TOP_INSET
             );
-            let _ = win.set_position(tauri::LogicalPosition::new(x, y + MASCOT_TOP_INSET));
+            win.set_position(tauri::LogicalPosition::new(x, y + MASCOT_TOP_INSET))
+                .map_err(|e| e.to_string())?;
+            if let (Ok(pos), Ok(size)) = (win.outer_position(), win.outer_size()) {
+                let scale = win.scale_factor().unwrap_or(1.0);
+                set_mini_window_frame((
+                    pos.x as f64 / scale,
+                    pos.y as f64 / scale,
+                    size.width as f64 / scale,
+                    size.height as f64 / scale,
+                ));
+            }
         }
     }
     let geom = *BUBBLE_GEOMETRY.lock().unwrap();
@@ -4124,8 +4381,16 @@ fn efficiency_hover_poll(app: tauri::AppHandle) {
             let cursor = macos_cursor_position();
             let buttons = macos_pressed_mouse_buttons();
             let left_pressed = (buttons & 1) != 0;
-            let is_expanded = EFFICIENCY_EXPANDED.load(Ordering::SeqCst);
-            let frame = MINI_WINDOW_FRAME.lock().ok().and_then(|g| *g);
+            let (is_expanded, frame, custom_hitbox) = {
+                let _geometry_update_guard = PET_GEOMETRY_UPDATE_LOCK
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                (
+                    EFFICIENCY_EXPANDED.load(Ordering::SeqCst),
+                    MINI_WINDOW_FRAME.lock().ok().and_then(|g| *g),
+                    PET_HITBOX_BOUNDS.lock().ok().and_then(|g| *g),
+                )
+            };
 
             let inside = if is_expanded {
                 if let Some((fx, fy, fw, fh)) = frame {
@@ -4163,7 +4428,6 @@ fn efficiency_hover_poll(app: tauri::AppHandle) {
             // bottom-right corner). Hover/drag should only fire on the
             // visible body, so we inset to ~35% wide x 65% tall around the
             // upper-centre where the head/torso sit.
-            let custom_hitbox = PET_HITBOX_BOUNDS.lock().ok().and_then(|g| *g);
             let resize_handle = 34.0_f64;
 
             let over_mascot = if is_expanded {
@@ -4313,6 +4577,10 @@ fn request_drag_apply(app: &tauri::AppHandle) {
         use objc2::runtime::AnyObject;
         use objc2_foundation::NSPoint;
 
+        let _geometry_update_guard = PET_GEOMETRY_UPDATE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
         DRAG_TASK_PENDING.store(false, Ordering::SeqCst);
         let anchor = drag_anchor().lock().ok().and_then(|g| *g);
         let Some((ax, ay)) = anchor else { return };
@@ -4323,6 +4591,7 @@ fn request_drag_apply(app: &tauri::AppHandle) {
         if let Some(win) = app_clone.get_webview_window("mini") {
             if let Ok(ns_win) = win.ns_window() {
                 let obj = unsafe { &*(ns_win as *mut AnyObject) };
+                let previous: objc2_foundation::NSRect = unsafe { msg_send![obj, frame] };
                 // setFrameOrigin: only moves the window — it does not
                 // redraw the contents — so it is far cheaper than
                 // setFrame:display:animate:NO and keeps up with fast
@@ -4330,11 +4599,12 @@ fn request_drag_apply(app: &tauri::AppHandle) {
                 unsafe {
                     let _: () = msg_send![obj, setFrameOrigin: new_origin];
                 }
-                if let Ok(mut f) = MINI_WINDOW_FRAME.lock() {
-                    if let Some((_, _, w, h)) = *f {
-                        *f = Some((new_origin.x, new_origin.y, w, h));
-                    }
-                }
+                let applied: objc2_foundation::NSRect = unsafe { msg_send![obj, frame] };
+                set_mini_window_frame((applied.origin.x, applied.origin.y, applied.size.width, applied.size.height));
+                translate_mini_video_pet_body_anchor(
+                    applied.origin.x - previous.origin.x,
+                    applied.origin.y - previous.origin.y,
+                );
             }
         }
     });
@@ -5515,182 +5785,186 @@ async fn set_pet_canvas_bounds(
     anchor_mode: Option<String>,
 ) -> Result<(), String> {
     let target_label = window_label.unwrap_or_else(|| "mini".to_string());
-
-    if target_label == "mini" {
-        if let (Some(cw), Some(ch)) = (canvas_w, canvas_h) {
-            if let Ok(mut guard) = PET_CANVAS_BOUNDS.lock() {
-                *guard = Some((cw, ch));
-            }
-        } else {
-            if let Ok(mut guard) = PET_CANVAS_BOUNDS.lock() {
-                *guard = None;
-            }
-        }
-
-        if let (Some(x), Some(y), Some(w), Some(h)) = (hitbox_x, hitbox_y, hitbox_w, hitbox_h) {
-            if let Ok(mut guard) = PET_HITBOX_BOUNDS.lock() {
-                *guard = Some((x, y, w, h));
-            }
-        } else {
-            if let Ok(mut guard) = PET_HITBOX_BOUNDS.lock() {
-                *guard = None;
-            }
+    let supplied_count = [canvas_w, canvas_h, hitbox_x, hitbox_y, hitbox_w, hitbox_h]
+        .into_iter()
+        .filter(Option::is_some)
+        .count();
+    if supplied_count != 0 && supplied_count != 6 {
+        return Err("VideoPet canvas bounds must be fully specified or fully cleared".into());
+    }
+    if let (Some(cw), Some(ch), Some(hx), Some(hy), Some(hw), Some(hh)) =
+        (canvas_w, canvas_h, hitbox_x, hitbox_y, hitbox_w, hitbox_h)
+    {
+        if !valid_pet_canvas_bounds(cw, ch, hx, hy, hw, hh) {
+            return Err("invalid VideoPet canvas or body hitbox bounds".into());
         }
     }
-
-    let has_bounds = canvas_w.is_some() && canvas_h.is_some()
-        && hitbox_x.is_some() && hitbox_y.is_some() && hitbox_w.is_some() && hitbox_h.is_some();
+    let has_bounds = supplied_count == 6;
 
     #[cfg(target_os = "macos")]
     {
-        let win = app.get_webview_window(&target_label);
-        if let Some(win) = win {
-            let win_clone = win.clone();
-            let target_c = target_label.clone();
-            let anchor_c = anchor_mode.clone();
-            let _ = app.run_on_main_thread(move || {
-                use objc2::runtime::AnyObject;
-                use objc2::msg_send;
-                use objc2_foundation::{NSRect, NSPoint, NSSize};
-                if let Ok(ns_win) = win_clone.ns_window() {
-                    let obj = unsafe { &*(ns_win as *mut AnyObject) };
-                    let current: NSRect = unsafe { msg_send![obj, frame] };
-                    let current_x = current.origin.x;
-                    let current_y = current.origin.y;
-                    let current_w = current.size.width;
-                    let current_h = current.size.height;
-
-                    let prev_entry = get_mascot_hitbox_entry(&target_c);
-
-                    if let (Some(cw), Some(ch), Some(hx), Some(hy), Some(hw), Some(hh)) =
-                        (canvas_w, canvas_h, hitbox_x, hitbox_y, hitbox_w, hitbox_h)
-                    {
-                        let mode = anchor_c.as_deref().unwrap_or(if target_c == "mini" { "bottom-right" } else { "top-left" });
-                        let (new_x, new_y) = match mode {
+        let win = app.get_webview_window(&target_label)
+            .ok_or_else(|| format!("window not found: {target_label}"))?;
+        let win_clone = win.clone();
+        let target_c = target_label.clone();
+        let anchor_c = anchor_mode.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        app.run_on_main_thread(move || {
+            use objc2::runtime::AnyObject;
+            use objc2::msg_send;
+            use objc2_foundation::{NSRect, NSPoint, NSSize};
+            let _geometry_update_guard = PET_GEOMETRY_UPDATE_LOCK.lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let result = if let Ok(ns_win) = win_clone.ns_window() {
+                let obj = unsafe { &*(ns_win as *mut AnyObject) };
+                let current: NSRect = unsafe { msg_send![obj, frame] };
+                let current_frame = (current.origin.x, current.origin.y, current.size.width, current.size.height);
+                let previous = get_mascot_hitbox_entry(&target_c);
+                if let (Some(cw), Some(ch), Some(hx), Some(hy), Some(hw), Some(hh)) =
+                    (canvas_w, canvas_h, hitbox_x, hitbox_y, hitbox_w, hitbox_h)
+                {
+                    let mode = anchor_c.as_deref().unwrap_or(if target_c == "mini" { "bottom-right" } else { "top-left" });
+                    let (x, y) = if target_c == "mini" && mode == "bottom-right" {
+                        let saved = PET_BODY_ANCHOR.lock().ok().and_then(|anchor| *anchor);
+                        let body_anchor = saved.or_else(|| previous.map(|entry| {
+                            let body = mascot_body_bounds(current_frame, entry, WindowCoordinateOrigin::BottomLeft);
+                            (body.right, body.bottom)
+                        })).unwrap_or((current_frame.0 + current_frame.2, current_frame.1));
+                        mini_pet_canvas_origin_for_body_anchor(ch, (hx, hy, hw, hh), body_anchor.0, body_anchor.1, WindowCoordinateOrigin::BottomLeft)
+                    } else {
+                        match mode {
                             "top-left" => {
-                                let body_left = if let Some(prev) = prev_entry {
-                                    current_x + prev.hitbox_x
-                                } else {
-                                    current_x
-                                };
-                                let body_top = if let Some(prev) = prev_entry {
-                                    current_y + current_h - prev.hitbox_y
-                                } else {
-                                    current_y + current_h
-                                };
-                                (body_left - hx, body_top - ch + hy)
+                                let left = previous.map(|entry| current_frame.0 + entry.hitbox_x).unwrap_or(current_frame.0);
+                                let top = previous.map(|entry| current_frame.1 + current_frame.3 - entry.hitbox_y).unwrap_or(current_frame.1 + current_frame.3);
+                                (left - hx, top - ch + hy)
                             }
                             _ => {
-                                // "bottom-right"
-                                let body_right = if let Some(prev) = prev_entry {
-                                    current_x + prev.hitbox_x + prev.hitbox_w
-                                } else {
-                                    current_x + current_w
-                                };
-                                let body_bottom = if let Some(prev) = prev_entry {
-                                    current_y + current_h - (prev.hitbox_y + prev.hitbox_h)
-                                } else {
-                                    current_y
-                                };
-                                (body_right - (hx + hw), body_bottom - (ch - (hy + hh)))
-                            }
-                        };
-
-                        let new_frame = NSRect::new(NSPoint::new(new_x, new_y), NSSize::new(cw, ch));
-                        unsafe {
-                            let _: () = msg_send![obj, setFrame: new_frame, display: true, animate: false];
-                        }
-                        if target_c == "mini" {
-                            if let Ok(mut f) = MINI_WINDOW_FRAME.lock() {
-                                *f = Some((new_x, new_y, cw, ch));
+                                let right = previous.map(|entry| current_frame.0 + entry.hitbox_x + entry.hitbox_w).unwrap_or(current_frame.0 + current_frame.2);
+                                let bottom = previous.map(|entry| current_frame.1 + current_frame.3 - (entry.hitbox_y + entry.hitbox_h)).unwrap_or(current_frame.1);
+                                (right - (hx + hw), bottom - (ch - (hy + hh)))
                             }
                         }
-                        set_mascot_hitbox_entry(target_c, MascotHitboxEntry {
-                            canvas_w: cw,
-                            canvas_h: ch,
-                            hitbox_x: hx,
-                            hitbox_y: hy,
-                            hitbox_w: hw,
-                            hitbox_h: hh,
-                        });
-                    } else {
-                        remove_mascot_hitbox_entry(&target_c);
+                    };
+                    let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(cw, ch));
+                    unsafe { let _: () = msg_send![obj, setFrame: frame, display: true, animate: false]; }
+                    let applied: NSRect = unsafe { msg_send![obj, frame] };
+                    let native_frame = (applied.origin.x, applied.origin.y, applied.size.width, applied.size.height);
+                    let entry = MascotHitboxEntry { canvas_w: native_frame.2, canvas_h: native_frame.3, hitbox_x: hx, hitbox_y: hy, hitbox_w: hw, hitbox_h: hh };
+                    if target_c == "mini" {
+                        set_mini_window_frame(native_frame);
+                        let body = mascot_body_bounds(native_frame, entry, WindowCoordinateOrigin::BottomLeft);
+                        if let Ok(mut anchor) = PET_BODY_ANCHOR.lock() { *anchor = Some((body.right, body.bottom)); }
+                        if let Ok(mut bounds) = PET_CANVAS_BOUNDS.lock() { *bounds = Some((entry.canvas_w, entry.canvas_h)); }
+                        if let Ok(mut bounds) = PET_HITBOX_BOUNDS.lock() { *bounds = Some((hx, hy, hw, hh)); }
+                    }
+                    set_mascot_hitbox_entry(target_c.clone(), entry);
+                } else {
+                    remove_mascot_hitbox_entry(&target_c);
+                    if target_c == "mini" {
+                        set_mini_window_frame(current_frame);
+                        if let Ok(mut anchor) = PET_BODY_ANCHOR.lock() { *anchor = None; }
+                        if let Ok(mut bounds) = PET_CANVAS_BOUNDS.lock() { *bounds = None; }
+                        if let Ok(mut bounds) = PET_HITBOX_BOUNDS.lock() { *bounds = None; }
                     }
                 }
-            });
-        }
+                Ok(())
+            } else { Err(format!("failed to get native window for {target_c}")) };
+            let _ = tx.send(result);
+        }).map_err(|e| e.to_string())?;
+        rx.recv().map_err(|e| e.to_string())??;
     }
 
     #[cfg(target_os = "windows")]
     {
-        if let Some(win) = app.get_webview_window(&target_label) {
-            if let (Some(cw), Some(ch), Some(hx), Some(hy), Some(hw), Some(hh)) =
-                (canvas_w, canvas_h, hitbox_x, hitbox_y, hitbox_w, hitbox_h)
-            {
-                if let Ok(Some(monitor)) = win.current_monitor() {
-                    let scale = monitor.scale_factor();
-                    if let (Ok(pos), Ok(size)) = (win.outer_position(), win.outer_size()) {
-                        let current_x = pos.x as f64 / scale;
-                        let current_y = pos.y as f64 / scale;
-                        let current_w = size.width as f64 / scale;
-                        let current_h = size.height as f64 / scale;
-
-                        let prev_entry = get_mascot_hitbox_entry(&target_label);
-
-                        let mode = anchor_mode.as_deref().unwrap_or(if target_label == "mini" { "bottom-right" } else { "top-left" });
-                        let (new_x, new_y) = match mode {
-                            "top-left" => {
-                                let body_left = if let Some(prev) = prev_entry {
-                                    current_x + prev.hitbox_x
-                                } else {
-                                    current_x
-                                };
-                                let body_top = if let Some(prev) = prev_entry {
-                                    current_y + prev.hitbox_y
-                                } else {
-                                    current_y
-                                };
-                                (body_left - hx, body_top - hy)
-                            }
-                            _ => {
-                                // "bottom-right"
-                                let body_right = if let Some(prev) = prev_entry {
-                                    current_x + prev.hitbox_x + prev.hitbox_w
-                                } else {
-                                    current_x + current_w
-                                };
-                                let body_bottom = if let Some(prev) = prev_entry {
-                                    current_y + prev.hitbox_y + prev.hitbox_h
-                                } else {
-                                    current_y + current_h
-                                };
-                                (body_right - (hx + hw), body_bottom - (hy + hh))
-                            }
-                        };
-
-                        let _ = win.set_size(tauri::LogicalSize::new(cw, ch));
-                        let _ = win.set_position(tauri::LogicalPosition::new(new_x, new_y));
+        let win = app.get_webview_window(&target_label)
+            .ok_or_else(|| format!("window not found: {target_label}"))?;
+        let _geometry_update_guard = PET_GEOMETRY_UPDATE_LOCK.lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let monitor = win.current_monitor().map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("{target_label} window has no current monitor"))?;
+        let scale = monitor.scale_factor();
+        let pos = win.outer_position().map_err(|e| e.to_string())?;
+        let size = win.outer_size().map_err(|e| e.to_string())?;
+        let current = (pos.x as f64 / scale, pos.y as f64 / scale, size.width as f64 / scale, size.height as f64 / scale);
+        let previous = get_mascot_hitbox_entry(&target_label);
+        if let (Some(cw), Some(ch), Some(hx), Some(hy), Some(hw), Some(hh)) =
+            (canvas_w, canvas_h, hitbox_x, hitbox_y, hitbox_w, hitbox_h)
+        {
+            let mode = anchor_mode.as_deref().unwrap_or(if target_label == "mini" { "bottom-right" } else { "top-left" });
+            let (x, y) = if target_label == "mini" && mode == "bottom-right" {
+                let saved = PET_BODY_ANCHOR.lock().ok().and_then(|anchor| *anchor);
+                let body_anchor = saved.or_else(|| previous.map(|entry| {
+                    let body = mascot_body_bounds(current, entry, WindowCoordinateOrigin::TopLeft);
+                    (body.right, body.bottom)
+                })).unwrap_or((current.0 + current.2, current.1 + current.3));
+                mini_pet_canvas_origin_for_body_anchor(ch, (hx, hy, hw, hh), body_anchor.0, body_anchor.1, WindowCoordinateOrigin::TopLeft)
+            } else {
+                match mode {
+                    "top-left" => {
+                        let left = previous.map(|entry| current.0 + entry.hitbox_x).unwrap_or(current.0);
+                        let top = previous.map(|entry| current.1 + entry.hitbox_y).unwrap_or(current.1);
+                        (left - hx, top - hy)
+                    }
+                    _ => {
+                        let right = previous.map(|entry| current.0 + entry.hitbox_x + entry.hitbox_w).unwrap_or(current.0 + current.2);
+                        let bottom = previous.map(|entry| current.1 + entry.hitbox_y + entry.hitbox_h).unwrap_or(current.1 + current.3);
+                        (right - (hx + hw), bottom - (hy + hh))
                     }
                 }
-
-                set_mascot_hitbox_entry(target_label.clone(), MascotHitboxEntry {
-                    canvas_w: cw,
-                    canvas_h: ch,
-                    hitbox_x: hx,
-                    hitbox_y: hy,
-                    hitbox_w: hw,
-                    hitbox_h: hh,
-                });
-            } else {
-                remove_mascot_hitbox_entry(&target_label);
+            };
+            let native_frame = set_window_frame_atomic(&win, x, y, cw, ch)?;
+            let entry = MascotHitboxEntry { canvas_w: native_frame.2, canvas_h: native_frame.3, hitbox_x: hx, hitbox_y: hy, hitbox_w: hw, hitbox_h: hh };
+            if target_label == "mini" {
+                set_mini_window_frame(native_frame);
+                let body = mascot_body_bounds(native_frame, entry, WindowCoordinateOrigin::TopLeft);
+                if let Ok(mut anchor) = PET_BODY_ANCHOR.lock() { *anchor = Some((body.right, body.bottom)); }
+                if let Ok(mut bounds) = PET_CANVAS_BOUNDS.lock() { *bounds = Some((entry.canvas_w, entry.canvas_h)); }
+                if let Ok(mut bounds) = PET_HITBOX_BOUNDS.lock() { *bounds = Some((hx, hy, hw, hh)); }
+            }
+            set_mascot_hitbox_entry(target_label.clone(), entry);
+        } else {
+            remove_mascot_hitbox_entry(&target_label);
+            if target_label == "mini" {
+                if let (Ok(pos), Ok(size)) = (win.outer_position(), win.outer_size()) {
+                    let scale = win.scale_factor().unwrap_or(1.0);
+                    set_mini_window_frame((pos.x as f64 / scale, pos.y as f64 / scale, size.width as f64 / scale, size.height as f64 / scale));
+                }
+                if let Ok(mut anchor) = PET_BODY_ANCHOR.lock() { *anchor = None; }
+                if let Ok(mut bounds) = PET_CANVAS_BOUNDS.lock() { *bounds = None; }
+                if let Ok(mut bounds) = PET_HITBOX_BOUNDS.lock() { *bounds = None; }
             }
         }
     }
 
-    if has_bounds {
-        ensure_mascot_passthrough_poll(app);
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    if target_label == "mini" {
+        if let Ok(mut bounds) = PET_CANVAS_BOUNDS.lock() { *bounds = if has_bounds { canvas_w.zip(canvas_h) } else { None }; }
+        if let Ok(mut bounds) = PET_HITBOX_BOUNDS.lock() { *bounds = if has_bounds { hitbox_x.zip(hitbox_y).zip(hitbox_w).zip(hitbox_h).map(|(((x, y), w), h)| (x, y, w, h)) } else { None }; }
     }
 
+    let bubble_geometry = *BUBBLE_GEOMETRY.lock().unwrap();
+    if let Some(request) = visible_mascot_bubble_reanchor_request(
+        &target_label,
+        MINI_IS_EXPANDED.load(Ordering::SeqCst),
+        BUBBLE_PASSTHROUGH_ACTIVE.load(Ordering::SeqCst),
+        bubble_geometry,
+    ) {
+        let _ = sync_mascot_bubble(
+            app.clone(),
+            request.width,
+            request.height,
+            Some(request.reserve_x),
+            Some(request.reserve_y),
+            Some(request.preserve_anchor),
+            None,
+            Some("video-pet-canvas-bounds".into()),
+        )
+        .await;
+    }
+
+    if has_bounds {
+        ensure_mascot_passthrough_poll(app.clone());
+    }
     Ok(())
 }
 
@@ -5880,16 +6154,13 @@ fn hit_test_mascot_window_macos(
             return true;
         }
 
-        let resize_handle = 34.0_f64;
-        let hit_left = fx + entry.hitbox_x;
-        let hit_right = hit_left + entry.hitbox_w;
-        let hit_bottom = fy + fh - (entry.hitbox_y + entry.hitbox_h);
-        let hit_top = fy + fh - entry.hitbox_y;
-
-        let over_body = cx >= hit_left && cx <= hit_right && cy >= hit_bottom && cy <= hit_top;
-        let over_resize = cx >= hit_right - resize_handle && cx <= hit_right
-            && cy >= hit_bottom && cy <= hit_bottom + resize_handle;
-        over_body || over_resize
+        hit_test_mascot_body_or_resize(
+            (fx, fy, fw, fh),
+            entry,
+            (cx, cy),
+            WindowCoordinateOrigin::BottomLeft,
+            34.0,
+        )
     } else if is_pet_mode {
         // Legacy Xiang-qi-e pet mode hit-testing in Cocoa coordinates
         let (current_mascot_scale, current_large_scale) = PET_MASCOT_SCALES
@@ -5963,16 +6234,13 @@ fn hit_test_mascot_window(
             return true;
         }
 
-        let resize_handle = 34.0_f64;
-        let hit_left = fx + entry.hitbox_x;
-        let hit_right = hit_left + entry.hitbox_w;
-        let hit_top = fy + entry.hitbox_y;
-        let hit_bottom = hit_top + entry.hitbox_h;
-
-        let over_body = cx >= hit_left && cx <= hit_right && cy >= hit_top && cy <= hit_bottom;
-        let over_resize = cx >= hit_right - resize_handle && cx <= hit_right
-            && cy >= hit_bottom - resize_handle && cy <= hit_bottom;
-        over_body || over_resize
+        hit_test_mascot_body_or_resize(
+            (fx, fy, fw, fh),
+            entry,
+            (cx, cy),
+            WindowCoordinateOrigin::TopLeft,
+            34.0,
+        )
     } else if is_pet_mode {
         // Legacy Xiang-qi-e pet mode hit-testing in logical pixels
         let (current_mascot_scale, current_large_scale) = PET_MASCOT_SCALES
@@ -6049,6 +6317,9 @@ fn mascot_passthrough_poll_windows(app: tauri::AppHandle) {
 
     loop {
         let pet_mode_active = PET_PASSTHROUGH_ACTIVE.load(Ordering::SeqCst);
+        let geometry_update_guard = PET_GEOMETRY_UPDATE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let registered_hitboxes: Vec<(String, MascotHitboxEntry)> = {
             if let Ok(reg) = REGISTERED_MASCOT_HITBOXES.lock() {
                 reg.iter().map(|(k, v)| (k.clone(), *v)).collect()
@@ -6065,6 +6336,7 @@ fn mascot_passthrough_poll_windows(app: tauri::AppHandle) {
                     }
                 }
             }
+            drop(geometry_update_guard);
             std::thread::sleep(Duration::from_millis(100));
             continue;
         }
@@ -6116,6 +6388,7 @@ fn mascot_passthrough_poll_windows(app: tauri::AppHandle) {
                 last_states.insert("mini".to_string(), want_ignore);
             }
         }
+        drop(geometry_update_guard);
 
         // 2. Extra / demo mascot windows
         for (label, entry) in &registered_hitboxes {
@@ -6169,6 +6442,9 @@ fn mascot_passthrough_poll_macos(app: tauri::AppHandle) {
 
     loop {
         let pet_mode_active = PET_PASSTHROUGH_ACTIVE.load(Ordering::SeqCst);
+        let geometry_update_guard = PET_GEOMETRY_UPDATE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let registered_hitboxes: Vec<(String, MascotHitboxEntry)> = {
             if let Ok(reg) = REGISTERED_MASCOT_HITBOXES.lock() {
                 reg.iter().map(|(k, v)| (k.clone(), *v)).collect()
@@ -6183,6 +6459,7 @@ fn mascot_passthrough_poll_macos(app: tauri::AppHandle) {
                     set_window_ignores_mouse_events(&app, &label, false);
                 }
             }
+            drop(geometry_update_guard);
             std::thread::sleep(Duration::from_millis(100));
             continue;
         }
@@ -6220,6 +6497,7 @@ fn mascot_passthrough_poll_macos(app: tauri::AppHandle) {
                 last_states.insert("mini".to_string(), want_ignore);
             }
         }
+        drop(geometry_update_guard);
 
         // 2. Extra / demo mascot windows
         for (label, entry) in &registered_hitboxes {
@@ -12179,6 +12457,46 @@ fn resting_card_edges_from_frame(win_x: f64, win_y: f64, win_w: f64, win_h: f64)
     (card_right, card_bottom)
 }
 
+#[cfg(target_os = "windows")]
+fn set_window_frame_atomic(
+    win: &tauri::WebviewWindow,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(f64, f64, f64, f64), String> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER,
+    };
+
+    let hwnd_raw = win.hwnd().map_err(|e| e.to_string())?.0;
+    let scale = win.scale_factor().unwrap_or(1.0);
+    let flags = SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER;
+    unsafe {
+        SetWindowPos(
+            HWND(hwnd_raw as _),
+            HWND::default(),
+            (x * scale).round() as i32,
+            (y * scale).round() as i32,
+            (width * scale).round() as i32,
+            (height * scale).round() as i32,
+            flags,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    let actual_scale = win.scale_factor().unwrap_or(scale);
+    let pos = win.outer_position().map_err(|e| e.to_string())?;
+    let size = win.outer_size().map_err(|e| e.to_string())?;
+    Ok((
+        pos.x as f64 / actual_scale,
+        pos.y as f64 / actual_scale,
+        size.width as f64 / actual_scale,
+        size.height as f64 / actual_scale,
+    ))
+}
+
 /// Position the mascot status bubble next to the primary mascot window.
 /// `width`/`height` are the bubble's logical content size in logical pixels, measured
 /// by the frontend via ResizeObserver.
@@ -12444,7 +12762,9 @@ async fn sync_mascot_bubble(
         (x, y)
     } else {
         // Mini window frame + its monitor rect, both in logical pixels.
-        let (mini_x, mini_y, mini_w, mini_h, mon_x, mon_y, mon_w, mon_h): (f64, f64, f64, f64, f64, f64, f64, f64) = match () {
+        let (mini_x, mini_y, mini_w, mini_h, mon_x, mon_y, mon_w, mon_h, mini_entry): (
+            f64, f64, f64, f64, f64, f64, f64, f64, Option<MascotHitboxEntry>,
+        ) = match () {
             #[cfg(target_os = "macos")]
             () => {
                 let (tx, rx) = std::sync::mpsc::channel();
@@ -12455,6 +12775,9 @@ async fn sync_mascot_bubble(
                         use objc2::msg_send;
                         use objc2::runtime::{AnyClass, AnyObject};
                         use objc2_foundation::NSRect;
+                        let _geometry_update_guard = PET_GEOMETRY_UPDATE_LOCK
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
                         if let Ok(ns_win) = mini_clone.ns_window() {
                             let obj = unsafe { &*(ns_win as *mut AnyObject) };
                             let frame: NSRect = unsafe { msg_send![obj, frame] };
@@ -12481,6 +12804,7 @@ async fn sync_mascot_bubble(
                                 screen_frame.origin.y,
                                 screen_frame.size.width,
                                 screen_frame.size.height,
+                                get_mascot_hitbox_entry("mini"),
                             ));
                         }
                     })
@@ -12490,6 +12814,9 @@ async fn sync_mascot_bubble(
             }
             #[cfg(target_os = "windows")]
             () => {
+                let _geometry_update_guard = PET_GEOMETRY_UPDATE_LOCK
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
                 let scale = mini.scale_factor().unwrap_or(1.0);
                 let pos = mini.outer_position().map_err(|e| e.to_string())?;
                 let size = mini.outer_size().map_err(|e| e.to_string())?;
@@ -12508,16 +12835,26 @@ async fn sync_mascot_bubble(
                     mpos.y as f64 / scale,
                     msize.width as f64 / scale,
                     msize.height as f64 / scale,
+                    get_mascot_hitbox_entry("mini"),
                 )
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             () => return Ok(()),
         };
 
-        // Horizontal Alignment: Resting bubble right edge aligns with the mascot's right edge.
-        // Inside the envelope window, the resting card's right edge is at `win_w - BUBBLE_PAD_RIGHT`.
-        // We want the resting card's right edge on screen to be `mini_x + mini_w - 12.0`.
-        let target_card_right = mini_x + mini_w - 12.0;
+        let body_hitbox = collapsed_video_pet_hitbox(mini_w, mini_h, is_expanded, mini_entry);
+        #[cfg(target_os = "macos")]
+        let body_bounds = bubble_mascot_bounds(
+            (mini_x, mini_y, mini_w, mini_h), body_hitbox, WindowCoordinateOrigin::BottomLeft,
+        );
+        #[cfg(not(target_os = "macos"))]
+        let body_bounds = bubble_mascot_bounds(
+            (mini_x, mini_y, mini_w, mini_h), body_hitbox, WindowCoordinateOrigin::TopLeft,
+        );
+
+        // Use the visible body edge when VideoPet owns the collapsed frame;
+        // legacy pets and panel layouts keep the whole-window alignment.
+        let target_card_right = body_bounds.right - 12.0;
         let mut win_x = target_card_right - (win_w - BUBBLE_PAD_RIGHT);
 
         // Clamp resting card to monitor bounds [mon_x + margin, mon_x + mon_w - margin]
@@ -12534,12 +12871,12 @@ async fn sync_mascot_bubble(
         // Vertical Alignment
         #[cfg(target_os = "macos")]
         let (win_y, card_bottom) = {
-            let card_target_bottom = mini_y + mini_h + MASCOT_BUBBLE_GAP + 8.0;
+            let card_target_bottom = body_bounds.top + MASCOT_BUBBLE_GAP + 8.0;
             let mut y = card_target_bottom - BUBBLE_PAD_BOTTOM;
 
             let card_screen_top = y + win_h - res_y;
             if card_screen_top > mon_y + mon_h - margin {
-                let card_flipped_top = mini_y - MASCOT_BUBBLE_GAP - 8.0;
+                let card_flipped_top = body_bounds.bottom - MASCOT_BUBBLE_GAP - 8.0;
                 y = card_flipped_top - (win_h - res_y);
             }
 
@@ -12552,12 +12889,12 @@ async fn sync_mascot_bubble(
 
         #[cfg(not(target_os = "macos"))]
         let (win_y, card_bottom) = {
-            let card_target_bottom = mini_y - MASCOT_BUBBLE_GAP - 8.0;
+            let card_target_bottom = body_bounds.top - MASCOT_BUBBLE_GAP - 8.0;
             let mut y = card_target_bottom - (win_h - BUBBLE_PAD_BOTTOM);
 
             let card_screen_top = y + res_y;
             if card_screen_top < mon_y + margin {
-                let card_flipped_top = mini_y + mini_h + MASCOT_BUBBLE_GAP + 8.0;
+                let card_flipped_top = body_bounds.bottom + MASCOT_BUBBLE_GAP + 8.0;
                 y = card_flipped_top - res_y;
             }
 
@@ -23949,6 +24286,153 @@ mod fullscreen_bubble_suppression_tests {
             assert!(is_cursor_over_bubble_card(700.0, 640.0, card_right, card_bottom, width, height, scale));
             // Outside card
             assert!(!is_cursor_over_bubble_card(500.0, 640.0, card_right, card_bottom, width, height, scale));
+        }
+    }
+}
+
+#[cfg(test)]
+mod video_pet_native_geometry_tests {
+    use super::*;
+
+    fn shenshen_canvas_entry() -> MascotHitboxEntry {
+        MascotHitboxEntry {
+            canvas_w: 640.0,
+            canvas_h: 360.0,
+            hitbox_x: 212.0,
+            hitbox_y: 60.0,
+            hitbox_w: 216.0,
+            hitbox_h: 270.0,
+        }
+    }
+
+    #[test]
+    fn bubble_anchors_to_video_pet_body_and_preserves_legacy_window_fallback() {
+        let frame = (700.0, 100.0, 640.0, 360.0);
+        let entry = shenshen_canvas_entry();
+
+        let custom = bubble_mascot_bounds(frame, Some(entry), WindowCoordinateOrigin::TopLeft);
+        assert_eq!(custom, MascotBodyBounds { left: 912.0, top: 160.0, right: 1128.0, bottom: 430.0 });
+        assert_eq!(custom.right - 12.0, 1116.0);
+
+        let legacy = bubble_mascot_bounds(frame, None, WindowCoordinateOrigin::TopLeft);
+        assert_eq!(legacy, MascotBodyBounds { left: 700.0, top: 100.0, right: 1340.0, bottom: 460.0 });
+        assert_eq!(legacy.right - 12.0, 1328.0);
+
+        let mac_legacy = bubble_mascot_bounds(frame, None, WindowCoordinateOrigin::BottomLeft);
+        assert_eq!(mac_legacy, MascotBodyBounds { left: 700.0, top: 460.0, right: 1340.0, bottom: 100.0 });
+    }
+
+    #[test]
+    fn bubble_uses_video_pet_body_hitbox_only_for_matching_collapsed_canvas() {
+        let entry = shenshen_canvas_entry();
+        assert_eq!(collapsed_video_pet_hitbox(640.0, 360.0, false, Some(entry)), Some(entry));
+        assert_eq!(collapsed_video_pet_hitbox(640.0, 360.0, true, Some(entry)), None);
+        assert_eq!(collapsed_video_pet_hitbox(640.0, 720.0, false, Some(entry)), None);
+        assert_eq!(collapsed_video_pet_hitbox(640.0, 360.0, false, None), None);
+    }
+
+    #[test]
+    fn visible_bubble_canvas_resize_reanchors_without_preserving_stale_anchor() {
+        let geometry = BubbleGeometryState {
+            width: 242.0,
+            height: 48.0,
+            reserve_x: 170.0,
+            reserve_y: 115.0,
+            anchor: Some(BubbleAnchor {
+                card_right: 1_200.0,
+                card_bottom: 700.0,
+                mon_x: 0.0,
+                mon_y: 0.0,
+                mon_w: 1_920.0,
+                mon_h: 1_080.0,
+            }),
+        };
+
+        let request = visible_mascot_bubble_reanchor_request("mini", false, true, geometry).unwrap();
+        assert_eq!(request.width, 242.0);
+        assert_eq!(request.height, 48.0);
+        assert_eq!(request.reserve_x, 170.0);
+        assert_eq!(request.reserve_y, 115.0);
+        assert!(!request.preserve_anchor);
+        assert!(visible_mascot_bubble_reanchor_request("mini", false, false, geometry).is_none());
+        assert!(visible_mascot_bubble_reanchor_request("mini", true, true, geometry).is_none());
+        assert!(visible_mascot_bubble_reanchor_request("extra", false, true, geometry).is_none());
+    }
+
+    #[test]
+    fn scale_and_panel_round_trip_restore_body_anchor_on_windows_and_macos() {
+        let original_frame = (700.0, 100.0, 640.0, 360.0);
+        let original_entry = shenshen_canvas_entry();
+        let larger_hitbox = (250.0, 80.0, 220.0, 360.0);
+
+        for origin in [WindowCoordinateOrigin::TopLeft, WindowCoordinateOrigin::BottomLeft] {
+            let body = mascot_body_bounds(original_frame, original_entry, origin);
+            let restored_origin = mini_pet_canvas_origin_for_body_anchor(
+                500.0,
+                larger_hitbox,
+                body.right,
+                body.bottom,
+                origin,
+            );
+            let restored_entry = MascotHitboxEntry {
+                canvas_w: 800.0,
+                canvas_h: 500.0,
+                hitbox_x: larger_hitbox.0,
+                hitbox_y: larger_hitbox.1,
+                hitbox_w: larger_hitbox.2,
+                hitbox_h: larger_hitbox.3,
+            };
+            let restored_frame = (
+                restored_origin.0,
+                restored_origin.1,
+                restored_entry.canvas_w,
+                restored_entry.canvas_h,
+            );
+            let restored_body = mascot_body_bounds(restored_frame, restored_entry, origin);
+
+            assert!((restored_body.right - body.right).abs() < 1e-9);
+            assert!((restored_body.bottom - body.bottom).abs() < 1e-9);
+            let center = (
+                (restored_body.left + restored_body.right) / 2.0,
+                (restored_body.top + restored_body.bottom) / 2.0,
+            );
+            assert!(hit_test_mascot_body_or_resize(restored_frame, restored_entry, center, origin, 34.0));
+            assert!(!hit_test_mascot_body_or_resize(
+                restored_frame,
+                restored_entry,
+                (restored_frame.0 + 20.0, center.1),
+                origin,
+                34.0,
+            ));
+            assert!(registered_entry_matches_frame(restored_frame.2, restored_frame.3, restored_entry));
+        }
+    }
+
+    #[test]
+    fn native_canvas_bounds_reject_nonfinite_out_of_canvas_and_extreme_values() {
+        assert!(valid_pet_canvas_bounds(800.0, 500.0, 250.0, 80.0, 220.0, 360.0));
+        assert!(!valid_pet_canvas_bounds(f64::NAN, 500.0, 0.0, 0.0, 10.0, 10.0));
+        assert!(!valid_pet_canvas_bounds(800.0, f64::INFINITY, 0.0, 0.0, 10.0, 10.0));
+        assert!(!valid_pet_canvas_bounds(800.0, 500.0, 790.0, 0.0, 20.0, 10.0));
+        assert!(!valid_pet_canvas_bounds(20_000.0, 500.0, 0.0, 0.0, 10.0, 10.0));
+    }
+
+    #[test]
+    fn native_canvas_bounds_accept_frontend_rounded_edge_case() {
+        // Before outward rounding, the front end sent canvas_w=236 while
+        // hitbox_x + hitbox_w was 237 for this valid source geometry.
+        assert!(!valid_pet_canvas_bounds(236.0, 236.0, 22.0, 0.0, 215.0, 215.0));
+        assert!(valid_pet_canvas_bounds(237.0, 236.0, 22.0, 0.0, 215.0, 215.0));
+    }
+
+    #[test]
+    fn mini_frame_cache_keeps_the_applied_native_frame() {
+        let previous = MINI_WINDOW_FRAME.lock().ok().and_then(|frame| *frame);
+        let applied = (125.5, 240.25, 800.0, 500.0);
+        set_mini_window_frame(applied);
+        assert_eq!(MINI_WINDOW_FRAME.lock().unwrap().unwrap(), applied);
+        if let Ok(mut frame) = MINI_WINDOW_FRAME.lock() {
+            *frame = previous;
         }
     }
 }

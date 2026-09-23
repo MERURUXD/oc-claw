@@ -41,6 +41,22 @@ test('computeVideoPetGeometry: computes exact body scale and container bounds', 
   assert.equal(bodyRenderBottom, geo.containerHeight)
 })
 
+test('computeVideoPetGeometry: rounded hitbox remains inside the native canvas', () => {
+  const canvas: VideoPetCanvasGeometry = {
+    width: 143,
+    height: 143,
+    bodyBox: [13, 0, 143, 130],
+    feetY: 130,
+  }
+  const geo = computeVideoPetGeometry(canvas, 215)
+
+  assert.equal(geo.hitboxLeft, 22)
+  assert.equal(geo.bodyWidth, 215)
+  assert.equal(Math.round(canvas.width * geo.scale), 236)
+  assert.equal(geo.canvasWidth, 237)
+  assert.ok(geo.hitboxLeft + geo.bodyWidth <= geo.canvasWidth)
+})
+
 test('computeVideoPetGeometry: handles degenerate or zero-size gracefully', () => {
   const customCanvas: VideoPetCanvasGeometry = {
     width: 100,
