@@ -4,6 +4,7 @@ import type { HarnessQuotaSummary } from './types'
 export type ShenshenSeason = 'spring' | 'summer' | 'autumn' | 'winter'
 export type ShenshenTimeWindow = 'breakfast' | 'lunch' | 'dinner' | 'generic'
 export type ShenshenIntent =
+  | 'idle-cycle'
   | 'ambient'
   | 'click'
   | 'headpat'
@@ -312,6 +313,8 @@ function entryIntentMatches(
       return !!context.petAction && entry.petActions.includes(context.petAction)
     case 'agent-state':
       return !!context.agentState && entry.agentStates.includes(context.agentState)
+    case 'idle-cycle':
+      return entry.intents.includes('ambient')
     case 'festival':
       return !!eventId && (entry.eventIds.includes(eventId) || entry.season === eventId)
     case 'quota-band':
@@ -340,13 +343,13 @@ function contextRejection(
     if (context.quotaBand !== entry.quotaBand) return 'quota-band-mismatch'
   }
 
-  if (intent === 'ambient') {
+  if (intent === 'ambient' || intent === 'idle-cycle') {
     if (!context.visible) return 'window-hidden-or-suspended'
     if (!context.isFree) return 'higher-priority-state-active'
     if (context.isDragging) return 'dragging'
     if (context.isMoving) return 'explicit-movement'
     if (context.interactionActive) return 'interaction-active'
-    if ((context.idleDurationMs ?? 0) < entry.minimumIdleMs) return 'minimum-idle-not-reached'
+    if (intent === 'ambient' && (context.idleDurationMs ?? 0) < entry.minimumIdleMs) return 'minimum-idle-not-reached'
   }
 
   if (entry.eventIds.length > 0 && !eventAllows(entry, context)) {
@@ -380,7 +383,8 @@ export function inspectShenshenCandidates(
     .map((entry) => {
       const rejection = contextRejection(entry, intent, context, options.eventId)
       const cooldownUntil = options.lastPlayedAt?.get(entry.id)
-      const cooling = intent === 'ambient' && cooldownUntil !== undefined && context.nowMs - cooldownUntil < entry.cooldownMs
+      const cooling = (intent === 'ambient' || intent === 'idle-cycle')
+        && cooldownUntil !== undefined && context.nowMs - cooldownUntil < entry.cooldownMs
       return {
         id: entry.id,
         eligible: rejection === null && !cooling,
@@ -444,7 +448,7 @@ export function createShenshenAnimationRequest(
     entry,
     meta: {
       src: resolveAssetUrl(baseDir, entry.src),
-      loop: entry.loop,
+      loop: intent === 'agent-state' && !isShenshenTerminalReactionState(agentState ?? '') ? false : entry.loop,
       noMirror: entry.noMirror || undefined,
     },
   }
@@ -568,7 +572,7 @@ export function createShenshenAnimationScheduler(random: () => number = Math.ran
     baseDir: string,
     options: { eventId?: string },
   ): ShenshenAnimationRequest => {
-    remember(selected, context.nowMs, intent === 'ambient' ? AMBIENT_RECENT_LIMIT : INTERACTION_RECENT_LIMIT)
+    remember(selected, context.nowMs, intent === 'ambient' || intent === 'idle-cycle' ? AMBIENT_RECENT_LIMIT : INTERACTION_RECENT_LIMIT)
     requestSequence += 1
     const reason = intent === 'festival'
       ? `festival:${options.eventId ?? 'unknown'}`
@@ -576,8 +580,8 @@ export function createShenshenAnimationScheduler(random: () => number = Math.ran
         ? `pet-action:${context.petAction ?? 'unknown'}`
         : intent === 'agent-state'
           ? `agent-state:${context.agentState ?? 'unknown'}`
-          : intent === 'ambient'
-            ? 'idle-ambient:weighted-context-pool'
+          : intent === 'ambient' || intent === 'idle-cycle'
+            ? `idle-${intent}:weighted-context-pool`
             : intent === 'quota-band' || intent === 'quota-recovery'
               ? `quota-band:${context.quotaBand ?? -1}`
               : `intent:${intent}`
@@ -616,8 +620,8 @@ export function createShenshenAnimationScheduler(random: () => number = Math.ran
       && workTurnId !== undefined
       && lastQuotaAccentWorkTurnId !== workTurnId
     const tiers = [
-      { key: 'core', entries: crossIntentFresh.filter((entry) => pool.core.includes(entry.id)), weight: 0.6 },
-      { key: 'secondary', entries: crossIntentFresh.filter((entry) => pool.secondary.includes(entry.id)), weight: 0.3 },
+      { key: 'core', entries: crossIntentFresh.filter((entry) => pool.core.includes(entry.id)), weight: 0.4 },
+      { key: 'secondary', entries: crossIntentFresh.filter((entry) => pool.secondary.includes(entry.id)), weight: 0.5 },
       {
         key: 'quota',
         entries: quotaAvailable ? crossIntentFresh.filter((entry) => entry.quotaBand !== null) : [],
@@ -663,7 +667,7 @@ export function createShenshenAnimationScheduler(random: () => number = Math.ran
     })
     if (candidates.length === 0) return null
 
-    const recentLimit = intent === 'ambient' ? AMBIENT_RECENT_LIMIT : INTERACTION_RECENT_LIMIT
+    const recentLimit = intent === 'ambient' || intent === 'idle-cycle' ? AMBIENT_RECENT_LIMIT : INTERACTION_RECENT_LIMIT
     let fresh = candidates.filter((entry) => !recentIds.slice(0, recentLimit).includes(entry.id))
     if (fresh.length === 0) fresh = candidates.filter((entry) => entry.id !== recentIds[0])
     if (fresh.length === 0) fresh = candidates

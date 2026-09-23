@@ -983,6 +983,18 @@ export default function Mini() {
     return requestShenshenAnimation('agent-state', { agentState: state }) !== null
   }, [requestShenshenAnimation])
 
+  const resumeShenshenIdleAnimation = useCallback(() => {
+    if (
+      effectiveShenshenAgentStateRef.current !== 'idle'
+      || appModeRef.current !== 'coding'
+      || miniPetRef.current?.id !== 'shenshen'
+      || document.visibilityState !== 'visible'
+      || mascotIsDraggingRef.current
+      || mascotDragActiveRef.current
+    ) return false
+    return requestShenshenAnimation('idle-cycle') !== null
+  }, [requestShenshenAnimation])
+
   const handleShenshenAnimationEnd = useCallback((requestId: string) => {
     const active = shenshenAnimationRequestRef.current
     if (!active || active.id !== requestId) return
@@ -1012,8 +1024,9 @@ export default function Mini() {
       if (requestShenshenAnimation('pet-action', { petAction: currentPetActionRef.current })) return
     }
     if (resumeShenshenLifecycleAnimation(effectiveShenshenAgentStateRef.current)) return
+    if (resumeShenshenIdleAnimation()) return
     setActiveShenshenRequest(null)
-  }, [clearReaction, requestShenshenAnimation, resumeShenshenLifecycleAnimation, setActiveShenshenRequest])
+  }, [clearReaction, requestShenshenAnimation, resumeShenshenIdleAnimation, resumeShenshenLifecycleAnimation, setActiveShenshenRequest])
 
   const handleShenshenPlaybackProgress = useCallback((requestId: string | null, currentTime: number, duration: number) => {
     const active = shenshenAnimationRequestRef.current
@@ -5533,11 +5546,12 @@ export default function Mini() {
     }
     if (effectiveShenshenAgentState === 'idle') {
       if (shenshenAnimationRequestRef.current?.intent === 'agent-state') setActiveShenshenRequest(null)
+      if (!shenshenAnimationRequestRef.current) resumeShenshenIdleAnimation()
       return
     }
     const request = requestShenshenAnimation('agent-state', { agentState: effectiveShenshenAgentState })
     if (!request && shenshenAnimationRequestRef.current?.intent === 'agent-state') setActiveShenshenRequest(null)
-  }, [shenshenIsSelected, appMode, effectiveShenshenAgentState, requestShenshenAnimation, setActiveShenshenRequest])
+  }, [shenshenIsSelected, appMode, effectiveShenshenAgentState, requestShenshenAnimation, resumeShenshenIdleAnimation, setActiveShenshenRequest])
 
   useEffect(() => {
     if (!shenshenIsSelected) {
@@ -5562,9 +5576,11 @@ export default function Mini() {
         return
       }
 
+      if (!active && appModeRef.current === 'coding' && resumeShenshenIdleAnimation()) return
+
       if (!shenshenAmbientSinceRef.current) shenshenAmbientSinceRef.current = Date.now()
       const idleDurationMs = Date.now() - shenshenAmbientSinceRef.current
-      const hasHigherPriorityRequest = !!active && active.intent !== 'ambient'
+      const hasHigherPriorityRequest = !!active && active.intent !== 'ambient' && active.intent !== 'idle-cycle'
       if (
         !hasHigherPriorityRequest
         && active?.intent !== 'ambient'
@@ -5587,7 +5603,7 @@ export default function Mini() {
       document.removeEventListener('visibilitychange', onVisibilityChange)
       clearInterval(timer)
     }
-  }, [shenshenIsSelected, getShenshenSelectionContext, requestShenshenAnimation, setActiveShenshenRequest])
+  }, [shenshenIsSelected, getShenshenSelectionContext, requestShenshenAnimation, resumeShenshenIdleAnimation, setActiveShenshenRequest])
 
   useEffect(() => {
     if (!import.meta.env.DEV || !shenshenIsSelected) return

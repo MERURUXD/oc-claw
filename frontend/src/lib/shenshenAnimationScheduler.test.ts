@@ -106,6 +106,21 @@ test('ambient scheduling enforces visibility, free state, idle delay, cooldown, 
   assert.ok(cooled.some((candidate) => !candidate.eligible && candidate.reason === 'per-clip-cooldown'))
 })
 
+test('continuous idle playback uses the ambient pool without replaying the previous clip', () => {
+  const scheduler = createShenshenAnimationScheduler(() => 0)
+  const context = { nowMs: 1_000_000, season: 'spring' as const, visible: true, isFree: true, idleDurationMs: 0 }
+  assert.equal(scheduler.select('idle-cycle', { ...context, visible: false }, '/assets/builtin/shenshen'), null)
+  assert.equal(scheduler.select('ambient', context, '/assets/builtin/shenshen'), null, 'occasional ambient events keep their idle delay')
+  let previousId: string | null = null
+  for (let i = 0; i < 30; i += 1) {
+    const request = scheduler.select('idle-cycle', { ...context, nowMs: context.nowMs + i * 10_000 }, '/assets/builtin/shenshen')!
+    assert.ok(request)
+    assert.equal(request.meta.loop, false)
+    assert.notEqual(request.animationId, previousId)
+    previousId = request.animationId
+  }
+})
+
 test('food timing weights prefer the matching meal period', () => {
   const breakfast = catalog.animations.find((entry) => entry.timeWindow === 'breakfast')!
   const lunch = catalog.animations.find((entry) => entry.timeWindow === 'lunch')!
@@ -297,7 +312,7 @@ test('success and failure are finite lifecycle reactions; persistent states keep
   }
 })
 
-test('working rotation advances only at a loop boundary after the bounded dwell and rejects stale callbacks', () => {
+test('looped lifecycle fallback rotates only at a boundary after its dwell and rejects stale callbacks', () => {
   assert.equal(SHENSHEN_LOOP_ROTATION_DWELL_MS, 15_000)
   const scheduler = createShenshenAnimationScheduler(() => 0)
   let request = scheduler.select('agent-state', { nowMs: 0, agentState: 'working' }, '/assets/builtin/shenshen')!
@@ -322,6 +337,20 @@ test('working rotation advances only at a loop boundary after the bounded dwell 
   assert.equal(isCurrentShenshenLifecycleRequest(request, 'stale-request', 'working'), false)
   assert.equal(isCurrentShenshenLifecycleRequest(request, request.id, 'waiting'), false)
   assert.equal(isCurrentShenshenLifecycleRequest(request, request.id, 'working'), true)
+})
+
+test('working clips play once and each completed clip is followed by a different one', () => {
+  const scheduler = createShenshenAnimationScheduler(() => 0)
+  let previousId: string | null = null
+  for (let i = 0; i < 30; i += 1) {
+    const request = scheduler.select('agent-state', {
+      nowMs: i * 10_000, agentState: 'working',
+    }, '/assets/builtin/shenshen')!
+    assert.ok(request)
+    assert.equal(request.meta.loop, false, 'even catalog loop clips should end after one play in lifecycle rotation')
+    assert.notEqual(request.animationId, previousId)
+    previousId = request.animationId
+  }
 })
 
 test('one-shot lifecycle requests can replay after completion and interruption cannot advance them', () => {
@@ -376,7 +405,7 @@ test('quota accents require fresh connected data, match its band, and occur at m
   assert.equal(mismatched.entry.quotaBand, 1, 'the accent must match the supplied measured band exactly')
 })
 
-test('working lifecycle draws favor core work over secondary clips near the planned 2:1 ratio', () => {
+test('working lifecycle draws distribute attention across core and secondary clips', () => {
   let seed = 0x12345678
   const scheduler = createShenshenAnimationScheduler(() => {
     seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0
@@ -390,7 +419,7 @@ test('working lifecycle draws favor core work over secondary clips near the plan
     else secondary += 1
   }
   const coreShare = core / (core + secondary)
-  assert.ok(coreShare > 0.62 && coreShare < 0.72, `expected about 2:1 core-to-secondary draws, got ${coreShare.toFixed(3)}`)
+  assert.ok(coreShare > 0.39 && coreShare < 0.50, `expected about 4:5 core-to-secondary draws, got ${coreShare.toFixed(3)}`)
 })
 
 test('Agent work interrupts ambient and drag remains the highest presentation state', () => {

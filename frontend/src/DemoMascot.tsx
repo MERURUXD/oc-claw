@@ -145,6 +145,23 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
     return selectShenshenLifecycleAnimation(state) !== null
   }, [selectShenshenLifecycleAnimation])
 
+  const resumeShenshenIdleAnimation = useCallback(() => {
+    const selected = petRef.current
+    if (
+      shenshenEffectiveAgentStateRef.current !== 'idle'
+      || !selected || !isVideoPet(selected) || selected.id !== 'shenshen'
+      || document.visibilityState !== 'visible'
+    ) return false
+    const nowMs = Date.now()
+    const request = shenshenSchedulerRef.current?.select(
+      'idle-cycle',
+      { ...getShenshenCalendarContext(nowMs), nowMs, visible: true, isFree: true },
+      selected.baseDir ?? '/assets/builtin/shenshen',
+    ) ?? null
+    if (request) setActiveShenshenRequest(request)
+    return request !== null
+  }, [setActiveShenshenRequest])
+
   const handleShenshenAnimationEnd = useCallback((requestId: string) => {
     const active = shenshenAnimationRequestRef.current
     if (active?.id !== requestId) return
@@ -162,8 +179,9 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
       return
     }
     if (resumeShenshenLifecycleAnimation(shenshenEffectiveAgentStateRef.current)) return
+    if (resumeShenshenIdleAnimation()) return
     setActiveShenshenRequest(null)
-  }, [clearReaction, resumeShenshenLifecycleAnimation, setActiveShenshenRequest])
+  }, [clearReaction, resumeShenshenIdleAnimation, resumeShenshenLifecycleAnimation, setActiveShenshenRequest])
 
   const handleShenshenPlaybackProgress = useCallback((requestId: string | null, currentTime: number) => {
     const active = shenshenAnimationRequestRef.current
@@ -589,10 +607,15 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
         : lifecycle
     shenshenEffectiveAgentStateRef.current = agentState
     if (agentState === 'idle') {
-      if (shenshenAnimationRequestRef.current?.intent === 'agent-state') {
-        shenshenAnimationRequestRef.current = null
-      }
-      return
+      queueMicrotask(() => {
+        if (
+          shenshenLifecycleRequestVersionRef.current !== requestVersion
+          || shenshenEffectiveAgentStateRef.current !== 'idle'
+        ) return
+        if (shenshenAnimationRequestRef.current?.intent === 'agent-state') setActiveShenshenRequest(null)
+        if (!shenshenAnimationRequestRef.current) resumeShenshenIdleAnimation()
+      })
+      return () => { shenshenLifecycleRequestVersionRef.current += 1 }
     }
     const request = makeShenshenLifecycleRequest(agentState)
     if (!request) return
@@ -606,7 +629,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
       ) setActiveShenshenRequest(request)
     })
     return () => { shenshenLifecycleRequestVersionRef.current += 1 }
-  }, [syncedLifecycleState, isReview, waiting, working, mascotReaction, pet?.id, makeShenshenLifecycleRequest, setActiveShenshenRequest])
+  }, [syncedLifecycleState, isReview, waiting, working, mascotReaction, pet?.id, makeShenshenLifecycleRequest, resumeShenshenIdleAnimation, setActiveShenshenRequest])
 
   const baseState: CodexPetState = walkDir === 1
     ? 'run-right'
