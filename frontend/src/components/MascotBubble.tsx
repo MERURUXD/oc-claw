@@ -28,6 +28,7 @@ import {
   resolveObservedGeometryMode,
   shouldExpandIncrementalEnvelope,
   shouldGateIncrementalResizeObserver,
+  shouldGateWidthResizeObserver,
   type GeometryLifecycleSnapshot,
 } from '../lib/bubbleGeometryLifecycle'
 import { traceBubbleEvent } from '../lib/bubbleTrace'
@@ -1303,10 +1304,11 @@ export default function MascotBubble() {
       const height = Math.ceil(target.offsetHeight)
       if (width <= 0 || height <= 0) return
 
-      // Gate native sync during incremental motion: envelope was prepared once upfront,
-      // so domestic spring animations must not flood SetWindowPos.
+      // Gate native sync during width spring animation or incremental motion:
+      // envelope is already sufficient, so domestic spring animations must not flood SetWindowPos.
       const hasIncrementalMotion = isIncrementalMotionActive(activeMotionTokensRef.current)
       if (
+        shouldGateWidthResizeObserver(isWidthAnimatingRef.current) ||
         shouldGateIncrementalResizeObserver({
           hasIncrementalMotion,
           incrementalEnvelopePrepared: incrementalEnvelopePreparedRef.current,
@@ -1623,6 +1625,25 @@ export default function MascotBubble() {
               onAnimationComplete={() => {
                 isWidthAnimatingRef.current = false
                 setShouldAnimateWidth(false)
+                const el = contentRef.current
+                if (el) {
+                  const settledW = Math.ceil(el.offsetWidth)
+                  const settledH = Math.ceil(el.offsetHeight)
+                  if (
+                    settledW > 0 &&
+                    settledH > 0 &&
+                    (!lastSyncedGeometryRef.current ||
+                      lastSyncedGeometryRef.current.width !== settledW ||
+                      lastSyncedGeometryRef.current.height !== settledH)
+                  ) {
+                    syncBubbleGeometry('motion', {
+                      preserveAnchor: true,
+                      width: settledW,
+                      height: settledH,
+                      reason: 'width-spring-settle',
+                    })
+                  }
+                }
                 maybeScheduleStableSettle()
               }}
             >

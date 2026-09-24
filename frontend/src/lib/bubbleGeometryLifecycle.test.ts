@@ -12,6 +12,7 @@ import {
   scheduleDeferredStable,
   shouldExpandIncrementalEnvelope,
   shouldGateIncrementalResizeObserver,
+  shouldGateWidthResizeObserver,
 } from './bubbleGeometryLifecycle.ts'
 
 test('1. Normal settle: motion → schedule → double-rAF apply marks settled without native shrink', () => {
@@ -389,5 +390,10 @@ test('12. Regression: 1→3+ session incremental envelope growth under persisten
   assert.equal(finalApplied.shouldShrinkToStable, false)
   // Native HWND envelope preserved at full 196px height, no clipping of 3 rows
   assert.equal(lastSyncedGeometry.height, 196)
+})
+
+test('13. Width spring motion gates ResizeObserver native IPC', () => {
+  assert.equal(shouldGateWidthResizeObserver(true), true, 'Must gate ResizeObserver while width spring is animating')
+  assert.equal(shouldGateWidthResizeObserver(false), false, 'Must not gate ResizeObserver when width spring is settled')
 })
 
