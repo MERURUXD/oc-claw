@@ -16,20 +16,13 @@
 </p>
 
 <p align="center">
-  <b>编程模式</b><br/>
+  <b>编程 Agent 监控 · 可选 Codex 像素宠物或申申视频宠物</b><br/>
   <sub>macOS：OpenClaw、Claude Code、Cursor、Codex、OpenCode、Gemini CLI、Google Antigravity、Hermes Agent</sub><br/>
   <sub>Windows：OpenClaw、Claude Code、Cursor、Codex、OpenCode、Gemini CLI、Google Antigravity、Hermes Agent（远程 SSH）</sub>
 </p>
 <p align="center">
   <img src="https://github.com/user-attachments/assets/74b8bbf8-ddcf-4149-a91e-d18d5c24fec6" width="600" />
 </p>
-<p align="center">
-  <b>桌宠模式</b>
-</p>
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/2a143250-174a-406e-8a43-fd30db7ce071" width="600" />
-</p>
-
 ## 功能
 
 - 实时响应 OpenClaw / Claude Code / Codex / Cursor / Gemini CLI / Google Antigravity / Hermes Agent 活动状态（工作、空闲、等待）

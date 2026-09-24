@@ -19,7 +19,7 @@ import {
   loadCodexPets,
   loadCustomCodexPets,
 } from '../lib/codexPet'
-import type { PetAsset } from '../lib/petAsset'
+import { isVideoPet, type PetAsset } from '../lib/petAsset'
 import { saveExtraMascots, loadMultiMascotMode, saveMultiMascotMode } from '../lib/petStore'
 
 // Non-codex entries shown at the top of the 看板娘 list (e.g. the legacy
@@ -337,7 +337,17 @@ export function PetPicker({
               <div className="text-xs text-white/30 px-4 py-6 text-center">{t('petPicker.noMascots')}</div>
             ) : (
               <>
-                {builtins.map((pet) => (
+                {builtins.some(isVideoPet) && <div className="px-4 pt-3 pb-1 text-[11px] uppercase tracking-wider text-white/35">{t('petPicker.videoPets', 'Video pets')}</div>}
+                {builtins.filter(isVideoPet).map((pet) => (
+                  <PetRow
+                    key={pet.id}
+                    pet={pet}
+                    selected={pet.id === selectedId}
+                    onSelect={() => onSelect(pet)}
+                  />
+                ))}
+                <div className="px-4 pt-3 pb-1 text-[11px] uppercase tracking-wider text-white/35">{t('petPicker.codexPets', 'Codex sprite pets')}</div>
+                {builtins.filter((pet) => !isVideoPet(pet)).map((pet) => (
                   <PetRow
                     key={pet.id}
                     pet={pet}

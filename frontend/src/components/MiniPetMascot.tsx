@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { invoke } from '@tauri-apps/api/core'
 import { PetRenderer } from './PetRenderer'
 import { ANIMATION_ROWS, fpsFor } from '../lib/codexPet'
 import type { CodexPetState } from '../lib/codexPet'
@@ -36,7 +37,6 @@ interface MiniPetMascotProps {
   animationRequest?: ShenshenAnimationRequest | null
   onAnimationRequestEnd?: (requestId: string) => void
   onPlaybackProgress?: (requestId: string | null, currentTime: number, duration: number) => void
-  freezeIdleVideo?: boolean
   // When true, the wrapper plays a one-shot jump while hovered, then waits
   // before triggering the next jump.
   enableHoverJump?: boolean
@@ -84,7 +84,6 @@ export function MiniPetMascot({
   animationRequest = null,
   onAnimationRequestEnd,
   onPlaybackProgress,
-  freezeIdleVideo = false,
   enableHoverJump = false,
   externalHover = false,
   useExternalHover = false,
@@ -195,6 +194,13 @@ export function MiniPetMascot({
     animationRequest: animationRequest ? { id: animationRequest.id, priority: animationRequest.priority } : null,
   })
   const catalogRequestActive = isVideo && !!animationRequest && videoState === `catalog:${animationRequest.id}`
+  useEffect(() => {
+    if (!isVideo || import.meta.env.VITE_OC_DIAGNOSTICS !== '1') return
+    invoke('debug_log', {
+      scope: 'mascot-video',
+      msg: `pet=${pet.id} hover=${hovering} jump=${showJump} state=${videoState} request=${animationRequest?.id ?? 'none'} dragging=${isDragging}`,
+    }).catch(() => {})
+  }, [isVideo, pet.id, hovering, showJump, videoState, animationRequest?.id, isDragging])
 
   const videoOneShotRequest: VideoOneShotRequest | null = useMemo(
     () => catalogRequestActive && animationRequest
@@ -354,7 +360,6 @@ export function MiniPetMascot({
         oneShotRequestId={videoOneShotRequestId}
         animationOverride={videoAnimationOverride}
         onPlaybackProgress={onPlaybackProgress}
-        freeze={freezeIdleVideo && isVideo && videoState === 'idle'}
         layoutMode={layoutMode}
       />
     </div>

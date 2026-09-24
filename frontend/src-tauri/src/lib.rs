@@ -6290,6 +6290,51 @@ fn hit_test_mascot_window(
     }
 }
 
+/// Toggle Windows mascot click-through without changing Tao's window flags.
+/// Tao still records VISIBLE=false after our no-activation native restore; its
+/// `set_ignore_cursor_events` reapplies that stale flag and hides the HWND.
+#[cfg(target_os = "windows")]
+fn set_mascot_passthrough_native(win: &tauri::WebviewWindow, ignore: bool) -> Result<(), String> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE,
+        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+        SWP_NOSIZE, SWP_NOZORDER, WS_EX_LAYERED, WS_EX_TRANSPARENT,
+    };
+
+    let hwnd = HWND(win.hwnd().map_err(|error| error.to_string())?.0);
+    let before = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+    let transparent = WS_EX_TRANSPARENT.0 as isize;
+    let layered = WS_EX_LAYERED.0 as isize;
+    let after = if ignore { before | transparent | layered } else { before & !transparent };
+    if before == after { return Ok(()); }
+    unsafe {
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, after);
+        SetWindowPos(
+            hwnd,
+            HWND::default(),
+            0, 0, 0, 0,
+            SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE
+                | SWP_NOOWNERZORDER | SWP_NOZORDER,
+        ).map_err(|error| error.to_string())?;
+    }
+    if cfg!(debug_assertions) {
+        log::info!(
+            "[mascot-passthrough] label={} ignore={} visible={:?} topmost={} exstyle_before={:#x} exstyle_after={:#x}",
+            win.label(), ignore, native_window_visible(win), bubble_trace::win32::is_topmost(hwnd), before, after,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn mascot_passthrough_native_enabled(win: &tauri::WebviewWindow) -> Option<bool> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWL_EXSTYLE, WS_EX_TRANSPARENT};
+    let hwnd = HWND(win.hwnd().ok()?.0);
+    Some((unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32 & WS_EX_TRANSPARENT.0) != 0)
+}
+
 /// Atomically ensures the single unified mascot pass-through polling thread is running.
 fn ensure_mascot_passthrough_poll(app: tauri::AppHandle) {
     if PASSTHROUGH_THREAD_RUNNING
@@ -6335,7 +6380,9 @@ fn mascot_passthrough_poll_windows(app: tauri::AppHandle) {
             for (label, was_ignoring) in last_states.drain() {
                 if was_ignoring {
                     if let Some(w) = app.get_webview_window(&label) {
-                        let _ = w.set_ignore_cursor_events(false);
+                        let _ = app.run_on_main_thread(move || {
+                            let _ = set_mascot_passthrough_native(&w, false);
+                        });
                     }
                 }
             }
@@ -6386,8 +6433,13 @@ fn mascot_passthrough_poll_windows(app: tauri::AppHandle) {
             };
 
             let want_ignore = !should_be_interactive;
-            if last_states.get("mini").copied() != Some(want_ignore) {
-                let _ = mini_win.set_ignore_cursor_events(want_ignore);
+            if last_states.get("mini").copied() != Some(want_ignore)
+                || mascot_passthrough_native_enabled(&mini_win) != Some(want_ignore)
+            {
+                let win = mini_win.clone();
+                let _ = app.run_on_main_thread(move || {
+                    let _ = set_mascot_passthrough_native(&win, want_ignore);
+                });
                 last_states.insert("mini".to_string(), want_ignore);
             }
         }
@@ -6407,8 +6459,13 @@ fn mascot_passthrough_poll_windows(app: tauri::AppHandle) {
                     hit_test_mascot_window(&extra_win, cursor_logical, Some(*entry), false)
                 };
                 let want_ignore = !should_be_interactive;
-                if last_states.get(label).copied() != Some(want_ignore) {
-                    let _ = extra_win.set_ignore_cursor_events(want_ignore);
+                if last_states.get(label).copied() != Some(want_ignore)
+                    || mascot_passthrough_native_enabled(&extra_win) != Some(want_ignore)
+                {
+                    let win = extra_win.clone();
+                    let _ = app.run_on_main_thread(move || {
+                        let _ = set_mascot_passthrough_native(&win, want_ignore);
+                    });
                     last_states.insert(label.clone(), want_ignore);
                 }
             }
@@ -6423,7 +6480,9 @@ fn mascot_passthrough_poll_windows(app: tauri::AppHandle) {
             if !still_registered {
                 if *was_ignoring {
                     if let Some(w) = app.get_webview_window(label) {
-                        let _ = w.set_ignore_cursor_events(false);
+                        let _ = app.run_on_main_thread(move || {
+                            let _ = set_mascot_passthrough_native(&w, false);
+                        });
                     }
                 }
                 false
@@ -13215,7 +13274,10 @@ fn native_window_visible(win: &tauri::WebviewWindow) -> Option<bool> {
 fn set_presentation_native_visibility(win: &tauri::WebviewWindow, label: &str, visible: bool) {
     #[cfg(target_os = "windows")]
     {
-        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOWNOACTIVATE};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowPos, ShowWindow, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE,
+            SWP_NOSIZE, SWP_NOOWNERZORDER, SW_HIDE, SW_SHOWNOACTIVATE,
+        };
         let action = if visible { "Show" } else { "Hide" };
         let visible_before = native_window_visible(win);
         match win.hwnd() {
@@ -13224,6 +13286,31 @@ fn set_presentation_native_visibility(win: &tauri::WebviewWindow, label: &str, v
                 let show_cmd = if visible { SW_SHOWNOACTIVATE } else { SW_HIDE };
                 let show_cmd_str = if visible { "SW_SHOWNOACTIVATE" } else { "SW_HIDE" };
                 let showwindow = unsafe { ShowWindow(raw, show_cmd) };
+                // A hidden WebView can return at a normal Z-order even while
+                // tao still believes its always-on-top flag is set. Reassert
+                // the native topmost band on every allowed mascot show, without
+                // activating or moving it. This also brings it ahead of other
+                // topmost windows after fullscreen exits.
+                let topmost_before = if visible && (label == "mini" || label.starts_with("extra-mascot-")) {
+                    Some(bubble_trace::win32::is_topmost(raw))
+                } else {
+                    None
+                };
+                let topmost_result = if topmost_before.is_some() && !PRESENTATION.active() {
+                    Some(unsafe {
+                        SetWindowPos(
+                            raw,
+                            HWND_TOPMOST,
+                            0,
+                            0,
+                            0,
+                            0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                        )
+                    })
+                } else {
+                    None
+                };
                 // Repair tao's bookkeeping on hide: when its flag still says
                 // visible this performs the normal apply_diff (styles + SW_HIDE),
                 // and when it is already false it is a no-op — either way the
@@ -13233,6 +13320,9 @@ fn set_presentation_native_visibility(win: &tauri::WebviewWindow, label: &str, v
                 let hwnd_str = format!("{:#x}", hwnd.0 as usize);
                 let vis_before_str = format!("{:?}", visible_before);
                 let vis_after_str = format!("{:?}", visible_after);
+                let topmost_after = topmost_before.map(|_| bubble_trace::win32::is_topmost(raw));
+                let topmost_before_str = format!("{:?}", topmost_before);
+                let topmost_after_str = format!("{:?}", topmost_after);
 
                 bubble_trace::trace(
                     "win32",
@@ -13246,8 +13336,13 @@ fn set_presentation_native_visibility(win: &tauri::WebviewWindow, label: &str, v
                         ("cmd", show_cmd_str),
                         ("visible_before", &vis_before_str),
                         ("visible_after", &vis_after_str),
+                        ("topmost_before", &topmost_before_str),
+                        ("topmost_after", &topmost_after_str),
                     ],
                 );
+                if let Some(Err(error)) = topmost_result {
+                    log::warn!("[presentation] label={} native topmost restore failed: {}", label, error);
+                }
                 log::info!(
                     "[presentation] label={} action={} visible_before={:?} showwindow={:?} tao_hide={:?} visible_after={:?} hwnd={:#x}",
                     label,

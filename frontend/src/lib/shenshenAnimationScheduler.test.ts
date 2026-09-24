@@ -134,9 +134,9 @@ test('idle clips do not overlap the working pool', () => {
   }
 })
 
-test('idle playback pauses for a bounded random gap between clips', () => {
+test('idle actions wait for a bounded random gap while the idle video keeps looping', () => {
   assert.equal(getShenshenIdleGapMs(() => 0), SHENSHEN_IDLE_GAP_MIN_MS)
-  assert.equal(getShenshenIdleGapMs(() => 0.5), 15_000)
+  assert.equal(getShenshenIdleGapMs(() => 0.5), 25_000)
   assert.equal(getShenshenIdleGapMs(() => 1), SHENSHEN_IDLE_GAP_MAX_MS)
 })
 

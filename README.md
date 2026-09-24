@@ -16,20 +16,13 @@
 </p>
 
 <p align="center">
-  <b>Code Mode</b><br/>
+  <b>Coding agent monitor · Codex sprite pets or Shenshen video pet</b><br/>
   <sub>macOS: OpenClaw, Claude Code, Cursor, Codex, OpenCode, Gemini CLI, Google Antigravity, Hermes Agent</sub><br/>
   <sub>Windows: OpenClaw, Claude Code, Cursor, Codex, OpenCode, Gemini CLI, Google Antigravity, Hermes Agent (remote SSH)</sub>
 </p>
 <p align="center">
   <img src="https://github.com/user-attachments/assets/74b8bbf8-ddcf-4149-a91e-d18d5c24fec6" width="600" />
 </p>
-<p align="center">
-  <b>Pet Mode</b>
-</p>
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/2a143250-174a-406e-8a43-fd30db7ce071" width="600" />
-</p>
-
 ## What it does
 
 - Reacts to OpenClaw / Claude Code / Codex / Cursor / Gemini CLI / Google Antigravity / Hermes Agent activity in real time (working, idle, waiting)

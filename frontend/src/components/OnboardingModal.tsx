@@ -1,13 +1,13 @@
 import { motion, AnimatePresence } from 'motion/react'
-import { useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { SpritePet } from './SpritePet'
+import { PetRenderer } from './PetRenderer'
 import type { CodexPet } from '../lib/codexPet'
-import type { AppMode } from '../lib/petStore'
+import type { VideoPet } from '../lib/videoPet'
 
 interface OnboardingModalProps {
   open: boolean
-  onSelect: (mode: AppMode) => void
+  onSelect: (family: 'codex' | 'shenshen') => void
 }
 
 // Codex pet metadata constructed inline so the onboarding modal renders
@@ -19,12 +19,17 @@ const PHOEBE_PET: CodexPet = {
   spritesheetUrl: '/assets/builtin/phoebe.codex-pet/spritesheet.webp',
 }
 
+const SHENSHEN_PREVIEW: VideoPet = {
+  id: 'shenshen',
+  displayName: '申申',
+  renderer: 'video-clips',
+  canvas: { width: 640, height: 360, bodyBox: [212, 60, 428, 330], feetY: 330 },
+  transparency: 'native',
+  animations: { idle: { src: '/assets/builtin/shenshen/videos/待机呼吸休闲.webm', loop: true } },
+}
+
 export function OnboardingModal({ open, onSelect }: OnboardingModalProps) {
   const { t } = useTranslation()
-  const preferWebm = typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows')
-  const petPreviewSrc = preferWebm
-    ? '/assets/builtin/香企鹅/large/webm/idle.webm'
-    : '/assets/builtin/香企鹅/large/mov/idle.mov'
   return (
     <AnimatePresence>
       {open && (
@@ -71,15 +76,14 @@ export function OnboardingModal({ open, onSelect }: OnboardingModalProps) {
 
             <div style={{ display: 'flex', gap: 16, width: '100%', marginTop: 8, alignItems: 'stretch' }}>
               <CodingModeCard
-                title={t('settings.codingMode')}
-                description={t('onboarding.codingModeLongDesc')}
-                onClick={() => onSelect('coding')}
+                title={t('settings.codexPetType')}
+                description={t('onboarding.codexPetLongDesc')}
+                onClick={() => onSelect('codex')}
               />
               <PetModeCard
-                title={t('settings.petMode')}
-                petPreviewSrc={petPreviewSrc}
-                description={t('onboarding.petModeLongDesc')}
-                onClick={() => onSelect('pet')}
+                title={t('settings.shenshenPetType')}
+                description={t('onboarding.shenshenPetLongDesc')}
+                onClick={() => onSelect('shenshen')}
               />
             </div>
           </motion.div>
@@ -164,12 +168,10 @@ function CodingModeCard({
 // recommended primary stands out, but still clearly clickable.
 function PetModeCard({
   title,
-  petPreviewSrc,
   description,
   onClick,
 }: {
   title: string
-  petPreviewSrc: string
   description: string
   onClick: () => void
 }) {
@@ -195,102 +197,12 @@ function PetModeCard({
       }}
     >
       <div style={{ height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-        <ChromaKeyVideo src={petPreviewSrc} size={150} />
+        <PetRenderer pet={SHENSHEN_PREVIEW} state="idle" size={150} />
       </div>
       <span style={{ fontSize: 14, fontWeight: 500, color: 'rgba(255,255,255,0.85)' }}>{title}</span>
       <span style={{ fontSize: 11.5, color: 'rgba(255,255,255,0.4)', lineHeight: 1.5 }}>
         {description}
       </span>
     </motion.button>
-  )
-}
-
-function ChromaKeyVideo({ src, size }: { src: string; size: number }) {
-  const isWindows = typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows')
-  const canvasRef = useRef<HTMLCanvasElement>(null)
-  const videoRef = useRef<HTMLVideoElement>(null)
-
-  useEffect(() => {
-    if (!isWindows) return
-    const canvas = canvasRef.current
-    const video = videoRef.current
-    if (!canvas || !video) return
-    const ctx = canvas.getContext('2d', { willReadFrequently: true })
-    if (!ctx) return
-    let rafId = 0
-    const draw = () => {
-      if (video.readyState >= 2 && video.videoWidth > 0) {
-        if (canvas.width !== size || canvas.height !== size) {
-          canvas.width = size
-          canvas.height = size
-        }
-        ctx.clearRect(0, 0, size, size)
-        ctx.drawImage(video, 0, 0, size, size)
-        const frame = ctx.getImageData(0, 0, size, size)
-        const data = frame.data
-        for (let i = 0; i < data.length; i += 4) {
-          const maxRgb = Math.max(data[i], data[i + 1], data[i + 2])
-          if (maxRgb <= 12) {
-            data[i + 3] = 0
-          } else if (maxRgb < 28) {
-            const softAlpha = Math.round(((maxRgb - 12) / 16) * 255)
-            if (softAlpha < data[i + 3]) data[i + 3] = softAlpha
-          }
-        }
-        ctx.putImageData(frame, 0, 0)
-      }
-      rafId = requestAnimationFrame(draw)
-    }
-    rafId = requestAnimationFrame(draw)
-    return () => cancelAnimationFrame(rafId)
-  }, [isWindows, size])
-
-  const handleError = (e: React.SyntheticEvent<HTMLVideoElement>) => {
-    const v = e.currentTarget
-    if (v.src.includes('/large/webm/')) {
-      v.src = v.src.replace('/large/webm/', '/large/mov/').replace(/\.webm(\?.*)?$/, '.mov$1')
-      v.load()
-      v.play().catch(() => {})
-    }
-  }
-
-  if (!isWindows) {
-    return (
-      <video
-        src={src}
-        autoPlay loop muted playsInline
-        onError={handleError}
-        style={{
-          width: size, height: size,
-          objectFit: 'contain', pointerEvents: 'none',
-          filter: 'drop-shadow(0 2px 8px rgba(0,0,0,0.45))',
-        }}
-      />
-    )
-  }
-
-  return (
-    <div style={{ position: 'relative', width: size, height: size }}>
-      <canvas
-        ref={canvasRef}
-        width={size} height={size}
-        style={{
-          width: size, height: size,
-          pointerEvents: 'none',
-          filter: 'drop-shadow(0 2px 8px rgba(0,0,0,0.45))',
-        }}
-      />
-      <video
-        ref={videoRef}
-        src={src}
-        autoPlay loop muted playsInline
-        onError={handleError}
-        style={{
-          position: 'absolute', top: 0, left: 0,
-          width: size, height: size,
-          opacity: 0, pointerEvents: 'none',
-        }}
-      />
-    </div>
   )
 }

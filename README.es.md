@@ -23,13 +23,6 @@
 <p align="center">
   <img src="https://github.com/user-attachments/assets/74b8bbf8-ddcf-4149-a91e-d18d5c24fec6" width="600" />
 </p>
-<p align="center">
-  <b>Modo Mascota</b>
-</p>
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/2a143250-174a-406e-8a43-fd30db7ce071" width="600" />
-</p>
-
 ## Funciones
 
 - Reacciona en tiempo real a la actividad de agentes OpenClaw / Claude Code / Codex / Cursor / Gemini CLI / Google Antigravity / Hermes Agent (trabajando, inactivo, esperando)

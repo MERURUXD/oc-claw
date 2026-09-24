@@ -1,4 +1,5 @@
 export interface CollapsedMascotGeometryState {
+  modeReady: boolean
   expanded: boolean
   settingsMode: boolean
   settingsTransitioning: boolean
@@ -14,7 +15,8 @@ export interface LatestWinsSerialQueue<T> {
 }
 
 export function canApplyCollapsedMascotGeometry(state: CollapsedMascotGeometryState): boolean {
-  return !state.expanded
+  return state.modeReady
+    && !state.expanded
     && !state.settingsMode
     && !state.settingsTransitioning
     && !state.updateModalOpen
