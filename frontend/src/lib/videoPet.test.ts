@@ -202,6 +202,22 @@ test('resolveSemanticVideoAnimation: selects lifecycle clips and uses idle for m
   })
 })
 
+test('resolveSemanticVideoAnimation honors a one-shot movement segment override', () => {
+  const pet: VideoPet = {
+    renderer: 'video-clips',
+    id: 'shenshen-test',
+    displayName: '申申',
+    canvas: DSH_GEOMETRY,
+    animations: { idle: 'idle.webm' },
+  }
+  const movementSegment: VideoPetAnimationMeta = { src: 'walk.webm', loop: false }
+
+  assert.deepEqual(resolveSemanticVideoAnimation(pet, 'catalog:walk:1', movementSegment), {
+    key: 'catalog:walk:1',
+    meta: movementSegment,
+  })
+})
+
 test('isCurrentOneShotRequest: ignores missing and superseded completion identities', () => {
   assert.equal(isCurrentOneShotRequest(undefined, 'reaction:2'), false)
   assert.equal(isCurrentOneShotRequest('reaction:1', 'reaction:2'), false)

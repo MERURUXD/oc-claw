@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { canExpandMascotPanel, canStartMascotPointerInteraction } from './mascotInteraction.ts'
+import { canExpandMascotPanel, canStartMascotPointerInteraction, classifyMascotPointerOutcome } from './mascotInteraction.ts'
 
 test('mascot drag and panel expansion cannot own the native window at the same time', () => {
   assert.equal(canExpandMascotPanel({ dragging: false, expanding: false, collapsing: false }), true)
@@ -12,4 +12,12 @@ test('mascot drag and panel expansion cannot own the native window at the same t
 test('mascot pointer interaction does not start after panel expansion has begun', () => {
   assert.equal(canStartMascotPointerInteraction(false), true)
   assert.equal(canStartMascotPointerInteraction(true), false)
+})
+
+test('mascot pointer outcome keeps short clicks separate from right-clicks and drags', () => {
+  assert.equal(classifyMascotPointerOutcome({ button: 0, wasDragging: false }), 'left-click')
+  assert.equal(classifyMascotPointerOutcome({ button: 2, wasDragging: false }), 'right-click')
+  assert.equal(classifyMascotPointerOutcome({ button: 0, ctrlKey: true, wasDragging: false }), 'right-click')
+  assert.equal(classifyMascotPointerOutcome({ button: 0, wasDragging: true }), 'drag')
+  assert.equal(classifyMascotPointerOutcome({ button: 1, wasDragging: false }), 'ignore')
 })

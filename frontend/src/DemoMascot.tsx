@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { emit, listen } from '@tauri-apps/api/event'
 import { load } from '@tauri-apps/plugin-store'
@@ -9,6 +9,18 @@ import { MiniPetMascot, type MascotLifecycleState, type MascotReaction } from '.
 import { loadCodexPetById, loadDefaultCodexPet, type CodexPetState } from './lib/codexPet'
 import { getPetAspectRatio, getPetRenderMetrics, isVideoPet, type PetAsset } from './lib/petAsset'
 import { clearReactionIfCurrent } from './lib/videoPet'
+import { classifyMascotPointerOutcome } from './lib/mascotInteraction'
+import {
+  advanceShenshenLifecyclePlayback,
+  createShenshenAnimationScheduler,
+  getShenshenCalendarContext,
+  getShenshenIdleGapMs,
+  isCurrentShenshenLifecycleRequest,
+  isShenshenTerminalReactionState,
+  SHENSHEN_QUOTA_FRESHNESS_MS,
+  type ShenshenAnimationRequest,
+  type ShenshenLifecyclePlaybackState,
+} from './lib/shenshenAnimationScheduler'
 
 const isWindowsPlatform =
   typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows')
@@ -42,27 +54,180 @@ function clampLargeMascotScale(s: number): number {
   return Math.min(LARGE_MASCOT_SCALE_MAX, Math.max(LARGE_MASCOT_SCALE_MIN, Math.round(s * 10) / 10))
 }
 
-// `functional` mascots (coding-mode multi-mascot feature) emit
-// `extra-mascot-activate` to the main mini window on a click (no drag) so the
-// main panel expands — making each extra mascot equivalent to the primary one.
-// Demo mascots leave `functional` false and stay decorative.
+// Functional coding-mode mascots keep Shenshen clicks local to the clicked
+// mascot and use right-click to toggle the main panel. Other extra mascots keep
+// their existing click-to-open behavior.
 export function DemoMascot({ functional = false }: { functional?: boolean } = {}) {
   const [pet, setPet] = useState<PetAsset | null>(null)
   const petRef = useRef<PetAsset | null>(null)
-  petRef.current = pet
+  useEffect(() => { petRef.current = pet }, [pet])
   const [working, setWorking] = useState(false)
   const [waiting, setWaiting] = useState(false)
   const [isReview, setIsReview] = useState(false)
   const [syncedLifecycleState, setSyncedLifecycleState] = useState<MascotLifecycleState | null>(null)
   const [syncedBaseState, setSyncedBaseState] = useState<CodexPetState | null>(null)
   const [mascotReaction, setMascotReaction] = useState<MascotReaction | null>(null)
+  const mascotReactionRef = useRef<MascotReaction | null>(null)
+  useLayoutEffect(() => { mascotReactionRef.current = mascotReaction }, [mascotReaction])
+  const [shenshenAnimationRequest, setShenshenAnimationRequest] = useState<ShenshenAnimationRequest | null>(null)
+  const shenshenAnimationRequestRef = useRef<ShenshenAnimationRequest | null>(null)
+  const shenshenIdleGapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const shenshenSchedulerRef = useRef<ReturnType<typeof createShenshenAnimationScheduler> | null>(null)
+  const shenshenLifecycleRequestVersionRef = useRef(0)
+  const shenshenLifecyclePlaybackRef = useRef<ShenshenLifecyclePlaybackState | null>(null)
+  const shenshenEffectiveAgentStateRef = useRef<MascotLifecycleState | 'success' | 'failure'>('idle')
+  const shenshenQuotaRef = useRef<{ band: number; updatedAtMs: number } | null>(null)
+  const shenshenWorkTurnIdRef = useRef(0)
+  const completedReactionIdRef = useRef(0)
+  if (shenshenSchedulerRef.current == null) shenshenSchedulerRef.current = createShenshenAnimationScheduler()
   const [walkDir, setWalkDir] = useState<-1 | 0 | 1>(0)
   const [dragging, setDragging] = useState(false)
   const [dragInterruptedReactionId, setDragInterruptedReactionId] = useState<number | null>(null)
 
   const clearReaction = useCallback((reactionId?: number) => {
+    const current = mascotReactionRef.current
+    if (current && (reactionId === undefined || current.id === reactionId)) {
+      completedReactionIdRef.current = Math.max(completedReactionIdRef.current, current.id)
+    }
     setMascotReaction((cur) => clearReactionIfCurrent(cur, reactionId))
   }, [])
+  const setActiveShenshenRequest = useCallback((request: ShenshenAnimationRequest | null) => {
+    if (request && shenshenIdleGapTimerRef.current) {
+      clearTimeout(shenshenIdleGapTimerRef.current)
+      shenshenIdleGapTimerRef.current = null
+    }
+    shenshenAnimationRequestRef.current = request
+    setShenshenAnimationRequest(request)
+  }, [])
+  const requestShenshenClick = useCallback(() => {
+    const selected = petRef.current
+    if (!selected || !isVideoPet(selected) || selected.id !== 'shenshen') return
+    const nowMs = Date.now()
+    const request = shenshenSchedulerRef.current?.select(
+      'click',
+      {
+        ...getShenshenCalendarContext(nowMs),
+        nowMs,
+        visible: document.visibilityState === 'visible',
+        isFree: true,
+        affectionTier: 'friendly',
+      },
+      selected.baseDir ?? '/assets/builtin/shenshen',
+    ) ?? null
+    if (request) setActiveShenshenRequest(request)
+  }, [setActiveShenshenRequest])
+
+  const makeShenshenLifecycleRequest = useCallback((state: MascotLifecycleState | 'success' | 'failure') => {
+    const selected = petRef.current
+    if (!selected || !isVideoPet(selected) || selected.id !== 'shenshen' || state === 'idle') return null
+    const nowMs = Date.now()
+    const quota = shenshenQuotaRef.current
+    const quotaAgeMs = quota ? nowMs - quota.updatedAtMs : Infinity
+    const request = shenshenSchedulerRef.current?.select(
+      'agent-state',
+      {
+        nowMs,
+        agentState: state,
+        quotaBand: quota?.band,
+        quotaFresh: quotaAgeMs >= -30_000 && quotaAgeMs <= SHENSHEN_QUOTA_FRESHNESS_MS,
+        workTurnId: shenshenWorkTurnIdRef.current,
+      },
+      selected.baseDir ?? '/assets/builtin/shenshen',
+    ) ?? null
+    return request
+  }, [])
+
+  const selectShenshenLifecycleAnimation = useCallback((state: MascotLifecycleState | 'success' | 'failure') => {
+    const request = makeShenshenLifecycleRequest(state)
+    if (request) setActiveShenshenRequest(request)
+    return request
+  }, [makeShenshenLifecycleRequest, setActiveShenshenRequest])
+
+  const resumeShenshenLifecycleAnimation = useCallback((state: MascotLifecycleState | 'success' | 'failure') => {
+    if (
+      state === 'idle'
+      || document.visibilityState !== 'visible'
+    ) return false
+    return selectShenshenLifecycleAnimation(state) !== null
+  }, [selectShenshenLifecycleAnimation])
+
+  const resumeShenshenIdleAnimation = useCallback(() => {
+    const selected = petRef.current
+    if (
+      shenshenEffectiveAgentStateRef.current !== 'idle'
+      || !selected || !isVideoPet(selected) || selected.id !== 'shenshen'
+      || document.visibilityState !== 'visible'
+    ) return false
+    const nowMs = Date.now()
+    const request = shenshenSchedulerRef.current?.select(
+      'idle-cycle',
+      { ...getShenshenCalendarContext(nowMs), nowMs, visible: true, isFree: true },
+      selected.baseDir ?? '/assets/builtin/shenshen',
+    ) ?? null
+    if (request) setActiveShenshenRequest(request)
+    return request !== null
+  }, [setActiveShenshenRequest])
+
+  const scheduleShenshenIdleAnimation = useCallback(() => {
+    if (
+      shenshenEffectiveAgentStateRef.current !== 'idle'
+      || petRef.current?.id !== 'shenshen'
+      || shenshenIdleGapTimerRef.current
+    ) return false
+    setActiveShenshenRequest(null)
+    shenshenIdleGapTimerRef.current = setTimeout(() => {
+      shenshenIdleGapTimerRef.current = null
+      if (!shenshenAnimationRequestRef.current) resumeShenshenIdleAnimation()
+    }, getShenshenIdleGapMs())
+    return true
+  }, [resumeShenshenIdleAnimation, setActiveShenshenRequest])
+
+  useEffect(() => () => {
+    if (shenshenIdleGapTimerRef.current) clearTimeout(shenshenIdleGapTimerRef.current)
+  }, [])
+
+  const handleShenshenAnimationEnd = useCallback((requestId: string) => {
+    const active = shenshenAnimationRequestRef.current
+    if (active?.id !== requestId) return
+    if (active.intent === 'agent-state') {
+      const state = shenshenEffectiveAgentStateRef.current
+      if (!isCurrentShenshenLifecycleRequest(active, requestId, state)) return
+      if (isShenshenTerminalReactionState(state)) {
+        const reactionId = mascotReactionRef.current?.id
+        if (reactionId !== undefined) clearReaction(reactionId)
+        setActiveShenshenRequest(null)
+        return
+      }
+      if (resumeShenshenLifecycleAnimation(state)) return
+      setActiveShenshenRequest(null)
+      return
+    }
+    if (resumeShenshenLifecycleAnimation(shenshenEffectiveAgentStateRef.current)) return
+    if (scheduleShenshenIdleAnimation()) return
+    setActiveShenshenRequest(null)
+  }, [clearReaction, resumeShenshenLifecycleAnimation, scheduleShenshenIdleAnimation, setActiveShenshenRequest])
+
+  const handleShenshenPlaybackProgress = useCallback((requestId: string | null, currentTime: number) => {
+    const active = shenshenAnimationRequestRef.current
+    if (!requestId || active?.id !== requestId || active.intent !== 'agent-state') return
+    const state = shenshenEffectiveAgentStateRef.current
+    if (
+      !isCurrentShenshenLifecycleRequest(active, requestId, state)
+      || state === 'idle'
+      || isShenshenTerminalReactionState(state)
+      || document.visibilityState !== 'visible'
+    ) return
+    const step = advanceShenshenLifecyclePlayback(
+      shenshenLifecyclePlaybackRef.current,
+      requestId,
+      state,
+      currentTime,
+      Date.now(),
+      active.meta.loop,
+    )
+    shenshenLifecyclePlaybackRef.current = step.state
+    if (step.shouldRotate) resumeShenshenLifecycleAnimation(state)
+  }, [resumeShenshenLifecycleAnimation])
   const [resizeHandleHovered, setResizeHandleHovered] = useState(false)
   const [hitboxHovered, setHitboxHovered] = useState(false)
   const [size, setSize] = useState(DEFAULT_MASCOT_SIZE)
@@ -268,8 +433,15 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
       baseState?: CodexPetState
       reaction?: 'waving' | 'failed' | null
       reactionId?: number | null
+      quotaBand?: number | null
+      quotaUpdatedAtMs?: number | null
+      workTurnId?: number
     }>('mini-pet-state', (ev) => {
       const p = ev.payload
+      shenshenWorkTurnIdRef.current = typeof p?.workTurnId === 'number' ? p.workTurnId : 0
+      shenshenQuotaRef.current = typeof p?.quotaBand === 'number' && typeof p.quotaUpdatedAtMs === 'number'
+        ? { band: p.quotaBand, updatedAtMs: p.quotaUpdatedAtMs }
+        : null
       if (p?.baseState) {
         setSyncedBaseState(p.baseState)
       }
@@ -294,6 +466,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
       }
 
       if (p?.reaction && typeof p.reactionId === 'number') {
+        if (p.reactionId <= completedReactionIdRef.current) return
         const nextReaction: MascotReaction = { state: p.reaction, id: p.reactionId }
         if (actualDraggingRef.current) setDragInterruptedReactionId(nextReaction.id)
         setMascotReaction((cur) => (cur?.id === nextReaction.id ? cur : nextReaction))
@@ -426,15 +599,69 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
       // mascot's click action: expand the main session panel. On macOS the
       // primary mascot opens the panel via notch hover (a tap is a no-op), so
       // keep extra mascots consistent and skip the click-to-expand there.
-      if (functional && !wasDragging && isWindowsPlatform) {
-        emit('extra-mascot-activate').catch(() => {})
+      const outcome = classifyMascotPointerOutcome({ button: e.button, ctrlKey: e.ctrlKey, wasDragging })
+      if (functional && outcome === 'left-click') {
+        if (petRef.current?.id === 'shenshen') requestShenshenClick()
+        else if (isWindowsPlatform) emit('extra-mascot-activate').catch(() => {})
       }
     }
 
     window.addEventListener('pointermove', onMove)
     window.addEventListener('pointerup', onUp, { once: true })
     window.addEventListener('pointercancel', onCancel, { once: true })
-  }, [functional, mascotReaction])
+  }, [functional, mascotReaction, requestShenshenClick])
+
+  const handleContextMenu = useCallback((e: React.MouseEvent) => {
+    e.preventDefault()
+    if (functional && e.button === 2) emit('extra-mascot-activate', { toggle: true }).catch(() => {})
+  }, [functional])
+
+  useEffect(() => {
+    const requestVersion = ++shenshenLifecycleRequestVersionRef.current
+    if (petRef.current?.id !== 'shenshen') {
+      if (shenshenIdleGapTimerRef.current) {
+        clearTimeout(shenshenIdleGapTimerRef.current)
+        shenshenIdleGapTimerRef.current = null
+      }
+      shenshenAnimationRequestRef.current = null
+      shenshenSchedulerRef.current?.clear()
+      return
+    }
+    const lifecycle = syncedLifecycleState ?? (isReview ? 'review' : waiting ? 'waiting' : working ? 'working' : 'idle')
+    const agentState = mascotReaction?.state === 'waving'
+      ? 'success'
+      : mascotReaction?.state === 'failed'
+        ? 'failure'
+        : lifecycle
+    shenshenEffectiveAgentStateRef.current = agentState
+    if (agentState === 'idle') {
+      queueMicrotask(() => {
+        if (
+          shenshenLifecycleRequestVersionRef.current !== requestVersion
+          || shenshenEffectiveAgentStateRef.current !== 'idle'
+        ) return
+        if (shenshenAnimationRequestRef.current?.intent === 'agent-state') setActiveShenshenRequest(null)
+        if (!shenshenAnimationRequestRef.current) scheduleShenshenIdleAnimation()
+      })
+      return () => { shenshenLifecycleRequestVersionRef.current += 1 }
+    }
+    if (shenshenIdleGapTimerRef.current) {
+      clearTimeout(shenshenIdleGapTimerRef.current)
+      shenshenIdleGapTimerRef.current = null
+    }
+    const request = makeShenshenLifecycleRequest(agentState)
+    if (!request) return
+    queueMicrotask(() => {
+      const active = shenshenAnimationRequestRef.current
+      if (
+        shenshenLifecycleRequestVersionRef.current === requestVersion
+        && petRef.current?.id === 'shenshen'
+        && shenshenEffectiveAgentStateRef.current === agentState
+        && (!active || active.intent === 'agent-state')
+      ) setActiveShenshenRequest(request)
+    })
+    return () => { shenshenLifecycleRequestVersionRef.current += 1 }
+  }, [syncedLifecycleState, isReview, waiting, working, mascotReaction, pet?.id, makeShenshenLifecycleRequest, scheduleShenshenIdleAnimation, setActiveShenshenRequest])
 
   const baseState: CodexPetState = walkDir === 1
     ? 'run-right'
@@ -450,6 +677,16 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
               ? 'running'
               : 'idle'
   const lifecycleState = syncedLifecycleState ?? (isReview ? 'review' : waiting ? 'waiting' : working ? 'working' : 'idle')
+  const effectiveAgentState = mascotReaction?.state === 'waving'
+    ? 'success'
+    : mascotReaction?.state === 'failed'
+      ? 'failure'
+      : lifecycleState
+  useLayoutEffect(() => { shenshenEffectiveAgentStateRef.current = effectiveAgentState }, [effectiveAgentState])
+  const activeShenshenAnimationRequest = pet?.id === 'shenshen'
+    && !(effectiveAgentState === 'idle' && shenshenAnimationRequest?.intent === 'agent-state')
+    ? shenshenAnimationRequest
+    : null
 
   if (!pet) return null
 
@@ -457,6 +694,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
 
   return (
     <div
+      onContextMenu={functional && pet?.id === 'shenshen' ? handleContextMenu : undefined}
       style={{
         position: 'relative',
         width: metrics.canvas.width,
@@ -479,6 +717,10 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
           lifecycleState={lifecycleState}
           reaction={mascotReaction}
           onReactionEnd={clearReaction}
+          animationRequest={activeShenshenAnimationRequest}
+          onAnimationRequestEnd={handleShenshenAnimationEnd}
+          onPlaybackProgress={handleShenshenPlaybackProgress}
+          freezeIdleVideo={pet.id === 'shenshen' && effectiveAgentState === 'idle' && !activeShenshenAnimationRequest}
           size={size}
           layoutMode="canvas"
           enableHoverJump

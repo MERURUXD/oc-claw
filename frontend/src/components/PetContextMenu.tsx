@@ -11,7 +11,15 @@ import {
 import { Heart, Drumstick, Coins } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
-type SubPanel = 'main' | 'actions' | 'shop' | 'pomodoro' | 'dev'
+type SubPanel = 'main' | 'actions' | 'shop' | 'pomodoro' | 'events' | 'dev'
+
+const SHENSHEN_EVENT_OPTIONS = [
+  ['spring-festival', '春节'], ['lantern-festival', '元宵'], ['qingming', '清明'],
+  ['dragon-boat', '端午'], ['laba', '腊八'], ['qixi', '七夕'],
+  ['mid-autumn', '中秋'], ['double-ninth', '重阳'], ['halloween', '万圣节'],
+  ['christmas', '圣诞节'], ['new-year', '新年'],
+  ['spring', '春季动画'], ['summer', '夏季动画'], ['autumn', '秋季动画'], ['winter', '冬季动画'],
+] as const
 
 interface PetContextMenuProps {
   open: boolean
@@ -31,12 +39,15 @@ interface PetContextMenuProps {
   onStar?: () => void
   onQuit?: () => void
   onPlayAudio?: (action: PetAction) => void
+  showShenshenEvents?: boolean
+  onPlayShenshenEvent?: (eventId: string) => void
 }
 
 export function PetContextMenu({
   open, petData, currentAction, pomodoro, mascotSize, side = 'left',
   onClose, onUpdatePetData, onSetAction,
   onStartPomodoro, onStopPomodoro, onOpenSettings, onFoodRain, onClaimGift, onStar, onQuit, onPlayAudio,
+  showShenshenEvents = false, onPlayShenshenEvent,
 }: PetContextMenuProps) {
   const [subPanel, setSubPanel] = useState<SubPanel>('main')
   const menuRef = useRef<HTMLDivElement>(null)
@@ -209,6 +220,7 @@ export function PetContextMenu({
               <SideBtn side={side} label={giftAvailable ? t('pet.dailyGift') : t('pet.claimed')} onClick={handleClaimGift} disabled={!giftAvailable || !!pomodoro?.active} active={giftAvailable && !pomodoro?.active} />
               <SideBtn side={side} label={t('pet.actions')} onClick={() => setSubPanel('actions')} disabled={!!pomodoro?.active} />
               <SideBtn side={side} label={t('pet.shop')} onClick={() => setSubPanel('shop')} disabled={!!pomodoro?.active} />
+              {showShenshenEvents && onPlayShenshenEvent && <SideBtn side={side} label="节日动画" onClick={() => setSubPanel('events')} disabled={!!pomodoro?.active} />}
               {pomodoro?.active ? (
                 <SideBtn side={side} label={t('pet.stop')} onClick={onStopPomodoro} />
               ) : (
@@ -254,6 +266,17 @@ export function PetContextMenu({
                   <CustomTimeInput side={side} onStart={onStartPomodoro} />
                 </>
               )}
+              {subPanel === 'events' && showShenshenEvents && onPlayShenshenEvent && SHENSHEN_EVENT_OPTIONS.map(([eventId, label]) => (
+                <SideBtn
+                  side={side}
+                  key={eventId}
+                  label={label}
+                  onClick={() => {
+                    onPlayShenshenEvent(eventId)
+                    onClose()
+                  }}
+                />
+              ))}
               {subPanel === 'dev' && (
                 <div style={{
                   display: 'flex', flexDirection: 'column', gap: 8,
