@@ -10,6 +10,7 @@ import {
   createShenshenAnimationScheduler,
   createShenshenQuotaBandTracker,
   getShenshenCalendarContext,
+  getShenshenIdleGapMs,
   getShenshenQuotaAnimationId,
   getShenshenQuotaBand,
   getNextShenshenWalkDirection,
@@ -21,6 +22,8 @@ import {
   resolveShenshenLifecycleState,
   resolveSemanticCatalogEntry,
   SHENSHEN_LOOP_ROTATION_DWELL_MS,
+  SHENSHEN_IDLE_GAP_MIN_MS,
+  SHENSHEN_IDLE_GAP_MAX_MS,
   SHENSHEN_QUOTA_FRESHNESS_MS,
   SHENSHEN_ANIMATION_CATALOG,
 } from './shenshenAnimationScheduler.ts'
@@ -119,6 +122,12 @@ test('continuous idle playback uses the ambient pool without replaying the previ
     assert.notEqual(request.animationId, previousId)
     previousId = request.animationId
   }
+})
+
+test('idle playback pauses for a bounded random gap between clips', () => {
+  assert.equal(getShenshenIdleGapMs(() => 0), SHENSHEN_IDLE_GAP_MIN_MS)
+  assert.equal(getShenshenIdleGapMs(() => 0.5), 12_500)
+  assert.equal(getShenshenIdleGapMs(() => 1), SHENSHEN_IDLE_GAP_MAX_MS)
 })
 
 test('food timing weights prefer the matching meal period', () => {

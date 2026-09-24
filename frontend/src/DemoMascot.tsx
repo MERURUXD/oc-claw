@@ -14,6 +14,7 @@ import {
   advanceShenshenLifecyclePlayback,
   createShenshenAnimationScheduler,
   getShenshenCalendarContext,
+  getShenshenIdleGapMs,
   isCurrentShenshenLifecycleRequest,
   isShenshenTerminalReactionState,
   SHENSHEN_QUOTA_FRESHNESS_MS,
@@ -70,6 +71,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
   useLayoutEffect(() => { mascotReactionRef.current = mascotReaction }, [mascotReaction])
   const [shenshenAnimationRequest, setShenshenAnimationRequest] = useState<ShenshenAnimationRequest | null>(null)
   const shenshenAnimationRequestRef = useRef<ShenshenAnimationRequest | null>(null)
+  const shenshenIdleGapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const shenshenSchedulerRef = useRef<ReturnType<typeof createShenshenAnimationScheduler> | null>(null)
   const shenshenLifecycleRequestVersionRef = useRef(0)
   const shenshenLifecyclePlaybackRef = useRef<ShenshenLifecyclePlaybackState | null>(null)
@@ -90,6 +92,10 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
     setMascotReaction((cur) => clearReactionIfCurrent(cur, reactionId))
   }, [])
   const setActiveShenshenRequest = useCallback((request: ShenshenAnimationRequest | null) => {
+    if (request && shenshenIdleGapTimerRef.current) {
+      clearTimeout(shenshenIdleGapTimerRef.current)
+      shenshenIdleGapTimerRef.current = null
+    }
     shenshenAnimationRequestRef.current = request
     setShenshenAnimationRequest(request)
   }, [])
@@ -162,6 +168,24 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
     return request !== null
   }, [setActiveShenshenRequest])
 
+  const scheduleShenshenIdleAnimation = useCallback(() => {
+    if (
+      shenshenEffectiveAgentStateRef.current !== 'idle'
+      || petRef.current?.id !== 'shenshen'
+      || shenshenIdleGapTimerRef.current
+    ) return false
+    setActiveShenshenRequest(null)
+    shenshenIdleGapTimerRef.current = setTimeout(() => {
+      shenshenIdleGapTimerRef.current = null
+      if (!shenshenAnimationRequestRef.current) resumeShenshenIdleAnimation()
+    }, getShenshenIdleGapMs())
+    return true
+  }, [resumeShenshenIdleAnimation, setActiveShenshenRequest])
+
+  useEffect(() => () => {
+    if (shenshenIdleGapTimerRef.current) clearTimeout(shenshenIdleGapTimerRef.current)
+  }, [])
+
   const handleShenshenAnimationEnd = useCallback((requestId: string) => {
     const active = shenshenAnimationRequestRef.current
     if (active?.id !== requestId) return
@@ -179,9 +203,9 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
       return
     }
     if (resumeShenshenLifecycleAnimation(shenshenEffectiveAgentStateRef.current)) return
-    if (resumeShenshenIdleAnimation()) return
+    if (scheduleShenshenIdleAnimation()) return
     setActiveShenshenRequest(null)
-  }, [clearReaction, resumeShenshenIdleAnimation, resumeShenshenLifecycleAnimation, setActiveShenshenRequest])
+  }, [clearReaction, resumeShenshenLifecycleAnimation, scheduleShenshenIdleAnimation, setActiveShenshenRequest])
 
   const handleShenshenPlaybackProgress = useCallback((requestId: string | null, currentTime: number) => {
     const active = shenshenAnimationRequestRef.current
@@ -595,6 +619,10 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
   useEffect(() => {
     const requestVersion = ++shenshenLifecycleRequestVersionRef.current
     if (petRef.current?.id !== 'shenshen') {
+      if (shenshenIdleGapTimerRef.current) {
+        clearTimeout(shenshenIdleGapTimerRef.current)
+        shenshenIdleGapTimerRef.current = null
+      }
       shenshenAnimationRequestRef.current = null
       shenshenSchedulerRef.current?.clear()
       return
@@ -613,9 +641,13 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
           || shenshenEffectiveAgentStateRef.current !== 'idle'
         ) return
         if (shenshenAnimationRequestRef.current?.intent === 'agent-state') setActiveShenshenRequest(null)
-        if (!shenshenAnimationRequestRef.current) resumeShenshenIdleAnimation()
+        if (!shenshenAnimationRequestRef.current) scheduleShenshenIdleAnimation()
       })
       return () => { shenshenLifecycleRequestVersionRef.current += 1 }
+    }
+    if (shenshenIdleGapTimerRef.current) {
+      clearTimeout(shenshenIdleGapTimerRef.current)
+      shenshenIdleGapTimerRef.current = null
     }
     const request = makeShenshenLifecycleRequest(agentState)
     if (!request) return
@@ -629,7 +661,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
       ) setActiveShenshenRequest(request)
     })
     return () => { shenshenLifecycleRequestVersionRef.current += 1 }
-  }, [syncedLifecycleState, isReview, waiting, working, mascotReaction, pet?.id, makeShenshenLifecycleRequest, resumeShenshenIdleAnimation, setActiveShenshenRequest])
+  }, [syncedLifecycleState, isReview, waiting, working, mascotReaction, pet?.id, makeShenshenLifecycleRequest, scheduleShenshenIdleAnimation, setActiveShenshenRequest])
 
   const baseState: CodexPetState = walkDir === 1
     ? 'run-right'

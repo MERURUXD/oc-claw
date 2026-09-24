@@ -74,6 +74,7 @@ import {
   createShenshenAnimationScheduler,
   createShenshenQuotaBandTracker,
   getShenshenCalendarContext,
+  getShenshenIdleGapMs,
   getNextShenshenWalkDirection,
   getShenshenQuotaBand,
   isCurrentShenshenLifecycleRequest,
@@ -758,6 +759,7 @@ export default function Mini() {
   petDataRef.current = petData
   const [shenshenAnimationRequest, setShenshenAnimationRequest] = useState<ShenshenAnimationRequest | null>(null)
   const shenshenAnimationRequestRef = useRef<ShenshenAnimationRequest | null>(null)
+  const shenshenIdleGapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const shenshenSchedulerRef = useRef<ReturnType<typeof createShenshenAnimationScheduler> | null>(null)
   if (shenshenSchedulerRef.current == null) shenshenSchedulerRef.current = createShenshenAnimationScheduler()
   const shenshenDebugClockRef = useRef<number | null>(null)
@@ -890,6 +892,10 @@ export default function Mini() {
   }
 
   const setActiveShenshenRequest = useCallback((request: ShenshenAnimationRequest | null) => {
+    if (request && shenshenIdleGapTimerRef.current) {
+      clearTimeout(shenshenIdleGapTimerRef.current)
+      shenshenIdleGapTimerRef.current = null
+    }
     shenshenAnimationRequestRef.current = request
     setShenshenAnimationRequest(request)
   }, [])
@@ -995,6 +1001,25 @@ export default function Mini() {
     return requestShenshenAnimation('idle-cycle') !== null
   }, [requestShenshenAnimation])
 
+  const scheduleShenshenIdleAnimation = useCallback(() => {
+    if (
+      effectiveShenshenAgentStateRef.current !== 'idle'
+      || appModeRef.current !== 'coding'
+      || miniPetRef.current?.id !== 'shenshen'
+      || shenshenIdleGapTimerRef.current
+    ) return false
+    setActiveShenshenRequest(null)
+    shenshenIdleGapTimerRef.current = setTimeout(() => {
+      shenshenIdleGapTimerRef.current = null
+      if (!shenshenAnimationRequestRef.current) resumeShenshenIdleAnimation()
+    }, getShenshenIdleGapMs())
+    return true
+  }, [resumeShenshenIdleAnimation, setActiveShenshenRequest])
+
+  useEffect(() => () => {
+    if (shenshenIdleGapTimerRef.current) clearTimeout(shenshenIdleGapTimerRef.current)
+  }, [])
+
   const handleShenshenAnimationEnd = useCallback((requestId: string) => {
     const active = shenshenAnimationRequestRef.current
     if (!active || active.id !== requestId) return
@@ -1024,9 +1049,9 @@ export default function Mini() {
       if (requestShenshenAnimation('pet-action', { petAction: currentPetActionRef.current })) return
     }
     if (resumeShenshenLifecycleAnimation(effectiveShenshenAgentStateRef.current)) return
-    if (resumeShenshenIdleAnimation()) return
+    if (scheduleShenshenIdleAnimation()) return
     setActiveShenshenRequest(null)
-  }, [clearReaction, requestShenshenAnimation, resumeShenshenIdleAnimation, resumeShenshenLifecycleAnimation, setActiveShenshenRequest])
+  }, [clearReaction, requestShenshenAnimation, resumeShenshenLifecycleAnimation, scheduleShenshenIdleAnimation, setActiveShenshenRequest])
 
   const handleShenshenPlaybackProgress = useCallback((requestId: string | null, currentTime: number, duration: number) => {
     const active = shenshenAnimationRequestRef.current
@@ -5541,21 +5566,33 @@ export default function Mini() {
   effectiveShenshenAgentStateRef.current = effectiveShenshenAgentState
   useEffect(() => {
     if (!shenshenIsSelected || appMode !== 'coding') {
-      if (shenshenAnimationRequestRef.current?.intent === 'agent-state') setActiveShenshenRequest(null)
+      if (shenshenIdleGapTimerRef.current) {
+        clearTimeout(shenshenIdleGapTimerRef.current)
+        shenshenIdleGapTimerRef.current = null
+      }
+      if (shenshenAnimationRequestRef.current?.intent === 'agent-state' || shenshenAnimationRequestRef.current?.intent === 'idle-cycle') setActiveShenshenRequest(null)
       return
     }
     if (effectiveShenshenAgentState === 'idle') {
       if (shenshenAnimationRequestRef.current?.intent === 'agent-state') setActiveShenshenRequest(null)
-      if (!shenshenAnimationRequestRef.current) resumeShenshenIdleAnimation()
+      if (!shenshenAnimationRequestRef.current) scheduleShenshenIdleAnimation()
       return
+    }
+    if (shenshenIdleGapTimerRef.current) {
+      clearTimeout(shenshenIdleGapTimerRef.current)
+      shenshenIdleGapTimerRef.current = null
     }
     const request = requestShenshenAnimation('agent-state', { agentState: effectiveShenshenAgentState })
     if (!request && shenshenAnimationRequestRef.current?.intent === 'agent-state') setActiveShenshenRequest(null)
-  }, [shenshenIsSelected, appMode, effectiveShenshenAgentState, requestShenshenAnimation, resumeShenshenIdleAnimation, setActiveShenshenRequest])
+  }, [shenshenIsSelected, appMode, effectiveShenshenAgentState, requestShenshenAnimation, scheduleShenshenIdleAnimation, setActiveShenshenRequest])
 
   useEffect(() => {
     if (!shenshenIsSelected) {
       shenshenAmbientSinceRef.current = 0
+      if (shenshenIdleGapTimerRef.current) {
+        clearTimeout(shenshenIdleGapTimerRef.current)
+        shenshenIdleGapTimerRef.current = null
+      }
       if (shenshenAnimationRequestRef.current) setActiveShenshenRequest(null)
       shenshenSchedulerRef.current?.clear()
       return
@@ -5576,7 +5613,7 @@ export default function Mini() {
         return
       }
 
-      if (!active && appModeRef.current === 'coding' && resumeShenshenIdleAnimation()) return
+      if (!active && appModeRef.current === 'coding') scheduleShenshenIdleAnimation()
 
       if (!shenshenAmbientSinceRef.current) shenshenAmbientSinceRef.current = Date.now()
       const idleDurationMs = Date.now() - shenshenAmbientSinceRef.current
@@ -5603,7 +5640,7 @@ export default function Mini() {
       document.removeEventListener('visibilitychange', onVisibilityChange)
       clearInterval(timer)
     }
-  }, [shenshenIsSelected, getShenshenSelectionContext, requestShenshenAnimation, resumeShenshenIdleAnimation, setActiveShenshenRequest])
+  }, [shenshenIsSelected, getShenshenSelectionContext, requestShenshenAnimation, scheduleShenshenIdleAnimation, setActiveShenshenRequest])
 
   useEffect(() => {
     if (!import.meta.env.DEV || !shenshenIsSelected) return
