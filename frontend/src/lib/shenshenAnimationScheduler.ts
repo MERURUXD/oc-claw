@@ -108,8 +108,8 @@ export interface ShenshenCandidateInspection {
 
 export const SHENSHEN_QUOTA_FRESHNESS_MS = 5 * 60_000
 export const SHENSHEN_LOOP_ROTATION_DWELL_MS = 15_000
-export const SHENSHEN_IDLE_GAP_MIN_MS = 30_000
-export const SHENSHEN_IDLE_GAP_MAX_MS = 60_000
+export const SHENSHEN_IDLE_GAP_MIN_MS = 10_000
+export const SHENSHEN_IDLE_GAP_MAX_MS = 20_000
 
 export function getShenshenIdleGapMs(random: () => number = Math.random): number {
   const fraction = Math.max(0, Math.min(1, random()))
