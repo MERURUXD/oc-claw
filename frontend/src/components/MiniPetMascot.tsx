@@ -36,6 +36,7 @@ interface MiniPetMascotProps {
   animationRequest?: ShenshenAnimationRequest | null
   onAnimationRequestEnd?: (requestId: string) => void
   onPlaybackProgress?: (requestId: string | null, currentTime: number, duration: number) => void
+  freezeIdleVideo?: boolean
   // When true, the wrapper plays a one-shot jump while hovered, then waits
   // before triggering the next jump.
   enableHoverJump?: boolean
@@ -83,6 +84,7 @@ export function MiniPetMascot({
   animationRequest = null,
   onAnimationRequestEnd,
   onPlaybackProgress,
+  freezeIdleVideo = false,
   enableHoverJump = false,
   externalHover = false,
   useExternalHover = false,
@@ -352,6 +354,7 @@ export function MiniPetMascot({
         oneShotRequestId={videoOneShotRequestId}
         animationOverride={videoAnimationOverride}
         onPlaybackProgress={onPlaybackProgress}
+        freeze={freezeIdleVideo && isVideo && videoState === 'idle'}
         layoutMode={layoutMode}
       />
     </div>

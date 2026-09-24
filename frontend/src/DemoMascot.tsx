@@ -720,6 +720,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
           animationRequest={activeShenshenAnimationRequest}
           onAnimationRequestEnd={handleShenshenAnimationEnd}
           onPlaybackProgress={handleShenshenPlaybackProgress}
+          freezeIdleVideo={pet.id === 'shenshen' && effectiveAgentState === 'idle' && !activeShenshenAnimationRequest}
           size={size}
           layoutMode="canvas"
           enableHoverJump

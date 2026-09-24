@@ -998,8 +998,20 @@ export default function Mini() {
       || mascotIsDraggingRef.current
       || mascotDragActiveRef.current
     ) return false
+    const context = getShenshenSelectionContext()
+    if (
+      (context.idleDurationMs ?? 0) >= 90_000
+      && Date.now() - shenshenLastAmbientAtRef.current >= 120_000
+    ) {
+      shenshenLastAmbientAtRef.current = Date.now()
+      const calendarEvent = context.activeEvents?.find((eventId) => !eventId.startsWith('season:'))
+      const eventId = calendarEvent ?? context.season
+      if (eventId && Math.random() < (calendarEvent ? 0.35 : 0.12)) {
+        if (requestShenshenAnimation('festival', { idleDurationMs: context.idleDurationMs }, { eventId })) return true
+      }
+    }
     return requestShenshenAnimation('idle-cycle') !== null
-  }, [requestShenshenAnimation])
+  }, [getShenshenSelectionContext, requestShenshenAnimation])
 
   const scheduleShenshenIdleAnimation = useCallback(() => {
     if (
@@ -5616,6 +5628,7 @@ export default function Mini() {
       if (!active && appModeRef.current === 'coding') scheduleShenshenIdleAnimation()
 
       if (!shenshenAmbientSinceRef.current) shenshenAmbientSinceRef.current = Date.now()
+      if (appModeRef.current === 'coding') return
       const idleDurationMs = Date.now() - shenshenAmbientSinceRef.current
       const hasHigherPriorityRequest = !!active && active.intent !== 'ambient' && active.intent !== 'idle-cycle'
       if (
@@ -6133,6 +6146,7 @@ export default function Mini() {
                   animationRequest={shenshenAnimationRequest}
                   onAnimationRequestEnd={handleShenshenAnimationEnd}
                   onPlaybackProgress={handleShenshenPlaybackProgress}
+                  freezeIdleVideo={shenshenIsSelected && appMode === 'coding' && effectiveShenshenAgentState === 'idle' && !shenshenAnimationRequest}
                   size={largeMascotVisualSize}
                   layoutMode="canvas"
                   enableHoverJump

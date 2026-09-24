@@ -8,6 +8,7 @@ export interface BufferedVideoProps {
   altSrc?: string
   getAlternateSrc?: (url: string) => string | undefined
   loop?: boolean
+  freeze?: boolean
   playbackRate?: number
   replayToken?: number | string
   onPlaying?: () => void
@@ -47,6 +48,7 @@ export function BufferedVideo({
   altSrc,
   getAlternateSrc,
   loop = true,
+  freeze = false,
   playbackRate = 1,
   replayToken,
   onPlaying,
@@ -91,6 +93,8 @@ export function BufferedVideo({
   altSrcRef.current = altSrc
   const playbackRateRef = useRef(playbackRate)
   playbackRateRef.current = playbackRate
+  const freezeRef = useRef(freeze)
+  freezeRef.current = freeze
 
   const effectiveTransparency =
     transparency === 'auto'
@@ -173,6 +177,7 @@ export function BufferedVideo({
       if (old) {
         old.pause()
       }
+      if (freezeRef.current) (newFront === 0 ? videoRefA.current : videoRefB.current)?.pause()
       onPlayingRef.current?.()
     }
 
@@ -224,6 +229,7 @@ export function BufferedVideo({
         allowAlternateFormatFallback,
         () => {
           if (!cancelled && generationRef.current === generation) {
+            if (freezeRef.current) front.pause()
             onPlayingRef.current?.()
           }
         },
@@ -264,6 +270,12 @@ export function BufferedVideo({
     if (videoRefA.current) videoRefA.current.playbackRate = playbackRate
     if (videoRefB.current) videoRefB.current.playbackRate = playbackRate
   }, [playbackRate])
+
+  useEffect(() => {
+    const front = activeBufferRef.current === 0 ? videoRefA.current : videoRefB.current
+    if (freeze) front?.pause()
+    else if (front?.src && front.paused) front.play().catch(() => {})
+  }, [freeze, activeBuffer])
 
   // Canvas Chroma-Key Render Loop (Windows transparency workaround)
   useEffect(() => {
@@ -307,7 +319,7 @@ export function BufferedVideo({
           }
           ctx.putImageData(frame, 0, 0)
         }
-      } else if (front && front.src && front.paused) {
+      } else if (!freezeRef.current && front && front.src && front.paused) {
         retryCount++
         if (retryCount % 30 === 0) front.play().catch(() => {})
       }

@@ -124,9 +124,19 @@ test('continuous idle playback uses the ambient pool without replaying the previ
   }
 })
 
+test('idle clips do not overlap the working pool', () => {
+  const context = { nowMs: 1_000_000, season: 'spring' as const, visible: true, isFree: true, idleDurationMs: 600_000 }
+  const workingIds = new Set(resolveSemanticCatalogEntry('agent-state', { nowMs: context.nowMs, agentState: 'working' }).map((entry) => entry.id))
+  for (const intent of ['idle-cycle', 'ambient'] as const) {
+    const idle = resolveSemanticCatalogEntry(intent, context)
+    assert.ok(idle.length > 0)
+    assert.ok(idle.every((entry) => !workingIds.has(entry.id)), `${intent} contains a working clip`)
+  }
+})
+
 test('idle playback pauses for a bounded random gap between clips', () => {
   assert.equal(getShenshenIdleGapMs(() => 0), SHENSHEN_IDLE_GAP_MIN_MS)
-  assert.equal(getShenshenIdleGapMs(() => 0.5), 12_500)
+  assert.equal(getShenshenIdleGapMs(() => 0.5), 45_000)
   assert.equal(getShenshenIdleGapMs(() => 1), SHENSHEN_IDLE_GAP_MAX_MS)
 })
 

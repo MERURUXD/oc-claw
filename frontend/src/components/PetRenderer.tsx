@@ -16,6 +16,7 @@ export interface PetRendererProps {
   animationOverride?: VideoPetAnimationMeta | null
   onPlaybackProgress?: (requestId: string | null, currentTime: number, duration: number) => void
   loop?: boolean
+  freeze?: boolean
   flipHorizontal?: boolean
   replayToken?: number | string
   transparency?: VideoTransparencyMode
@@ -38,6 +39,7 @@ export function PetRenderer({
   animationOverride,
   onPlaybackProgress,
   loop,
+  freeze,
   flipHorizontal,
   replayToken,
   transparency,
@@ -57,6 +59,7 @@ export function PetRenderer({
         animationOverride={animationOverride}
         onPlaybackProgress={onPlaybackProgress}
         loop={loop}
+        freeze={freeze}
         flipHorizontal={flipHorizontal}
         replayToken={replayToken}
         transparency={transparency}
