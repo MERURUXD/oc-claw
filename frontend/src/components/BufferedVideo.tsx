@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
+import { listen } from '@tauri-apps/api/event'
+import { invoke } from '@tauri-apps/api/core'
 import type { ChromaKeyOptions, VideoTransparencyMode } from '../lib/videoPet'
 
 export type { ChromaKeyOptions, VideoTransparencyMode }
@@ -30,6 +32,12 @@ export interface BufferedVideoProps {
 
 const isWindowsPlatform =
   typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows')
+
+function traceVideo(message: string) {
+  if (import.meta.env.VITE_OC_DIAGNOSTICS === '1') {
+    invoke('debug_log', { scope: 'video', msg: message }).catch(() => {})
+  }
+}
 
 /**
  * Reusable double-buffered video component.
@@ -149,6 +157,7 @@ export function BufferedVideo({
     prevReplayTokenRef.current = replayToken
     prevOneShotRequestIdRef.current = normalizedRequestId
     const generation = ++generationRef.current
+    traceVideo(`load generation=${generation} first=${isFirstLoad} front=${frontIdx} back=${backIdx} src=${src.split('/').pop()} request=${normalizedRequestId ?? 'none'} visible=${document.visibilityState}`)
 
     let cancelled = false
     const listeners: Array<() => void> = []
@@ -171,6 +180,7 @@ export function BufferedVideo({
       if (cancelled || generationRef.current !== generation) return
       activeBufferRef.current = newFront
       setActiveBuffer(newFront)
+      traceVideo(`swap generation=${generation} front=${newFront} readyState=${(newFront === 0 ? videoRefA.current : videoRefB.current)?.readyState ?? -1}`)
       // Only pause the old buffer; do not clear its src synchronously
       // so React has time to apply visibility: hidden without a blank flash.
       const old = newFront === 0 ? videoRefB.current : videoRefA.current
@@ -195,12 +205,14 @@ export function BufferedVideo({
       const ready = () => {
         clearListeners()
         if (cancelled || generationRef.current !== generation) return
+        traceVideo(`playing generation=${generation} target=${target === videoRefA.current ? 0 : 1} time=${target.currentTime.toFixed(2)}`)
         onReady()
       }
 
       const failed = () => {
         clearListeners()
         if (cancelled || generationRef.current !== generation) return
+        traceVideo(`error generation=${generation} target=${target === videoRefA.current ? 0 : 1} code=${target.error?.code ?? 'none'} src=${targetUrl.split('/').pop()}`)
         if (allowFallback) {
           const alt = altSrcRef.current ?? getAlternateSrcRef.current?.(targetUrl)
           if (alt && alt !== targetUrl) {
@@ -277,6 +289,29 @@ export function BufferedVideo({
     else if (front?.src && front.paused) front.play().catch(() => {})
   }, [freeze, activeBuffer])
 
+  // WebView2 can pause media when the mascot's native window is hidden for
+  // fullscreen. The video stays mounted, so no source or buffer effect reruns.
+  useEffect(() => {
+    const resume = (nativeRestored = false) => {
+      if ((!nativeRestored && document.hidden) || freezeRef.current) return
+      const front = activeBufferRef.current === 0 ? videoRefA.current : videoRefB.current
+      if (front?.src && front.paused) front.play().catch(() => {})
+    }
+    const resumeWhenVisible = () => resume()
+    document.addEventListener('visibilitychange', resumeWhenVisible)
+    window.addEventListener('focus', resumeWhenVisible)
+    const unlisten = listen<{ suppressed: boolean }>('mascot-presentation-suppression', (event) => {
+      const front = activeBufferRef.current === 0 ? videoRefA.current : videoRefB.current
+      traceVideo(`presentation suppressed=${event.payload.suppressed} front=${activeBufferRef.current} paused=${front?.paused ?? 'none'} readyState=${front?.readyState ?? -1} visible=${document.visibilityState}`)
+      if (!event.payload.suppressed) resume(true)
+    }).catch(() => null)
+    return () => {
+      document.removeEventListener('visibilitychange', resumeWhenVisible)
+      window.removeEventListener('focus', resumeWhenVisible)
+      unlisten.then((stop) => stop?.())
+    }
+  }, [])
+
   // Canvas Chroma-Key Render Loop (Windows transparency workaround)
   useEffect(() => {
     if (!useChromaKey) return
@@ -294,8 +329,10 @@ export function BufferedVideo({
 
     const draw = () => {
       const front = activeBufferRef.current === 0 ? videoRefA.current : videoRefB.current
+      if (!freezeRef.current && front?.src && front.paused && retryCount++ % 30 === 0) {
+        front.play().catch(() => {})
+      }
       if (front && front.readyState >= 2 && front.videoWidth > 0 && front.videoHeight > 0) {
-        retryCount = 0
         const targetW = canvasWidth ?? canvas.clientWidth ?? front.videoWidth
         const targetH = canvasHeight ?? canvas.clientHeight ?? front.videoHeight
         if (targetW > 0 && targetH > 0 && (canvas.width !== targetW || canvas.height !== targetH)) {
@@ -319,9 +356,6 @@ export function BufferedVideo({
           }
           ctx.putImageData(frame, 0, 0)
         }
-      } else if (!freezeRef.current && front && front.src && front.paused) {
-        retryCount++
-        if (retryCount % 30 === 0) front.play().catch(() => {})
       }
       rafId = requestAnimationFrame(draw)
     }

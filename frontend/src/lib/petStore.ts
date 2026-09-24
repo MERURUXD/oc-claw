@@ -211,7 +211,7 @@ export async function saveMultiMascotMode(enabled: boolean): Promise<void> {
 // missing or strictly below this value, the saved app_mode is ignored and
 // the onboarding modal is shown again. After the user picks a mode we save
 // this constant so subsequent launches pass the check.
-export const APP_MODE_ONBOARDING_VERSION = '1.8.1'
+export const APP_MODE_ONBOARDING_VERSION = '1.9.0'
 
 export async function loadAppModeVersion(): Promise<string | null> {
   const store = await getPetStore()

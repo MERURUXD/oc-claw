@@ -680,7 +680,7 @@ function HermesSection({ hermesHookStatus, t }: {
   )
 }
 
-export function SettingsTab({ bubbleStyle, onChangeBubbleStyle, notifySound, onChangeNotifySound, quotaRecoverySound = 'default', onChangeQuotaRecoverySound, waitingSound, onToggleWaitingSound, soundEnabled, onToggleSoundEnabled, codexSoundEnabled, onToggleCodexSoundEnabled, cursorSoundEnabled, onToggleCursorSoundEnabled, geminiSoundEnabled, onToggleGeminiSoundEnabled, opencodeSoundEnabled, onToggleOpencodeSoundEnabled, hermesSoundEnabled, onToggleHermesSoundEnabled, antigravitySoundEnabled, onToggleAntigravitySoundEnabled, autoCloseCompletion, onToggleAutoCloseCompletion, autoExpandOnTask, onToggleAutoExpandOnTask, islandBg, onChangeIslandBg, bgPos, onChangeBgPos, panelMaxHeight, onChangePanelMaxHeight, hoverDelay, onChangeHoverDelay, largeMascotScale, onChangeLargeMascotScale, appMode, onChangeAppMode, petSfxEnabled, onTogglePetSfxEnabled, petIdleIntervalMin, onChangePetIdleIntervalMin }: { bubbleStyle?: BubbleStyle; onChangeBubbleStyle?: (v: BubbleStyle) => void; notifySound: 'default' | 'manbo' | 'therock'; onChangeNotifySound: (v: 'default' | 'manbo' | 'therock') => void; quotaRecoverySound?: 'default' | 'manbo' | 'therock'; onChangeQuotaRecoverySound?: (v: 'default' | 'manbo' | 'therock') => void; waitingSound: boolean; onToggleWaitingSound: (v: boolean) => void; soundEnabled: boolean; onToggleSoundEnabled: (v: boolean) => void; codexSoundEnabled: boolean; onToggleCodexSoundEnabled: (v: boolean) => void; cursorSoundEnabled: boolean; onToggleCursorSoundEnabled: (v: boolean) => void; geminiSoundEnabled: boolean; onToggleGeminiSoundEnabled: (v: boolean) => void; opencodeSoundEnabled: boolean; onToggleOpencodeSoundEnabled: (v: boolean) => void; hermesSoundEnabled: boolean; onToggleHermesSoundEnabled: (v: boolean) => void; antigravitySoundEnabled?: boolean; onToggleAntigravitySoundEnabled?: (v: boolean) => void; autoCloseCompletion: boolean; onToggleAutoCloseCompletion: (v: boolean) => void; autoExpandOnTask: boolean; onToggleAutoExpandOnTask: (v: boolean) => void; islandBg: string; onChangeIslandBg: (v: string) => void; bgPos: { x: number; y: number }; onChangeBgPos: (v: { x: number; y: number }) => void; panelMaxHeight: number; onChangePanelMaxHeight: (v: number) => void; hoverDelay: number; onChangeHoverDelay: (v: number) => void; largeMascotScale: number; onChangeLargeMascotScale: (v: number) => void; appMode?: 'coding' | 'pet' | null; onChangeAppMode?: (v: 'coding' | 'pet') => void; petSfxEnabled?: boolean; onTogglePetSfxEnabled?: (v: boolean) => void; petIdleIntervalMin?: number; onChangePetIdleIntervalMin?: (v: number) => void }) {
+export function SettingsTab({ bubbleStyle, onChangeBubbleStyle, notifySound, onChangeNotifySound, quotaRecoverySound = 'default', onChangeQuotaRecoverySound, waitingSound, onToggleWaitingSound, soundEnabled, onToggleSoundEnabled, codexSoundEnabled, onToggleCodexSoundEnabled, cursorSoundEnabled, onToggleCursorSoundEnabled, geminiSoundEnabled, onToggleGeminiSoundEnabled, opencodeSoundEnabled, onToggleOpencodeSoundEnabled, hermesSoundEnabled, onToggleHermesSoundEnabled, antigravitySoundEnabled, onToggleAntigravitySoundEnabled, autoCloseCompletion, onToggleAutoCloseCompletion, autoExpandOnTask, onToggleAutoExpandOnTask, islandBg, onChangeIslandBg, bgPos, onChangeBgPos, panelMaxHeight, onChangePanelMaxHeight, hoverDelay, onChangeHoverDelay, largeMascotScale, onChangeLargeMascotScale, appMode, petSfxEnabled, onTogglePetSfxEnabled, petIdleIntervalMin, onChangePetIdleIntervalMin }: { bubbleStyle?: BubbleStyle; onChangeBubbleStyle?: (v: BubbleStyle) => void; notifySound: 'default' | 'manbo' | 'therock'; onChangeNotifySound: (v: 'default' | 'manbo' | 'therock') => void; quotaRecoverySound?: 'default' | 'manbo' | 'therock'; onChangeQuotaRecoverySound?: (v: 'default' | 'manbo' | 'therock') => void; waitingSound: boolean; onToggleWaitingSound: (v: boolean) => void; soundEnabled: boolean; onToggleSoundEnabled: (v: boolean) => void; codexSoundEnabled: boolean; onToggleCodexSoundEnabled: (v: boolean) => void; cursorSoundEnabled: boolean; onToggleCursorSoundEnabled: (v: boolean) => void; geminiSoundEnabled: boolean; onToggleGeminiSoundEnabled: (v: boolean) => void; opencodeSoundEnabled: boolean; onToggleOpencodeSoundEnabled: (v: boolean) => void; hermesSoundEnabled: boolean; onToggleHermesSoundEnabled: (v: boolean) => void; antigravitySoundEnabled?: boolean; onToggleAntigravitySoundEnabled?: (v: boolean) => void; autoCloseCompletion: boolean; onToggleAutoCloseCompletion: (v: boolean) => void; autoExpandOnTask: boolean; onToggleAutoExpandOnTask: (v: boolean) => void; islandBg: string; onChangeIslandBg: (v: string) => void; bgPos: { x: number; y: number }; onChangeBgPos: (v: { x: number; y: number }) => void; panelMaxHeight: number; onChangePanelMaxHeight: (v: number) => void; hoverDelay: number; onChangeHoverDelay: (v: number) => void; largeMascotScale: number; onChangeLargeMascotScale: (v: number) => void; appMode?: 'coding' | 'pet' | null; petSfxEnabled?: boolean; onTogglePetSfxEnabled?: (v: boolean) => void; petIdleIntervalMin?: number; onChangePetIdleIntervalMin?: (v: number) => void }) {
   const { t, i18n } = useTranslation()
   const [connections, setConnections] = useState<OcConnection[]>([])
   const [enableClaudeCode, setEnableClaudeCode] = useState(true)
@@ -1037,37 +1037,6 @@ export function SettingsTab({ bubbleStyle, onChangeBubbleStyle, notifySound, onC
 
   return (
     <div className="max-w-2xl mx-auto pt-10 pb-20 px-6 flex flex-col gap-10">
-      {/* App Mode Switch */}
-      {appMode && onChangeAppMode && (
-        <section className="flex flex-col gap-4">
-          <h2 className="text-lg font-medium text-white">{t('settings.appMode', 'Mode')}</h2>
-          <div className="bg-[#0f0f0f] border border-white/5 rounded-2xl overflow-hidden p-4">
-            <div className="flex gap-3">
-              {([
-                { mode: 'coding' as const, label: t('settings.codingMode'), icon: '💻', desc: t('settings.codingModeDesc') },
-                { mode: 'pet' as const, label: t('settings.petMode'), icon: '🐾', desc: t('settings.petModeDesc') },
-              ]).map(({ mode, label, icon, desc }) => (
-                <button
-                  key={mode}
-                  onClick={() => onChangeAppMode(mode)}
-                  className={`flex-1 flex items-center gap-3 p-3 rounded-xl border transition-all ${
-                    appMode === mode
-                      ? 'bg-white/10 border-white/20'
-                      : 'bg-white/[0.02] border-white/5 hover:bg-white/[0.05] hover:border-white/10'
-                  }`}
-                >
-                  <span className="text-xl">{icon}</span>
-                  <div className="text-left">
-                    <div className={`text-sm font-medium ${appMode === mode ? 'text-white' : 'text-white/60'}`}>{label}</div>
-                    <div className="text-[11px] text-white/30">{desc}</div>
-                  </div>
-                </button>
-              ))}
-            </div>
-          </div>
-        </section>
-      )}
-
       {/* Pet mode: mascot size */}
       {isPetMode && (
         <section className="flex flex-col gap-4">

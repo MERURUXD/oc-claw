@@ -46,7 +46,7 @@ import { OnboardingModal } from './components/OnboardingModal'
 import { PetContextMenu, PomodoroOverlay } from './components/PetContextMenu'
 import {
   type AppMode, type PetData, type PetAction, type PomodoroState,
-  loadAppMode, saveAppMode, loadPetData, savePetData, tickPetData,
+  loadAppMode, saveAppMode, savePetData, tickPetData,
   loadAppModeVersion, saveAppModeVersion, isAppModeOnboardingStale,
   APP_MODE_ONBOARDING_VERSION,
   defaultPetData, getAffectionTier, canWalk,
@@ -1726,76 +1726,33 @@ export default function Mini() {
     return () => clearInterval(id)
   }, [appMode, getNowPlayingSafe])
 
-  const handleSelectAppMode = useCallback(async (mode: AppMode) => {
-    appModeRef.current = mode
-    await saveAppMode(mode)
-    // Record the onboarding version so we don't re-prompt this user until
-    // we bump APP_MODE_ONBOARDING_VERSION again.
-    await saveAppModeVersion(APP_MODE_ONBOARDING_VERSION)
-    if (mode === 'pet') {
-      largeMascotRef.current = true
-      const store = await load('settings.json', { defaults: {}, autoSave: true })
-      await store.set('large_mascot', true)
-      await store.save()
-      const data = await loadPetData()
-      const ticked = tickPetData(data)
-      petDataRef.current = ticked
-      await savePetData(ticked)
-      // When switching mode from inside Settings, keep the settings-sized
-      // window completely untouched. Any native resize/move call (even a
-      // theoretically idempotent set_mini_size) can produce a visible
-      // jump of the fixed-position settings overlay on macOS, so just
-      // update React state and let exitSettings handle the real layout
-      // when the user closes the panel.
-      if (settingsModeRef.current || settingsTransitioningRef.current) {
-        setAppMode(mode)
-        setShowOnboarding(false)
-        setLargeMascot(true)
-        setPetData(ticked)
-        return
-      }
-      // Hide window content before resizing to avoid flashing the
-      // onboarding modal at the wrong window dimensions.
-      document.documentElement.style.opacity = '0'
-      // Reposition window, then update React state, then fade in
-      await invoke('set_mini_expanded', { expanded: false, position: mascotPositionRef.current, efficiency: true, mascotScale: mascotScaleRef.current, largeMascot: true, largeMascotScale: largeMascotScaleRef.current }).catch(() => {})
-      await invoke('set_pet_mode_window', { active: true, mascotScale: mascotScaleRef.current, largeMascotScale: largeMascotScaleRef.current }).catch(() => {})
-      setAppMode(mode)
-      setShowOnboarding(false)
-      setLargeMascot(true)
-      setPetData(ticked)
-      // Wait for React to render the mascot and chroma key canvas to draw, then reveal.
-      // Windows needs extra frames for the canvas chroma key loop to process the first frame.
-      const reveal = () => { document.documentElement.style.opacity = '1' }
-      if (isWindowsPlatform) {
-        setTimeout(reveal, 150)
-      } else {
-        requestAnimationFrame(reveal)
-      }
-    } else {
-      setAppMode(mode)
-      setShowOnboarding(false)
-      // First time entering coding mode (no persisted preference): default
-      // to the large mascot so new users see it out of the box. Existing
-      // users who have explicitly toggled the size are left alone.
-      setLargeMascot(true)
-      largeMascotRef.current = true
-      // When switching mode from inside Settings, keep the settings window
-      // completely untouched. enterSettings already disabled pet pass-
-      // through, and any extra native resize/move call (even an
-      // "idempotent" set_mini_size) can visibly jump the fixed-position
-      // settings overlay on macOS. exitSettings will switch back to the
-      // correct collapsed/pet layout when the user closes the panel.
-      if (settingsModeRef.current || settingsTransitioningRef.current) {
-        return
-      }
-      // Leaving pet mode (not from settings): stop the pass-through poll first.
-      await invoke('set_pet_mode_window', { active: false, mascotScale: mascotScaleRef.current, largeMascotScale: largeMascotScaleRef.current }).catch(() => {})
-      // Restore window back to collapsed mascot size
-      try {
-        await invoke('set_mini_size', { restore: true, position: mascotPositionRef.current, mascotScale: mascotScaleRef.current, largeMascot: true, largeMascotScale: largeMascotScaleRef.current })
-      } catch {}
+  const handleSelectPetFamily = useCallback(async (family: 'codex' | 'shenshen') => {
+    const store = await load('settings.json', { defaults: {}, autoSave: true })
+    if (miniPetRef.current && !isVideoPet(miniPetRef.current)) {
+      await store.set('last_codex_pet_id', miniPetRef.current.id)
     }
+    const lastCodexPetId = await store.get('last_codex_pet_id')
+    const pet = family === 'shenshen'
+      ? await loadCodexPetById('shenshen')
+      : (miniPetRef.current && !isVideoPet(miniPetRef.current) ? miniPetRef.current : null)
+        ?? (typeof lastCodexPetId === 'string' ? await loadCodexPetById(lastCodexPetId) : null)
+        ?? await loadDefaultCodexPet()
+    if (!pet) return
+    await saveMiniPetId(pet.id)
+    setMiniPet(pet)
+    setLargeMascot(false)
+    largeMascotRef.current = false
+    appModeRef.current = 'coding'
+    setAppMode('coding')
+    await saveAppMode('coding')
+    await saveAppModeVersion(APP_MODE_ONBOARDING_VERSION)
+    await store.set('large_mascot', false)
+    await store.save()
+    if (!settingsModeRef.current && !settingsTransitioningRef.current) {
+      await invoke('set_pet_mode_window', { active: false, mascotScale: mascotScaleRef.current, largeMascotScale: largeMascotScaleRef.current }).catch(() => {})
+      await invoke('set_mini_expanded', { expanded: false, position: mascotPositionRef.current, efficiency: true, mascotScale: mascotScaleRef.current, largeMascot: false, largeMascotScale: largeMascotScaleRef.current }).catch(() => {})
+    }
+    setShowOnboarding(false)
   }, [])
 
   const handleUpdatePetData = useCallback(async (data: PetData) => {
@@ -1999,12 +1956,9 @@ export default function Mini() {
       const storedLargeMascotScale = await store.get('large_mascot_scale')
       const initialLargeMascotScale = typeof storedLargeMascotScale === 'number' ? Math.min(6, Math.max(1, storedLargeMascotScale)) : 5
       const existingMode = await loadAppMode()
-      // Avoid startup flicker: decide large/small mascot from the persisted mode
-      // BEFORE applying initial React/native window state. Otherwise we briefly
-      // render the stored small mascot and then switch to large in pet mode.
-      // Default to large mascot for both pet and coding modes when the user
-      // has no explicit preference yet; respect the stored boolean otherwise.
-      const initialLargeMascot = true
+      // The coding monitor always starts with the selected sprite or video pet.
+      // Ignore the legacy large-mascot preference before sizing the native window.
+      const initialLargeMascot = false
       setMascotPosition(initialMascotPosition)
       setMascotScale(initialMascotScale)
       setLargeMascot(initialLargeMascot)
@@ -2015,44 +1969,26 @@ export default function Mini() {
       largeMascotScaleRef.current = initialLargeMascotScale
 
       const existingModeVersion = await loadAppModeVersion()
-      // Force re-onboarding when the stored version is missing or older
-      // than APP_MODE_ONBOARDING_VERSION (e.g. after we ship changes that
-      // require users to re-confirm their mode choice).
+      // Re-onboard older installs to choose a pet format. A stored pet mode
+      // cannot resume because its bundled mascot assets are no longer shipped.
       const onboardingStale = isAppModeOnboardingStale(existingModeVersion)
-      if (!onboardingStale && (existingMode === 'pet' || existingMode === 'coding')) {
-        setAppMode(existingMode)
-        appModeRef.current = existingMode
+      if (!onboardingStale && existingMode === 'coding') {
+        setAppMode('coding')
+        appModeRef.current = 'coding'
         setShowOnboarding(false)
-        if (existingMode === 'pet') {
-          const data = await loadPetData()
-          const ticked = tickPetData(data)
-          setPetData(ticked)
-          petDataRef.current = ticked
-          await savePetData(ticked)
-          // Keep persisted setting aligned with pet mode for next startup.
-          await store.set('large_mascot', true)
-        }
         await invoke('set_mini_expanded', {
           expanded: false,
           position: initialMascotPosition,
           efficiency: true,
           mascotScale: initialMascotScale,
-          largeMascot: true,
+          largeMascot: false,
           largeMascotScale: initialLargeMascotScale,
         }).catch(() => {})
-        if (existingMode === 'pet') {
-          await invoke('set_pet_mode_window', {
-            active: true,
-            mascotScale: initialMascotScale,
-            largeMascotScale: initialLargeMascotScale,
-          }).catch(() => {})
-        } else {
-          invoke('set_pet_mode_window', {
-            active: false,
-            mascotScale: initialMascotScale,
-            largeMascotScale: initialLargeMascotScale,
-          }).catch(() => {})
-        }
+        invoke('set_pet_mode_window', {
+          active: false,
+          mascotScale: initialMascotScale,
+          largeMascotScale: initialLargeMascotScale,
+        }).catch(() => {})
       } else {
         // First launch (or mode not chosen yet): show mode onboarding.
         setAppMode(null)
@@ -2065,13 +2001,16 @@ export default function Mini() {
             mascotScale: initialMascotScale,
           })
         } catch {}
-        // `set_mini_size` schedules its NSWindow resize on the main thread
-        // and returns immediately, so the modal would otherwise render
-        // inside the still-collapsed 96x96 frame and clip its own
-        // contents (clicks effectively land outside the visible area).
-        // A short delay lets the resize land before React mounts the
-        // modal at a sane size.
-        await new Promise<void>((r) => setTimeout(r, 120))
+        // macOS applies the NSWindow resize on the main thread after the IPC
+        // returns. Wait for the webview to report the actual onboarding size.
+        await new Promise<void>((resolve) => {
+          const deadline = performance.now() + 1500
+          const check = () => {
+            if ((window.innerWidth >= 500 && window.innerHeight >= 400) || performance.now() >= deadline) resolve()
+            else requestAnimationFrame(check)
+          }
+          check()
+        })
         setShowOnboarding(true)
       }
 
@@ -2579,11 +2518,7 @@ export default function Mini() {
         setAutoExpandOnTask(aet)
         autoExpandOnTaskRef.current = aet
       }
-      const lm = await store.get('large_mascot')
-      if (typeof lm === 'boolean' && appModeRef.current !== 'pet') {
-        setLargeMascot(lm)
-        largeMascotRef.current = lm
-      }
+      // Legacy large-mascot selection is no longer a supported startup path.
       const lms = await store.get('large_mascot_scale')
       if (typeof lms === 'number') {
         const clamped = Math.min(6, Math.max(1, lms))
@@ -3881,7 +3816,7 @@ export default function Mini() {
         expandedRef.current = true
         setShowPanel(true)
       } else {
-        await invoke('set_mini_size', { restore: true, position: mascotPositionRef.current, mascotScale: mascotScaleRef.current, largeMascot: true, largeMascotScale: largeMascotScaleRef.current })
+        await invoke('set_mini_size', { restore: true, position: mascotPositionRef.current, mascotScale: mascotScaleRef.current, largeMascot: largeMascotRef.current, largeMascotScale: largeMascotScaleRef.current })
         await restoreCollapsedMascotPosition()
         await restoreCollapsedPetLayoutRef.current()
         setExpanded(false)
@@ -4127,7 +4062,7 @@ export default function Mini() {
           efficiency: true,
           keepPosition: true,
           mascotScale: mascotScaleRef.current,
-          largeMascot: true,
+          largeMascot: largeMascotRef.current,
           largeMascotScale: clamped,
         }).catch(() => {})
       }
@@ -4789,7 +4724,7 @@ export default function Mini() {
             transitionId: bubbleTransitionIdRef.current,
             details: { gen: myGen, wasSettings: true },
           })
-          await invoke('set_mini_size', { restore: true, position: mascotPositionRef.current, mascotScale: mascotScaleRef.current, largeMascot: true, largeMascotScale: largeMascotScaleRef.current })
+          await invoke('set_mini_size', { restore: true, position: mascotPositionRef.current, mascotScale: mascotScaleRef.current, largeMascot: largeMascotRef.current, largeMascotScale: largeMascotScaleRef.current })
           traceBubbleEvent('mini-native-collapse-done', {
             transitionId: bubbleTransitionIdRef.current,
             details: { gen: myGen, wasSettings: true },
@@ -4806,7 +4741,7 @@ export default function Mini() {
             position: mascotPositionRef.current,
             efficiency: viewModeRef.current === 'efficiency',
             mascotScale: mascotScaleRef.current,
-            largeMascot: true,
+            largeMascot: largeMascotRef.current,
             largeMascotScale: largeMascotScaleRef.current,
           })
           traceBubbleEvent('mini-native-collapse-done', {
@@ -5188,7 +5123,7 @@ export default function Mini() {
             restore: true,
             position: mascotPositionRef.current,
             mascotScale: mascotScaleRef.current,
-            largeMascot: true,
+            largeMascot: largeMascotRef.current,
             largeMascotScale: largeMascotScaleRef.current,
           })
           if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
@@ -5205,6 +5140,11 @@ export default function Mini() {
         setSettingsTransitioning(false)
         settingsTransitioningRef.current = false
         setHiding(false)
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          if (isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) {
+            document.documentElement.style.opacity = '1'
+          }
+        }))
         debugToTerminal('close', 'exitSettings finished')
         flushPendingQuotaRevealIfSafe()
       } else {
@@ -5952,6 +5892,7 @@ export default function Mini() {
 
   useEffect(() => {
     const canApplyGeometry = canApplyCollapsedMascotGeometry({
+      modeReady: appMode === 'coding',
       expanded: expanded || expandedRef.current,
       settingsMode: settingsMode || settingsModeRef.current,
       settingsTransitioning: settingsTransitioning || settingsTransitioningRef.current,
@@ -5967,7 +5908,7 @@ export default function Mini() {
     syncMiniPetCanvasBounds(activeMiniPetMetrics).catch((error) => {
       console.warn('[mini] sync VideoPet canvas bounds failed:', error)
     })
-  }, [activeMiniPetMetrics, expanded, hiding, settingsMode, settingsTransitioning, showOnboarding, syncMiniPetCanvasBounds, updateModalOpen])
+  }, [activeMiniPetMetrics, appMode, expanded, hiding, settingsMode, settingsTransitioning, showOnboarding, syncMiniPetCanvasBounds, updateModalOpen])
 
   restoreCollapsedPetLayoutRef.current = async () => {
     if (expandedRef.current || settingsModeRef.current || updateModalOpenRef.current) return
@@ -5992,7 +5933,7 @@ export default function Mini() {
       }}
     >
       {/* Collapsed */}
-      {!expanded && !hiding && !updateModalOpen && !showOnboarding && (
+      {appMode !== null && !expanded && !hiding && !updateModalOpen && !showOnboarding && (
         <div
           id="mini-panel"
           onMouseEnter={() => {
@@ -6146,7 +6087,6 @@ export default function Mini() {
                   animationRequest={shenshenAnimationRequest}
                   onAnimationRequestEnd={handleShenshenAnimationEnd}
                   onPlaybackProgress={handleShenshenPlaybackProgress}
-                  freezeIdleVideo={shenshenIsSelected && appMode === 'coding' && effectiveShenshenAgentState === 'idle' && !shenshenAnimationRequest}
                   size={largeMascotVisualSize}
                   layoutMode="canvas"
                   enableHoverJump
@@ -8296,14 +8236,33 @@ export default function Mini() {
                   {settingsNav === 'pairing' && (
                     <div className="h-full overflow-y-auto bg-[#151515] pt-6 px-6 pb-10 scrollbar-hidden">
                       <div className="max-w-3xl mx-auto">
-                        <p className="text-sm text-white/50 mb-6">
-                          选择小看板娘要使用的 codex 像素宠物。大看板娘（香企鹅）由顶部按钮切换。
-                        </p>
+                        <p className="text-sm text-white/50 mb-6">选择主看板娘类型；多看板娘仍可混搭两种格式。</p>
+                        <div className="flex gap-3 mb-6">
+                          {(['shenshen', 'codex'] as const).map((family) => (
+                            <button
+                              key={family}
+                              data-no-drag
+                              onClick={() => void handleSelectPetFamily(family)}
+                              className={`flex-1 p-3 rounded-xl border text-sm ${
+                                (miniPet?.id === 'shenshen') === (family === 'shenshen')
+                                  ? 'bg-white/10 border-white/25 text-white'
+                                  : 'bg-white/[0.02] border-white/5 text-white/60 hover:bg-white/[0.05]'
+                              }`}
+                            >
+                              {family === 'shenshen' ? '申申 · 视频动画' : 'Codex · 像素宠物'}
+                            </button>
+                          ))}
+                        </div>
                         <PetPicker
-                          selectedId={largeMascot ? '__xiang-qi-e__' : (miniPet?.id ?? null)}
+                          selectedId={miniPet?.id ?? null}
                           onSelect={async (pet) => {
                             await saveMiniPetId(pet.id)
                             setMiniPet(pet)
+                            if (!isVideoPet(pet)) {
+                              const store = await load('settings.json', { defaults: {}, autoSave: true })
+                              await store.set('last_codex_pet_id', pet.id)
+                              await store.save()
+                            }
                             if (largeMascot) {
                               setLargeMascot(false)
                               largeMascotRef.current = false
@@ -8311,26 +8270,6 @@ export default function Mini() {
                               await store.set('large_mascot', false)
                               await store.save()
                             }
-                          }}
-                          specialPets={[
-                            {
-                              id: '__xiang-qi-e__',
-                              displayName: '香企鹅',
-                              description: '特殊的存在',
-                              avatar: <span style={{ fontSize: 24, lineHeight: 1 }}>🐧</span>,
-                            },
-                          ]}
-                          onSelectSpecial={async (pet) => {
-                            if (pet.id !== '__xiang-qi-e__') return
-                            setLargeMascot(true)
-                            largeMascotRef.current = true
-                            if (largeActionTimerRef.current) clearTimeout(largeActionTimerRef.current)
-                            largeActionTimerRef.current = null
-                            setLargePetAction(null)
-                            largePetActionRef.current = null
-                            const store = await load('settings.json', { defaults: {}, autoSave: true })
-                            await store.set('large_mascot', true)
-                            await store.save()
                           }}
                           queueIds={petQueue}
                           onChangeQueue={savePetQueue}
@@ -8518,7 +8457,6 @@ export default function Mini() {
                           await store.save()
                         }}
                         appMode={appMode}
-                        onChangeAppMode={handleSelectAppMode}
                         petSfxEnabled={petSfxEnabled}
                         onTogglePetSfxEnabled={async (v) => {
                           setPetSfxEnabled(v)
@@ -8619,7 +8557,7 @@ export default function Mini() {
       />
 
       {/* Onboarding modal — first launch only */}
-      <OnboardingModal open={showOnboarding} onSelect={handleSelectAppMode} />
+      <OnboardingModal open={showOnboarding} onSelect={handleSelectPetFamily} />
 
       {/* Pet context menu rendered inside mascot wrapper below */}
     </div>

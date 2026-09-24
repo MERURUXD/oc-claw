@@ -4,6 +4,7 @@ import { canApplyCollapsedMascotGeometry, createLatestWinsSerialQueue } from './
 
 test('collapsed mascot geometry is gated while panel and modal layouts own the native window', () => {
   const collapsed = {
+    modeReady: true,
     expanded: false,
     settingsMode: false,
     settingsTransitioning: false,
@@ -12,6 +13,7 @@ test('collapsed mascot geometry is gated while panel and modal layouts own the n
     hiding: false,
   }
   assert.equal(canApplyCollapsedMascotGeometry(collapsed), true)
+  assert.equal(canApplyCollapsedMascotGeometry({ ...collapsed, modeReady: false }), false)
   assert.equal(canApplyCollapsedMascotGeometry({ ...collapsed, expanded: true }), false)
   assert.equal(canApplyCollapsedMascotGeometry({ ...collapsed, settingsMode: true }), false)
   assert.equal(canApplyCollapsedMascotGeometry({ ...collapsed, settingsTransitioning: true }), false)

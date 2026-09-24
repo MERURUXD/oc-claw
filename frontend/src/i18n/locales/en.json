@@ -286,6 +286,8 @@
     "exitApp": "Exit Application",
 
     "appMode": "Mode",
+    "codexPetType": "Codex Sprite Pet",
+    "shenshenPetType": "Shenshen Video Pet",
     "codingMode": "Coding Mode",
     "codingModeDesc": "Multi-agent monitoring, token stats & task alerts",
     "petMode": "Pet Mode",
@@ -302,8 +304,10 @@
   },
 
   "onboarding": {
-    "chooseModeTitle": "Choose Your Mode",
-    "chooseModeSubtitle": "You can switch between modes at any time in Settings.",
+    "chooseModeTitle": "Choose Your Main Mascot",
+    "chooseModeSubtitle": "Both pets monitor coding agents. Switch later in Settings or mix them in multi-mascot mode.",
+    "codexPetLongDesc": "Codex-format sprite pets with custom characters and agent-state animations.",
+    "shenshenPetLongDesc": "Shenshen-format video pet with a rich set of transparent agent-state animations.",
     "codingModeLongDesc": "Monitor your AI agents. Hover the mascot to see agent status, sessions, and activity.",
     "petModeLongDesc": "Raise your desktop pet! Feed, play, and build affection with rich animations.",
     "recommended": "Recommended"
@@ -330,6 +334,8 @@
   },
 
   "petPicker": {
+    "videoPets": "Shenshen format · Video pets",
+    "codexPets": "Codex format · Sprite pets",
     "mascots": "Mascots",
     "selectedMascot": "Selected {{name}}",
     "noMascots": "No mascots",

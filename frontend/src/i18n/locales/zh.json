@@ -286,6 +286,8 @@
     "exitApp": "退出应用",
 
     "appMode": "模式",
+    "codexPetType": "Codex 像素宠物",
+    "shenshenPetType": "申申视频宠物",
     "codingMode": "编程模式",
     "codingModeDesc": "监控多 Agent 会话、Token 统计与任务提醒",
     "petMode": "桌宠模式",
@@ -302,8 +304,10 @@
   },
 
   "onboarding": {
-    "chooseModeTitle": "选择你的模式",
-    "chooseModeSubtitle": "你可以随时在设置中切换模式。",
+    "chooseModeTitle": "选择主看板娘类型",
+    "chooseModeSubtitle": "两种宠物都能监控编程 Agent；之后可在设置中切换，多看板娘也能混搭。",
+    "codexPetLongDesc": "Codex 格式像素宠物，支持自定义形象和 Agent 状态动画。",
+    "shenshenPetLongDesc": "申申格式视频宠物，使用丰富的透明动画响应 Agent 状态。",
     "codingModeLongDesc": "监控你的 AI Agent。悬停看板娘可查看状态、会话和活动。",
     "petModeLongDesc": "养成你的桌面宠物！喂食、互动，并通过丰富动画提升好感。",
     "recommended": "推荐"
@@ -330,6 +334,8 @@
   },
 
   "petPicker": {
+    "videoPets": "申申格式 · 视频宠物",
+    "codexPets": "Codex 格式 · 像素宠物",
     "mascots": "看板娘",
     "selectedMascot": "已选择 {{name}}",
     "noMascots": "没有看板娘",
