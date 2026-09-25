@@ -12508,6 +12508,68 @@ const BUBBLE_RESERVE_Y: f64 = 115.0;
 const BUBBLE_PAD_RIGHT: f64 = 16.0;
 const BUBBLE_PAD_BOTTOM: f64 = 16.0;
 
+/// Resolve the native frame from the logical resting anchor. Native pixel rounding
+/// must never feed back into this anchor on subsequent width changes.
+fn preserved_bubble_frame(
+    anchor: BubbleAnchor,
+    bubble_w: f64,
+    bubble_h: f64,
+    win_w: f64,
+    win_h: f64,
+    margin: f64,
+) -> (f64, f64) {
+    let mut card_right = anchor.card_right;
+    let mut card_bottom = anchor.card_bottom;
+    if card_right - bubble_w < anchor.mon_x + margin {
+        card_right = anchor.mon_x + margin + bubble_w;
+    }
+    if card_right > anchor.mon_x + anchor.mon_w - margin {
+        card_right = anchor.mon_x + anchor.mon_w - margin;
+    }
+    let x = card_right - (win_w - BUBBLE_PAD_RIGHT);
+
+    #[cfg(target_os = "macos")]
+    let y = {
+        if card_bottom + bubble_h > anchor.mon_y + anchor.mon_h - margin {
+            card_bottom = (anchor.mon_y + anchor.mon_h - margin - bubble_h).max(anchor.mon_y + margin);
+        }
+        if card_bottom < anchor.mon_y + margin {
+            card_bottom = anchor.mon_y + margin;
+        }
+        card_bottom - BUBBLE_PAD_BOTTOM
+    };
+
+    #[cfg(not(target_os = "macos"))]
+    let y = {
+        if card_bottom - bubble_h < anchor.mon_y + margin {
+            card_bottom = (anchor.mon_y + margin + bubble_h).min(anchor.mon_y + anchor.mon_h - margin);
+        }
+        if card_bottom > anchor.mon_y + anchor.mon_h - margin {
+            card_bottom = anchor.mon_y + anchor.mon_h - margin;
+        }
+        card_bottom - (win_h - BUBBLE_PAD_BOTTOM)
+    };
+
+    (x, y)
+}
+
+fn record_bubble_geometry(
+    geom: &mut BubbleGeometryState,
+    bubble_w: f64,
+    bubble_h: f64,
+    res_x: f64,
+    res_y: f64,
+    new_anchor: Option<BubbleAnchor>,
+) {
+    geom.width = bubble_w;
+    geom.height = bubble_h;
+    geom.reserve_x = res_x;
+    geom.reserve_y = res_y;
+    if let Some(anchor) = new_anchor {
+        geom.anchor = Some(anchor);
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn set_window_frame_atomic(
     win: &tauri::WebviewWindow,
@@ -12722,42 +12784,17 @@ async fn sync_mascot_bubble(
     let anchor_before_str = format!("{:?}", existing_anchor.map(|a| (a.card_right, a.card_bottom)));
     let mut anchor_source = "new";
 
-    let (final_win_x, final_win_y) = if should_preserve && existing_anchor.is_some() {
+    let (final_win_x, final_win_y, new_anchor) = if should_preserve && existing_anchor.is_some() {
         anchor_source = "stored";
-        let anchor = existing_anchor.unwrap();
-        let (mut preserved_card_right, mut preserved_card_bottom) = (anchor.card_right, anchor.card_bottom);
-        if preserved_card_right - bubble_w < anchor.mon_x + margin {
-            preserved_card_right = anchor.mon_x + margin + bubble_w;
-        }
-        if preserved_card_right > anchor.mon_x + anchor.mon_w - margin {
-            preserved_card_right = anchor.mon_x + anchor.mon_w - margin;
-        }
-
-        let x = preserved_card_right - (win_w - BUBBLE_PAD_RIGHT);
-
-        #[cfg(target_os = "macos")]
-        let y = {
-            if preserved_card_bottom + bubble_h > anchor.mon_y + anchor.mon_h - margin {
-                preserved_card_bottom = (anchor.mon_y + anchor.mon_h - margin - bubble_h).max(anchor.mon_y + margin);
-            }
-            if preserved_card_bottom < anchor.mon_y + margin {
-                preserved_card_bottom = anchor.mon_y + margin;
-            }
-            preserved_card_bottom - BUBBLE_PAD_BOTTOM
-        };
-
-        #[cfg(not(target_os = "macos"))]
-        let y = {
-            if preserved_card_bottom - bubble_h < anchor.mon_y + margin {
-                preserved_card_bottom = (anchor.mon_y + margin + bubble_h).min(anchor.mon_y + anchor.mon_h - margin);
-            }
-            if preserved_card_bottom > anchor.mon_y + anchor.mon_h - margin {
-                preserved_card_bottom = anchor.mon_y + anchor.mon_h - margin;
-            }
-            preserved_card_bottom - (win_h - BUBBLE_PAD_BOTTOM)
-        };
-
-        (x, y)
+        let (x, y) = preserved_bubble_frame(
+            existing_anchor.unwrap(),
+            bubble_w,
+            bubble_h,
+            win_w,
+            win_h,
+            margin,
+        );
+        (x, y, None)
     } else {
         // Mini window frame + its monitor rect, both in logical pixels.
         let (mini_x, mini_y, mini_w, mini_h, mon_x, mon_y, mon_w, mon_h, mini_entry): (
@@ -12912,9 +12949,7 @@ async fn sync_mascot_bubble(
             mon_w,
             mon_h,
         };
-        BUBBLE_GEOMETRY.lock().unwrap().anchor = Some(anchor);
-
-        (win_x, win_y)
+        (win_x, win_y, Some(anchor))
     };
 
     bubble_trace::trace(
@@ -12929,10 +12964,7 @@ async fn sync_mascot_bubble(
 
     {
         let mut geom = BUBBLE_GEOMETRY.lock().unwrap();
-        geom.width = bubble_w;
-        geom.height = bubble_h;
-        geom.reserve_x = res_x;
-        geom.reserve_y = res_y;
+        record_bubble_geometry(&mut geom, bubble_w, bubble_h, res_x, res_y, new_anchor);
     }
 
     #[cfg(target_os = "windows")]
@@ -24157,7 +24189,6 @@ mod fullscreen_bubble_suppression_tests {
 
     #[test]
     fn test_preserve_anchor_is_stable_across_width_changes_without_drift() {
-        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let anchor = BubbleAnchor {
             card_right: 1088.0,
             card_bottom: 500.0,
@@ -24166,57 +24197,51 @@ mod fullscreen_bubble_suppression_tests {
             mon_w: 1920.0,
             mon_h: 1080.0,
         };
-        {
-            let mut geom = BUBBLE_GEOMETRY.lock().unwrap();
-            geom.anchor = Some(anchor);
-        }
-
         let margin = 8.0;
-        let res_x = BUBBLE_RESERVE_X;
-
-        // Test across various display scaling factors (1.0, 1.25, 1.5, 1.75, 2.0)
-        // and changing bubble widths (190px -> 345px -> 200px)
         let scales = [1.0, 1.25, 1.5, 1.75, 2.0];
         let widths = [190.0, 220.0, 260.0, 310.0, 345.0, 280.0, 210.0, 190.0];
 
         for &scale in &scales {
+            let mut geom = BubbleGeometryState {
+                width: 190.0,
+                height: 40.0,
+                reserve_x: BUBBLE_RESERVE_X,
+                reserve_y: BUBBLE_RESERVE_Y,
+                anchor: Some(anchor),
+            };
             for &bubble_w in &widths {
-                let win_w = (bubble_w + res_x + BUBBLE_PAD_RIGHT).max(8.0);
-
-                let geom_anchor = BUBBLE_GEOMETRY.lock().unwrap().anchor.unwrap();
-                let mut preserved_card_right = geom_anchor.card_right;
-
-                if preserved_card_right - bubble_w < geom_anchor.mon_x + margin {
-                    preserved_card_right = geom_anchor.mon_x + margin + bubble_w;
-                }
-                if preserved_card_right > geom_anchor.mon_x + geom_anchor.mon_w - margin {
-                    preserved_card_right = geom_anchor.mon_x + geom_anchor.mon_w - margin;
-                }
-
-                let final_win_x = preserved_card_right - (win_w - BUBBLE_PAD_RIGHT);
-
-                // Simulate Win32 integer pixel quantization
-                let px_x = (final_win_x * scale).round() as i32;
+                let bubble_h = 40.0;
+                let win_w = bubble_w + BUBBLE_RESERVE_X + BUBBLE_PAD_RIGHT;
+                let win_h = bubble_h + BUBBLE_RESERVE_Y + BUBBLE_PAD_BOTTOM;
+                // Exercise the same positioning and state update functions used by
+                // sync_mascot_bubble, with a quantized native frame at each step.
+                let (x, y) = preserved_bubble_frame(
+                    geom.anchor.unwrap(), bubble_w, bubble_h, win_w, win_h, margin,
+                );
+                let px_x = (x * scale).round() as i32;
                 let px_w = (win_w * scale).round() as i32;
                 let actual_card_right = (px_x + px_w) as f64 / scale - BUBBLE_PAD_RIGHT;
+                let px_y = (y * scale).round() as i32;
+                let px_h = (win_h * scale).round() as i32;
+                #[cfg(target_os = "macos")]
+                let actual_card_bottom = px_y as f64 / scale + BUBBLE_PAD_BOTTOM;
+                #[cfg(not(target_os = "macos"))]
+                let actual_card_bottom = (px_y + px_h) as f64 / scale - BUBBLE_PAD_BOTTOM;
 
-                // Card right edge on screen must remain tightly snapped to anchor (within 1 physical px / scale)
+                record_bubble_geometry(
+                    &mut geom, bubble_w, bubble_h, BUBBLE_RESERVE_X, BUBBLE_RESERVE_Y, None,
+                );
                 assert!(
                     (actual_card_right - anchor.card_right).abs() <= 1.0 / scale + 1e-9,
                     "scale={} width={} actual={} expected={}",
                     scale, bubble_w, actual_card_right, anchor.card_right
                 );
-
-                // Anchor itself must remain completely immutable and stable (zero drift)
-                assert_eq!(
-                    geom_anchor.card_right,
-                    anchor.card_right,
-                    "Stored anchor must never drift across width updates"
-                );
+                assert!((actual_card_bottom - anchor.card_bottom).abs() <= 1.0 / scale + 1e-9);
+                assert_eq!(geom.anchor.unwrap().card_right, anchor.card_right);
+                assert_eq!(geom.anchor.unwrap().card_bottom, anchor.card_bottom);
+                assert_eq!(geom.width, bubble_w);
             }
         }
-
-        BUBBLE_GEOMETRY.lock().unwrap().anchor = None;
     }
 
     #[test]
