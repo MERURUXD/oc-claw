@@ -92,6 +92,18 @@ import { getPetAspectRatio, getPetRenderMetrics, isVideoPet, type PetAsset } fro
 import { canApplyCollapsedMascotGeometry, createLatestWinsSerialQueue, type LatestWinsSerialQueue } from './lib/miniPetGeometry'
 import { PetPicker } from './components/PetPicker'
 import { PetGallery } from './components/PetGallery'
+import {
+  EdgeProbeMachine,
+  computeProbeEnvelope,
+  computeRotatedBounds,
+  detectEdgeAtRest,
+  probeWindowX,
+  EDGE_IDLE_SECONDS,
+  type EdgeProbePose,
+  type ProbeEnvelope,
+  type ScreenRect,
+  type PetRenderMetricsLite,
+} from './lib/edgeProbe'
 
 interface CharacterMeta {
   name: string
@@ -1147,6 +1159,255 @@ export default function Mini() {
     window.addEventListener('pointerup', onUp, { once: true })
     window.addEventListener('pointercancel', onCancel, { once: true })
   }, [setMascotIsDragging])
+  // ── Mascot Edge Probe State Machine (Coding Mode Collapsed Mascot) ──
+  const probeMachineRef = useRef<EdgeProbeMachine>(new EdgeProbeMachine())
+  const [probePose, setProbePose] = useState<EdgeProbePose | null>(null)
+  const probePoseRef = useRef<EdgeProbePose | null>(null)
+  const [probeEnvelope, setProbeEnvelope] = useState<ProbeEnvelope | null>(null)
+  const probeEnvelopeRef = useRef<ProbeEnvelope | null>(null)
+  const probeRafRef = useRef<number | null>(null)
+  const probeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const probeQueueRef = useRef(
+    createLatestWinsSerialQueue<{ x: number; y: number }>((target) =>
+      invoke('set_mini_origin', { x: target.x, y: target.y, confine: false }),
+    ),
+  )
+  const probeMonitorRef = useRef<ScreenRect | null>(null)
+  const probeNormalMetricsRef = useRef<PetRenderMetricsLite | null>(null)
+  const probeInitialOriginRef = useRef<{ x: number; y: number } | null>(null)
+
+  const clearProbeTimer = useCallback(() => {
+    if (probeTimerRef.current) {
+      clearTimeout(probeTimerRef.current)
+      probeTimerRef.current = null
+    }
+  }, [])
+
+  const getCurrentMascotRenderMetrics = useCallback((): PetRenderMetricsLite => {
+    const visualSize = Math.round(MASCOT_BASE_SIZE * mascotScaleRef.current) * largeMascotScaleRef.current
+    if (!largeMascotRef.current && miniPetRef.current) {
+      const m = getPetRenderMetrics(miniPetRef.current, visualSize)
+      return {
+        canvas: { width: m.canvas.width, height: m.canvas.height },
+        hitbox: { left: m.hitbox.left, top: m.hitbox.top, width: m.hitbox.width, height: m.hitbox.height },
+        body: { width: m.body.width, height: m.body.height },
+      }
+    }
+    if (largeMascotRef.current) {
+      const hitW = visualSize * (LARGE_MASCOT_HITBOX_WIDTH_MULTIPLIER / 3 * largeMascotScaleRef.current)
+      const hitH = visualSize * (LARGE_MASCOT_HITBOX_HEIGHT_MULTIPLIER / 3 * largeMascotScaleRef.current)
+      const insetX = Math.max(0, (visualSize - hitW) / 2)
+      const insetY = Math.max(0, (visualSize - hitH) / 2)
+      return {
+        canvas: { width: visualSize, height: visualSize },
+        hitbox: { left: insetX, top: insetY, width: hitW, height: hitH },
+        body: { width: hitW, height: hitH },
+      }
+    }
+    const m = getPetRenderMetrics(null, visualSize)
+    return {
+      canvas: { width: m.canvas.width, height: m.canvas.height },
+      hitbox: { left: m.hitbox.left, top: m.hitbox.top, width: m.hitbox.width, height: m.hitbox.height },
+      body: { width: m.body.width, height: m.body.height },
+    }
+  }, [])
+
+  const cancelProbePresentation = useCallback((reason: string = 'cancel') => {
+    clearProbeTimer()
+    if (probeRafRef.current) {
+      cancelAnimationFrame(probeRafRef.current)
+      probeRafRef.current = null
+    }
+    probeQueueRef.current.invalidate()
+    probeMachineRef.current.cancel(reason)
+    probePoseRef.current = null
+    setProbePose(null)
+  }, [clearProbeTimer])
+
+  const restoreProbeEnvelope = useCallback(async () => {
+    const envelope = probeEnvelopeRef.current
+    const normalMetrics = probeNormalMetricsRef.current
+    probeEnvelopeRef.current = null
+    setProbeEnvelope(null)
+    probeMonitorRef.current = null
+    probeInitialOriginRef.current = null
+
+    if (envelope && normalMetrics) {
+      // 1. Physically restore native window frame using normal unexpanded metrics
+      await invoke('set_pet_canvas_bounds', {
+        windowLabel: 'mini',
+        canvasW: normalMetrics.canvas.width,
+        canvasH: normalMetrics.canvas.height,
+        hitboxX: normalMetrics.hitbox.left,
+        hitboxY: normalMetrics.hitbox.top,
+        hitboxW: normalMetrics.hitbox.width,
+        hitboxH: normalMetrics.hitbox.height,
+        anchorMode: 'bottom-right',
+      }).catch(() => {})
+
+      // 2. If this pet is not VideoPet, clear registration so default hit-testing takes over
+      if (!isVideoPet(miniPetRef.current)) {
+        await invoke('set_pet_canvas_bounds', {
+          windowLabel: 'mini',
+          canvasW: null,
+          canvasH: null,
+          hitboxX: null,
+          hitboxY: null,
+          hitboxW: null,
+          hitboxH: null,
+          anchorMode: 'bottom-right',
+        }).catch(() => {})
+      }
+    }
+    probeNormalMetricsRef.current = null
+  }, [])
+
+  const exitProbe = useCallback(async (reason: string = 'exit') => {
+    cancelProbePresentation(reason)
+    await restoreProbeEnvelope()
+  }, [cancelProbePresentation, restoreProbeEnvelope])
+
+  const runTransitionLoop = useCallback(() => {
+    if (probeRafRef.current) {
+      cancelAnimationFrame(probeRafRef.current)
+      probeRafRef.current = null
+    }
+
+    const tick = () => {
+      const machine = probeMachineRef.current
+      if (!machine.isActive()) {
+        void exitProbe('completed')
+        return
+      }
+
+      const now = performance.now()
+      const { pose, isTransitioning } = machine.tick(now)
+      probePoseRef.current = pose
+      setProbePose(pose)
+
+      const side = machine.getSide()
+      const envelope = probeEnvelopeRef.current
+      const monitor = probeMonitorRef.current
+      const initialOrigin = probeInitialOriginRef.current
+
+      if (side && envelope && monitor && initialOrigin) {
+        const envelopeRotatedBounds = computeRotatedBounds(
+          {
+            left: envelope.hitboxLeft,
+            top: envelope.hitboxTop,
+            width: envelope.bodyWidth,
+            height: envelope.bodyHeight,
+          },
+          {
+            x: envelope.hitboxLeft + envelope.bodyWidth / 2,
+            y: envelope.hitboxTop + envelope.bodyHeight / 2,
+          },
+          pose.angle,
+        )
+        const winX = probeWindowX(side, pose.exposure, envelopeRotatedBounds, monitor)
+        probeQueueRef.current.enqueue({ x: winX, y: initialOrigin.y })
+      }
+
+      if (isTransitioning) {
+        probeRafRef.current = requestAnimationFrame(tick)
+      } else {
+        probeRafRef.current = null
+        if (machine.getState() === 'STRAIGHTENED') {
+          clearProbeTimer()
+          probeTimerRef.current = setTimeout(() => {
+            probeTimerRef.current = null
+            if (probeMachineRef.current.getState() === 'STRAIGHTENED') {
+              probeMachineRef.current.startReturning(performance.now())
+              runTransitionLoop()
+            }
+          }, EDGE_IDLE_SECONDS * 1000)
+        }
+      }
+    }
+
+    probeRafRef.current = requestAnimationFrame(tick)
+  }, [clearProbeTimer, exitProbe])
+
+  const handleProbeClick = useCallback((): boolean => {
+    if (!probeMachineRef.current.isActive()) return false
+    const prev = probeMachineRef.current.getState()
+    const handled = probeMachineRef.current.onClicked(performance.now())
+    if (!handled) return false
+    const next = probeMachineRef.current.getState()
+
+    if (next === 'STRAIGHTENING') {
+      clearProbeTimer()
+      runTransitionLoop()
+      return true
+    }
+    if (prev === 'STRAIGHTENED' && next === 'STRAIGHTENED') {
+      clearProbeTimer()
+      probeTimerRef.current = setTimeout(() => {
+        probeTimerRef.current = null
+        if (probeMachineRef.current.getState() === 'STRAIGHTENED') {
+          probeMachineRef.current.startReturning(performance.now())
+          runTransitionLoop()
+        }
+      }, EDGE_IDLE_SECONDS * 1000)
+      return true
+    }
+    return true
+  }, [clearProbeTimer, runTransitionLoop])
+
+  const handleProbeDragEnd = useCallback(async () => {
+    if (appModeRef.current !== 'coding' || expandedRef.current || moveModeRef.current || probeMachineRef.current.isActive()) {
+      return
+    }
+    try {
+      if (probeEnvelopeRef.current) {
+        await restoreProbeEnvelope()
+      }
+      const [pos, monitorRect] = await Promise.all([
+        invoke<[number, number]>('get_mini_origin'),
+        invoke<[number, number, number, number]>('get_mini_monitor_rect'),
+      ])
+      const windowPos = { x: pos[0], y: pos[1] }
+      const monitor: ScreenRect = {
+        left: monitorRect[0],
+        top: monitorRect[1],
+        width: monitorRect[2],
+        height: monitorRect[3],
+      }
+      const normalMetrics = getCurrentMascotRenderMetrics()
+      const side = detectEdgeAtRest(windowPos, normalMetrics.hitbox, monitor)
+      if (!side) return
+
+      const envelope = computeProbeEnvelope(normalMetrics)
+      probeMonitorRef.current = monitor
+      probeNormalMetricsRef.current = normalMetrics
+      probeEnvelopeRef.current = envelope
+      setProbeEnvelope(envelope)
+
+      // Atomically expand native window canvas bounds for the probe envelope
+      await invoke('set_pet_canvas_bounds', {
+        windowLabel: 'mini',
+        canvasW: envelope.canvasWidth,
+        canvasH: envelope.canvasHeight,
+        hitboxX: envelope.hitboxLeft,
+        hitboxY: envelope.hitboxTop,
+        hitboxW: envelope.bodyWidth,
+        hitboxH: envelope.bodyHeight,
+        anchorMode: 'bottom-right',
+      })
+
+      if (!probeEnvelopeRef.current) return
+
+      // Re-read current origin to lock in the exact anchor-stable post-expansion Y coordinate
+      const [currX, currY] = await invoke<[number, number]>('get_mini_origin')
+      if (!probeEnvelopeRef.current) return
+      probeInitialOriginRef.current = { x: currX, y: currY }
+
+      probeMachineRef.current.startEntering(side, normalMetrics, performance.now())
+      runTransitionLoop()
+    } catch (e) {
+      console.warn('[handleProbeDragEnd] failed:', e)
+    }
+  }, [getCurrentMascotRenderMetrics, restoreProbeEnvelope, runTransitionLoop])
 
   const { t, i18n } = useTranslation()
   const [updateModalOpen, setUpdateModalOpen] = useState(false)
@@ -4195,7 +4456,7 @@ export default function Mini() {
       // sprite via updateWalkDir so the pet visibly runs while moving.
       if (!moveModeRef.current && appModeRef.current !== 'pet') {
         if (e.button !== 0 || e.ctrlKey || collapsingRef.current) return
-        if (!largeMascotRef.current && miniPetRef.current) {
+        if (!probeMachineRef.current.isActive() && !largeMascotRef.current && miniPetRef.current) {
           const visualSize = Math.round(MASCOT_BASE_SIZE * mascotScaleRef.current) * largeMascotScaleRef.current
           const m = getPetRenderMetrics(miniPetRef.current, visualSize)
           const rect = e.currentTarget.getBoundingClientRect()
@@ -4264,6 +4525,9 @@ export default function Mini() {
             if (Math.abs(dxTotal) + Math.abs(dyTotal) >= DRAG_THRESHOLD) {
               dragging = true
               setMascotIsDragging(true)
+              if (probeMachineRef.current.isActive() || probeEnvelopeRef.current) {
+                cancelProbePresentation('drag_started')
+              }
             } else {
               return
             }
@@ -4289,12 +4553,19 @@ export default function Mini() {
         const onCancel = (ev: PointerEvent) => {
           if (ev.pointerId !== pid) return
           cleanup()
+          if (dragging) {
+            void restoreProbeEnvelope()
+          }
         }
 
         const onUp = (ev: PointerEvent) => {
           if (ev.pointerId !== pid) return
           cleanup()
           if (!dragging) {
+            if (probeMachineRef.current.isActive()) {
+              const handled = handleProbeClick()
+              if (handled) return
+            }
             const outcome = classifyMascotPointerOutcome({ button: e.button, ctrlKey: e.ctrlKey, wasDragging: false })
             if (outcome === 'left-click' && miniPetRef.current?.id === 'shenshen') {
               requestShenshenAnimation('click')
@@ -4306,13 +4577,20 @@ export default function Mini() {
               expand()
             }
           } else {
-            invoke('get_mini_origin').then(async (pos) => {
-              const [x, y] = pos as [number, number]
-              customPosRef.current = { x, y }
-              const store = await load('settings.json', { defaults: {}, autoSave: true })
-              await store.set('mini_custom_pos', { x, y })
-              await store.save()
-            }).catch(() => {})
+            (async () => {
+              try {
+                await restoreProbeEnvelope()
+                const pos = (await invoke('get_mini_origin')) as [number, number]
+                const [x, y] = pos
+                customPosRef.current = { x, y }
+                const store = await load('settings.json', { defaults: {}, autoSave: true })
+                await store.set('mini_custom_pos', { x, y })
+                await store.save()
+                void handleProbeDragEnd()
+              } catch {
+                /* ignore */
+              }
+            })()
           }
         }
 
@@ -4828,12 +5106,34 @@ export default function Mini() {
       const dir = event.payload
       if (dir === 1 || dir === -1 || dir === 0) {
         updateWalkDir(dir)
+        if (dir !== 0 && (probeMachineRef.current.isActive() || probeEnvelopeRef.current)) {
+          cancelProbePresentation('macos_walk')
+        }
       }
     })
     return () => {
       unlisten.then((fn) => fn())
     }
-  }, [appMode, updateWalkDir])
+  }, [appMode, updateWalkDir, cancelProbePresentation])
+
+  // macOS 2-stage drag start & click listeners
+  useEffect(() => {
+    if (appMode === 'pet') return
+    const unlistenDragStart = listen('mini-mascot-drag-start', () => {
+      if (probeMachineRef.current.isActive() || probeEnvelopeRef.current) {
+        cancelProbePresentation('macos_drag_start')
+      }
+    })
+    const unlistenClick = listen('mini-mascot-click', () => {
+      if (probeMachineRef.current.isActive()) {
+        handleProbeClick()
+      }
+    })
+    return () => {
+      unlistenDragStart.then((fn) => fn())
+      unlistenClick.then((fn) => fn())
+    }
+  }, [appMode, cancelProbePresentation, handleProbeClick])
 
   // The macOS native cursor poll owns pointerdown/up for the collapsed mascot.
   // Mirror its lifecycle separately from hover suppression and walk direction.
@@ -4856,12 +5156,14 @@ export default function Mini() {
     if (appMode === 'pet') return
     const unlisten = listen('mini-mascot-drag-end', async () => {
       try {
+        await restoreProbeEnvelope()
         const pos = (await invoke('get_mini_origin')) as [number, number]
         const [x, y] = pos
         customPosRef.current = { x, y }
         const store = await load('settings.json', { defaults: {}, autoSave: true })
         await store.set('mini_custom_pos', { x, y })
         await store.save()
+        void handleProbeDragEnd()
       } catch {
         /* ignore */
       }
@@ -4869,7 +5171,26 @@ export default function Mini() {
     return () => {
       unlisten.then((fn) => fn())
     }
-  }, [appMode])
+  }, [appMode, handleProbeDragEnd, restoreProbeEnvelope])
+
+  // Cancel edge probe on expanded panel, settings mode, or appMode change
+  useEffect(() => {
+    if (expanded && (probeMachineRef.current.isActive() || probeEnvelopeRef.current)) {
+      void exitProbe('expanded')
+    }
+  }, [expanded, exitProbe])
+
+  useEffect(() => {
+    if ((settingsMode || settingsTransitioning) && (probeMachineRef.current.isActive() || probeEnvelopeRef.current)) {
+      void exitProbe('settings')
+    }
+  }, [settingsMode, settingsTransitioning, exitProbe])
+
+  useEffect(() => {
+    if (appMode !== 'coding' && (probeMachineRef.current.isActive() || probeEnvelopeRef.current)) {
+      void exitProbe('appMode_change')
+    }
+  }, [appMode, exitProbe])
 
   useEffect(() => {
     if (viewMode !== 'efficiency' || appMode === 'pet') return
@@ -5997,123 +6318,155 @@ export default function Mini() {
                 : {}),
             }}
           >
-            {largeMascot && largeVideoUrl ? (
-              <div style={{ position: 'relative', width: largeMascotVisualSize, height: largeMascotVisualSize }}>
-              {currentPetAction === 'peek' && !moveMode && (() => {
-                // Narrow cursor:pointer strip aligned to the actual peeking side.
-                // The strip width is a small fraction of the mascot visual size to
-                // avoid the "cursor turns into hand even before reaching the pet" feel.
-                // pointer-events: 'auto' lets the cursor style apply; clicks bubble
-                // to the click handler on the parent div, which still enforces the
-                // shrunken hitbox check.
-                const stripW = Math.round(largeMascotVisualSize * PEEK_HIT_WIDTH_RATIO)
-                const isLeft = peekEdgeRef.current === 'left'
+            {(() => {
+              const petContent = largeMascot && largeVideoUrl ? (
+                <div style={{ position: 'relative', width: largeMascotVisualSize, height: largeMascotVisualSize }}>
+                  {currentPetAction === 'peek' && !moveMode && (() => {
+                    // Narrow cursor:pointer strip aligned to the actual peeking side.
+                    // The strip width is a small fraction of the mascot visual size to
+                    // avoid the "cursor turns into hand even before reaching the pet" feel.
+                    // pointer-events: 'auto' lets the cursor style apply; clicks bubble
+                    // to the click handler on the parent div, which still enforces the
+                    // shrunken hitbox check.
+                    const stripW = Math.round(largeMascotVisualSize * PEEK_HIT_WIDTH_RATIO)
+                    const isLeft = peekEdgeRef.current === 'left'
+                    return (
+                      <div
+                        style={{
+                          position: 'absolute',
+                          top: 0,
+                          height: '100%',
+                          width: stripW,
+                          left: isLeft ? 0 : largeMascotVisualSize - stripW,
+                          cursor: 'pointer',
+                          pointerEvents: 'auto',
+                          background: 'transparent',
+                          zIndex: 2,
+                        }}
+                      />
+                    )
+                  })()}
+                  <BufferedVideo
+                    src={largeVideoUrl}
+                    getAlternateSrc={getAlternateLargeVideoUrl}
+                    loop={!(appMode === 'pet' && TRANSIENT_PET_ACTIONS.includes(currentPetAction))}
+                    transparency={useWindowsChromaKey ? 'windows-chroma-key' : 'native'}
+                    canvasWidth={Math.max(1, Math.round(largeMascotVisualSize))}
+                    canvasHeight={Math.max(1, Math.round(largeMascotVisualSize))}
+                    transform={
+                      (currentPetAction === 'walk' && walkFlipped) ? 'scaleX(-1)'
+                      : ((currentPetAction === 'peek' || currentPetAction === 'walkout') && peekEdgeRef.current === 'left') ? 'scaleX(-1)'
+                      : undefined
+                    }
+                    style={{
+                      position: 'absolute',
+                      inset: 0,
+                      width: '100%',
+                      height: '100%',
+                    }}
+                    onError={(err) => {
+                      console.warn('[large-video] error:', err, 'src:', largeVideoUrl)
+                      if (appModeRef.current === 'pet' && TRANSIENT_PET_ACTIONS.includes(currentPetActionRef.current)) {
+                        const d = petDataRef.current
+                        const next: PetAction = d.hunger < 30 ? 'hungry' : 'idle'
+                        setCurrentPetAction(next)
+                        currentPetActionRef.current = next
+                      }
+                    }}
+                    onEnded={() => {
+                      if (appModeRef.current === 'pet' && TRANSIENT_PET_ACTIONS.includes(currentPetActionRef.current)) {
+                        if (currentPetActionRef.current === 'farewell') {
+                          invoke('exit_app').catch(() => {})
+                          return
+                        }
+                        let next: PetAction
+                        if (currentPetActionRef.current === 'dance' && danceFromMusicRef.current) {
+                          danceFromMusicRef.current = false
+                          next = 'music'
+                        } else {
+                          const d = petDataRef.current
+                          next = d.hunger < 30 ? 'hungry' : 'idle'
+                        }
+                        setCurrentPetAction(next)
+                        currentPetActionRef.current = next
+                      }
+                    }}
+                  />
+                </div>
+              ) : miniPet ? (
+                <div
+                  style={{
+                    position: 'relative',
+                    width: activeMiniPetMetrics?.canvas.width ?? largeMascotVisualSize,
+                    height: activeMiniPetMetrics?.canvas.height ?? getPetRenderMetrics(miniPet, largeMascotVisualSize).height,
+                  }}
+                >
+                  <MiniPetMascot
+                    pet={miniPet}
+                    baseState={mainSpriteState}
+                    lifecycleState={mainPetState}
+                    reaction={mascotReaction}
+                    onReactionEnd={clearReaction}
+                    animationRequest={shenshenAnimationRequest}
+                    onAnimationRequestEnd={handleShenshenAnimationEnd}
+                    onPlaybackProgress={handleShenshenPlaybackProgress}
+                    size={largeMascotVisualSize}
+                    layoutMode="canvas"
+                    enableHoverJump
+                    externalHover={mascotHover}
+                    useExternalHover={!isWindowsPlatform}
+                    suppressHover={mascotDragActive}
+                    isDragging={mascotIsDragging}
+                    interruptedReactionId={dragInterruptedReactionId}
+                    probePose={probePose}
+                  />
+                </div>
+              ) : (
+                <div
+                  style={{
+                    width: largeMascotVisualSize,
+                    height: largeMascotVisualSize,
+                    borderRadius: collapsedPlaceholderRadius,
+                    background: 'rgba(0,0,0,0.3)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    color: '#999',
+                    fontSize: collapsedPlaceholderFontSize,
+                  }}
+                >
+                  ?
+                </div>
+              )
+
+              if (probeEnvelope) {
                 return (
                   <div
                     style={{
-                      position: 'absolute',
-                      top: 0,
-                      height: '100%',
-                      width: stripW,
-                      left: isLeft ? 0 : largeMascotVisualSize - stripW,
-                      cursor: 'pointer',
-                      pointerEvents: 'auto',
-                      background: 'transparent',
-                      zIndex: 2,
+                      position: 'relative',
+                      width: probeEnvelope.canvasWidth,
+                      height: probeEnvelope.canvasHeight,
+                      overflow: 'visible',
                     }}
-                  />
+                  >
+                    <div
+                      style={{
+                        position: 'absolute',
+                        left: probeEnvelope.contentOffsetX,
+                        top: probeEnvelope.contentOffsetY,
+                        transform: probePose?.active ? `rotate(${probePose.angle}deg)` : undefined,
+                        transformOrigin: probePose?.active ? probePose.transformOrigin : undefined,
+                        pointerEvents: 'auto',
+                      }}
+                    >
+                      {petContent}
+                    </div>
+                  </div>
                 )
-              })()}
-              <BufferedVideo
-                src={largeVideoUrl}
-                getAlternateSrc={getAlternateLargeVideoUrl}
-                loop={!(appMode === 'pet' && TRANSIENT_PET_ACTIONS.includes(currentPetAction))}
-                transparency={useWindowsChromaKey ? 'windows-chroma-key' : 'native'}
-                canvasWidth={Math.max(1, Math.round(largeMascotVisualSize))}
-                canvasHeight={Math.max(1, Math.round(largeMascotVisualSize))}
-                transform={
-                  (currentPetAction === 'walk' && walkFlipped) ? 'scaleX(-1)'
-                  : ((currentPetAction === 'peek' || currentPetAction === 'walkout') && peekEdgeRef.current === 'left') ? 'scaleX(-1)'
-                  : undefined
-                }
-                style={{
-                  position: 'absolute',
-                  inset: 0,
-                  width: '100%',
-                  height: '100%',
-                }}
-                onError={(err) => {
-                  console.warn('[large-video] error:', err, 'src:', largeVideoUrl)
-                  if (appModeRef.current === 'pet' && TRANSIENT_PET_ACTIONS.includes(currentPetActionRef.current)) {
-                    const d = petDataRef.current
-                    const next: PetAction = d.hunger < 30 ? 'hungry' : 'idle'
-                    setCurrentPetAction(next)
-                    currentPetActionRef.current = next
-                  }
-                }}
-                onEnded={() => {
-                  if (appModeRef.current === 'pet' && TRANSIENT_PET_ACTIONS.includes(currentPetActionRef.current)) {
-                    if (currentPetActionRef.current === 'farewell') {
-                      invoke('exit_app').catch(() => {})
-                      return
-                    }
-                    let next: PetAction
-                    if (currentPetActionRef.current === 'dance' && danceFromMusicRef.current) {
-                      danceFromMusicRef.current = false
-                      next = 'music'
-                    } else {
-                      const d = petDataRef.current
-                      next = d.hunger < 30 ? 'hungry' : 'idle'
-                    }
-                    setCurrentPetAction(next)
-                    currentPetActionRef.current = next
-                  }
-                }}
-              />
-            </div>) : miniPet ? (
-              <div
-                style={{
-                  position: 'relative',
-                  width: activeMiniPetMetrics?.canvas.width ?? largeMascotVisualSize,
-                  height: activeMiniPetMetrics?.canvas.height ?? getPetRenderMetrics(miniPet, largeMascotVisualSize).height,
-                }}
-              >
-                <MiniPetMascot
-                  pet={miniPet}
-                  baseState={mainSpriteState}
-                  lifecycleState={mainPetState}
-                  reaction={mascotReaction}
-                  onReactionEnd={clearReaction}
-                  animationRequest={shenshenAnimationRequest}
-                  onAnimationRequestEnd={handleShenshenAnimationEnd}
-                  onPlaybackProgress={handleShenshenPlaybackProgress}
-                  size={largeMascotVisualSize}
-                  layoutMode="canvas"
-                  enableHoverJump
-                  externalHover={mascotHover}
-                  useExternalHover={!isWindowsPlatform}
-                  suppressHover={mascotDragActive}
-                  isDragging={mascotIsDragging}
-                  interruptedReactionId={dragInterruptedReactionId}
-                />
-              </div>
-            ) : (
-              <div
-                style={{
-                  width: largeMascotVisualSize,
-                  height: largeMascotVisualSize,
-                  borderRadius: collapsedPlaceholderRadius,
-                  background: 'rgba(0,0,0,0.3)',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  color: '#999',
-                  fontSize: collapsedPlaceholderFontSize,
-                }}
-              >
-                ?
-              </div>
-            )}
+              }
+
+              return petContent
+            })()}
             {appMode !== 'pet' && (
               <div
                 style={{

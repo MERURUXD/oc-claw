@@ -13,6 +13,7 @@ import {
   isVideoReactionRequestActive,
   resolveVideoPetPresentationState,
 } from '../lib/videoPet'
+import type { EdgeProbePose } from '../lib/edgeProbe'
 
 export type MascotLifecycleState = 'idle' | 'working' | 'compacting' | 'waiting' | 'review'
 
@@ -59,6 +60,8 @@ interface MiniPetMascotProps {
   // Reaction identity already interrupted by this drag; it stays suppressed
   // until a different reaction request arrives.
   interruptedReactionId?: number | null
+  // Active edge probe pose. When active, hover jump is suppressed.
+  probePose?: EdgeProbePose | null
   layoutMode?: 'body' | 'canvas'
   className?: string
   style?: React.CSSProperties
@@ -90,6 +93,7 @@ export function MiniPetMascot({
   suppressHover = false,
   isDragging = false,
   interruptedReactionId = null,
+  probePose = null,
   layoutMode,
   className,
   style,
@@ -125,13 +129,13 @@ export function MiniPetMascot({
     isVideoReactionRequestActive(reaction.id, interruptedReactionId, isDragging)
 
   // Hover jumping is only allowed when:
-  // 1. enableHoverJump is active and not suppressed by drag
+  // 1. enableHoverJump is active and not suppressed by drag or active edge probe
   // 2. Not in active movement (run-left / run-right)
   // 3. Not currently playing a transient reaction (failed / waving)
   // 4. Not in persistent review state
   const allowHoverJump = isMascotHoverJumpAllowed(
     enableHoverJump,
-    suppressHover,
+    suppressHover || !!probePose?.active,
     isMovement,
     isReactionActive,
     isReview,
