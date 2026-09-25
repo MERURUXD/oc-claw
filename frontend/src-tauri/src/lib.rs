@@ -4367,6 +4367,8 @@ fn efficiency_hover_poll(app: tauri::AppHandle) {
     // priming click. We mirror codex's approach: poll cursor + button,
     // translate the mini NSWindow ourselves, and emit walk-dir events to
     // the frontend so the codex sprite shows run-left/run-right.
+    let mut drag_candidate = false;
+    let mut drag_start_cursor: (f64, f64) = (0.0, 0.0);
     let mut drag_active = false;
     let mut last_cursor: (f64, f64) = (0.0, 0.0);
     let mut last_walk_dir: i32 = 0;
@@ -4489,35 +4491,51 @@ fn efficiency_hover_poll(app: tauri::AppHandle) {
                         }
                         let _ = app.emit("mini-mascot-drag-end", ());
                     }
-                } else if over_mascot && left_pressed && !was_pressed {
-                    drag_active = true;
-                    let _ = app.emit("mini-mascot-drag-state", true);
-                    last_cursor = cursor;
-                    // Capture the cursor-to-origin offset at drag start so
-                    // the main-thread task can place the window absolutely
-                    // each frame instead of summing deltas.
-                    if let Some((fx, fy, _, _)) = frame {
-                        if let Ok(mut a) = drag_anchor().lock() {
-                            *a = Some((cursor.0 - fx, cursor.1 - fy));
+                } else if drag_candidate {
+                    if left_pressed {
+                        let dist = ((cursor.0 - drag_start_cursor.0).powi(2)
+                            + (cursor.1 - drag_start_cursor.1).powi(2))
+                        .sqrt();
+                        if dist >= 3.0 {
+                            drag_candidate = false;
+                            drag_active = true;
+                            last_cursor = cursor;
+                            if let Some((fx, fy, _, _)) = frame {
+                                if let Ok(mut a) = drag_anchor().lock() {
+                                    *a = Some((cursor.0 - fx, cursor.1 - fy));
+                                }
+                            }
+                            if was_over_mascot {
+                                let _ = app.emit("mini-mascot-hover", false);
+                                was_over_mascot = false;
+                            }
+                            let _ = app.emit("mini-mascot-drag-start", ());
+                            let _ = app.emit("mini-mascot-drag-state", true);
+                            request_drag_apply(&app);
                         }
+                    } else {
+                        // Released before moving 3px: count as tap/click.
+                        drag_candidate = false;
+                        let _ = app.emit("mini-mascot-click", ());
                     }
-                    // Cancel any active hover so the sprite immediately
-                    // switches from `jumping` to its base/run state when
-                    // the drag begins.
-                    if was_over_mascot {
-                        let _ = app.emit("mini-mascot-hover", false);
-                        was_over_mascot = false;
+                } else if over_mascot && left_pressed && !was_pressed {
+                    drag_candidate = true;
+                    drag_start_cursor = cursor;
+                }
+            } else {
+                if drag_candidate {
+                    drag_candidate = false;
+                }
+                if drag_active {
+                    drag_active = false;
+                    let _ = app.emit("mini-mascot-drag-state", false);
+                    if let Ok(mut a) = drag_anchor().lock() {
+                        *a = None;
                     }
-                }
-            } else if drag_active {
-                drag_active = false;
-                let _ = app.emit("mini-mascot-drag-state", false);
-                if let Ok(mut a) = drag_anchor().lock() {
-                    *a = None;
-                }
-                if last_walk_dir != 0 {
-                    let _ = app.emit("mini-mascot-walk", 0i32);
-                    last_walk_dir = 0;
+                    if last_walk_dir != 0 {
+                        let _ = app.emit("mini-mascot-walk", 0i32);
+                        last_walk_dir = 0;
+                    }
                 }
             }
             was_pressed = left_pressed;
