@@ -6312,19 +6312,32 @@ fn hit_test_mascot_window(
 /// Tao still records VISIBLE=false after our no-activation native restore; its
 /// `set_ignore_cursor_events` reapplies that stale flag and hides the HWND.
 #[cfg(target_os = "windows")]
+fn mascot_passthrough_exstyle(before: isize, ignore: bool) -> isize {
+    use windows::Win32::UI::WindowsAndMessaging::{WS_EX_LAYERED, WS_EX_TRANSPARENT};
+
+    let passthrough = (WS_EX_TRANSPARENT | WS_EX_LAYERED).0 as isize;
+    if ignore {
+        before | passthrough
+    } else {
+        before & !passthrough
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn set_mascot_passthrough_native(win: &tauri::WebviewWindow, ignore: bool) -> Result<(), String> {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
         GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE,
-        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
-        SWP_NOSIZE, SWP_NOZORDER, WS_EX_LAYERED, WS_EX_TRANSPARENT,
+        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+        SWP_NOZORDER,
     };
 
     let hwnd = HWND(win.hwnd().map_err(|error| error.to_string())?.0);
     let before = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
-    let transparent = WS_EX_TRANSPARENT.0 as isize;
-    let layered = WS_EX_LAYERED.0 as isize;
-    let after = if ignore { before | transparent | layered } else { before & !transparent };
+    // These mascot windows use DWM transparency, not a permanent layered style.
+    // Leaving WS_EX_LAYERED behind after click-through changes hit testing
+    // for the expanded WebView2 panel even after WS_EX_TRANSPARENT is cleared.
+    let after = mascot_passthrough_exstyle(before, ignore);
     if before == after { return Ok(()); }
     unsafe {
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, after);
@@ -6346,11 +6359,17 @@ fn set_mascot_passthrough_native(win: &tauri::WebviewWindow, ignore: bool) -> Re
 }
 
 #[cfg(target_os = "windows")]
-fn mascot_passthrough_native_enabled(win: &tauri::WebviewWindow) -> Option<bool> {
+fn mascot_passthrough_native_styles(win: &tauri::WebviewWindow) -> Option<(bool, bool)> {
     use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWL_EXSTYLE, WS_EX_TRANSPARENT};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, GWL_EXSTYLE, WS_EX_LAYERED, WS_EX_TRANSPARENT,
+    };
     let hwnd = HWND(win.hwnd().ok()?.0);
-    Some((unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32 & WS_EX_TRANSPARENT.0) != 0)
+    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
+    Some((
+        (style & WS_EX_TRANSPARENT.0) != 0,
+        (style & WS_EX_LAYERED.0) != 0,
+    ))
 }
 
 /// Atomically ensures the single unified mascot pass-through polling thread is running.
@@ -6452,7 +6471,7 @@ fn mascot_passthrough_poll_windows(app: tauri::AppHandle) {
 
             let want_ignore = !should_be_interactive;
             if last_states.get("mini").copied() != Some(want_ignore)
-                || mascot_passthrough_native_enabled(&mini_win) != Some(want_ignore)
+                || mascot_passthrough_native_styles(&mini_win) != Some((want_ignore, want_ignore))
             {
                 let win = mini_win.clone();
                 let _ = app.run_on_main_thread(move || {
@@ -6478,7 +6497,7 @@ fn mascot_passthrough_poll_windows(app: tauri::AppHandle) {
                 };
                 let want_ignore = !should_be_interactive;
                 if last_states.get(label).copied() != Some(want_ignore)
-                    || mascot_passthrough_native_enabled(&extra_win) != Some(want_ignore)
+                    || mascot_passthrough_native_styles(&extra_win) != Some((want_ignore, want_ignore))
                 {
                     let win = extra_win.clone();
                     let _ = app.run_on_main_thread(move || {
@@ -24329,6 +24348,24 @@ mod fullscreen_bubble_suppression_tests {
 #[cfg(test)]
 mod video_pet_native_geometry_tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn mascot_passthrough_restores_nonlayered_style_for_expanded_panel() {
+        use windows::Win32::UI::WindowsAndMessaging::{WS_EX_LAYERED, WS_EX_TRANSPARENT};
+
+        let normal_style = 0x0000_0008isize; // WS_EX_TOPMOST, unrelated to passthrough.
+        let ignored = mascot_passthrough_exstyle(normal_style, true);
+        assert_ne!(ignored & WS_EX_TRANSPARENT.0 as isize, 0);
+        assert_ne!(ignored & WS_EX_LAYERED.0 as isize, 0);
+        assert_eq!(mascot_passthrough_exstyle(ignored, false), normal_style);
+
+        // A stale layered style from an earlier poll must also be repaired.
+        assert_eq!(
+            mascot_passthrough_exstyle(normal_style | WS_EX_LAYERED.0 as isize, false),
+            normal_style
+        );
+    }
 
     fn shenshen_canvas_entry() -> MascotHitboxEntry {
         MascotHitboxEntry {
