@@ -148,6 +148,14 @@ export function shouldGateIncrementalResizeObserver(opts: {
 }
 
 /**
+ * Gate native ResizeObserver IPC during domestic width spring animation
+ * to prevent SetWindowPos storms while content smoothly animates.
+ */
+export function shouldGateWidthResizeObserver(isWidthAnimating: boolean): boolean {
+  return isWidthAnimating
+}
+
+/**
  * Decouples row-level animation completion from window-level settle.
  * Stable settle is permitted ONLY when:
  * 1. Bubble phase is visible
