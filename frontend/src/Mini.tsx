@@ -100,6 +100,7 @@ import {
   probeWindowX,
   EDGE_IDLE_SECONDS,
   type EdgeProbePose,
+  type EdgeProbeSide,
   type ProbeEnvelope,
   type ScreenRect,
   type PetRenderMetricsLite,
@@ -1175,6 +1176,7 @@ export default function Mini() {
   const probeMonitorRef = useRef<ScreenRect | null>(null)
   const probeNormalMetricsRef = useRef<PetRenderMetricsLite | null>(null)
   const probeInitialOriginRef = useRef<{ x: number; y: number } | null>(null)
+  const panelProbeSideRef = useRef<'left' | 'right' | null>(null)
 
   const clearProbeTimer = useCallback(() => {
     if (probeTimerRef.current) {
@@ -1354,7 +1356,7 @@ export default function Mini() {
     return true
   }, [clearProbeTimer, runTransitionLoop])
 
-  const handleProbeDragEnd = useCallback(async () => {
+  const handleProbeDragEnd = useCallback(async (forcedSide?: EdgeProbeSide) => {
     if (appModeRef.current !== 'coding' || expandedRef.current || moveModeRef.current || probeMachineRef.current.isActive()) {
       return
     }
@@ -1374,7 +1376,7 @@ export default function Mini() {
         height: monitorRect[3],
       }
       const normalMetrics = getCurrentMascotRenderMetrics()
-      const side = detectEdgeAtRest(windowPos, normalMetrics.hitbox, monitor)
+      const side = forcedSide ?? detectEdgeAtRest(windowPos, normalMetrics.hitbox, monitor)
       if (!side) return
 
       const envelope = computeProbeEnvelope(normalMetrics)
@@ -3740,6 +3742,7 @@ export default function Mini() {
       efficiency: mode === 'efficiency',
       maxHeight: panelMaxHeightRef.current,
       mascotScale: mascotScaleRef.current,
+      edgeAnchor: panelProbeSideRef.current,
     })
     expandedWindowModeRef.current = mode
   }, [])
@@ -3750,6 +3753,11 @@ export default function Mini() {
       collapsing: collapsingRef.current,
     })) return
     expandingRef.current = true
+    const probeSide = probeMachineRef.current.getSide()
+    if (probeMachineRef.current.isActive() && probeSide) {
+      panelProbeSideRef.current = probeSide
+      cancelProbePresentation('panel_expand')
+    }
     invalidateMiniPetCanvasQueueRef.current()
     setHiding(true)
     // The native window has to be resized + repositioned before the
@@ -3763,6 +3771,10 @@ export default function Mini() {
     // panel from the notch.)
     document.documentElement.style.opacity = '0'
     try {
+      if (panelProbeSideRef.current) {
+        await probeQueueRef.current.drain()
+        await restoreProbeEnvelope()
+      }
       await new Promise<void>((r) => setTimeout(r, 50))
       await syncExpandedWindowLayout(viewModeRef.current)
       setExpanded(true)
@@ -3779,12 +3791,15 @@ export default function Mini() {
       setExpanded(false)
       expandedRef.current = false
       expandedWindowModeRef.current = null
+      const side = panelProbeSideRef.current
+      panelProbeSideRef.current = null
+      if (side) await handleProbeDragEnd(side)
       document.documentElement.style.opacity = '1'
     } finally {
       setHiding(false)
       expandingRef.current = false
     }
-  }, [syncExpandedWindowLayout])
+  }, [cancelProbePresentation, handleProbeDragEnd, restoreProbeEnvelope, syncExpandedWindowLayout])
   expandFnRef.current = expand
 
   const flushPendingQuotaRevealIfSafe = useCallback(() => {
@@ -4294,7 +4309,7 @@ export default function Mini() {
       return
     }
 
-    if (appModeRef.current === 'coding' && miniPetRef.current?.id === 'shenshen') {
+    if (appModeRef.current === 'coding' && (probeMachineRef.current.isActive() || miniPetRef.current?.id === 'shenshen')) {
       if (expandedRef.current) collapseFnRef.current?.()
       else if (!expandingRef.current && !collapsingRef.current) expandFnRef.current?.()
     }
@@ -5031,6 +5046,9 @@ export default function Mini() {
         }
         if (!isPanelUiGenerationCurrent(panelUiTransitionRef.current, myGen)) return
         await restoreCollapsedPetLayoutRef.current()
+        const side = panelProbeSideRef.current
+        panelProbeSideRef.current = null
+        if (side && appModeRef.current === 'coding') await handleProbeDragEnd(side)
       } catch {
         /* ensure hiding is always cleared when we still own the transition */
       }
@@ -5061,7 +5079,7 @@ export default function Mini() {
         flushPendingQuotaRevealIfSafe()
       }, 300)
     }, delay)
-  }, [fetchAgents, restoreCollapsedMascotPosition, debugToTerminal, isSettingsPickerBlockingClose, flushPendingQuotaRevealIfSafe])
+  }, [fetchAgents, handleProbeDragEnd, restoreCollapsedMascotPosition, debugToTerminal, isSettingsPickerBlockingClose, flushPendingQuotaRevealIfSafe])
   collapseFnRef.current = collapse
 
   // ── Efficiency-mode notch hover tracking (native cursor polling) ──
@@ -6212,6 +6230,12 @@ export default function Mini() {
   invalidateMiniPetCanvasQueueRef.current = () => miniPetCanvasQueueRef.current!.invalidate()
 
   useEffect(() => {
+    // The probe envelope owns the same native canvas bounds as VideoPet.
+    // A completion panel closing must not immediately overwrite the resumed probe.
+    if (probeMachineRef.current.isActive() || probeEnvelopeRef.current) {
+      miniPetCanvasQueueRef.current?.invalidate()
+      return
+    }
     const canApplyGeometry = canApplyCollapsedMascotGeometry({
       modeReady: appMode === 'coding',
       expanded: expanded || expandedRef.current,
