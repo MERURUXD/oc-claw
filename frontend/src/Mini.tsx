@@ -3742,7 +3742,6 @@ export default function Mini() {
       efficiency: mode === 'efficiency',
       maxHeight: panelMaxHeightRef.current,
       mascotScale: mascotScaleRef.current,
-      edgeAnchor: panelProbeSideRef.current,
     })
     expandedWindowModeRef.current = mode
   }, [])

@@ -4032,51 +4032,9 @@ async fn set_ime_mode(_app: tauri::AppHandle, _active: bool) -> Result<(), Strin
     Ok(())
 }
 
-/// Place an expanded panel beside the screen edge where its mascot was probing.
-fn edge_panel_position(
-    side: &str,
-    screen_x: f64,
-    screen_y: f64,
-    screen_w: f64,
-    screen_h: f64,
-    panel_w: f64,
-    panel_h: f64,
-    mascot_center_y: f64,
-) -> Option<(f64, f64)> {
-    let x = match side {
-        "left" => screen_x,
-        "right" => screen_x + (screen_w - panel_w).max(0.0),
-        _ => return None,
-    };
-    let y = (mascot_center_y - panel_h / 2.0)
-        .clamp(screen_y, screen_y + (screen_h - panel_h).max(0.0));
-    Some((x, y))
-}
-
-#[cfg(test)]
-mod edge_panel_position_tests {
-    use super::edge_panel_position;
-
-    #[test]
-    fn anchors_panel_to_probe_edge_and_keeps_it_on_monitor() {
-        assert_eq!(
-            edge_panel_position("left", 100.0, 50.0, 1200.0, 800.0, 600.0, 400.0, 700.0),
-            Some((100.0, 450.0))
-        );
-        assert_eq!(
-            edge_panel_position("right", 100.0, 50.0, 1200.0, 800.0, 600.0, 400.0, 75.0),
-            Some((700.0, 50.0))
-        );
-        assert_eq!(
-            edge_panel_position("other", 100.0, 50.0, 1200.0, 800.0, 600.0, 400.0, 75.0),
-            None
-        );
-    }
-}
-
 /// Resize/reposition the mini window between collapsed and expanded states.
 #[tauri::command]
-async fn set_mini_expanded(app: tauri::AppHandle, expanded: bool, position: Option<String>, efficiency: Option<bool>, #[allow(unused_variables)] max_height: Option<f64>, mascot_scale: Option<f64>, large_mascot: Option<bool>, keep_position: Option<bool>, large_mascot_scale: Option<f64>, edge_anchor: Option<String>) -> Result<(), String> {
+async fn set_mini_expanded(app: tauri::AppHandle, expanded: bool, position: Option<String>, efficiency: Option<bool>, #[allow(unused_variables)] max_height: Option<f64>, mascot_scale: Option<f64>, large_mascot: Option<bool>, keep_position: Option<bool>, large_mascot_scale: Option<f64>) -> Result<(), String> {
     MINI_IS_EXPANDED.store(expanded, Ordering::SeqCst);
     if !expanded {
         BUBBLE_GEOMETRY.lock().unwrap().anchor = None;
@@ -4133,16 +4091,12 @@ async fn set_mini_expanded(app: tauri::AppHandle, expanded: bool, position: Opti
                     let (final_x, final_y, final_w, final_h) = if expanded {
                         let win_w = if efficiency.unwrap_or(false) { 600.0 } else { 500.0 };
                         let win_h = max_height.unwrap_or(350.0).max(200.0).min(500.0);
-                        let current: NSRect = unsafe { msg_send![obj, frame] };
-                        let anchored = edge_anchor.as_deref().and_then(|side| {
-                            edge_panel_position(side, sx, sy, sw, sh, win_w, win_h, current.origin.y + current.size.height / 2.0)
-                        });
-                        let x = anchored.map(|(x, _)| x).unwrap_or(sx + (sw - win_w) / 2.0);
-                        // The default expanded panel hugs the top of the screen
-                        // (its window level is high enough to draw over the menu bar). The
+                        let x = sx + (sw - win_w) / 2.0;
+                        // Expanded panel hugs the top of the screen (its window
+                        // level is high enough to draw over the menu bar). The
                         // MASCOT_TOP_INSET only applies to the collapsed mascot
                         // so it stays clear of the notch.
-                        let y = anchored.map(|(_, y)| y).unwrap_or(sy + sh - win_h);
+                        let y = sy + sh - win_h;
                         log::debug!(
                             "[mini-pos] set_mini_expanded(mac,expanded) frame x={:.1} y={:.1} w={:.1} h={:.1}",
                             x, y, win_w, win_h
@@ -4216,18 +4170,10 @@ async fn set_mini_expanded(app: tauri::AppHandle, expanded: bool, position: Opti
                 let base_w = if efficiency.unwrap_or(false) { 600.0 } else { 500.0 };
                 let win_w = (base_w * ui).round();
                 let win_h = (400.0 * ui).round();
-                let sh = monitor.size().height as f64 / scale;
-                let current_center_y = win.outer_position().ok().map(|p| {
-                    let height = win.outer_size().map(|s| s.height as f64 / scale).unwrap_or(0.0);
-                    p.y as f64 / scale + height / 2.0
-                }).unwrap_or(my);
-                let anchored = edge_anchor.as_deref().and_then(|side| {
-                    edge_panel_position(side, mx, my, sw, sh, win_w, win_h, current_center_y)
-                });
-                let x = anchored.map(|(x, _)| x).unwrap_or(mx + (sw - win_w) / 2.0);
-                // The default expanded panel hugs the top of the monitor (no inset)
-                // so it does not get pushed below the IDE chrome.
-                let y = anchored.map(|(_, y)| y).unwrap_or(my);
+                let x = mx + (sw - win_w) / 2.0;
+                // Expanded panel hugs the top of the monitor (no inset) so it
+                // does not get pushed below the IDE chrome.
+                let y = my;
                 log::debug!(
                     "[mini-pos] set_mini_expanded(win,expanded) frame x={:.1} y={:.1} w={:.1} h={:.1} ui={:.2}",
                     x, y, win_w, win_h, ui
