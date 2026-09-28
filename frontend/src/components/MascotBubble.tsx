@@ -68,6 +68,12 @@ export const BUBBLE_MOTION = {
   exitFadeDelay: 0.08,
 }
 
+type BubbleHorizontalAnchorSide = 'left' | 'right'
+
+function applyBubbleHorizontalAnchor(side: BubbleHorizontalAnchorSide) {
+  document.documentElement.dataset.bubbleHorizontalAnchor = side
+}
+
 export type BubblePlacement = 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right'
 
 export function getBubbleEntryOffset(placement: BubblePlacement = 'top-left') {
@@ -804,7 +810,7 @@ export default function MascotBubble() {
     })
 
     isSyncInFlightRef.current = true
-    invoke('sync_mascot_bubble', {
+    invoke<BubbleHorizontalAnchorSide>('sync_mascot_bubble', {
       width: pending.width,
       height: pending.height,
       entryOffsetX,
@@ -813,6 +819,7 @@ export default function MascotBubble() {
       transitionId: tid,
       reason,
     })
+      .then(applyBubbleHorizontalAnchor)
       .finally(() => {
         isSyncInFlightRef.current = false
         if (pendingSyncRef.current) {
@@ -844,7 +851,7 @@ export default function MascotBubble() {
     const reason = options?.reason ?? (mode === 'stable' ? 'stable' : 'motion')
 
     logBubbleDev(`[bubble] syncBubbleGeometry mode=${mode} size=${width}x${height} offset=${entryOffsetX}x${entryOffsetY} preserve=${preserveAnchor} reason=${reason}`)
-    return invoke('sync_mascot_bubble', {
+    return invoke<BubbleHorizontalAnchorSide>('sync_mascot_bubble', {
       width,
       height,
       entryOffsetX,
@@ -852,7 +859,7 @@ export default function MascotBubble() {
       preserveAnchor,
       transitionId: tid,
       reason,
-    }).catch(() => {})
+    }).then(applyBubbleHorizontalAnchor).catch(() => {})
   }, [])
 
 
@@ -913,7 +920,7 @@ export default function MascotBubble() {
       details: { width, height, reason: 'prepare' },
     })
 
-    invoke('sync_mascot_bubble', {
+    invoke<BubbleHorizontalAnchorSide>('sync_mascot_bubble', {
       width,
       height,
       entryOffsetX: BUBBLE_MOTION.reserveX,
@@ -922,7 +929,8 @@ export default function MascotBubble() {
       transitionId: tid,
       reason: 'prepare',
     })
-      .then(() => {
+      .then((side) => {
+        applyBubbleHorizontalAnchor(side)
         if (readySentForTransitionRef.current !== tid && transitionIdRef.current === tid) {
           readySentForTransitionRef.current = tid
           logBubbleDev(`[bubble ${tid}] ready`)
@@ -939,7 +947,15 @@ export default function MascotBubble() {
     let unlistenEnter: (() => void) | undefined
     let unlistenSummary: (() => void) | undefined
     let unlistenClose: (() => void) | undefined
+    let unlistenHorizontalAnchor: (() => void) | undefined
     let disposed = false
+
+    listen<BubbleHorizontalAnchorSide>('mascot-bubble-horizontal-anchor', (e) => {
+      if (!disposed) applyBubbleHorizontalAnchor(e.payload)
+    }).then((fn) => {
+      if (disposed) fn()
+      else unlistenHorizontalAnchor = fn
+    })
 
     listen<BubbleTransitionEvent>('mascot-bubble-prepare', (e) => {
       if (disposed) return
@@ -1196,6 +1212,7 @@ export default function MascotBubble() {
       unlistenEnter?.()
       unlistenSummary?.()
       unlistenClose?.()
+      unlistenHorizontalAnchor?.()
       if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current)
       cancelScheduledStableGeometrySync()
       incrementalEnvelopePreparedRef.current = false
@@ -1337,7 +1354,7 @@ export default function MascotBubble() {
             transitionId: tid,
             details: { width, height, mode: 'motion', phase: 'prepared' },
           })
-          invoke('sync_mascot_bubble', {
+          invoke<BubbleHorizontalAnchorSide>('sync_mascot_bubble', {
             width,
             height,
             entryOffsetX: BUBBLE_MOTION.reserveX,
@@ -1345,7 +1362,7 @@ export default function MascotBubble() {
             preserveAnchor: false,
             transitionId: tid,
             reason: 'resize-observer-prepared',
-          }).catch(() => {})
+          }).then(applyBubbleHorizontalAnchor).catch(() => {})
         }
         const tid = transitionIdRef.current
         if (readySentForTransitionRef.current !== tid) {

@@ -1050,13 +1050,13 @@ mod tests {
             assert!(summary.primary.is_some(), "Connected Antigravity should have primary window");
         }
 
-        // Second call should hit the fast-path endpoint cache in <50ms
-        let start = std::time::Instant::now();
+        // A second forced refresh remains valid whether a live endpoint was
+        // cached or no Antigravity process exists on this machine.
         let res2 = get_harness_quota("antigravity".to_string(), Some(true)).await;
-        let elapsed = start.elapsed();
-        println!("Fast-path Antigravity elapsed: {:?}", elapsed);
-        assert!(res2.is_ok());
-        assert!(elapsed.as_millis() < 500, "Fast-path should complete in <500ms, took {:?}", elapsed);
+        let summary2 = res2
+            .expect("Second forced refresh should succeed")
+            .expect("Second forced refresh should return a summary");
+        assert_eq!(summary2.harness, "antigravity");
     }
 
     #[tokio::test]

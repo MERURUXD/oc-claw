@@ -268,9 +268,15 @@ fn remove_mascot_hitbox_entry(label: &str) -> Option<MascotHitboxEntry> {
 }
 
 static PASSTHROUGH_THREAD_RUNNING: AtomicBool = AtomicBool::new(false);
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BubbleHorizontalAnchor {
+    Left(f64),
+    Right(f64),
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct BubbleAnchor {
-    pub card_right: f64,
+    pub horizontal: BubbleHorizontalAnchor,
     pub card_bottom: f64,
     pub mon_x: f64,
     pub mon_y: f64,
@@ -12543,6 +12549,40 @@ const BUBBLE_RESERVE_X: f64 = 170.0;
 const BUBBLE_RESERVE_Y: f64 = 115.0;
 const BUBBLE_PAD_RIGHT: f64 = 16.0;
 const BUBBLE_PAD_BOTTOM: f64 = 16.0;
+// Keep the transparent window wide enough for the full detailed-card spring.
+// This matches BUBBLE_WIDTH.max in frontend/src/lib/bubbleWidth.ts.
+const BUBBLE_MAX_CONTENT_WIDTH: f64 = 345.0;
+
+impl BubbleHorizontalAnchor {
+    fn card_right(self, width: f64) -> f64 {
+        match self {
+            Self::Left(left) => left + width,
+            Self::Right(right) => right,
+        }
+    }
+
+    fn side(self) -> &'static str {
+        match self {
+            Self::Left(_) => "left",
+            Self::Right(_) => "right",
+        }
+    }
+}
+
+fn initial_bubble_horizontal_anchor(
+    target_card_right: f64,
+    mon_x: f64,
+    mon_w: f64,
+    margin: f64,
+) -> BubbleHorizontalAnchor {
+    // Choose against the full width so a later spring cannot switch the
+    // resting edge after a narrower card was initially shown.
+    if target_card_right - BUBBLE_MAX_CONTENT_WIDTH < mon_x + margin {
+        BubbleHorizontalAnchor::Left(mon_x + margin)
+    } else {
+        BubbleHorizontalAnchor::Right(target_card_right.min(mon_x + mon_w - margin))
+    }
+}
 
 /// Resolve the native frame from the logical resting anchor. Native pixel rounding
 /// must never feed back into this anchor on subsequent width changes.
@@ -12552,17 +12592,31 @@ fn preserved_bubble_frame(
     bubble_h: f64,
     win_w: f64,
     win_h: f64,
+    res_x: f64,
     margin: f64,
 ) -> (f64, f64) {
-    let mut card_right = anchor.card_right;
+    let mut horizontal = anchor.horizontal;
     let mut card_bottom = anchor.card_bottom;
-    if card_right - bubble_w < anchor.mon_x + margin {
-        card_right = anchor.mon_x + margin + bubble_w;
-    }
-    if card_right > anchor.mon_x + anchor.mon_w - margin {
-        card_right = anchor.mon_x + anchor.mon_w - margin;
-    }
-    let x = card_right - (win_w - BUBBLE_PAD_RIGHT);
+    let x = match &mut horizontal {
+        BubbleHorizontalAnchor::Right(card_right) => {
+            if *card_right - bubble_w < anchor.mon_x + margin {
+                *card_right = anchor.mon_x + margin + bubble_w;
+            }
+            if *card_right > anchor.mon_x + anchor.mon_w - margin {
+                *card_right = anchor.mon_x + anchor.mon_w - margin;
+            }
+            *card_right - (win_w - BUBBLE_PAD_RIGHT)
+        }
+        BubbleHorizontalAnchor::Left(card_left) => {
+            if *card_left + bubble_w > anchor.mon_x + anchor.mon_w - margin {
+                *card_left = anchor.mon_x + anchor.mon_w - margin - bubble_w;
+            }
+            if *card_left < anchor.mon_x + margin {
+                *card_left = anchor.mon_x + margin;
+            }
+            *card_left - res_x
+        }
+    };
 
     #[cfg(target_os = "macos")]
     let y = {
@@ -12699,6 +12753,10 @@ fn set_bubble_frame_atomic(
         ],
     );
 
+    if before_rect == Some([px_x, px_y, px_w, px_h]) {
+        return Ok(());
+    }
+
     unsafe {
         let _ = SetWindowPos(
             hwnd,
@@ -12749,15 +12807,15 @@ async fn sync_mascot_bubble(
     preserve_anchor: Option<bool>,
     transition_id: Option<i64>,
     reason: Option<String>,
-) -> Result<(), String> {
+) -> Result<&'static str, String> {
     let res_x = entry_offset_x.unwrap_or(BUBBLE_RESERVE_X);
     let res_y = entry_offset_y.unwrap_or(BUBBLE_RESERVE_Y);
 
     let Some(win) = app.get_webview_window("mascot-bubble") else {
-        return Ok(());
+        return Ok("right");
     };
     let Some(mini) = app.get_webview_window("mini") else {
-        return Ok(());
+        return Ok("right");
     };
 
     let margin = 8.0;
@@ -12765,7 +12823,8 @@ async fn sync_mascot_bubble(
     let bubble_h = height.max(8.0);
 
     // Total native window envelope dimensions
-    let win_w = (bubble_w + res_x + BUBBLE_PAD_RIGHT).max(8.0);
+    let win_w =
+        (bubble_w.max(BUBBLE_MAX_CONTENT_WIDTH) + res_x + BUBBLE_PAD_RIGHT).max(8.0);
     let win_h = (bubble_h + res_y + BUBBLE_PAD_BOTTOM).max(8.0);
 
     let is_expanded = MINI_IS_EXPANDED.load(Ordering::SeqCst);
@@ -12817,7 +12876,10 @@ async fn sync_mascot_bubble(
     }
     bubble_trace::trace("rust", "sync-begin", transition_id, &begin_details);
 
-    let anchor_before_str = format!("{:?}", existing_anchor.map(|a| (a.card_right, a.card_bottom)));
+    let anchor_before_str = format!(
+        "{:?}",
+        existing_anchor.map(|a| (a.horizontal, a.card_bottom))
+    );
     let mut anchor_source = "new";
 
     let (final_win_x, final_win_y, new_anchor) = if should_preserve && existing_anchor.is_some() {
@@ -12828,6 +12890,7 @@ async fn sync_mascot_bubble(
             bubble_h,
             win_w,
             win_h,
+            res_x,
             margin,
         );
         (x, y, None)
@@ -12910,7 +12973,7 @@ async fn sync_mascot_bubble(
                 )
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-            () => return Ok(()),
+            () => return Ok("right"),
         };
 
         let body_hitbox = collapsed_video_pet_hitbox(mini_w, mini_h, is_expanded, mini_entry);
@@ -12926,18 +12989,26 @@ async fn sync_mascot_bubble(
         // Use the visible body edge when VideoPet owns the collapsed frame;
         // legacy pets and panel layouts keep the whole-window alignment.
         let target_card_right = body_bounds.right - 12.0;
-        let mut win_x = target_card_right - (win_w - BUBBLE_PAD_RIGHT);
-
-        // Clamp resting card to monitor bounds [mon_x + margin, mon_x + mon_w - margin]
-        let card_screen_left = win_x + res_x;
-        if card_screen_left < mon_x + margin {
-            win_x += (mon_x + margin) - card_screen_left;
-        }
-        let card_screen_right = win_x + win_w - BUBBLE_PAD_RIGHT;
-        if card_screen_right > mon_x + mon_w - margin {
-            win_x -= card_screen_right - (mon_x + mon_w - margin);
-        }
-        let card_right = win_x + win_w - BUBBLE_PAD_RIGHT;
+        // When the card cannot fit to the mascot's left, keep its left edge
+        // fixed at the monitor margin. Width changes then grow to the right.
+        let horizontal = initial_bubble_horizontal_anchor(target_card_right, mon_x, mon_w, margin);
+        let provisional_anchor = BubbleAnchor {
+            horizontal,
+            card_bottom: 0.0,
+            mon_x,
+            mon_y,
+            mon_w,
+            mon_h,
+        };
+        let (win_x, _) = preserved_bubble_frame(
+            provisional_anchor,
+            bubble_w,
+            bubble_h,
+            win_w,
+            win_h,
+            res_x,
+            margin,
+        );
 
         // Vertical Alignment
         #[cfg(target_os = "macos")]
@@ -12978,7 +13049,7 @@ async fn sync_mascot_bubble(
         };
 
         let anchor = BubbleAnchor {
-            card_right,
+            horizontal,
             card_bottom,
             mon_x,
             mon_y,
@@ -13020,8 +13091,15 @@ async fn sync_mascot_bubble(
                 if let Ok(ns_win) = win_clone.ns_window() {
                     let obj = unsafe { &*(ns_win as *mut AnyObject) };
                     let new_frame = NSRect::new(NSPoint::new(final_win_x, final_win_y), NSSize::new(win_w, win_h));
-                    unsafe {
-                        let _: () = msg_send![obj, setFrame: new_frame, display: true, animate: false];
+                    let current: NSRect = unsafe { msg_send![obj, frame] };
+                    if current.origin.x != final_win_x
+                        || current.origin.y != final_win_y
+                        || current.size.width != win_w
+                        || current.size.height != win_h
+                    {
+                        unsafe {
+                            let _: () = msg_send![obj, setFrame: new_frame, display: true, animate: false];
+                        }
                     }
                 }
             })
@@ -13034,7 +13112,9 @@ async fn sync_mascot_bubble(
         let _ = win.set_position(tauri::LogicalPosition::new(final_win_x, final_win_y));
     }
 
-    let anchor_after_str = format!("{:?}", BUBBLE_GEOMETRY.lock().unwrap().anchor.map(|a| (a.card_right, a.card_bottom)));
+    let anchor_after = BUBBLE_GEOMETRY.lock().unwrap().anchor;
+    let horizontal_side = anchor_after.map(|a| a.horizontal.side()).unwrap_or("right");
+    let anchor_after_str = format!("{:?}", anchor_after.map(|a| (a.horizontal, a.card_bottom)));
     let final_frame_str = format!("[{:.1}, {:.1}, {:.1}, {:.1}]", final_win_x, final_win_y, win_w, win_h);
     let mut end_details = vec![
         ("reason", reason_val),
@@ -13090,7 +13170,8 @@ async fn sync_mascot_bubble(
     {
         let _ = win.set_always_on_top(want_top);
     }
-    Ok(())
+    let _ = app.emit_to("mascot-bubble", "mascot-bubble-horizontal-anchor", horizontal_side);
+    Ok(horizontal_side)
 }
 
 /// Ensure the mascot status bubble window is spawned (starts hidden, visible=false).
@@ -13476,7 +13557,14 @@ fn bubble_passthrough_poll(app: tauri::AppHandle) {
 
         let geom_opt = {
             let geom = BUBBLE_GEOMETRY.lock().unwrap();
-            geom.anchor.map(|a| (a.card_right, a.card_bottom, geom.width, geom.height))
+            geom.anchor.map(|a| {
+                (
+                    a.horizontal.card_right(geom.width),
+                    a.card_bottom,
+                    geom.width,
+                    geom.height,
+                )
+            })
         };
 
         if let Some((card_right, card_bottom, width, height)) = geom_opt {
@@ -24177,7 +24265,7 @@ mod fullscreen_bubble_suppression_tests {
         let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         // Set an existing anchor in BUBBLE_GEOMETRY
         let sample_anchor = BubbleAnchor {
-            card_right: 850.0,
+            horizontal: BubbleHorizontalAnchor::Right(850.0),
             card_bottom: 120.0,
             mon_x: 0.0,
             mon_y: 0.0,
@@ -24198,7 +24286,7 @@ mod fullscreen_bubble_suppression_tests {
             let geom = BUBBLE_GEOMETRY.lock().unwrap();
             assert!(geom.anchor.is_some());
             let a = geom.anchor.unwrap();
-            assert_eq!(a.card_right, 850.0);
+            assert_eq!(a.horizontal, BubbleHorizontalAnchor::Right(850.0));
             assert_eq!(a.card_bottom, 120.0);
         }
 
@@ -24206,7 +24294,7 @@ mod fullscreen_bubble_suppression_tests {
         // Fullscreen exit alone cannot lift tray suppression or clear the anchor.
         PRESENTATION.set(presentation::FULLSCREEN, false);
         assert!(PRESENTATION.active());
-        assert_eq!(BUBBLE_GEOMETRY.lock().unwrap().anchor.unwrap().card_right, 850.0);
+        assert_eq!(BUBBLE_GEOMETRY.lock().unwrap().anchor.unwrap().horizontal, BubbleHorizontalAnchor::Right(850.0));
         PRESENTATION.set(presentation::USER, false);
         assert!(!PRESENTATION.active());
 
@@ -24226,7 +24314,7 @@ mod fullscreen_bubble_suppression_tests {
     #[test]
     fn test_preserve_anchor_is_stable_across_width_changes_without_drift() {
         let anchor = BubbleAnchor {
-            card_right: 1088.0,
+            horizontal: BubbleHorizontalAnchor::Right(1088.0),
             card_bottom: 500.0,
             mon_x: 0.0,
             mon_y: 0.0,
@@ -24235,7 +24323,7 @@ mod fullscreen_bubble_suppression_tests {
         };
         let margin = 8.0;
         let scales = [1.0, 1.25, 1.5, 1.75, 2.0];
-        let widths = [190.0, 220.0, 260.0, 310.0, 345.0, 280.0, 210.0, 190.0];
+        let widths: [f64; 8] = [190.0, 220.0, 260.0, 310.0, 345.0, 280.0, 210.0, 190.0];
 
         for &scale in &scales {
             let mut geom = BubbleGeometryState {
@@ -24247,12 +24335,12 @@ mod fullscreen_bubble_suppression_tests {
             };
             for &bubble_w in &widths {
                 let bubble_h = 40.0;
-                let win_w = bubble_w + BUBBLE_RESERVE_X + BUBBLE_PAD_RIGHT;
+                let win_w = bubble_w.max(BUBBLE_MAX_CONTENT_WIDTH) + BUBBLE_RESERVE_X + BUBBLE_PAD_RIGHT;
                 let win_h = bubble_h + BUBBLE_RESERVE_Y + BUBBLE_PAD_BOTTOM;
                 // Exercise the same positioning and state update functions used by
                 // sync_mascot_bubble, with a quantized native frame at each step.
                 let (x, y) = preserved_bubble_frame(
-                    geom.anchor.unwrap(), bubble_w, bubble_h, win_w, win_h, margin,
+                    geom.anchor.unwrap(), bubble_w, bubble_h, win_w, win_h, BUBBLE_RESERVE_X, margin,
                 );
                 let px_x = (x * scale).round() as i32;
                 let px_w = (win_w * scale).round() as i32;
@@ -24268,14 +24356,50 @@ mod fullscreen_bubble_suppression_tests {
                     &mut geom, bubble_w, bubble_h, BUBBLE_RESERVE_X, BUBBLE_RESERVE_Y, None,
                 );
                 assert!(
-                    (actual_card_right - anchor.card_right).abs() <= 1.0 / scale + 1e-9,
+                    (actual_card_right - anchor.horizontal.card_right(bubble_w)).abs() <= 1.0 / scale + 1e-9,
                     "scale={} width={} actual={} expected={}",
-                    scale, bubble_w, actual_card_right, anchor.card_right
+                    scale, bubble_w, actual_card_right, anchor.horizontal.card_right(bubble_w)
                 );
                 assert!((actual_card_bottom - anchor.card_bottom).abs() <= 1.0 / scale + 1e-9);
-                assert_eq!(geom.anchor.unwrap().card_right, anchor.card_right);
+                assert_eq!(geom.anchor.unwrap().horizontal, anchor.horizontal);
                 assert_eq!(geom.anchor.unwrap().card_bottom, anchor.card_bottom);
                 assert_eq!(geom.width, bubble_w);
+            }
+        }
+    }
+
+    #[test]
+    fn left_anchored_card_keeps_its_left_edge_and_native_width_during_width_spring() {
+        assert_eq!(
+            initial_bubble_horizontal_anchor(250.0, 0.0, 1_920.0, 8.0),
+            BubbleHorizontalAnchor::Left(8.0),
+        );
+        assert_eq!(
+            initial_bubble_horizontal_anchor(900.0, 0.0, 1_920.0, 8.0),
+            BubbleHorizontalAnchor::Right(900.0),
+        );
+        let anchor = BubbleAnchor {
+            horizontal: BubbleHorizontalAnchor::Left(8.0),
+            card_bottom: 500.0,
+            mon_x: 0.0,
+            mon_y: 0.0,
+            mon_w: 1_920.0,
+            mon_h: 1_080.0,
+        };
+        let widths: [f64; 5] = [190.0, 260.0, 345.0, 260.0, 190.0];
+        for scale in [1.0, 1.25, 1.5, 1.75, 2.0] {
+            let mut native_width = None;
+            for width in widths {
+                let win_w = width.max(BUBBLE_MAX_CONTENT_WIDTH) + BUBBLE_RESERVE_X + BUBBLE_PAD_RIGHT;
+                let win_h = 40.0 + BUBBLE_RESERVE_Y + BUBBLE_PAD_BOTTOM;
+                let (x, _) = preserved_bubble_frame(
+                    anchor, width, 40.0, win_w, win_h, BUBBLE_RESERVE_X, 8.0,
+                );
+                let physical_x = (x * scale).round();
+                let card_left = physical_x / scale + BUBBLE_RESERVE_X;
+                assert!((card_left - 8.0).abs() <= 0.5 / scale + 1e-9);
+                let physical_width = (win_w * scale).round();
+                assert_eq!(*native_width.get_or_insert(physical_width), physical_width);
             }
         }
     }
@@ -24411,7 +24535,7 @@ mod video_pet_native_geometry_tests {
             reserve_x: 170.0,
             reserve_y: 115.0,
             anchor: Some(BubbleAnchor {
-                card_right: 1_200.0,
+                horizontal: BubbleHorizontalAnchor::Right(1_200.0),
                 card_bottom: 700.0,
                 mon_x: 0.0,
                 mon_y: 0.0,

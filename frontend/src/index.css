@@ -132,6 +132,11 @@ input, textarea, pre, [contenteditable], .selectable-text, .selectable-text * {
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro", "Segoe UI", sans-serif;
 }
 
+:root[data-bubble-horizontal-anchor="left"] .mascot-bubble-root {
+  justify-content: flex-start;
+  padding-left: 170px;
+}
+
 .mascot-bubble-logical-box {
   display: inline-flex;
   flex-direction: column;
