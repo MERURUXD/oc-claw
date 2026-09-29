@@ -4,6 +4,7 @@ import { SettingsTab as SettingsTabBase } from './SettingsTabBase'
 import { DebugSettingsSection } from './DebugSettingsSection'
 import { getStore } from '../lib/store'
 import type { DebugInjectPreset } from '../lib/debugInject'
+import type { QuotaHarness } from '../lib/quotaRecovery'
 
 type BaseSettingsTabProps = ComponentProps<typeof SettingsTabBase>
 
@@ -11,7 +12,7 @@ type SettingsTabProps = BaseSettingsTabProps & {
   onDebugInjectPreset?: (preset: DebugInjectPreset) => void
   onClearDebugInject?: () => void
   debugInjectCount?: number
-  onTriggerQuotaRecovery?: (harness: 'codex' | 'antigravity') => void
+  onTriggerQuotaRecovery?: (harness: QuotaHarness) => void
 }
 
 const STORE_KEY = 'developer_mode'

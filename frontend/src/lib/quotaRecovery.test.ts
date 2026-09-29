@@ -5,6 +5,7 @@ import {
   calculateRemainingPercent,
   computeResetCheckDelay,
   extractQuotaWindows,
+  quotaHarnessForSource,
   QUOTA_LOW_REMAINING_THRESHOLD,
   RESET_GRACE_PERIOD_MS,
   RESET_RETRY_INTERVAL_MS,
@@ -13,7 +14,7 @@ import {
 import type { HarnessQuotaSummary } from './types.ts'
 
 function createSummary(
-  harness: 'codex' | 'antigravity',
+  harness: 'codex' | 'antigravity' | 'claude',
   windows: { label: string; percent: number; resets_at?: string | null }[],
   connected = true,
 ): HarnessQuotaSummary {
@@ -275,3 +276,21 @@ test('quota recovery: reset 第一次检查仍 low，第二次检查恢复', () 
   assert.equal(sm.getArmedWindows().length, 0)
 })
 
+
+test('quotaHarnessForSource: Claude Code sessions report source cc', () => {
+  assert.equal(quotaHarnessForSource('cc'), 'claude')
+  assert.equal(quotaHarnessForSource('codex'), 'codex')
+  assert.equal(quotaHarnessForSource('antigravity'), 'antigravity')
+  assert.equal(quotaHarnessForSource('cursor'), null)
+  assert.equal(quotaHarnessForSource(undefined), null)
+})
+
+test('quota recovery: claude windows arm below 10% and recover on reset', () => {
+  const sm = createQuotaRecoveryStateMachine()
+  assert.equal(sm.processQuotaSummary(createSummary('claude', [{ label: '5-Hour Window', percent: 95 }])), null)
+  assert.equal(sm.getWindowState('claude', '5-Hour Window'), 'armed')
+
+  const event = sm.processQuotaSummary(createSummary('claude', [{ label: '5-Hour Window', percent: 2 }]))
+  assert.deepEqual(event, { harness: 'claude', recoveredWindows: ['5-Hour Window'] })
+  assert.equal(sm.getWindowState('claude', '5-Hour Window'), 'normal')
+})

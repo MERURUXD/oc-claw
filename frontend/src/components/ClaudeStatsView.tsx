@@ -6,6 +6,7 @@ import { motion } from 'motion/react'
 import { formatTokens } from '../lib/agents'
 import { ChatList } from './ChatList'
 import { QuotaCard } from './QuotaCapsule'
+import { quotaHarnessForSource } from '../lib/quotaRecovery'
 
 interface DailyStats {
   date: string
@@ -341,9 +342,9 @@ export function ClaudeStatsView({ source = 'cc', isActive, channel, sshConn, her
         <span className="text-xs text-white/40">{t('claudeStats.last14Days')}</span>
       </div>
 
-      {/* Harness Quota Overview Card (Codex / Antigravity) */}
-      {(source === 'codex' || source === 'antigravity') && (
-        <QuotaCard harness={source} />
+      {/* Harness Quota Overview Card (Claude Code / Codex / Antigravity) */}
+      {quotaHarnessForSource(source) && (
+        <QuotaCard harness={quotaHarnessForSource(source)} />
       )}
 
       {/* Bento: totals */}

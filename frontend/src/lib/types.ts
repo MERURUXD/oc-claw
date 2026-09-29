@@ -234,7 +234,7 @@ export interface QuotaWindow {
 }
 
 export interface HarnessQuotaSummary {
-  harness: 'codex' | 'antigravity'
+  harness: 'codex' | 'antigravity' | 'claude'
   connected: boolean
   plan_label?: string | null
   primary?: QuotaWindow | null

@@ -15,7 +15,7 @@ import { QuotaSideRail } from './components/QuotaCapsule'
 import { ChatList } from './components/ChatList'
 import { getStore, DEFAULT_CHAR, DEFAULT_CHAR_NAME, loadCharacters, loadOcConnections, saveOcConnections } from './lib/store'
 import type { AgentMetrics, BubbleSessionDetail, BubbleStyle, BubbleTransitionEvent, HarnessQuotaSummary, MascotBubblePayload, OcConnection, SubagentDetail } from './lib/types'
-import { calculateRemainingPercent, createQuotaRecoveryStateMachine, computeResetCheckDelay, extractQuotaWindows, fetchHarnessQuota, subscribeHarnessQuota, type QuotaRecoveryStateMachine, type WindowRecord } from './lib/quotaRecovery'
+import { calculateRemainingPercent, createQuotaRecoveryStateMachine, computeResetCheckDelay, extractQuotaWindows, fetchHarnessQuota, subscribeHarnessQuota, type QuotaHarness, type QuotaRecoveryStateMachine, type WindowRecord } from './lib/quotaRecovery'
 import { deriveSessionActivity, isSameBubblePayload } from './lib/sessionActivity'
 import {
   beginPanelUiTransition,
@@ -629,10 +629,10 @@ export default function Mini() {
   const quotaRecoverySoundRef = useRef(quotaRecoverySound)
   quotaRecoverySoundRef.current = quotaRecoverySound
   const quotaRecoveryRef = useRef<QuotaRecoveryStateMachine>(createQuotaRecoveryStateMachine())
-  const [quotaRevealRequest, setQuotaRevealRequest] = useState<{ id: number; harness: 'codex' | 'antigravity' } | null>(null)
+  const [quotaRevealRequest, setQuotaRevealRequest] = useState<{ id: number; harness: QuotaHarness } | null>(null)
   const quotaRevealSeqRef = useRef(0)
   const consumedQuotaRevealIdRef = useRef<number | null>(null)
-  const pendingQuotaRevealRef = useRef<'codex' | 'antigravity' | null>(null)
+  const pendingQuotaRevealRef = useRef<QuotaHarness | null>(null)
   const handleQuotaRevealHandled = useCallback((id: number) => {
     consumedQuotaRevealIdRef.current = id
     setQuotaRevealRequest((prev) => (prev?.id === id ? null : prev))
@@ -5492,7 +5492,7 @@ export default function Mini() {
   }, [fetchAgents, restoreCollapsedMascotPosition, debugToTerminal, isSettingsPickerBlockingClose, setNativeDialogActive, flushPendingQuotaRevealIfSafe])
 
   const handleQuotaRecovered = useCallback(
-    async (harness: 'codex' | 'antigravity', isDebug = false) => {
+    async (harness: QuotaHarness, isDebug = false) => {
       console.log('[QuotaRecovery] handleQuotaRecovered for', harness, 'isDebug:', isDebug)
       playQuotaRecoverySound()
 
@@ -5573,7 +5573,7 @@ export default function Mini() {
 
     function onQuotaSummary(
       summary: HarnessQuotaSummary | null | undefined,
-      expectedHarness?: 'codex' | 'antigravity',
+      expectedHarness?: QuotaHarness,
     ) {
       if (!mounted) return
       if (!summary) {
@@ -5626,24 +5626,27 @@ export default function Mini() {
       }
     }
 
-    const unsubCodex = subscribeHarnessQuota('codex', (summary) => onQuotaSummary(summary, 'codex'))
-    const unsubAntigravity = subscribeHarnessQuota('antigravity', (summary) => onQuotaSummary(summary, 'antigravity'))
+    const quotaHarnesses: QuotaHarness[] = ['codex', 'antigravity', 'claude']
+    const unsubscribers = quotaHarnesses.map((harness) =>
+      subscribeHarnessQuota(harness, (summary) => onQuotaSummary(summary, harness)),
+    )
+
+    const pollQuotas = () => {
+      for (const harness of quotaHarnesses) {
+        fetchHarnessQuota(harness, false).then((summary) => onQuotaSummary(summary, harness)).catch(() => {})
+      }
+    }
 
     // Initial background fetch
-    fetchHarnessQuota('codex', false).then((summary) => onQuotaSummary(summary, 'codex')).catch(() => {})
-    fetchHarnessQuota('antigravity', false).then((summary) => onQuotaSummary(summary, 'antigravity')).catch(() => {})
+    pollQuotas()
 
     // Routine 5-minute background polling
-    const pollInterval = setInterval(() => {
-      fetchHarnessQuota('codex', false).then((summary) => onQuotaSummary(summary, 'codex')).catch(() => {})
-      fetchHarnessQuota('antigravity', false).then((summary) => onQuotaSummary(summary, 'antigravity')).catch(() => {})
-    }, 300_000)
+    const pollInterval = setInterval(pollQuotas, 300_000)
 
     return () => {
       mounted = false
       clearInterval(pollInterval)
-      unsubCodex()
-      unsubAntigravity()
+      unsubscribers.forEach((unsub) => unsub())
       for (const timer of resetTimers.values()) {
         clearTimeout(timer)
       }

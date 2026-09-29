@@ -33,6 +33,7 @@ import {
 } from '../lib/bubbleGeometryLifecycle'
 import { traceBubbleEvent } from '../lib/bubbleTrace'
 import { QuotaMiniBadge } from './QuotaCapsule'
+import { quotaHarnessForSource } from '../lib/quotaRecovery'
 import { SHIMMER_TIMING, isShimmerActive } from '../lib/bubbleShimmer'
 
 export { BUBBLE_WIDTH, BUBBLE_WIDTH_MOTION, SHIMMER_TIMING, isShimmerActive }
@@ -543,8 +544,8 @@ function SessionBubbleRow({
                   +{remainingOthers}
                 </span>
               )}
-              {(session.source === 'codex' || session.source === 'antigravity') && (
-                <QuotaMiniBadge harness={session.source} />
+              {quotaHarnessForSource(session.source) && (
+                <QuotaMiniBadge harness={quotaHarnessForSource(session.source)!} />
               )}
             </div>
           </div>
@@ -605,8 +606,8 @@ function MeasureSessionBubbleRow({
               {showBadge && (
                 <span className="mascot-bubble-badge">+{remainingOthers}</span>
               )}
-              {(session.source === 'codex' || session.source === 'antigravity') && (
-                <QuotaMiniBadge harness={session.source} />
+              {quotaHarnessForSource(session.source) && (
+                <QuotaMiniBadge harness={quotaHarnessForSource(session.source)!} />
               )}
             </div>
           </div>
