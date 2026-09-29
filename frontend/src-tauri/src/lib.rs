@@ -10755,7 +10755,7 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
             if !dominated { continue; }
 
             let is_desktop_hosted = session.host_terminal.as_deref() == Some("Claude Desktop");
-            if session.source == "cursor" || session.source == "codex" || session.source == "opencode" || session.source == "antigravity" || is_desktop_hosted {
+            if uses_event_timeout(&session.source, session.host_terminal.as_deref(), session.pid) {
                 if session.source == "codex" {
                     if let Some(path) = resolve_session_jsonl_path(&session.session_id, Some(&session.cwd)) {
                         if let Some(interaction) = session.pending_interaction.clone().filter(|p| p.hook_owned)
@@ -10832,7 +10832,9 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
                     continue;
                 }
                 let age_ms = now_ms.saturating_sub(session.updated_at);
-                let timeout_limit = if session.source == "codex" {
+                let timeout_limit = if session.source == "codex" || (is_desktop_hosted && session.source == "cc") {
+                    // A desktop session only lands here without a PID to check,
+                    // so it gets the same wide crash-recovery window as Codex.
                     30 * 60_000
                 } else if session.status == "waiting" && session.source == "antigravity" {
                     300_000
@@ -10863,6 +10865,7 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
                     if !is_pid_alive(pid) {
                         log::info!("[get_claude_sessions] CC pid {} dead, clearing {} for {}", pid, session.status, session.session_id);
                         session.status = "stopped".to_string();
+                        session.is_processing = false;
                         session.pending_agents = 0;
                         session.activity = None;
                     }
@@ -17876,6 +17879,30 @@ fn subagent_counter_delta(
     }
 }
 
+/// Subagent lifecycle events report bookkeeping for the session's counter, not
+/// a change in the turn itself. Claude Code can deliver `SubagentStop` after the
+/// turn's `Stop`, so mapping it to "processing" revived a finished session that
+/// then never received another `Stop` and only cleared through the stale
+/// fallback. The session keeps whatever status its turn events last set.
+fn keeps_session_status(hook_event: &str) -> bool {
+    matches!(hook_event, "SubagentStart" | "SubagentStop")
+}
+
+/// Whether a running/waiting session is judged stale by "no hook event for N ms"
+/// instead of by its process being gone.
+///
+/// Claude Code hosted by Claude Desktop reports the CLI's PID, which lives
+/// exactly as long as the session, so liveness is checked directly and a long
+/// tool call or a long reasoning step is never mistaken for a dead session.
+/// Only harnesses without a reliable PID (or a desktop session that did not
+/// report one) fall back to the event timeout.
+fn uses_event_timeout(source: &str, host_terminal: Option<&str>, pid: Option<u32>) -> bool {
+    match source {
+        "cursor" | "codex" | "opencode" | "antigravity" => true,
+        _ => host_terminal == Some("Claude Desktop") && pid.is_none(),
+    }
+}
+
 /// `StopFailure` ends a turn on an API error (rate limit, overload, auth) and
 /// replaces `Stop`, which does not fire in that case.
 fn is_stop_failure_event(raw_hook_event: &str) -> bool {
@@ -18008,6 +18035,27 @@ mod claude_hook_tests {
         assert_eq!(subagent_counter_delta("PreToolUse", "PreToolUse", "invoke_subagent", "hermes"), 1);
         assert_eq!(subagent_counter_delta("PreToolUse", "subagentStart", "", "cursor"), 1);
         assert_eq!(subagent_counter_delta("PreToolUse", "PreToolUse", "Bash", "codex"), 0);
+    }
+
+    #[test]
+    fn subagent_events_never_change_the_session_status() {
+        assert!(keeps_session_status("SubagentStart"));
+        assert!(keeps_session_status("SubagentStop"));
+        assert!(!keeps_session_status("Stop"));
+        assert!(!keeps_session_status("PostToolUse"));
+        assert!(!keeps_session_status("UserPromptSubmit"));
+    }
+
+    #[test]
+    fn desktop_claude_with_a_pid_is_checked_by_liveness_not_by_silence() {
+        assert!(!uses_event_timeout("cc", Some("Claude Desktop"), Some(4242)));
+        assert!(!uses_event_timeout("cc", Some("Windows Terminal"), Some(4242)));
+        assert!(!uses_event_timeout("cc", None, None));
+        // No PID to check, so a desktop session falls back to the timeout.
+        assert!(uses_event_timeout("cc", Some("Claude Desktop"), None));
+        for source in ["cursor", "codex", "opencode", "antigravity"] {
+            assert!(uses_event_timeout(source, None, Some(4242)));
+        }
     }
 
     #[test]
@@ -20250,7 +20298,18 @@ fn process_claude_event(
             let prev_status = sessions.get(&session_id).map(|s| s.status.clone()).unwrap_or_default();
             was_processing = matches!(prev_status.as_str(), "processing" | "tool_running" | "compacting");
             was_compacting = prev_status == "compacting";
-
+            let prev_is_processing = sessions.get(&session_id).map(|s| s.is_processing);
+            // Subagent bookkeeping must not revive a finished turn or interrupt a
+            // waiting one; only the counter below reacts to it.
+            let keep_prev_status = keeps_session_status(&hook_event) && prev_is_processing.is_some();
+            if keep_prev_status {
+                status = prev_status.clone();
+            }
+            let event_is_processing = if keep_prev_status {
+                prev_is_processing.unwrap_or(is_processing)
+            } else {
+                is_processing
+            };
 
 
             if hook_event == "SessionEnd" {
@@ -20374,7 +20433,7 @@ fn process_claude_event(
 
                 if !is_stale_turn_stop {
                     session.status = status.clone();
-                    session.is_processing = is_processing;
+                    session.is_processing = event_is_processing;
                 }
                 let mut incoming_cwd = event
                     .get("cwd")
@@ -20598,7 +20657,7 @@ fn process_claude_event(
                     }
                 }
 
-                if (hook_event == "PostToolUse" || hook_event == "Stop" || hook_event == "SubagentStop" || hook_event == "GatewayAgentEnd") && !is_stale_turn_stop {
+                if (hook_event == "PostToolUse" || hook_event == "Stop" || hook_event == "GatewayAgentEnd") && !is_stale_turn_stop {
                     session.tool = None;
                     session.tool_input = None;
                     session.activity = None;
