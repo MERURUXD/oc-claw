@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { DEBUG_INJECT_PRESETS, type DebugInjectPreset } from '../lib/debugInject'
 import { getBubbleRuntimeTrace, setBubbleRuntimeTrace } from '../lib/bubbleTrace'
+import type { QuotaHarness } from '../lib/quotaRecovery'
 
 export function DebugSettingsSection({
   onDebugInjectPreset,
@@ -11,7 +12,7 @@ export function DebugSettingsSection({
   onDebugInjectPreset?: (preset: DebugInjectPreset) => void
   onClearDebugInject?: () => void
   debugInjectCount?: number
-  onTriggerQuotaRecovery?: (harness: 'codex' | 'antigravity') => void
+  onTriggerQuotaRecovery?: (harness: QuotaHarness) => void
 }) {
   const isZh = typeof navigator !== 'undefined' && navigator.language.toLowerCase().startsWith('zh')
   const [bubbleTraceEnabled, setBubbleTraceEnabled] = useState(false)
@@ -111,6 +112,14 @@ export function DebugSettingsSection({
           </span>
         </div>
         <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={() => onTriggerQuotaRecovery?.('claude')}
+            disabled={!onTriggerQuotaRecovery}
+            className="flex-1 px-3 py-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-sm text-white/80 transition-colors disabled:opacity-40 cursor-pointer text-center"
+          >
+            {isZh ? '触发 Claude 恢复提醒' : 'Trigger Claude Recovery'}
+          </button>
           <button
             type="button"
             onClick={() => onTriggerQuotaRecovery?.('codex')}

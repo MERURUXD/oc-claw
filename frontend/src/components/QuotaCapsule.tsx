@@ -6,7 +6,39 @@ import {
   fetchHarnessQuota,
   subscribeHarnessQuota,
   getHarnessQuotaCache,
+  type QuotaHarness,
 } from '../lib/quotaRecovery'
+
+const HARNESS_DISPLAY_NAMES: Record<QuotaHarness, string> = {
+  claude: 'Claude Code',
+  codex: 'OpenAI Codex',
+  antigravity: 'Google Antigravity',
+}
+
+const HARNESS_SHORT_NAMES: Record<QuotaHarness, string> = {
+  claude: 'Claude',
+  codex: 'Codex',
+  antigravity: 'Antigravity',
+}
+
+/**
+ * Claude Code starburst icon SVG (white clean vector)
+ */
+export function ClaudeIcon({ className = 'w-4 h-4' }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" className={className}>
+      {[0, 30, 60, 90, 120, 150].map((deg) => (
+        <line key={deg} x1="12" y1="3" x2="12" y2="21" transform={`rotate(${deg} 12 12)`} />
+      ))}
+    </svg>
+  )
+}
+
+export function HarnessIcon({ harness, className }: { harness: QuotaHarness; className?: string }) {
+  if (harness === 'antigravity') return <AntigravityIcon className={className} />
+  if (harness === 'claude') return <ClaudeIcon className={className} />
+  return <CodexIcon className={className} />
+}
 
 /**
  * Google Gemini / Antigravity 4-point star icon SVG (White clean vector)
@@ -34,19 +66,16 @@ export function CodexIcon({ className = 'w-4 h-4' }: { className?: string }) {
  * Hook to fetch and poll harness quota summary with 5-minute background interval
  * and manual refresh capability.
  */
-export function useHarnessQuota(harness: 'codex' | 'antigravity' | null | undefined) {
+export function useHarnessQuota(harness: QuotaHarness | null | undefined) {
   const [data, setData] = useState<HarnessQuotaSummary | null>(() => {
-    if (harness === 'codex' || harness === 'antigravity') {
-      return getHarnessQuotaCache(harness)
-    }
-    return null
+    return harness ? getHarnessQuotaCache(harness) : null
   })
   const [loading, setLoading] = useState(false)
   const [isRefreshing, setIsRefreshing] = useState(false)
 
   const fetchQuota = useCallback(
     async (forceRefresh = false) => {
-      if (!harness || (harness !== 'codex' && harness !== 'antigravity')) {
+      if (!harness) {
         setData(null)
         return
       }
@@ -71,7 +100,7 @@ export function useHarnessQuota(harness: 'codex' | 'antigravity' | null | undefi
   )
 
   useEffect(() => {
-    if (!harness || (harness !== 'codex' && harness !== 'antigravity')) {
+    if (!harness) {
       setData(null)
       return
     }
@@ -246,7 +275,7 @@ export function QuotaCard({
   onRefresh: propOnRefresh,
   variant = 'card',
 }: {
-  harness?: 'codex' | 'antigravity' | null
+  harness?: QuotaHarness | null
   summary?: HarnessQuotaSummary | null
   isRefreshing?: boolean
   onRefresh?: () => Promise<void> | void
@@ -262,7 +291,7 @@ export function QuotaCard({
     return null
   }
 
-  const harnessName = data.harness === 'codex' ? 'OpenAI Codex' : 'Google Antigravity'
+  const harnessName = HARNESS_DISPLAY_NAMES[data.harness] ?? data.harness
   const allWindows: QuotaWindow[] = []
   if (data.primary) {
     allWindows.push(data.primary)
@@ -292,11 +321,7 @@ export function QuotaCard({
       {/* Header: White Icon + Title + Plan Label + Refresh */}
       <div className="flex items-center justify-between gap-2 pb-2 border-b border-white/10">
         <div className="flex items-center gap-2 min-w-0">
-          {data.harness === 'antigravity' ? (
-            <AntigravityIcon className="w-4 h-4 text-white shrink-0" />
-          ) : (
-            <CodexIcon className="w-4 h-4 text-white shrink-0" />
-          )}
+          <HarnessIcon harness={data.harness} className="w-4 h-4 text-white shrink-0" />
           <span className="font-bold text-xs tracking-tight text-white/95 truncate">
             {harnessName}
           </span>
@@ -414,7 +439,7 @@ export function getQuotaMiniBadgeTone(remainingPercent: number) {
 export function QuotaMiniBadge({
   harness,
 }: {
-  harness: 'codex' | 'antigravity'
+  harness: QuotaHarness
 }) {
   const { data } = useHarnessQuota(harness)
   const now = useQuotaTicker()
@@ -427,7 +452,7 @@ export function QuotaMiniBadge({
   const countdown = primary.resets_at
     ? formatCountdown(primary.resets_at, now, { short: true })
     : null
-  const harnessLabel = data.harness === 'codex' ? 'Codex' : 'Antigravity'
+  const harnessLabel = HARNESS_SHORT_NAMES[data.harness] ?? data.harness
 
   return (
     <span
@@ -456,14 +481,15 @@ export function QuotaSideRail({
 }: {
   onOverlayHeightChange?: (height: number) => void
   uiScale?: number
-  revealRequest?: { id: number; harness: 'codex' | 'antigravity' } | null
+  revealRequest?: { id: number; harness: QuotaHarness } | null
   onRevealHandled?: (id: number) => void
 }) {
+  const claude = useHarnessQuota('claude')
   const codex = useHarnessQuota('codex')
   const antigravity = useHarnessQuota('antigravity')
   const now = useQuotaTicker()
 
-  const [activePopover, setActivePopover] = useState<'codex' | 'antigravity' | null>(null)
+  const [activePopover, setActivePopover] = useState<QuotaHarness | null>(null)
   const [prevRevealId, setPrevRevealId] = useState<number | null>(null)
   if (revealRequest && revealRequest.id !== prevRevealId) {
     setPrevRevealId(revealRequest.id)
@@ -511,7 +537,7 @@ export function QuotaSideRail({
   }, [activePopover])
 
   const items: {
-    harness: 'antigravity' | 'codex'
+    harness: QuotaHarness
     data: HarnessQuotaSummary
     isRefreshing: boolean
     refresh: () => Promise<void> | void
@@ -524,7 +550,7 @@ export function QuotaSideRail({
       data: antigravity.data,
       isRefreshing: antigravity.isRefreshing,
       refresh: antigravity.refresh,
-      name: 'Google Antigravity',
+      name: HARNESS_DISPLAY_NAMES.antigravity,
     })
   }
   if (codex.data && codex.data.connected) {
@@ -533,7 +559,16 @@ export function QuotaSideRail({
       data: codex.data,
       isRefreshing: codex.isRefreshing,
       refresh: codex.refresh,
-      name: 'OpenAI Codex',
+      name: HARNESS_DISPLAY_NAMES.codex,
+    })
+  }
+  if (claude.data && claude.data.connected) {
+    items.push({
+      harness: 'claude',
+      data: claude.data,
+      isRefreshing: claude.isRefreshing,
+      refresh: claude.refresh,
+      name: HARNESS_DISPLAY_NAMES.claude,
     })
   }
 
@@ -695,11 +730,7 @@ export function QuotaSideRail({
               </svg>
 
               {/* Provider Icon (Both in pure clean white!) */}
-              {item.harness === 'antigravity' ? (
-                <AntigravityIcon className="w-5 h-5 text-white shrink-0" />
-              ) : (
-                <CodexIcon className="w-5 h-5 text-white shrink-0" />
-              )}
+              <HarnessIcon harness={item.harness} className="w-5 h-5 text-white shrink-0" />
             </button>
 
             {/* Percentage text right below (Clean white Codeburn style) */}

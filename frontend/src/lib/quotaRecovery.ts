@@ -6,7 +6,20 @@ export const RESET_GRACE_PERIOD_MS = 3000
 export const RESET_RETRY_INTERVAL_MS = 30_000
 export const MAX_RESET_RETRIES = 3
 
-export type QuotaHarness = 'codex' | 'antigravity'
+export type QuotaHarness = 'codex' | 'antigravity' | 'claude'
+
+/** Map a session `source` (Claude Code reports 'cc') to the harness that owns its quota. */
+export function quotaHarnessForSource(source: string | null | undefined): QuotaHarness | null {
+  switch (source) {
+    case 'cc':
+      return 'claude'
+    case 'codex':
+    case 'antigravity':
+      return source
+    default:
+      return null
+  }
+}
 
 export type WindowStatus = 'normal' | 'armed'
 
@@ -87,7 +100,7 @@ export function createQuotaRecoveryStateMachine(): QuotaRecoveryStateMachine {
     }
 
     const harness = summary.harness
-    if (harness !== 'codex' && harness !== 'antigravity') {
+    if (harness !== 'codex' && harness !== 'antigravity' && harness !== 'claude') {
       return null
     }
 
@@ -175,24 +188,20 @@ export function createQuotaRecoveryStateMachine(): QuotaRecoveryStateMachine {
 // the active harness (e.g. side rail + bubble + stats view) stay synchronized.
 export type QuotaSubscriber = (data: HarnessQuotaSummary | null) => void
 
-const subscribers: {
-  codex: Set<QuotaSubscriber>
-  antigravity: Set<QuotaSubscriber>
-} = {
+const subscribers: Record<QuotaHarness, Set<QuotaSubscriber>> = {
   codex: new Set(),
   antigravity: new Set(),
+  claude: new Set(),
 }
 
-const memoryCache: {
-  codex: HarnessQuotaSummary | null
-  antigravity: HarnessQuotaSummary | null
-} = {
+const memoryCache: Record<QuotaHarness, HarnessQuotaSummary | null> = {
   codex: null,
   antigravity: null,
+  claude: null,
 }
 
 function updateHarnessQuotaCache(
-  harness: 'codex' | 'antigravity',
+  harness: QuotaHarness,
   summary: HarnessQuotaSummary | null,
 ) {
   memoryCache[harness] = summary
@@ -206,7 +215,7 @@ function updateHarnessQuotaCache(
 }
 
 export async function fetchHarnessQuota(
-  harness: 'codex' | 'antigravity',
+  harness: QuotaHarness,
   forceRefresh = false,
 ): Promise<HarnessQuotaSummary | null> {
   try {
@@ -223,7 +232,7 @@ export async function fetchHarnessQuota(
 }
 
 export function subscribeHarnessQuota(
-  harness: 'codex' | 'antigravity',
+  harness: QuotaHarness,
   cb: QuotaSubscriber,
 ): () => void {
   subscribers[harness].add(cb)
@@ -240,7 +249,7 @@ export function subscribeHarnessQuota(
 }
 
 export function getHarnessQuotaCache(
-  harness: 'codex' | 'antigravity',
+  harness: QuotaHarness,
 ): HarnessQuotaSummary | null {
   return memoryCache[harness]
 }
