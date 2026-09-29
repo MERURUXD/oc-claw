@@ -17129,12 +17129,18 @@ try {
 
     // Update ~/.claude/settings.json to register hooks
     let settings_path = claude_dir.join("settings.json");
-    let mut settings: serde_json::Value = if settings_path.exists() {
+    let original: serde_json::Value = if settings_path.exists() {
         let content = std::fs::read_to_string(&settings_path).map_err(|e| e.to_string())?;
-        serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
+        // Never fall back to an empty object here: the file is rewritten below,
+        // so an unparseable settings.json would otherwise be replaced by just
+        // our hooks and the user's other settings would be lost.
+        serde_json::from_str(&content).map_err(|e| {
+            format!("{} is not valid JSON ({e}); leaving it untouched", settings_path.display())
+        })?
     } else {
         serde_json::json!({})
     };
+    let mut settings = original.clone();
 
     // On Windows, Claude Code runs hooks via bash (Git Bash), so the command
     // must be bash-compatible. We call powershell/pwsh with forward-slash path.
@@ -17146,6 +17152,31 @@ try {
     );
     #[cfg(not(windows))]
     let hook_path_str = hook_path.to_string_lossy().to_string();
+
+    register_claude_hooks(&mut settings, &hook_path_str)?;
+
+    // Skip the write when nothing changed so an app start does not touch a file
+    // Claude Code may be reading or writing at the same moment.
+    if settings == original {
+        return Ok(());
+    }
+
+    // Write to a sibling temp file and rename so a crash mid-write cannot leave a
+    // truncated settings.json behind.
+    let tmp_path = claude_dir.join("settings.json.ooclaw-tmp");
+    std::fs::write(&tmp_path, serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp_path, &settings_path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        e.to_string()
+    })?;
+
+    Ok(())
+}
+
+/// Register oc-claw's hook command for every Claude Code event it observes,
+/// replacing any earlier oc-claw entries and leaving other tools' hooks alone.
+fn register_claude_hooks(settings: &mut serde_json::Value, hook_path_str: &str) -> Result<(), String> {
     let hooks = settings.as_object_mut().ok_or("settings not object")?
         .entry("hooks").or_insert(serde_json::json!({}))
         .as_object_mut().ok_or("hooks not object")?;
@@ -17159,13 +17190,22 @@ try {
         serde_json::json!({"matcher": "manual", "hooks": hook_entry}),
     ];
 
+    // Hooks stay synchronous on purpose: Claude Code waits for each one, which
+    // keeps events arriving in order (a fast tool's PostToolUse must not overtake
+    // its PreToolUse). `async: true` would remove that guarantee.
     let hook_configs: Vec<(&str, &Vec<serde_json::Value>)> = vec![
         ("UserPromptSubmit", &without_matcher),
         ("PreToolUse", &with_matcher),
         ("PostToolUse", &with_matcher),
+        // PostToolUse does not fire for a failed tool call.
+        ("PostToolUseFailure", &with_matcher),
         ("PermissionRequest", &with_matcher),
         ("PreCompact", &pre_compact),
         ("Stop", &without_matcher),
+        // Replaces Stop when a turn ends on an API error such as a rate limit.
+        ("StopFailure", &without_matcher),
+        // SubagentStart/SubagentStop are the balanced pair that tracks running subagents.
+        ("SubagentStart", &without_matcher),
         ("SubagentStop", &without_matcher),
         ("SessionStart", &without_matcher),
         ("SessionEnd", &without_matcher),
@@ -17190,9 +17230,6 @@ try {
             arr.push(config.clone());
         }
     }
-
-    std::fs::write(&settings_path, serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
 
     Ok(())
 }
@@ -17816,6 +17853,35 @@ fn is_compaction_session_start(event: &serde_json::Value) -> bool {
     event.get("source").and_then(|v| v.as_str()) == Some("compact")
 }
 
+/// Net change to a session's running-subagent counter caused by one hook event.
+///
+/// Claude Code reports each subagent with a balanced `SubagentStart` /
+/// `SubagentStop` pair, so those are the only events counted for it. Counting
+/// `PreToolUse(Agent)` as well would be unbalanced: a denied or failed Agent
+/// call never produces a `SubagentStop`, which left the counter above zero and
+/// suppressed the turn's completion notification.
+fn subagent_counter_delta(
+    hook_event: &str,
+    raw_hook_event: &str,
+    tool_name: &str,
+    session_source: &str,
+) -> i32 {
+    match hook_event {
+        "SubagentStart" => 1,
+        "SubagentStop" => -1,
+        "PreToolUse" if raw_hook_event == "subagentStart" => 1,
+        "PreToolUse" if tool_name == "invoke_subagent" => 1,
+        "PreToolUse" if tool_name == "Agent" && session_source != "cc" => 1,
+        _ => 0,
+    }
+}
+
+/// `StopFailure` ends a turn on an API error (rate limit, overload, auth) and
+/// replaces `Stop`, which does not fire in that case.
+fn is_stop_failure_event(raw_hook_event: &str) -> bool {
+    matches!(raw_hook_event, "StopFailure" | "stopFailure")
+}
+
 fn is_codex_internal_utility_event(event: &serde_json::Value) -> bool {
     let source = event.get("source").and_then(|v| v.as_str()).unwrap_or("");
     let model = event.get("model").and_then(|v| v.as_str()).unwrap_or("");
@@ -17921,6 +17987,98 @@ fn is_codex_internal_utility_session(session: &ClaudeSession) -> bool {
     last_lower.starts_with("memories -")
         || last_lower.starts_with("## memory")
         || last_lower.starts_with("# memory")
+}
+
+#[cfg(test)]
+mod claude_hook_tests {
+    use super::*;
+
+    #[test]
+    fn claude_subagents_are_counted_only_by_the_balanced_start_stop_pair() {
+        assert_eq!(subagent_counter_delta("SubagentStart", "SubagentStart", "", "cc"), 1);
+        assert_eq!(subagent_counter_delta("SubagentStop", "SubagentStop", "", "cc"), -1);
+        // A denied or failed Agent call never produces SubagentStop, so it must not count.
+        assert_eq!(subagent_counter_delta("PreToolUse", "PreToolUse", "Agent", "cc"), 0);
+        assert_eq!(subagent_counter_delta("PostToolUse", "PostToolUse", "Agent", "cc"), 0);
+    }
+
+    #[test]
+    fn other_harnesses_keep_their_subagent_counting() {
+        assert_eq!(subagent_counter_delta("PreToolUse", "PreToolUse", "Agent", "codex"), 1);
+        assert_eq!(subagent_counter_delta("PreToolUse", "PreToolUse", "invoke_subagent", "hermes"), 1);
+        assert_eq!(subagent_counter_delta("PreToolUse", "subagentStart", "", "cursor"), 1);
+        assert_eq!(subagent_counter_delta("PreToolUse", "PreToolUse", "Bash", "codex"), 0);
+    }
+
+    #[test]
+    fn stop_failure_is_recognised_only_for_its_own_event() {
+        assert!(is_stop_failure_event("StopFailure"));
+        assert!(is_stop_failure_event("stopFailure"));
+        assert!(!is_stop_failure_event("Stop"));
+        assert!(!is_stop_failure_event("SubagentStop"));
+    }
+
+    fn event_commands(settings: &serde_json::Value, event: &str) -> Vec<String> {
+        settings["hooks"][event]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .flat_map(|e| e["hooks"].as_array().cloned().unwrap_or_default())
+                    .filter_map(|h| h["command"].as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn register_claude_hooks_covers_failure_and_subagent_events() {
+        let mut settings = serde_json::json!({});
+        register_claude_hooks(&mut settings, "/home/u/.claude/hooks/ooclaw-hook.sh").unwrap();
+        for event in [
+            "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure",
+            "PermissionRequest", "PreCompact", "Stop", "StopFailure",
+            "SubagentStart", "SubagentStop", "SessionStart", "SessionEnd",
+        ] {
+            assert_eq!(
+                event_commands(&settings, event).iter().filter(|c| c.contains("ooclaw-hook")).count(),
+                if event == "PreCompact" { 2 } else { 1 },
+                "{event} should be registered exactly once per matcher",
+            );
+            // Observation hooks must stay synchronous so events keep their order.
+            assert!(!settings["hooks"][event].to_string().contains("\"async\""));
+        }
+    }
+
+    #[test]
+    fn register_claude_hooks_is_idempotent_and_keeps_foreign_hooks() {
+        let mut settings = serde_json::json!({
+            "theme": "dark",
+            "hooks": {
+                "Stop": [{"hooks": [{"type": "command", "command": "node other-tool.js"}]}]
+            }
+        });
+        register_claude_hooks(&mut settings, "hook-a --file ooclaw-hook.ps1").unwrap();
+        // Re-registering with a different command replaces our old entry, not the other tool's.
+        register_claude_hooks(&mut settings, "hook-b --file ooclaw-hook.ps1").unwrap();
+        let once = settings.clone();
+        register_claude_hooks(&mut settings, "hook-b --file ooclaw-hook.ps1").unwrap();
+
+        assert_eq!(settings, once);
+        assert_eq!(settings["theme"], "dark");
+        let stop = event_commands(&settings, "Stop");
+        assert!(stop.contains(&"node other-tool.js".to_string()));
+        assert_eq!(stop.iter().filter(|c| c.contains("ooclaw-hook")).count(), 1);
+        assert!(stop.contains(&"hook-b --file ooclaw-hook.ps1".to_string()));
+    }
+
+    #[test]
+    fn register_claude_hooks_rejects_malformed_settings_instead_of_replacing_them() {
+        let mut not_object = serde_json::json!([1, 2]);
+        assert!(register_claude_hooks(&mut not_object, "ooclaw-hook").is_err());
+        let mut bad_event = serde_json::json!({"hooks": {"Stop": "oops"}});
+        assert!(register_claude_hooks(&mut bad_event, "ooclaw-hook").is_err());
+    }
 }
 
 #[cfg(test)]
@@ -19911,7 +20069,7 @@ fn process_claude_event(
             "agentStop" => "Stop".to_string(),
             "StopFailure" | "stopFailure" => "Stop".to_string(),
             "preToolUse" => "PreToolUse".to_string(),
-            "postToolUse" | "postToolUseFailure" => "PostToolUse".to_string(),
+            "postToolUse" | "postToolUseFailure" | "PostToolUseFailure" => "PostToolUse".to_string(),
             "subagentStart" => "PreToolUse".to_string(),
             "subagentStop" => "SubagentStop".to_string(),
             "preCompact" => "PreCompact".to_string(),
@@ -20201,17 +20359,17 @@ fn process_claude_event(
                     session.activity = None;
                     session.activity_origin = None;
                     session.pending_interaction = None;
-                } else if hook_event == "SubagentStart"
-                    || (hook_event == "PreToolUse" && (tool_name == "Agent" || tool_name == "invoke_subagent"))
-                    || raw_hook_event == "subagentStart"
-                {
-                    session.pending_agents += 1;
-                    log::info!("[claude_event] session={} Agent launched, pending_agents={}",
-                        &session_id[..session_id.len().min(8)], session.pending_agents);
-                } else if hook_event == "SubagentStop" {
-                    session.pending_agents = session.pending_agents.saturating_sub(1);
-                    log::info!("[claude_event] session={} SubagentStop, pending_agents={}",
-                        &session_id[..session_id.len().min(8)], session.pending_agents);
+                } else {
+                    let delta = subagent_counter_delta(&hook_event, &raw_hook_event, tool_name, &session.source);
+                    if delta > 0 {
+                        session.pending_agents += 1;
+                        log::info!("[claude_event] session={} Agent launched, pending_agents={}",
+                            &session_id[..session_id.len().min(8)], session.pending_agents);
+                    } else if delta < 0 {
+                        session.pending_agents = session.pending_agents.saturating_sub(1);
+                        log::info!("[claude_event] session={} SubagentStop, pending_agents={}",
+                            &session_id[..session_id.len().min(8)], session.pending_agents);
+                    }
                 }
 
                 if !is_stale_turn_stop {
@@ -20474,7 +20632,13 @@ fn process_claude_event(
                 // is already looking at this terminal tab. If so, skip setting
                 // last_response so the completion popup never triggers.
                 if (hook_event == "Stop" || hook_event == "GatewayAgentEnd") && !is_stale_turn_stop {
-                    let interrupted = stop_event_was_interrupted(&event, &session.source, &claude_status);
+                    let stop_failure = is_stop_failure_event(&raw_hook_event);
+                    if stop_failure {
+                        // The turn is over; nothing launched by it can still be pending.
+                        session.pending_agents = 0;
+                    }
+                    let interrupted = stop_failure
+                        || stop_event_was_interrupted(&event, &session.source, &claude_status);
                     // CC: check if the user is looking at this session's Ghostty tab
                     // Cursor: check if Cursor (or oc-claw) is the frontmost app.
                     // If a terminal ID is missing (older hooks / non-Ghostty),
