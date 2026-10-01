@@ -13,8 +13,8 @@ import { CreateCharacterModal } from './components/CreateCharacterModal'
 import { ClaudeStatsView } from './components/ClaudeStatsView'
 import { QuotaSideRail } from './components/QuotaCapsule'
 import { ChatList } from './components/ChatList'
-import { getStore, DEFAULT_CHAR, DEFAULT_CHAR_NAME, loadCharacters, loadOcConnections, saveOcConnections } from './lib/store'
-import type { AgentMetrics, BubbleSessionDetail, BubbleStyle, BubbleTransitionEvent, HarnessQuotaSummary, MascotBubblePayload, OcConnection, SubagentDetail } from './lib/types'
+import { getStore, getBubbleStatusMotion, DEFAULT_CHAR, DEFAULT_CHAR_NAME, loadCharacters, loadOcConnections, saveOcConnections, setBubbleStatusMotion as persistBubbleStatusMotion } from './lib/store'
+import type { AgentMetrics, BubbleSessionDetail, BubbleStatusMotion, BubbleStyle, BubbleTransitionEvent, HarnessQuotaSummary, MascotBubblePayload, OcConnection, SubagentDetail } from './lib/types'
 import { calculateRemainingPercent, createQuotaRecoveryStateMachine, computeResetCheckDelay, extractQuotaWindows, fetchHarnessQuota, subscribeHarnessQuota, type QuotaHarness, type QuotaRecoveryStateMachine, type WindowRecord } from './lib/quotaRecovery'
 import { deriveSessionActivity, isSameBubblePayload } from './lib/sessionActivity'
 import {
@@ -676,6 +676,10 @@ export default function Mini() {
   const [bubbleStyle, setBubbleStyle] = useState<BubbleStyle>('compact')
   const bubbleStyleRef = useRef<BubbleStyle>('compact')
   bubbleStyleRef.current = bubbleStyle
+  // Running-status animation inside the bubble. The `mascot-bubble` window
+  // resolves the persisted value itself and listens for live updates, so this
+  // window only owns the settings control.
+  const [bubbleStatusMotion, setBubbleStatusMotionStyle] = useState<BubbleStatusMotion>('matrix')
   const lastActiveSessionRef = useRef<any>(null)
   const lastBubblePayloadRef = useRef<MascotBubblePayload>({ style: 'compact', running: 0, waiting: 0, activeSession: null, activeSessions: [] })
   const bubbleActiveSessionOrderRef = useRef<string[]>([])
@@ -2817,6 +2821,7 @@ export default function Mini() {
         setBubbleStyle(bs)
         bubbleStyleRef.current = bs
       }
+      setBubbleStatusMotionStyle(await getBubbleStatusMotion())
       invoke('get_ui_scale')
         .then((s) => {
           if (typeof s === 'number' && s > 0) setUiScale(s)
@@ -8687,6 +8692,11 @@ export default function Mini() {
                     <div className="h-full overflow-y-auto bg-[#151515] scrollbar-hidden">
                       <SettingsTab
                         bubbleStyle={bubbleStyle}
+                        bubbleStatusMotion={bubbleStatusMotion}
+                        onChangeBubbleStatusMotion={async (v) => {
+                          setBubbleStatusMotionStyle(v)
+                          await persistBubbleStatusMotion(v)
+                        }}
                         onDebugInjectPreset={applyDebugInjectPreset}
                         onClearDebugInject={clearDebugInjectSessions}
                         debugInjectCount={debugInjectSessions.length}

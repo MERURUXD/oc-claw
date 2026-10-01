@@ -1,4 +1,5 @@
-/* Bubble status motion: 5×5 Dot Matrix state indicators and smooth transitions.
+/* Bubble status motion: the two switchable running-status indicators and their
+ * transitions — a 5×5 dot matrix (default) and the thinking-orbs thought orbs.
  * Replaces the legacy running spinner patch with deterministic dot-matrix animation.
  */
 
@@ -75,4 +76,33 @@
     animation: none !important;
     opacity: var(--dot-matrix-resting, 1) !important;
   }
+}
+
+/* ── thinking-orbs status indicator ──────────────────────────────────────
+ * Alternative to the dot matrix (settings → 气泡运行动画). It occupies exactly
+ * the box the matrix uses, so switching styles does not change bubble geometry.
+ * Animation, pausing and the reduced-motion static frame are owned by the
+ * thinking-orbs canvas renderer, so no keyframes live here.
+ */
+.bubble-status-orb {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  line-height: 0;
+  vertical-align: middle;
+}
+
+.bubble-status-orb--detailed {
+  width: 14px;
+  height: 14px;
+}
+
+.bubble-status-orb--compact {
+  width: 10px;
+  height: 10px;
+}
+
+.bubble-status-orb-canvas {
+  display: block;
 }

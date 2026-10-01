@@ -1,7 +1,13 @@
 import { invoke } from '@tauri-apps/api/core'
 import { emit } from '@tauri-apps/api/event'
 import { load } from '@tauri-apps/plugin-store'
-import type { BubbleStyle, CharacterMeta, OcConnection } from './types'
+import {
+  BUBBLE_STATUS_MOTION_DEFAULT,
+  BUBBLE_STATUS_MOTION_EVENT,
+  BUBBLE_STATUS_MOTION_STORE_KEY,
+  normalizeBubbleStatusMotion,
+} from './bubbleStatusMotion.ts'
+import type { BubbleStatusMotion, BubbleStyle, CharacterMeta, OcConnection } from './types'
 
 export async function getStore() {
   return load('settings.json', { defaults: {}, autoSave: true })
@@ -16,6 +22,53 @@ export async function setBubbleStyle(style: BubbleStyle) {
   const store = await getStore()
   await store.set('bubble_style', style)
   await store.save()
+}
+
+/**
+ * Bubble status-indicator animation style. Read from the shared settings store
+ * so every window (mini + mascot-bubble) resolves the same value; the
+ * `localStorage` mirror keeps the style switchable in a plain browser preview,
+ * where the Tauri store plugin is unavailable.
+ */
+export async function getBubbleStatusMotion(): Promise<BubbleStatusMotion> {
+  try {
+    const store = await getStore()
+    const stored = normalizeBubbleStatusMotion(await store.get(BUBBLE_STATUS_MOTION_STORE_KEY))
+    if (stored) return stored
+  } catch {
+    // Not running inside Tauri (browser preview) — fall through to localStorage.
+  }
+  try {
+    const mirrored = normalizeBubbleStatusMotion(
+      localStorage.getItem(BUBBLE_STATUS_MOTION_STORE_KEY)
+    )
+    if (mirrored) return mirrored
+  } catch {
+    // Storage disabled (private mode) — the default keeps the shipped style.
+  }
+  return BUBBLE_STATUS_MOTION_DEFAULT
+}
+
+/** Persists the style and pushes it live into the `mascot-bubble` window. */
+export async function setBubbleStatusMotion(motion: BubbleStatusMotion) {
+  try {
+    const store = await getStore()
+    await store.set(BUBBLE_STATUS_MOTION_STORE_KEY, motion)
+    await store.save()
+  } catch {
+    // Ignore: the localStorage mirror below still carries the value.
+  }
+  try {
+    localStorage.setItem(BUBBLE_STATUS_MOTION_STORE_KEY, motion)
+  } catch {
+    // Ignore: nothing to mirror.
+  }
+  try {
+    await emit(BUBBLE_STATUS_MOTION_EVENT, motion)
+  } catch {
+    // No event bus outside Tauri: the bubble window still picks the value up
+    // from the store on its next mount.
+  }
 }
 
 // On Windows, WebView2 maps custom URI schemes to http://<scheme>.localhost/

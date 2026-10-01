@@ -6,6 +6,13 @@ export type ClaudeStatsSource = 'cc' | 'codex' | 'cursor' | 'gemini' | 'hermes' 
 
 export type BubbleStyle = 'compact' | 'detailed'
 
+/**
+ * Animation style of the bubble's running-status indicator: the deterministic
+ * 5×5 dot matrix (`matrix`, default) or the thinking-orbs dotted thought orbs
+ * (`orbs`). See `src/lib/bubbleStatusMotion.ts`.
+ */
+export type BubbleStatusMotion = 'matrix' | 'orbs'
+
 export interface SubagentDetail {
   id: string
   role: string

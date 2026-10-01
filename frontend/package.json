@@ -26,7 +26,8 @@
     "react-dom": "^19.2.4",
     "react-i18next": "^17.0.1",
     "react-markdown": "^10.1.0",
-    "tailwindcss": "^4.2.2"
+    "tailwindcss": "^4.2.2",
+    "thinking-orbs": "^0.3.2"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",
