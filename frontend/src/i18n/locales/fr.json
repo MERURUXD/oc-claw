@@ -177,7 +177,7 @@
     "bubbleStatusMotion": "Animation d'état de la bulle",
     "bubbleStatusMotionDesc": "Animation de l'indicateur d'exécution dans la bulle d'état",
     "bubbleStatusMotionMatrix": "Matrice de points",
-    "bubbleStatusMatrixModeDesc": "Onde déterministe 5×5, teintée comme le texte d'état",
+    "bubbleStatusMotionMatrixModeDesc": "Onde déterministe 5×5, teintée comme le texte d'état",
     "bubbleStatusMotionOrbs": "Orbes de pensée",
     "bubbleStatusMotionOrbsDesc": "Animation d'orbites pointillées thinking-orbs, encombrement identique",
     "bubbleActiveOthers": "+{{count}} autres",

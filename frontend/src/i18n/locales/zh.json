@@ -205,7 +205,7 @@
     "bubbleStatusMotion": "气泡运行动画",
     "bubbleStatusMotionDesc": "状态气泡中运行指示器的动画样式",
     "bubbleStatusMotionMatrix": "点阵",
-    "bubbleStatusMatrixModeDesc": "5×5 点阵波形，与状态文字同色",
+    "bubbleStatusMotionMatrixModeDesc": "5×5 点阵波形，与状态文字同色",
     "bubbleStatusMotionOrbs": "思维球",
     "bubbleStatusMotionOrbsDesc": "thinking-orbs 光点轨道动画，占用空间完全相同",
     "bubbleActiveOthers": "+{{count}} 个其他任务",

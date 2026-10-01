@@ -177,7 +177,7 @@
     "bubbleStatusMotion": "말풍선 실행 애니메이션",
     "bubbleStatusMotionDesc": "말풍선 내부 실행 상태 표시기에 사용되는 애니메이션 스타일",
     "bubbleStatusMotionMatrix": "닷 매트릭스",
-    "bubbleStatusMatrixModeDesc": "결정적인 5×5 점 매트릭스 웨이브, 상태 텍스트와 같은 색상",
+    "bubbleStatusMotionMatrixModeDesc": "결정적인 5×5 점 매트릭스 웨이브, 상태 텍스트와 같은 색상",
     "bubbleStatusMotionOrbs": "싱킹 오브",
     "bubbleStatusMotionOrbsDesc": "thinking-orbs 점 궤도 애니메이션, 동일한 크기",
     "bubbleActiveOthers": "+{{count}}개 기타 작업",

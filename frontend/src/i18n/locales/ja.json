@@ -178,7 +178,7 @@
     "bubbleStatusMotion": "吹き出しの稼働アニメーション",
     "bubbleStatusMotionDesc": "バブル内にある稼働ステータスインジケーターのアニメーションスタイル",
     "bubbleStatusMotionMatrix": "ドットマトリクス",
-    "bubbleStatusMatrixModeDesc": "決定論的な 5×5 ドット波形、状態テキストと同じ色",
+    "bubbleStatusMotionMatrixModeDesc": "決定論的な 5×5 ドット波形、状態テキストと同じ色",
     "bubbleStatusMotionOrbs": "シンキングオーブ",
     "bubbleStatusMotionOrbsDesc": "thinking-orbs の軌道ドットアニメーション（占有サイズは同一）",
     "bubbleActiveOthers": "+{{count}} 件の他タスク",

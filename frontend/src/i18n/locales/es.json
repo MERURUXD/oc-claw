@@ -177,7 +177,7 @@
     "bubbleStatusMotion": "Animación de estado de la burbuja",
     "bubbleStatusMotionDesc": "Animación del indicador de ejecución dentro de la burbuja de estado",
     "bubbleStatusMotionMatrix": "Matriz de puntos",
-    "bubbleStatusMatrixModeDesc": "Onda determinista de 5×5 puntos, con el color del texto",
+    "bubbleStatusMotionMatrixModeDesc": "Onda determinista de 5×5 puntos, con el color del texto",
     "bubbleStatusMotionOrbs": "Orbes de pensamiento",
     "bubbleStatusMotionOrbsDesc": "Animación de órbitas punteadas thinking-orbs, mismo espacio",
     "bubbleActiveOthers": "+{{count}} otros",

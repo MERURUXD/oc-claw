@@ -205,7 +205,7 @@
     "bubbleStatusMotion": "Bubble Status Animation",
     "bubbleStatusMotionDesc": "Animation used by the running-status indicator inside the desktop bubble",
     "bubbleStatusMotionMatrix": "Dot Matrix",
-    "bubbleStatusMatrixModeDesc": "Deterministic 5×5 matrix wave, tinted like the status text",
+    "bubbleStatusMotionMatrixModeDesc": "Deterministic 5×5 matrix wave, tinted like the status text",
     "bubbleStatusMotionOrbs": "Thinking Orbs",
     "bubbleStatusMotionOrbsDesc": "thinking-orbs dotted orbit animation, identical footprint",
     "bubbleActiveOthers": "+{{count}} others",
