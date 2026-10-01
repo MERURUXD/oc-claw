@@ -5,6 +5,15 @@ import { useTranslation } from 'react-i18next'
 import type { TFunction } from 'i18next'
 import { motion, useReducedMotion } from 'motion/react'
 import { BubbleDotMatrix, toDotMatrixState } from './BubbleDotMatrix'
+import { BubbleStatusOrb } from './BubbleStatusOrb'
+import {
+  BUBBLE_STATUS_MOTION_DEFAULT,
+  BUBBLE_STATUS_MOTION_EVENT,
+  normalizeBubbleStatusMotion,
+  readBubbleStatusMotionFromHash,
+  toOrbState,
+} from '../lib/bubbleStatusMotion'
+import type { BubbleStatusMotion } from '../lib/types'
 import type {
   BubbleSessionDetail,
   BubbleTransitionEvent,
@@ -32,6 +41,7 @@ import {
   type GeometryLifecycleSnapshot,
 } from '../lib/bubbleGeometryLifecycle'
 import { traceBubbleEvent } from '../lib/bubbleTrace'
+import { getBubbleStatusMotion } from '../lib/store'
 import { QuotaMiniBadge } from './QuotaCapsule'
 import { quotaHarnessForSource } from '../lib/quotaRecovery'
 import { SHIMMER_TIMING, isShimmerActive } from '../lib/bubbleShimmer'
@@ -227,8 +237,36 @@ function hashSessionId(id: string): number {
   return Math.abs(hash)
 }
 
-function StatusIcon({ kind, isMeasure }: { kind: BubbleStatusKind; isMeasure?: boolean }) {
-  return <BubbleDotMatrix state={toDotMatrixState(kind)} size="detailed" isMeasure={isMeasure} />
+function StatusIcon({
+  kind,
+  isMeasure,
+  motionStyle,
+}: {
+  kind: BubbleStatusKind
+  isMeasure?: boolean
+  motionStyle: BubbleStatusMotion
+}) {
+  const matrixState = toDotMatrixState(kind)
+  if (motionStyle === 'orbs') {
+    return <BubbleStatusOrb state={toOrbState(matrixState)} isMeasure={isMeasure} />
+  }
+  return <BubbleDotMatrix state={matrixState} size="detailed" isMeasure={isMeasure} />
+}
+
+/**
+ * Compact-capsule indicator: the same two animation styles, in the 10px box.
+ */
+function CompactStatusIcon({
+  matrixState,
+  motionStyle,
+}: {
+  matrixState: 'loading' | 'waiting'
+  motionStyle: BubbleStatusMotion
+}) {
+  if (motionStyle === 'orbs') {
+    return <BubbleStatusOrb state={toOrbState(matrixState)} size="compact" />
+  }
+  return <BubbleDotMatrix state={matrixState} size="compact" />
 }
 
 /**
@@ -385,6 +423,7 @@ interface SessionBubbleRowProps {
   fallbackThinkingText?: string
   showBadge: boolean
   remainingOthers: number
+  motionStyle: BubbleStatusMotion
 }
 
 function SessionBubbleRow({
@@ -402,6 +441,7 @@ function SessionBubbleRow({
   fallbackThinkingText,
   showBadge,
   remainingOthers,
+  motionStyle,
 }: SessionBubbleRowProps) {
   const fallback = fallbackThinkingText || thinkingText
   const status = resolveBubbleStatus(session, t, fallback)
@@ -557,7 +597,7 @@ function SessionBubbleRow({
             <div className={`mascot-bubble-action-line ${status.className}`}>
               <span className={`mascot-bubble-status-badge ${status.className}`}>
                 <span className="mascot-bubble-status-icon" aria-hidden="true">
-                  <StatusIcon kind={status.kind} />
+                  <StatusIcon kind={status.kind} motionStyle={motionStyle} />
                 </span>
                 <span className="mascot-bubble-status-label">{status.statusLabel}</span>
               </span>
@@ -579,6 +619,7 @@ interface MeasureSessionBubbleRowProps {
   fallbackThinkingText?: string
   showBadge: boolean
   remainingOthers: number
+  motionStyle: BubbleStatusMotion
 }
 
 function MeasureSessionBubbleRow({
@@ -587,6 +628,7 @@ function MeasureSessionBubbleRow({
   fallbackThinkingText,
   showBadge,
   remainingOthers,
+  motionStyle,
 }: MeasureSessionBubbleRowProps) {
   const status = resolveBubbleStatus(session, t, fallbackThinkingText)
 
@@ -629,7 +671,7 @@ function MeasureSessionBubbleRow({
             <div className={`mascot-bubble-action-line ${status.className}`}>
               <span className={`mascot-bubble-status-badge ${status.className}`}>
                 <span className="mascot-bubble-status-icon" aria-hidden="true">
-                  <StatusIcon kind={status.kind} isMeasure />
+                  <StatusIcon kind={status.kind} isMeasure motionStyle={motionStyle} />
                 </span>
                 <span className="mascot-bubble-status-label" style={{ whiteSpace: 'nowrap' }}>
                   {status.statusLabel}
@@ -722,6 +764,44 @@ function measureExpectedStackDimensions(
 export default function MascotBubble() {
   const { t } = useTranslation()
   const prefersReducedMotion = useReducedMotion()
+
+  // Status-indicator animation style (mini settings → 气泡运行动画). The shared
+  // settings store owns the value, the mini window pushes live changes over
+  // `mascot-bubble-status-motion`, and `?motion=matrix|orbs` pins it in the
+  // browser preview, where neither the store plugin nor the events resolve.
+  const [hashMotionOverride] = useState<BubbleStatusMotion | null>(() =>
+    typeof window === 'undefined' ? null : readBubbleStatusMotionFromHash(window.location.hash)
+  )
+  const [statusMotion, setStatusMotion] = useState<BubbleStatusMotion>(
+    () => hashMotionOverride ?? BUBBLE_STATUS_MOTION_DEFAULT
+  )
+
+  useEffect(() => {
+    if (hashMotionOverride) return
+    let disposed = false
+    let unlisten: (() => void) | undefined
+
+    getBubbleStatusMotion()
+      .then((stored) => {
+        if (!disposed) setStatusMotion(stored)
+      })
+      .catch(() => {})
+
+    listen<BubbleStatusMotion>(BUBBLE_STATUS_MOTION_EVENT, (e) => {
+      const next = normalizeBubbleStatusMotion(e.payload)
+      if (next && !disposed) setStatusMotion(next)
+    })
+      .then((fn) => {
+        if (disposed) fn()
+        else unlisten = fn
+      })
+      .catch(() => {})
+
+    return () => {
+      disposed = true
+      unlisten?.()
+    }
+  }, [hashMotionOverride])
 
   const [summary, setSummary] = useState<MascotBubblePayload | null>(null)
   const [phase, setPhase] = useState<BubblePhase>('hidden')
@@ -1609,7 +1689,7 @@ export default function MascotBubble() {
               {hasRunning && (
                 <div className="mascot-bubble-item">
                   <span className="mascot-bubble-compact-matrix">
-                    <BubbleDotMatrix state="loading" size="compact" />
+                    <CompactStatusIcon matrixState="loading" motionStyle={statusMotion} />
                   </span>
                   <span className="mascot-bubble-count is-running">{displaySummary.running}</span>
                   <span className="mascot-bubble-label">running</span>
@@ -1621,7 +1701,7 @@ export default function MascotBubble() {
               {hasWaiting && (
                 <div className="mascot-bubble-item">
                   <span className="mascot-bubble-compact-matrix is-waiting">
-                    <BubbleDotMatrix state="waiting" size="compact" />
+                    <CompactStatusIcon matrixState="waiting" motionStyle={statusMotion} />
                   </span>
                   <span className="mascot-bubble-count is-waiting">{displaySummary.waiting}</span>
                   <span className="mascot-bubble-label">waiting</span>
@@ -1688,6 +1768,7 @@ export default function MascotBubble() {
                     thinkingText={fallbackThinkingText}
                     showBadge={showBadge}
                     remainingOthers={remainingOthers}
+                    motionStyle={statusMotion}
                   />
                 )
               })}
@@ -1727,6 +1808,7 @@ export default function MascotBubble() {
                   fallbackThinkingText={fallbackThinkingText}
                   showBadge={showBadge}
                   remainingOthers={remainingOthers}
+                  motionStyle={statusMotion}
                 />
               )
             })}
