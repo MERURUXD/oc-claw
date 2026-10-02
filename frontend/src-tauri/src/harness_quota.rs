@@ -20,6 +20,8 @@ pub struct HarnessQuotaSummary {
     pub primary: Option<QuotaWindow>,
     pub details: Vec<QuotaWindow>,
     pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_message: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -296,6 +298,7 @@ pub fn decode_antigravity_quota_summary(
         primary,
         details,
         updated_at: now,
+        status_message: None,
     }
 }
 
@@ -383,6 +386,7 @@ pub fn decode_antigravity_user_status(
         primary,
         details,
         updated_at: now,
+        status_message: None,
     }
 }
 
@@ -511,6 +515,7 @@ async fn fetch_antigravity_quota(now: u64) -> Result<(HarnessQuotaSummary, Optio
                 primary: None,
                 details: Vec::new(),
                 updated_at: now,
+                status_message: None,
             },
             None,
         ));
@@ -554,6 +559,7 @@ async fn fetch_antigravity_quota(now: u64) -> Result<(HarnessQuotaSummary, Optio
             primary: None,
             details: Vec::new(),
             updated_at: now,
+            status_message: None,
         },
         None,
     ))
@@ -639,6 +645,7 @@ pub fn decode_codex_usage(
         primary,
         details,
         updated_at: now,
+        status_message: None,
     }
 }
 
@@ -719,6 +726,7 @@ async fn fetch_codex_quota(now: u64) -> Result<(HarnessQuotaSummary, Option<u64>
                 primary: None,
                 details: Vec::new(),
                 updated_at: now,
+                status_message: None,
             },
             None,
         ));
@@ -760,6 +768,7 @@ async fn fetch_codex_quota(now: u64) -> Result<(HarnessQuotaSummary, Option<u64>
                     primary: None,
                     details: Vec::new(),
                     updated_at: now,
+                    status_message: None,
                 },
                 None,
             ));
@@ -820,6 +829,7 @@ async fn fetch_codex_quota(now: u64) -> Result<(HarnessQuotaSummary, Option<u64>
                 primary: None,
                 details: Vec::new(),
                 updated_at: now,
+                status_message: None,
             },
             Some(retry_after),
         ));
@@ -850,7 +860,121 @@ const CLAUDE_COOLDOWN_DEFAULT_SECS: u64 = 300;
 const CLAUDE_COOLDOWN_MIN_SECS: u64 = 60;
 const CLAUDE_COOLDOWN_MAX_SECS: u64 = 3600;
 /// In-memory reuse window for a successful poll (Codex/Antigravity use 300s).
-const CLAUDE_CACHE_TTL_SECS: u64 = 600;
+const CLAUDE_CACHE_TTL_SECS: u64 = 120;
+const CLAUDE_NATIVE_TTL_SECS: u64 = 120;
+static CLAUDE_NATIVE_USAGE: std::sync::LazyLock<Mutex<HashMap<String, HarnessQuotaSummary>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static CLAUDE_FETCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+// The identity is process-local, never serialized: CLI may omit account UUIDs.
+// Re-read credentials before reusing quota so an account switch cannot reuse bars.
+static CLAUDE_HTTP_CACHE: Mutex<Option<(String, QuotaCacheEntry)>> = Mutex::new(None);
+
+fn reusable_claude_entry(
+    key: &str,
+    entry: &QuotaCacheEntry,
+    credential: &str,
+    force: bool,
+    now: u64,
+) -> bool {
+    key == credential
+        && !force
+        && entry.cached_at <= now
+        && now - entry.cached_at < CLAUDE_CACHE_TTL_SECS
+        && (entry.backoff_until == 0 || entry.backoff_until > now)
+        && entry
+            .summary
+            .primary
+            .iter()
+            .chain(&entry.summary.details)
+            .all(|w| {
+                w.resets_at
+                    .as_ref()
+                    .and_then(|r| DateTime::parse_from_rfc3339(r).ok())
+                    .is_none_or(|r| r.timestamp() > now as i64)
+            })
+}
+
+/// Statusline schema has a session ID but no account/org. Store it separately:
+/// it cannot overwrite OAuth-owned quota or bypass credential selection.
+pub fn observe_claude_usage(event: &serde_json::Value) -> bool {
+    record_claude_native_usage(&mut CLAUDE_NATIVE_USAGE.lock().unwrap(), event, unix_now())
+}
+
+fn record_claude_native_usage(
+    readings: &mut HashMap<String, HarnessQuotaSummary>,
+    event: &serde_json::Value,
+    now: u64,
+) -> bool {
+    let Some(session) = event["session_id"].as_str().filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let Some(summary) = decode_claude_statusline(event, now) else {
+        return false;
+    };
+    readings.retain(|_, s| s.updated_at <= now && now - s.updated_at < CLAUDE_NATIVE_TTL_SECS);
+    if !readings.contains_key(session) && readings.len() >= 128 {
+        return false;
+    }
+    readings.insert(session.to_owned(), summary);
+    true
+}
+
+fn decode_claude_statusline(event: &serde_json::Value, now: u64) -> Option<HarnessQuotaSummary> {
+    let limits = event.get("rate_limits")?;
+    let window = |key: &str, label: &str| -> Option<QuotaWindow> {
+        let value = limits.get(key)?;
+        let percent = value.get("used_percentage")?.as_f64()?;
+        let reset = value.get("resets_at").and_then(|v| v.as_i64());
+        if reset.is_some_and(|reset| reset <= now as i64) {
+            return None;
+        }
+        Some(QuotaWindow {
+            label: label.into(),
+            percent: percent.clamp(0.0, 100.0),
+            resets_at: reset
+                .and_then(|r| DateTime::from_timestamp(r, 0))
+                .map(|r| r.to_rfc3339()),
+        })
+    };
+    let mut primary = window("five_hour", "5-Hour Window");
+    let mut details: Vec<_> = window("seven_day", "Weekly Window").into_iter().collect();
+    if primary.is_none() && !details.is_empty() {
+        primary = Some(details.remove(0));
+    }
+    primary.as_ref()?;
+    Some(HarnessQuotaSummary {
+        harness: "claude".into(),
+        connected: true,
+        plan_label: None,
+        primary,
+        details,
+        updated_at: now,
+        status_message: None,
+    })
+}
+
+fn unscoped_claude_native_usage(
+    readings: &HashMap<String, HarnessQuotaSummary>,
+    oauth_identity: bool,
+    now: u64,
+) -> Option<HarnessQuotaSummary> {
+    if oauth_identity {
+        return None;
+    }
+    let mut fresh = readings.values().filter(|s| {
+        s.updated_at <= now
+            && now - s.updated_at < CLAUDE_NATIVE_TTL_SECS
+            && s.primary
+                .as_ref()
+                .and_then(|w| w.resets_at.as_ref())
+                .and_then(|r| DateTime::parse_from_rfc3339(r).ok())
+                .is_none_or(|r| r.timestamp() > now as i64)
+    });
+    let only = fresh.next()?.clone();
+    // The aggregate UI has no selected session; don't choose among sessions
+    // whose accounts cannot be proven equal.
+    fresh.next().is_none().then_some(only)
+}
 /// How long a persisted last-good reading may still be shown while the
 /// endpoint is unreachable or cooling down.
 const CLAUDE_LAST_GOOD_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
@@ -883,14 +1007,54 @@ impl ClaudePersistedState {
     }
 
     fn fresh_last_good(&self, now: u64) -> Option<HarnessQuotaSummary> {
-        self.last_good
+        let mut summary = self
+            .last_good
             .clone()
-            .filter(|s| now.saturating_sub(s.updated_at) <= CLAUDE_LAST_GOOD_MAX_AGE_SECS)
+            .filter(|s| s.updated_at <= now && now - s.updated_at <= CLAUDE_LAST_GOOD_MAX_AGE_SECS)?;
+        let usable = |w: &QuotaWindow| {
+            w.resets_at
+                .as_ref()
+                .and_then(|r| DateTime::parse_from_rfc3339(r).ok())
+                .is_none_or(|r| r.timestamp() > now as i64)
+        };
+        summary.primary = summary.primary.filter(&usable);
+        summary.details.retain(usable);
+        if summary.primary.is_none() && !summary.details.is_empty() {
+            summary.primary = Some(summary.details.remove(0));
+        }
+        summary.primary.as_ref()?;
+        Some(summary)
     }
 }
 
 fn claude_state_path() -> Option<std::path::PathBuf> {
     dirs::data_dir().map(|d| d.join(APP_DATA_DIRNAME).join(CLAUDE_STATE_FILE))
+}
+
+/// Never import the legacy shared CLI state: its account cannot be proved.
+/// Custom configs have no verified identity metadata yet, so they use only
+/// token-scoped in-memory reuse rather than borrowing another login's disk data.
+fn scoped_claude_state_path(
+    base: &Path,
+    desktop_key: Option<&str>,
+    cli_identity: Option<&(String, String)>,
+    custom_config: bool,
+) -> Option<std::path::PathBuf> {
+    let key = if let Some(key) = desktop_key {
+        key.to_owned()
+    } else {
+        if custom_config {
+            return None;
+        }
+        let (account, org) = cli_identity?;
+        if account.trim().is_empty() || org.trim().is_empty() {
+            return None;
+        }
+        // JSON encodes both IDs unambiguously; CLI and Desktop namespaces differ.
+        format!("cli-{}", serde_json::to_string(&(account, org)).ok()?)
+    };
+    let safe = percent_encoding::utf8_percent_encode(&key, percent_encoding::NON_ALPHANUMERIC);
+    Some(base.with_file_name(format!("claude-usage-{safe}.json")))
 }
 
 fn load_claude_state(path: &Path) -> ClaudePersistedState {
@@ -933,6 +1097,7 @@ fn disconnected_summary(harness: &str, now: u64) -> HarnessQuotaSummary {
         primary: None,
         details: Vec::new(),
         updated_at: now,
+        status_message: None,
     }
 }
 
@@ -959,10 +1124,7 @@ fn parse_claude_credentials(raw: &str) -> Option<ClaudeOauthCredentials> {
 }
 
 fn claude_config_dir() -> Option<std::path::PathBuf> {
-    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) {
-        return Some(std::path::PathBuf::from(dir));
-    }
-    dirs::home_dir().map(|h| h.join(".claude"))
+    crate::claude_metadata::config_dir()
 }
 
 /// Read Claude Code's subscription login. Windows/Linux keep it in
@@ -1100,6 +1262,7 @@ pub fn decode_claude_usage(
         primary,
         details,
         updated_at: now,
+        status_message: None,
     }
 }
 
@@ -1120,18 +1283,184 @@ fn claude_fallback_summary(state: &ClaudePersistedState, now: u64) -> HarnessQuo
     })
 }
 
-async fn fetch_claude_quota(now: u64) -> Result<(HarnessQuotaSummary, Option<u64>), String> {
-    let creds = match read_claude_credentials().await {
+fn desktop_claude_quota(usage: crate::claude_desktop::Usage, now: u64) -> HarnessQuotaSummary {
+    let mut summary = disconnected_summary("claude", usage.sampled_at);
+    // Desktop samples background usage every 15 minutes, but its UI may stop
+    // refreshing. Retain the actual measurement time and never label old data
+    // as a current balance or invent a reset time absent from the history.
+    if usage.sampled_at > now || now.saturating_sub(usage.sampled_at) > 20 * 60 {
+        let readings = usage
+            .windows
+            .iter()
+            .map(|(label, percent)| format!("{label}已用 {percent}%"))
+            .collect::<Vec<_>>()
+            .join("，");
+        summary.status_message = Some(format!("Claude Desktop 配额缓存已过期（{readings}）。Desktop 更新配额后会自动读取；当前余额未知。"));
+        return summary;
+    }
+    summary.connected = true;
+    let mut windows = usage
+        .windows
+        .into_iter()
+        .map(|(label, percent)| QuotaWindow {
+            label,
+            percent,
+            resets_at: None,
+        })
+        .collect::<Vec<_>>();
+    if !windows.is_empty() {
+        summary.primary = Some(windows.remove(0));
+    }
+    summary.details = windows;
+    summary.status_message =
+        Some("读取自 Claude Desktop 最近的配额记录；该记录未提供重置时间。".into());
+    summary
+}
+
+async fn fetch_claude_quota(
+    now: u64,
+    force: bool,
+) -> Result<(HarnessQuotaSummary, Option<u64>), String> {
+    let cli = read_claude_credentials().await;
+    let expired = cli.as_ref().is_some_and(|c| {
+        c.expires_at_ms
+            .is_some_and(|t| t <= now.saturating_mul(1000) + 30_000)
+    });
+    // A custom CLI config may have a different account; default metadata is
+    // not proof of its identity, so never borrow based on that file.
+    let identity = dirs::home_dir()
+        .filter(|_| {
+            std::env::var_os("CLAUDE_CONFIG_DIR")
+                .filter(|v| !v.is_empty())
+                .is_none()
+        })
+        .and_then(|home| crate::claude_desktop::json_file(&home.join(".claude.json")))
+        .and_then(|json| {
+            Some((
+                json["oauthAccount"]["accountUuid"].as_str()?.to_owned(),
+                json["oauthAccount"]["organizationUuid"]
+                    .as_str()?
+                    .to_owned(),
+            ))
+        });
+    // CLI and Desktop can be different accounts. Only borrow for an expired
+    // CLI login when both IDs match; an absent CLI uses Desktop independently.
+    let desktop = if cli.is_none() {
+        crate::claude_desktop_auth::read_credentials(None, now)
+    } else if expired {
+        identity
+            .as_ref()
+            .and_then(|(a, o)| crate::claude_desktop_auth::read_credentials(Some((a, o)), now))
+    } else {
+        None
+    };
+    let desktop_key = desktop.as_ref().map(|c| c.account_key.clone());
+    let creds = match desktop
+        .map(|d| ClaudeOauthCredentials {
+            access_token: d.access_token,
+            expires_at_ms: Some(d.expires_at_ms),
+            subscription_type: d.subscription_type,
+            rate_limit_tier: d.rate_limit_tier,
+        })
+        .or(cli)
+    {
         Some(c) => c,
-        None => return Ok((disconnected_summary("claude", now), None)),
+        None => {
+            let oauth_identity =
+                identity.is_some() || crate::claude_desktop_auth::has_selected_account();
+            if let Some(native) = unscoped_claude_native_usage(
+                &CLAUDE_NATIVE_USAGE.lock().unwrap(),
+                oauth_identity,
+                now,
+            ) {
+                return Ok((native, None));
+            }
+            if let Some(usage) = crate::claude_desktop::snapshot().usage {
+                return Ok((desktop_claude_quota(usage, now), None));
+            }
+            let mut summary = disconnected_summary("claude", now);
+            summary.status_message = Some("未找到 Claude Code 的订阅登录。Desktop 和终端可能使用独立登录；支持时将自动读取 Claude 提供的配额。".into());
+            return Ok((summary, None));
+        }
     };
 
-    let state_path = claude_state_path();
-    let mut state = state_path
+    let credential_key = creds.access_token.clone();
+    {
+        let mut cache = CLAUDE_HTTP_CACHE.lock().unwrap();
+        if cache.as_ref().is_none_or(|(key, _)| key != &credential_key) {
+            *cache = None;
+            get_cache().lock().unwrap().remove("claude");
+        }
+        if let Some((key, entry)) = cache.as_ref() {
+            if reusable_claude_entry(key, entry, &credential_key, force, now) {
+                return Ok((
+                    entry.summary.clone(),
+                    entry.backoff_until.checked_sub(now).filter(|t| *t > 0),
+                ));
+            }
+        }
+    }
+    // Every persisted reading/cooldown belongs to one known account and org.
+    let state_path = claude_state_path().and_then(|path| {
+        scoped_claude_state_path(
+            &path,
+            desktop_key.as_deref(),
+            identity.as_ref(),
+            std::env::var_os("CLAUDE_CONFIG_DIR").is_some_and(|v| !v.is_empty()),
+        )
+    });
+    let state = state_path
         .as_deref()
         .map(load_claude_state)
         .unwrap_or_default();
+    let result = poll_claude_usage(
+        now,
+        &creds,
+        state_path.as_deref(),
+        state,
+        desktop_key.is_some(),
+    )
+    .await;
+    if let Ok((summary, backoff)) = &result {
+        *CLAUDE_HTTP_CACHE.lock().unwrap() = Some((
+            credential_key,
+            QuotaCacheEntry {
+                cached_at: unix_now(),
+                summary: summary.clone(),
+                backoff_until: backoff.map(|b| now + b).unwrap_or(0),
+            },
+        ));
+    }
+    result
+}
 
+fn claude_rate_limited(
+    now: u64,
+    creds: &ClaudeOauthCredentials,
+    state_path: Option<&Path>,
+    mut state: ClaudePersistedState,
+    cooldown: u64,
+) -> (HarnessQuotaSummary, Option<u64>) {
+    state.retry_at = Some(now + cooldown);
+    state.cooldown_token_expires_at_ms = creds.expires_at_ms;
+    if let Some(path) = state_path {
+        save_claude_state(path, &state);
+    }
+    let mut summary = claude_fallback_summary(&state, now);
+    summary.status_message = Some(format!(
+        "Claude 暂时限制配额查询，将在约 {} 分钟后重试。",
+        cooldown.div_ceil(60)
+    ));
+    (summary, Some(cooldown))
+}
+
+async fn poll_claude_usage(
+    now: u64,
+    creds: &ClaudeOauthCredentials,
+    state_path: Option<&Path>,
+    mut state: ClaudePersistedState,
+    desktop: bool,
+) -> Result<(HarnessQuotaSummary, Option<u64>), String> {
     // Claude Code rotates its refresh token on every refresh. If oc-claw
     // refreshed too, Claude Code's copy of the token could be invalidated and
     // force a re-login, so never refresh or write the credentials file here.
@@ -1152,11 +1481,17 @@ async fn fetch_claude_quota(now: u64) -> Result<(HarnessQuotaSummary, Option<u64
     // checked here rather than only in the in-memory cache so that neither a
     // restart nor a manual refresh can punch through it.
     if let Some(remaining) = state.cooldown_remaining(creds.expires_at_ms, now) {
-        return Ok((claude_fallback_summary(&state, now), Some(remaining)));
+        let mut summary = claude_fallback_summary(&state, now);
+        summary.status_message = Some(format!(
+            "Claude 暂时限制配额查询，将在约 {} 分钟后重试。",
+            remaining.div_ceil(60)
+        ));
+        return Ok((summary, Some(remaining)));
     }
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(12))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 
@@ -1181,18 +1516,15 @@ async fn fetch_claude_quota(now: u64) -> Result<(HarnessQuotaSummary, Option<u64
             "[harness_quota] Claude 429 rate limit hit, cooling down for {}s",
             cooldown
         );
-        state.retry_at = Some(now + cooldown);
-        state.cooldown_token_expires_at_ms = creds.expires_at_ms;
-        if let Some(path) = state_path.as_deref() {
-            save_claude_state(path, &state);
-        }
-        return Ok((claude_fallback_summary(&state, now), Some(cooldown)));
+        return Ok(claude_rate_limited(now, creds, state_path, state, cooldown));
     }
 
     // 403: token lacks the `user:profile` scope (e.g. a `setup-token` login) or
     // the account is not a claude.ai subscription, so there is no quota to show.
     if status == reqwest::StatusCode::FORBIDDEN {
-        return Ok((disconnected_summary("claude", now), None));
+        let mut summary = disconnected_summary("claude", now);
+        summary.status_message = Some("当前 Claude 登录没有订阅配额查询权限。".into());
+        return Ok((summary, None));
     }
     if !status.is_success() {
         return Err(format!("Claude usage endpoint returned HTTP {status}"));
@@ -1203,7 +1535,10 @@ async fn fetch_claude_quota(now: u64) -> Result<(HarnessQuotaSummary, Option<u64
         .await
         .map_err(|e| format!("Failed to parse Claude usage response: {e}"))?;
 
-    let summary = decode_claude_usage(&usage_json, claude_plan_label(&creds), now);
+    let mut summary = decode_claude_usage(&usage_json, claude_plan_label(&creds), unix_now());
+    if desktop {
+        summary.status_message = Some("使用 Claude Desktop 登录直接查询配额。".into());
+    }
     if summary.primary.is_some() {
         state.last_good = Some(summary.clone());
     }
@@ -1230,12 +1565,19 @@ pub async fn get_harness_quota(
     }
 
     let force = force_refresh.unwrap_or(false);
+    // Several UI consumers mount together; do not send duplicate cold polls to
+    // the shared, rate-limited OAuth endpoint.
+    let _claude_fetch_guard = if harness_key == "claude" {
+        Some(CLAUDE_FETCH_LOCK.lock().await)
+    } else {
+        None
+    };
     let now = unix_now();
 
     // Check cache and active 429 backoff
     {
         let cache = get_cache().lock().unwrap();
-        if let Some(entry) = cache.get(&harness_key) {
+        if let Some(entry) = cache.get(&harness_key).filter(|_| harness_key != "claude") {
             // Claude's cooldown is enforced (and cleared on re-login) by its
             // persisted state inside fetch_claude_quota, so it is not short-circuited here.
             if entry.backoff_until > now && harness_key != "claude" {
@@ -1261,7 +1603,7 @@ pub async fn get_harness_quota(
     let result = match harness_key.as_str() {
         "codex" => fetch_codex_quota(now).await,
         "antigravity" => fetch_antigravity_quota(now).await,
-        "claude" => fetch_claude_quota(now).await,
+        "claude" => fetch_claude_quota(now, force).await,
         _ => unreachable!(),
     };
 
@@ -1284,9 +1626,27 @@ pub async fn get_harness_quota(
             Ok(Some(summary))
         }
         Err(err) => {
-            log::error!("[harness_quota] Failed to fetch quota for {}: {}", harness_key, err);
+            log::error!(
+                "[harness_quota] Failed to fetch quota for {}: {}",
+                harness_key,
+                err
+            );
             // Fall back to cached entry if present
             let cache = get_cache().lock().unwrap();
+            if harness_key == "claude" {
+                let mut summary = ClaudePersistedState {
+                    last_good: cache.get(&harness_key).map(|e| e.summary.clone()),
+                    ..Default::default()
+                }
+                .fresh_last_good(unix_now())
+                .unwrap_or_else(|| disconnected_summary("claude", now));
+                summary.status_message = Some(if summary.primary.is_some() {
+                    format!("{err} 显示上次成功查询的配额。")
+                } else {
+                    err
+                });
+                return Ok(Some(summary));
+            }
             if let Some(entry) = cache.get(&harness_key) {
                 return Ok(Some(entry.summary.clone()));
             }
@@ -1302,6 +1662,191 @@ pub async fn get_harness_quota(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_account_switch_does_not_borrow_a_balance_or_cooldown_on_b_429() {
+        let dir = std::env::temp_dir().join(format!("oc-claw-cli-429-{}", std::process::id()));
+        let base = dir.join(CLAUDE_STATE_FILE);
+        let a = ("account-a".into(), "org".into());
+        let b = ("account-b".into(), "org".into());
+        let path_a = scoped_claude_state_path(&base, None, Some(&a), false).unwrap();
+        let path_b = scoped_claude_state_path(&base, None, Some(&b), false).unwrap();
+        let state_a = ClaudePersistedState {
+            last_good: Some(decode_claude_usage(
+                &serde_json::json!({"five_hour":{"utilization":91}}),
+                None,
+                1000,
+            )),
+            retry_at: Some(5000),
+            cooldown_token_expires_at_ms: Some(2000000),
+        };
+        save_claude_state(&path_a, &state_a);
+        // The old shared file also must never migrate into B's state.
+        save_claude_state(&base, &state_a);
+        assert_ne!(path_a, path_b);
+        let state_b = load_claude_state(&path_b);
+        assert_eq!(state_b, ClaudePersistedState::default());
+        let creds_b = ClaudeOauthCredentials {
+            access_token: "b-token".into(),
+            expires_at_ms: Some(2000000),
+            subscription_type: None,
+            rate_limit_tier: None,
+        };
+        let (quota_b, retry) = claude_rate_limited(1001, &creds_b, Some(&path_b), state_b, 600);
+        assert!(quota_b.primary.is_none());
+        assert_eq!(retry, Some(600));
+        let persisted_b = load_claude_state(&path_b);
+        assert!(persisted_b.last_good.is_none());
+        assert_eq!(
+            persisted_b.cooldown_remaining(Some(2000000), 1001),
+            Some(600)
+        );
+        assert_eq!(load_claude_state(&path_a), state_a);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cli_account_switch_does_not_borrow_a_balance_with_b_expired_token() {
+        let dir = std::env::temp_dir().join(format!("oc-claw-cli-expired-{}", std::process::id()));
+        let base = dir.join(CLAUDE_STATE_FILE);
+        let a = ("account-a".into(), "org".into());
+        let b = ("account-b".into(), "org".into());
+        let path_a = scoped_claude_state_path(&base, None, Some(&a), false).unwrap();
+        let path_b = scoped_claude_state_path(&base, None, Some(&b), false).unwrap();
+        let state_a = ClaudePersistedState {
+            last_good: Some(decode_claude_usage(
+                &serde_json::json!({"five_hour":{"utilization":91}}),
+                None,
+                1000,
+            )),
+            ..Default::default()
+        };
+        save_claude_state(&path_a, &state_a);
+        save_claude_state(&base, &state_a);
+        let expired = ClaudeOauthCredentials {
+            access_token: "b-token".into(),
+            expires_at_ms: Some(1),
+            subscription_type: None,
+            rate_limit_tier: None,
+        };
+        let result = poll_claude_usage(
+            1001,
+            &expired,
+            Some(&path_b),
+            load_claude_state(&path_b),
+            false,
+        )
+        .await;
+        assert!(result.unwrap_err().contains("token expired"));
+        // Its own known balance remains usable; no HTTP is made for expired tokens.
+        let own = poll_claude_usage(
+            1001,
+            &expired,
+            Some(&path_a),
+            load_claude_state(&path_a),
+            false,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(own.primary.unwrap().percent, 91.0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cli_persistence_requires_known_identity_and_never_shares_custom_config_state() {
+        let base = Path::new("cache").join(CLAUDE_STATE_FILE);
+        let account = ("account".into(), "org".into());
+        let other_org = ("account".into(), "other-org".into());
+        let cli = scoped_claude_state_path(&base, None, Some(&account), false).unwrap();
+        assert_ne!(cli, base);
+        assert_ne!(
+            cli,
+            scoped_claude_state_path(&base, None, Some(&other_org), false).unwrap()
+        );
+        assert_ne!(
+            cli,
+            scoped_claude_state_path(&base, Some("account:org"), None, false).unwrap()
+        );
+        assert!(scoped_claude_state_path(&base, None, None, false).is_none());
+        assert!(
+            scoped_claude_state_path(&base, None, Some(&("".into(), "org".into())), false)
+                .is_none()
+        );
+        // Even supplied default metadata cannot prove a custom config's account.
+        assert!(scoped_claude_state_path(&base, None, Some(&account), true).is_none());
+        assert!(scoped_claude_state_path(&base, None, None, true).is_none());
+    }
+
+    #[test]
+    fn cli_a_statusline_cannot_replace_desktop_b_oauth_quota() {
+        let mut readings = HashMap::new();
+        let cli_a = serde_json::json!({"session_id":"cli-account-a",
+            "rate_limits":{"five_hour":{"used_percentage":91,"resets_at":2000}}});
+        assert!(record_claude_native_usage(&mut readings, &cli_a, 1000));
+        assert_eq!(
+            unscoped_claude_native_usage(&readings, false, 1001)
+                .unwrap()
+                .primary
+                .unwrap()
+                .percent,
+            91.0
+        );
+        // Desktop B owns the aggregate UI even if its OAuth lookup is expired,
+        // cooling down or unavailable; the unbound A reading is never eligible.
+        assert!(unscoped_claude_native_usage(&readings, true, 1001).is_none());
+        let desktop_b = serde_json::json!({"session_id":"desktop-account-b",
+            "rate_limits":{"five_hour":{"used_percentage":12,"resets_at":2000}}});
+        assert!(record_claude_native_usage(&mut readings, &desktop_b, 1001));
+        assert_eq!(readings.len(), 2);
+        assert!(unscoped_claude_native_usage(&readings, false, 1001).is_none());
+        assert!(unscoped_claude_native_usage(&readings, true, 1001).is_none());
+        assert!(unscoped_claude_native_usage(&readings, false, 1121).is_none());
+        assert!(!record_claude_native_usage(
+            &mut readings,
+            &serde_json::json!({"rate_limits":{"five_hour":{"used_percentage":5}}}),
+            1001
+        ));
+    }
+
+    #[test]
+    fn desktop_usage_keeps_measurement_age_and_hides_stale_or_future_balances() {
+        let usage = crate::claude_desktop::Usage {
+            sampled_at: 1000,
+            windows: vec![("5小时".into(), 0.0), ("7天".into(), 44.0)],
+        };
+        let fresh = desktop_claude_quota(usage.clone(), 2000);
+        assert!(fresh.connected);
+        assert_eq!(fresh.updated_at, 1000);
+        assert_eq!(fresh.primary.unwrap().percent, 0.0);
+        assert!(fresh.details[0].resets_at.is_none());
+        for now in [999, 2201] {
+            let stale = desktop_claude_quota(usage.clone(), now);
+            assert!(!stale.connected);
+            assert!(stale.primary.is_none());
+            assert!(stale.details.is_empty());
+            assert_eq!(stale.updated_at, 1000);
+            assert!(stale.status_message.unwrap().contains("当前余额未知"));
+        }
+    }
+    #[test]
+    fn claude_statusline_usage_handles_zero_absent_and_expired_windows() {
+        let event = serde_json::json!({"rate_limits": {
+            "five_hour":{"used_percentage":0.0,"resets_at":2000},
+            "seven_day":{"used_percentage":42.5,"resets_at":3000}
+        }});
+        let summary = decode_claude_statusline(&event, 1000).unwrap();
+        assert_eq!(summary.primary.unwrap().percent, 0.0);
+        assert_eq!(summary.details[0].percent, 42.5);
+        let summary = decode_claude_statusline(&event, 2000).unwrap();
+        assert_eq!(summary.primary.unwrap().label, "Weekly Window");
+        assert!(decode_claude_statusline(&event, 3000).is_none());
+        assert!(decode_claude_statusline(&serde_json::json!({}), 1).is_none());
+        assert!(
+            decode_claude_statusline(&serde_json::json!({"rate_limits":{"five_hour":{}}}), 1)
+                .is_none()
+        );
+    }
 
     #[test]
     fn test_extract_arg_value() {
@@ -1533,6 +2078,50 @@ mod tests {
         let fallback = claude_fallback_summary(&state, stale_now);
         assert!(fallback.connected);
         assert!(fallback.primary.is_none());
+    }
+
+    #[test]
+    fn claude_cache_cannot_cross_credentials_or_window_resets() {
+        let mut entry = QuotaCacheEntry {
+            summary: decode_claude_usage(
+                &serde_json::json!({"five_hour":{"utilization":42}}),
+                None,
+                1000,
+            ),
+            cached_at: 1000,
+            backoff_until: 0,
+        };
+        assert!(reusable_claude_entry("a", &entry, "a", false, 1100));
+        assert!(!reusable_claude_entry("a", &entry, "b", false, 1100));
+        assert!(!reusable_claude_entry("a", &entry, "a", true, 1100));
+        assert!(!reusable_claude_entry("a", &entry, "a", false, 1120));
+        entry.backoff_until = 1050;
+        assert!(!reusable_claude_entry("a", &entry, "a", false, 1100));
+        entry.backoff_until = 0;
+        entry.summary.primary.as_mut().unwrap().resets_at =
+            Some(DateTime::from_timestamp(1050, 0).unwrap().to_rfc3339());
+        assert!(!reusable_claude_entry("a", &entry, "a", false, 1100));
+    }
+
+    #[test]
+    fn claude_fallback_drops_reset_windows_and_future_readings() {
+        let summary = decode_claude_usage(
+            &serde_json::json!({
+                "five_hour":{"utilization":90,"resets_at":"1970-01-01T00:18:20Z"},
+                "seven_day":{"utilization":40,"resets_at":"1970-01-01T00:33:20Z"}
+            }),
+            None,
+            1000,
+        );
+        let state = ClaudePersistedState {
+            last_good: Some(summary),
+            ..Default::default()
+        };
+        assert!(state.fresh_last_good(999).is_none());
+        let fallback = state.fresh_last_good(1100).unwrap();
+        assert_eq!(fallback.primary.unwrap().label, "Weekly Window");
+        assert!(fallback.details.is_empty());
+        assert!(state.fresh_last_good(2000).is_none());
     }
 
     #[test]

@@ -6,6 +6,11 @@ use std::time::SystemTime;
 
 mod presentation;
 mod interaction_state;
+mod claude_permission;
+mod claude_metadata;
+mod claude_desktop;
+mod claude_desktop_auth;
+mod claude_statusline;
 mod bubble_trace;
 static PRESENTATION: presentation::Suppression = presentation::Suppression::new();
 static EXTRA_MASCOTS_HIDDEN: AtomicBool = AtomicBool::new(false);
@@ -7746,6 +7751,11 @@ pub struct ClaudeSession {
     pub user_prompt: Option<String>,
     #[serde(rename = "customTitle", skip_serializing_if = "Option::is_none")]
     pub custom_title: Option<String>,
+    /// Exact transcript path supplied by the owning Claude hook, including Desktop.
+    #[serde(skip)]
+    pub transcript_path: Option<PathBuf>,
+    #[serde(skip)]
+    pub native_title: Option<String>,
     pub interactive: bool,
     #[serde(rename = "updatedAt")]
     pub updated_at: u64,
@@ -7762,6 +7772,9 @@ pub struct ClaudeSession {
     /// Sound only plays on Stop when this reaches 0 (all agents done).
     #[serde(skip)]
     pub pending_agents: u32,
+    /// The root received Stop, but required descendants may still be running.
+    #[serde(skip)]
+    pub root_turn_finished: bool,
     /// Raw permission_suggestions JSON from the PermissionRequest hook event.
     #[serde(rename = "permissionSuggestions", skip_serializing_if = "Option::is_none")]
     pub permission_suggestions: Option<serde_json::Value>,
@@ -7828,7 +7841,7 @@ pub struct ClaudeSession {
     pub pending_interaction: Option<PendingInteraction>,
 }
 
-type PendingPermissions = Arc<Mutex<HashMap<String, std::sync::mpsc::Sender<String>>>>;
+use claude_permission::PendingPermissions;
 
 #[derive(Debug)]
 pub struct PendingCodexApproval {
@@ -7950,7 +7963,6 @@ struct CursorWindowBinding {
 
 /// Compute the JSONL session file path (matching notchi's ConversationParser.sessionFilePath)
 fn claude_session_file_path(session_id: &str, cwd: &str) -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_default();
     // On Windows, Claude Code replaces all of / \ : . with "-" when computing
     // the project directory name (e.g. G:\Desktop\code → G--Desktop-code).
     // The colon after the drive letter (G:) must also be replaced.
@@ -7958,7 +7970,7 @@ fn claude_session_file_path(session_id: &str, cwd: &str) -> PathBuf {
     let project_dir = cwd.replace('/', "-").replace('\\', "-").replace(':', "-").replace('.', "-");
     #[cfg(not(windows))]
     let project_dir = cwd.replace('/', "-").replace('.', "-");
-    home.join(".claude").join("projects").join(project_dir).join(format!("{}.jsonl", session_id))
+    claude_metadata::config_dir().unwrap_or_default().join("projects").join(project_dir).join(format!("{}.jsonl", session_id))
 }
 
 fn collect_jsonl_files_recursive(root: &std::path::Path) -> Vec<PathBuf> {
@@ -8380,8 +8392,7 @@ fn collect_opencode_stats() -> Result<ClaudeStats, String> {
 }
 
 fn collect_claude_project_jsonl_files() -> Vec<PathBuf> {
-    let home = dirs::home_dir().unwrap_or_default();
-    let claude_projects = home.join(".claude").join("projects");
+    let claude_projects = claude_metadata::config_dir().unwrap_or_default().join("projects");
     if !claude_projects.exists() {
         return Vec::new();
     }
@@ -10069,11 +10080,14 @@ pub fn load_recent_antigravity_sessions() -> Vec<ClaudeSession> {
             tool_input: None,
             user_prompt: None,
             custom_title: meta.and_then(|m| if m.title.is_empty() { None } else { Some(m.title.clone()) }),
+            transcript_path: None,
+            native_title: None,
             interactive: false,
             updated_at,
             is_processing: false,
             pid: None,
             pending_agents: 0,
+            root_turn_finished: false,
             permission_suggestions: None,
             needs_review: None,
             last_response: None,
@@ -10476,7 +10490,7 @@ fn start_session_file_watcher(
                 }
 
                 // Interruption detection: active/waiting but file shows interrupted
-                if matches!(session.status.as_str(), "processing" | "tool_running" | "waiting") {
+                if session.source != "cc" && matches!(session.status.as_str(), "processing" | "tool_running" | "waiting") {
                     if check_interrupted(&path2) {
                         log::info!("File watcher: interrupted session {}", sid2);
                         session.status = "stopped".to_string();
@@ -10539,13 +10553,19 @@ fn is_pid_alive(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+        use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, STILL_ACTIVE};
         unsafe {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
             match handle {
-                Ok(h) => { let _ = CloseHandle(h); true }
-                Err(_) => false,
+                Ok(h) => {
+                    let mut code = 0;
+                    let alive = GetExitCodeProcess(h, &mut code).is_err() || code == STILL_ACTIVE.0 as u32;
+                    let _ = CloseHandle(h);
+                    alive
+                }
+                // Access denied and transient query errors do not prove exit.
+                Err(error) => error.code() != windows::core::HRESULT::from_win32(ERROR_INVALID_PARAMETER.0),
             }
         }
     }
@@ -10928,6 +10948,16 @@ async fn get_claude_sessions(state: tauri::State<'_, ClaudeState>) -> Result<Vec
                 // authoritative than prompt-derived or hook-provided labels.
                 session.custom_title = Some(title.clone());
             }
+        }
+    }
+    let desktop_metadata = claude_desktop::snapshot();
+    for session in list.iter_mut().filter(|s| s.source == "cc") {
+        let path = session.transcript_path.clone().or_else(|| {
+            let path = claude_session_file_path(&session.session_id, &session.cwd);
+            path.is_file().then_some(path)
+        }).or_else(|| find_claude_session_file(&session.session_id));
+        if let Some(title) = desktop_metadata.titles.get(&session.session_id).cloned().or_else(|| path.as_deref().and_then(|p| claude_metadata::read_title(p, &session.session_id, session.native_title.as_deref()))) {
+            session.custom_title = Some(title);
         }
     }
     list.retain(|s| s.source != "antigravity" || !is_antigravity_subagent_session(&s.session_id));
@@ -11397,11 +11427,14 @@ fn load_recent_hermes_sessions_from_db() -> Result<Vec<ClaudeSession>, String> {
             tool_input: None,
             user_prompt,
             custom_title,
+            transcript_path: None,
+            native_title: None,
             interactive: false,
             updated_at: updated_at_ms,
             is_processing: is_active,
             pid: None,
             pending_agents: 0,
+            root_turn_finished: false,
             permission_suggestions: None,
             needs_review: None,
             last_response: asst_response,
@@ -11441,6 +11474,7 @@ async fn remove_claude_session(session_id: String, state: tauri::State<'_, Claud
 #[tauri::command]
 async fn resolve_claude_permission(
     session_id: String,
+    request_id: String,
     decision: String,
     state: tauri::State<'_, ClaudeState>,
 ) -> Result<(), String> {
@@ -11527,33 +11561,29 @@ async fn resolve_claude_permission(
             _ => return Err(format!("Unknown decision: {}", decision)),
     };
 
-    let tx = {
-        let mut map = state.pending_permissions.lock().map_err(|e| e.to_string())?;
-        map.remove(&session_id)
-    };
-
-    if let Some(tx) = tx {
-        if cfg!(debug_assertions) {
-            log::info!(
-                "[resolve_permission] sending decision='{}' tool={:?} session={} response_json={}",
-                decision,
-                tool_name,
-                &session_id[..session_id.len().min(8)],
-                response_json,
-            );
-        } else {
-            log::info!(
-                "[resolve_permission] sent '{}' tool={:?} for session={}",
-                decision,
-                tool_name,
-                &session_id[..session_id.len().min(8)],
-            );
-        }
-        tx.send(response_json).map_err(|_| "Failed to send permission response".to_string())?;
+    claude_permission::resolve(
+        &state.pending_permissions,
+        &session_id,
+        &request_id,
+        response_json.clone(),
+    )
+    .await?;
+    if cfg!(debug_assertions) {
+        log::info!(
+            "[resolve_permission] sending decision='{}' tool={:?} session={} response_json={}",
+            decision,
+            tool_name,
+            &session_id[..session_id.len().min(8)],
+            response_json,
+        );
     } else {
-        log::warn!("[resolve_permission] no pending permission for session={}", &session_id[..session_id.len().min(8)]);
+        log::info!(
+            "[resolve_permission] sent '{}' tool={:?} for session={}",
+            decision,
+            tool_name,
+            &session_id[..session_id.len().min(8)],
+        );
     }
-
     Ok(())
 }
 
@@ -16892,8 +16922,7 @@ fn load_hermes_conversation(session_id: &str) -> Result<Vec<ChatMessage>, String
 
 #[tauri::command]
 async fn install_claude_hooks() -> Result<(), String> {
-    let home = dirs::home_dir().ok_or("no home dir")?;
-    let claude_dir = home.join(".claude");
+    let claude_dir = claude_metadata::config_dir().ok_or("no Claude config dir")?;
     let hooks_dir = claude_dir.join("hooks");
     std::fs::create_dir_all(&hooks_dir).map_err(|e| e.to_string())?;
 
@@ -16979,6 +17008,8 @@ output = {
     'claudeStatus': input_data.get('status', status_map.get(hook_event, 'unknown')),
     'interactive': os.environ.get('OOCLAW_INTERACTIVE', 'true') == 'true',
     'pid': int(os.environ.get('CC_PID', '0')) or None,
+    'transcript_path': input_data.get('transcript_path', ''),
+    'tool_use_id': input_data.get('tool_use_id'),
 }
 
 # Ghostty terminal ID for precise tab jumping
@@ -17158,6 +17189,23 @@ try {
 
     register_claude_hooks(&mut settings, &hook_path_str)?;
 
+    #[cfg(windows)]
+    let statusline_command = {
+        let path = hooks_dir.join("ooclaw-statusline.ps1");
+        std::fs::write(&path, claude_statusline::WINDOWS_SCRIPT).map_err(|e| e.to_string())?;
+        format!("{} -NoProfile -ExecutionPolicy Bypass -File '{}'",
+            get_powershell_executable(), path.to_string_lossy().replace('\\', "/"))
+    };
+    #[cfg(not(windows))]
+    let statusline_command = {
+        let path = hooks_dir.join("ooclaw-statusline.py");
+        std::fs::write(&path, claude_statusline::UNIX_SCRIPT).map_err(|e| e.to_string())?;
+        format!("python3 '{}'", path.to_string_lossy().replace('\'', "'\\''"))
+    };
+    if let Err(error) = claude_statusline::install(&mut settings, &hooks_dir, &statusline_command) {
+        log::warn!("[claude_hooks] statusline relay unavailable: {error}");
+    }
+
     // Skip the write when nothing changed so an app start does not touch a file
     // Claude Code may be reading or writing at the same moment.
     if settings == original {
@@ -17186,6 +17234,10 @@ fn register_claude_hooks(settings: &mut serde_json::Value, hook_path_str: &str) 
 
     // Hook registration configs matching notchi's HookInstaller approach
     let hook_entry = serde_json::json!([{"type": "command", "command": hook_path_str}]);
+    let permission = vec![serde_json::json!({"matcher": "*", "hooks": [{
+        "type": "command", "command": hook_path_str,
+        "timeout": claude_permission::HOOK_TIMEOUT_SECS,
+    }]})];
     let without_matcher = vec![serde_json::json!({"hooks": hook_entry})];
     let with_matcher = vec![serde_json::json!({"matcher": "*", "hooks": hook_entry})];
     let pre_compact = vec![
@@ -17202,7 +17254,7 @@ fn register_claude_hooks(settings: &mut serde_json::Value, hook_path_str: &str) 
         ("PostToolUse", &with_matcher),
         // PostToolUse does not fire for a failed tool call.
         ("PostToolUseFailure", &with_matcher),
-        ("PermissionRequest", &with_matcher),
+        ("PermissionRequest", &permission),
         ("PreCompact", &pre_compact),
         ("Stop", &without_matcher),
         // Replaces Stop when a turn ends on an API error such as a rate limit.
@@ -17606,6 +17658,7 @@ pub fn parse_codex_permission_request(event: &serde_json::Value) -> Option<Pendi
         detail: Some(detail),
         justification,
         request_id: None,
+        delivery_error: None,
         approval_actions: None,
     })
 }
@@ -17733,6 +17786,7 @@ pub fn apply_codex_permission_relay_to_session(
                 detail: None,
                 justification: reason_str,
                 request_id: None,
+                delivery_error: None,
                 approval_actions: None,
             }
         });
@@ -17888,18 +17942,34 @@ fn keeps_session_status(hook_event: &str) -> bool {
     matches!(hook_event, "SubagentStart" | "SubagentStop")
 }
 
-/// Whether a running/waiting session is judged stale by "no hook event for N ms"
-/// instead of by its process being gone.
-///
-/// Claude Code hosted by Claude Desktop reports the CLI's PID, which lives
-/// exactly as long as the session, so liveness is checked directly and a long
-/// tool call or a long reasoning step is never mistaken for a dead session.
-/// Only harnesses without a reliable PID (or a desktop session that did not
-/// report one) fall back to the event timeout.
-fn uses_event_timeout(source: &str, host_terminal: Option<&str>, pid: Option<u32>) -> bool {
+fn claude_root_status(
+    status: &str,
+    hook_event: &str,
+    pending_agents: u32,
+    root_finished: &mut bool,
+) -> String {
+    if hook_event == "UserPromptSubmit" {
+        *root_finished = false;
+    } else if hook_event == "Stop" {
+        *root_finished = true;
+    }
+    if *root_finished && status != "failed" {
+        if hook_event == "Stop" && pending_agents > 0 {
+            return "processing".into();
+        }
+        if hook_event == "SubagentStop" && pending_agents == 0 {
+            return "stopped".into();
+        }
+    }
+    status.to_owned()
+}
+
+/// Claude turns end on lifecycle events or confirmed process exit. Missing PID
+/// metadata and long silence cannot prove completion, including in Desktop.
+fn uses_event_timeout(source: &str, _host_terminal: Option<&str>, _pid: Option<u32>) -> bool {
     match source {
         "cursor" | "codex" | "opencode" | "antigravity" => true,
-        _ => host_terminal == Some("Claude Desktop") && pid.is_none(),
+        _ => false,
     }
 }
 
@@ -18021,6 +18091,41 @@ mod claude_hook_tests {
     use super::*;
 
     #[test]
+    fn root_stop_waits_for_descendants_and_new_prompt_clears_old_completion() {
+        let mut root_finished = false;
+        assert_eq!(
+            claude_root_status("stopped", "Stop", 2, &mut root_finished),
+            "processing"
+        );
+        assert!(root_finished);
+        assert_eq!(
+            claude_root_status("processing", "SubagentStop", 1, &mut root_finished),
+            "processing"
+        );
+        assert_eq!(
+            claude_root_status("processing", "SubagentStop", 0, &mut root_finished),
+            "stopped"
+        );
+        assert_eq!(
+            claude_root_status("processing", "UserPromptSubmit", 0, &mut root_finished),
+            "processing"
+        );
+        assert!(!root_finished);
+        assert_eq!(
+            claude_root_status("processing", "SubagentStop", 0, &mut root_finished),
+            "processing"
+        );
+        assert_eq!(
+            claude_root_status("failed", "Stop", 2, &mut root_finished),
+            "failed"
+        );
+        assert_eq!(
+            claude_root_status("failed", "SubagentStop", 0, &mut root_finished),
+            "failed"
+        );
+    }
+
+    #[test]
     fn claude_subagents_are_counted_only_by_the_balanced_start_stop_pair() {
         assert_eq!(subagent_counter_delta("SubagentStart", "SubagentStart", "", "cc"), 1);
         assert_eq!(subagent_counter_delta("SubagentStop", "SubagentStop", "", "cc"), -1);
@@ -18051,8 +18156,8 @@ mod claude_hook_tests {
         assert!(!uses_event_timeout("cc", Some("Claude Desktop"), Some(4242)));
         assert!(!uses_event_timeout("cc", Some("Windows Terminal"), Some(4242)));
         assert!(!uses_event_timeout("cc", None, None));
-        // No PID to check, so a desktop session falls back to the timeout.
-        assert!(uses_event_timeout("cc", Some("Claude Desktop"), None));
+        // Missing process metadata is not evidence that a turn has ended.
+        assert!(!uses_event_timeout("cc", Some("Claude Desktop"), None));
         for source in ["cursor", "codex", "opencode", "antigravity"] {
             assert!(uses_event_timeout(source, None, Some(4242)));
         }
@@ -18096,6 +18201,7 @@ mod claude_hook_tests {
             // Observation hooks must stay synchronous so events keep their order.
             assert!(!settings["hooks"][event].to_string().contains("\"async\""));
         }
+        assert_eq!(settings["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"], claude_permission::HOOK_TIMEOUT_SECS);
     }
 
     #[test]
@@ -18206,11 +18312,14 @@ mod codex_adapter_tests {
             tool_input: None,
             user_prompt: Some("Normal looking prompt".to_string()),
             custom_title: None,
+            transcript_path: None,
+            native_title: None,
             interactive: true,
             updated_at: 0,
             is_processing: true,
             pid: None,
             pending_agents: 0,
+            root_turn_finished: false,
             permission_suggestions: None,
             needs_review: None,
             last_response: None,
@@ -18608,11 +18717,14 @@ mod codex_adapter_tests {
             tool_input: Some("{\"permissions\":{\"network\":{\"enabled\":true}}}".to_string()),
             user_prompt: None,
             custom_title: None,
+            transcript_path: None,
+            native_title: None,
             interactive: true,
             updated_at: 0,
             is_processing: false,
             pid: None,
             pending_agents: 0,
+            root_turn_finished: false,
             permission_suggestions: None,
             needs_review: Some(true),
             last_response: None,
@@ -18641,6 +18753,7 @@ mod codex_adapter_tests {
                 detail: Some("网络访问".to_string()),
                 justification: Some("curl baidu".to_string()),
                 request_id: None,
+                delivery_error: None,
                 approval_actions: None,
             }),
         };
@@ -18879,11 +18992,14 @@ mod codex_adapter_tests {
             tool_input: None,
             user_prompt: None,
             custom_title: None,
+            transcript_path: None,
+            native_title: None,
             interactive: true,
             updated_at: 0,
             is_processing: false,
             pid: None,
             pending_agents: 0,
+            root_turn_finished: false,
             permission_suggestions: None,
             needs_review: Some(true),
             last_response: None,
@@ -18941,11 +19057,14 @@ mod codex_adapter_tests {
             tool_input: None,
             user_prompt: None,
             custom_title: None,
+            transcript_path: None,
+            native_title: None,
             interactive: true,
             updated_at: 0,
             is_processing: true,
             pid: None,
             pending_agents: 0,
+            root_turn_finished: false,
             permission_suggestions: None,
             needs_review: None,
             last_response: None,
@@ -19100,11 +19219,14 @@ mod codex_adapter_tests {
             tool_input: None,
             user_prompt: None,
             custom_title: None,
+            transcript_path: None,
+            native_title: None,
             interactive: true,
             updated_at: 0,
             is_processing: true,
             pid: None,
             pending_agents: 0,
+            root_turn_finished: false,
             permission_suggestions: None,
             needs_review: None,
             last_response: None,
@@ -19133,6 +19255,7 @@ mod codex_adapter_tests {
                 detail: None,
                 justification: None,
                 request_id: None,
+                delivery_error: None,
                 approval_actions: None,
             }),
         };
@@ -19171,11 +19294,14 @@ mod codex_adapter_tests {
             tool_input: None,
             user_prompt: None,
             custom_title: None,
+            transcript_path: None,
+            native_title: None,
             interactive: true,
             updated_at: 0,
             is_processing: false,
             pid: None,
             pending_agents: 0,
+            root_turn_finished: false,
             permission_suggestions: None,
             needs_review: None,
             last_response: None,
@@ -19204,6 +19330,7 @@ mod codex_adapter_tests {
                 detail: None,
                 justification: None,
                 request_id: None,
+                delivery_error: None,
                 approval_actions: None,
             }),
         };
@@ -19240,11 +19367,14 @@ mod codex_adapter_tests {
             tool_input: None,
             user_prompt: None,
             custom_title: None,
+            transcript_path: None,
+            native_title: None,
             interactive: true,
             updated_at: 0,
             is_processing: false,
             pid: None,
             pending_agents: 0,
+            root_turn_finished: false,
             permission_suggestions: None,
             needs_review: None,
             last_response: None,
@@ -19273,6 +19403,7 @@ mod codex_adapter_tests {
                 detail: None,
                 justification: None,
                 request_id: None,
+                delivery_error: None,
                 approval_actions: None,
             }),
         };
@@ -19311,11 +19442,14 @@ mod codex_adapter_tests {
             tool_input: None,
             user_prompt: None,
             custom_title: None,
+            transcript_path: None,
+            native_title: None,
             interactive: true,
             updated_at: 0,
             is_processing: false,
             pid: None,
             pending_agents: 0,
+            root_turn_finished: false,
             permission_suggestions: None,
             needs_review: Some(true),
             last_response: None,
@@ -19344,6 +19478,7 @@ mod codex_adapter_tests {
                 detail: None,
                 justification: Some("curl test".to_string()),
                 request_id: Some("req_turn_1_timeout".to_string()),
+                delivery_error: None,
                 approval_actions: Some(ApprovalActions {
                     can_deny: true,
                     can_allow_turn: true,
@@ -19590,11 +19725,14 @@ mod codex_adapter_tests {
             tool_input: None,
             user_prompt: None,
             custom_title: None,
+            transcript_path: None,
+            native_title: None,
             interactive: true,
             updated_at: 100,
             is_processing: false,
             pid: None,
             pending_agents: 0,
+            root_turn_finished: false,
             last_response: None,
             is_active_tab: false,
             source: "antigravity".to_string(),
@@ -19683,11 +19821,14 @@ mod codex_adapter_tests {
             tool_input: None,
             user_prompt: None,
             custom_title: None,
+            transcript_path: None,
+            native_title: None,
             interactive: true,
             updated_at: 100,
             is_processing: true,
             pid: None,
             pending_agents: 2,
+            root_turn_finished: false,
             last_response: None,
             is_active_tab: false,
             source: "antigravity".to_string(),
@@ -19800,11 +19941,14 @@ mod codex_adapter_tests {
             tool_input: None,
             user_prompt: None,
             custom_title: None,
+            transcript_path: None,
+            native_title: None,
             interactive: true,
             updated_at: 100,
             is_processing: false,
             pid: None,
             pending_agents: 0,
+            root_turn_finished: false,
             last_response: None,
             is_active_tab: false,
             source: "antigravity".to_string(),
@@ -19850,11 +19994,14 @@ mod codex_adapter_tests {
             tool_input: Some("{\"Query\":\"MySearch\"}".to_string()),
             user_prompt: Some("Find code".to_string()),
             custom_title: None,
+            transcript_path: None,
+            native_title: None,
             interactive: true,
             updated_at: 100,
             is_processing: true,
             pid: None,
             pending_agents: 0,
+            root_turn_finished: false,
             permission_suggestions: None,
             needs_review: None,
             last_response: None,
@@ -19985,11 +20132,14 @@ pub fn handle_antigravity_subagent_event(
             tool_input: None,
             user_prompt: None,
             custom_title: meta.and_then(|m| if m.title.is_empty() { None } else { Some(m.title.clone()) }),
+            transcript_path: None,
+            native_title: None,
             interactive: true,
             updated_at: now_ms,
             is_processing: true,
             pid: None,
             pending_agents: 0,
+            root_turn_finished: false,
             last_response: None,
             is_active_tab: false,
             source: "antigravity".to_string(),
@@ -20105,6 +20255,25 @@ fn process_claude_event(
             .or_else(|| event.get("codex_event_type"))
             .or_else(|| event.get("hookEvent"))
             .and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if raw_hook_event == "StatusLine" {
+            if harness_quota::observe_claude_usage(&event) {
+                // UI must re-enter credential selection before updating its
+                // aggregate quota; this session supplies no account/org ID.
+                let _ = app.emit("harness-quota-invalidated", "claude");
+            }
+            let mut sessions = state.lock().unwrap();
+            if let Some(session) = sessions.get_mut(&session_id).filter(|s| s.source == "cc") {
+                if let Some(title) = event.get("session_name").and_then(|v| v.as_str())
+                    .map(str::trim).filter(|s| !s.is_empty()) {
+                    session.native_title = Some(title.to_owned());
+                    session.custom_title = Some(title.to_owned());
+                }
+                // Metadata can arrive after Stop or during a newer turn. Never
+                // change lifecycle, activity, pending approvals, or updated_at.
+                let _ = app.emit("claude-session-update", &session_id);
+            }
+            return None;
+        }
         // Normalize event names from various agents to CC's PascalCase.
         // Cursor uses camelCase, Gemini CLI uses PascalCase (BeforeAgent/AfterAgent etc.),
         // CC uses PascalCase (UserPromptSubmit, Stop, etc.).
@@ -20257,7 +20426,8 @@ fn process_claude_event(
         // Guard: if CC's own status is "waiting_for_input" but our event-derived
         // status says "processing"/"tool_running", something is out of sync.
         // Override to "stopped" — EXCEPT for UserPromptSubmit/GatewayAgentStart/HermesPostLlm.
-        if !is_processing
+        if source_override.or_else(|| event.get("source").and_then(|v| v.as_str())).unwrap_or("cc") != "cc"
+            && !is_processing
             && matches!(status.as_str(), "processing" | "tool_running")
             && hook_event != "UserPromptSubmit"
             && hook_event != "GatewayAgentStart"
@@ -20289,7 +20459,7 @@ fn process_claude_event(
         {
             let mut sessions = state.lock().unwrap();
             if let Some(session) = sessions.get(&session_id) {
-                if matches!(session.source.as_str(), "codex" | "antigravity")
+                if matches!(session.source.as_str(), "cc" | "codex" | "antigravity")
                     && interaction_state::stale_turn(session.turn_id.as_deref(), &event, &hook_event) {
                     return None;
                 }
@@ -20334,11 +20504,14 @@ fn process_claude_event(
                     tool_input: None,
                     user_prompt: None,
                     custom_title: None,
+                    transcript_path: None,
+                    native_title: None,
                     interactive: true,
                     updated_at: 0,
                     is_processing: false,
                     pid: None,
                     pending_agents: 0,
+                    root_turn_finished: false,
                     last_response: None,
                     is_active_tab: false,
                     source: source.clone(),
@@ -20597,6 +20770,12 @@ fn process_claude_event(
                         }
                     }
                 }
+                if session.source == "cc" {
+                    if let Some(path) = event.get("transcript_path").or_else(|| event.get("transcriptPath"))
+                        .and_then(|v| v.as_str()).filter(|p| !p.is_empty()) {
+                        session.transcript_path = Some(PathBuf::from(path));
+                    }
+                }
                 // Store CC process PID from hook event for stale-session detection
                 if let Some(p) = event.get("pid").and_then(|v| v.as_u64()) {
                     let pid_u32 = p as u32;
@@ -20791,6 +20970,11 @@ fn process_claude_event(
                     stop_was_interrupted = false;
                 }
 
+                if session.source == "cc" && !is_stale_turn_stop {
+                    status = claude_root_status(&status, &hook_event, session.pending_agents, &mut session.root_turn_finished);
+                    session.status = status.clone();
+                }
+
                 if hook_event == "PermissionRequest" {
                     session.permission_suggestions = event.get("permission_suggestions")
                         .or_else(|| event.get("permissionSuggestions"))
@@ -20811,13 +20995,18 @@ fn process_claude_event(
                     session.pending_interaction = None;
                 }
 
-                if matches!(session.source.as_str(), "codex" | "antigravity") {
+                if matches!(session.source.as_str(), "cc" | "codex" | "antigravity") {
                     let observed = interaction_state::from_hook(&event, &hook_event, &session.source);
-                    let retained = previous_interaction.filter(|p| !stop_was_interrupted && interaction_state::retain(p, &event, &hook_event));
+                    let retained = previous_interaction.filter(|p| {
+                        !stop_was_interrupted
+                            && interaction_state::retain(p, &event, &hook_event, &session.source)
+                    });
                     if let Some(interaction) = observed.or(retained) {
                         session.needs_review = Some(interaction.kind == "approval");
                         session.tool = interaction.tool.clone();
-                        session.tool_input = interaction.detail.clone();
+                        if session.source != "cc" {
+                            session.tool_input = interaction.detail.clone();
+                        }
                         session.pending_interaction = Some(interaction);
                         session.status = "waiting".to_string();
                         session.is_processing = false;
@@ -20826,6 +21015,9 @@ fn process_claude_event(
                     }
                 }
 
+                if session.source == "cc" {
+                    session.is_processing = matches!(session.status.as_str(), "processing" | "tool_running" | "compacting");
+                }
                 if session.source == "antigravity" && hook_event == "ModelInvocation" {
                     update_antigravity_session_from_transcript(session);
                     status = session.status.clone();
@@ -20852,14 +21044,14 @@ fn process_claude_event(
         // Previously we checked status transitions, but guard overrides on PostToolUse
         // could falsely trigger "stopped" mid-task when CC's status field lags behind.
         // Also suppress sound while sub-agents are still running (pending_agents > 0).
-        // Each PreToolUse(Agent) increments the counter, each SubagentStop decrements it.
+        // Claude uses the balanced SubagentStart/SubagentStop pair for its counter.
         // Sound only plays when all sub-agents have completed.
         let is_wait_event = ((hook_event == "ModelInvocation" && status == "waiting") || hook_event == "PermissionRequest"
             || (hook_event == "PreToolUse" && status == "waiting"))
             // Suppress the waiting popup when the user is already looking at the
             // session's terminal tab (same focus rule as the completion popup).
             && !wait_tab_active;
-        let is_completion_stop = (hook_event == "Stop" || hook_event == "GatewayAgentEnd") && status == "stopped" && pending_agents == 0 && !stop_was_interrupted && !is_stale_turn_stop;
+        let is_completion_stop = (hook_event == "Stop" || hook_event == "GatewayAgentEnd" || (hook_event == "SubagentStop" && session_source == "cc")) && status == "stopped" && pending_agents == 0 && !stop_was_interrupted && !is_stale_turn_stop;
         let is_failed_stop = (hook_event == "Stop" || hook_event == "GatewayAgentEnd") && pending_agents == 0 && stop_was_interrupted && !is_stale_turn_stop;
 
         if was_processing && !was_compacting && is_failed_stop {
@@ -20946,7 +21138,7 @@ fn process_claude_event(
                 }
             }
         }
-        if hook_event == "SessionEnd" || (hook_event == "Stop" && status == "stopped" && session_source != "antigravity") || (session_source == "antigravity" && status == "stopped" && pending_agents == 0) {
+        if hook_event == "SessionEnd" || ((hook_event == "Stop" || (hook_event == "SubagentStop" && session_source == "cc")) && status == "stopped" && session_source != "antigravity") || (session_source == "antigravity" && status == "stopped" && pending_agents == 0) {
             stop_session_file_watcher(&session_id);
         }
 
@@ -23525,6 +23717,104 @@ fn start_antigravity_socket_server(
     }
 }
 
+fn dispatch_claude_socket_event<S: std::io::Write>(
+    buf: &str,
+    stream: &mut S,
+    state: &Arc<Mutex<HashMap<String, ClaudeSession>>>,
+    pending: &PendingPermissions,
+    codex_approvals: &CodexPendingApprovals,
+    app: &tauri::AppHandle,
+) {
+    // The response channel must exist before process_claude_event emits the
+    // waiting popup; the user can click as soon as that event is published.
+    let (buf, connection) = claude_permission::prepare(buf, pending);
+    let previous_request = serde_json::from_str::<serde_json::Value>(&buf)
+        .ok()
+        .and_then(|event| {
+            let sid = event
+                .get("sessionId")
+                .or_else(|| event.get("session_id"))?
+                .as_str()?;
+            let sessions = state.lock().unwrap();
+            let session = sessions.get(sid).filter(|s| s.source == "cc")?;
+            Some((
+                sid.to_owned(),
+                session.pending_interaction.as_ref()?.request_id.clone()?,
+            ))
+        });
+    let result = process_claude_event(&buf, state, app, None);
+    let mut delivered = false;
+    if let Some(res) = result.as_ref().filter(|r| r.accepted) {
+        if let Some((ref sid, ref request)) = previous_request {
+            let still_pending = state
+                .lock()
+                .unwrap()
+                .get(sid)
+                .and_then(|s| s.pending_interaction.as_ref())
+                .is_some_and(|p| p.request_id.as_ref() == Some(request));
+            if !still_pending {
+                claude_permission::cleanup(pending, sid, request);
+            }
+        }
+        if matches!(
+            res.hook_event.as_str(),
+            "PostToolUse" | "Stop" | "UserPromptSubmit"
+        ) {
+            cleanup_codex_approval(&res.session_id, res.turn_id.as_deref(), codex_approvals);
+        }
+        if res.hook_event == "PermissionRequest" {
+            let source = state
+                .lock()
+                .unwrap()
+                .get(&res.session_id)
+                .map(|s| s.source.clone());
+            if source.as_deref() == Some("codex") {
+                if let Some(ref c) = connection {
+                    claude_permission::cleanup(pending, &c.session_id, &c.request_id);
+                }
+                handle_codex_permission_relay(&res.session_id, codex_approvals, stream);
+                return;
+            }
+            if let Some(ref c) = connection
+                .as_ref()
+                .filter(|_| source.as_deref() == Some("cc"))
+            {
+                match c
+                    .receiver
+                    .recv_timeout(std::time::Duration::from_secs(claude_permission::WAIT_SECS))
+                {
+                    Ok(response) => {
+                        delivered = response.deliver(stream);
+                        if !delivered {
+                            log::warn!(
+                                "[claude_socket] approval response write failed session={}",
+                                c.session_id
+                            );
+                        }
+                    }
+                    Err(_) => log::info!(
+                        "[claude_socket] approval relay ended; returning to native UI session={}",
+                        c.session_id
+                    ),
+                }
+            }
+        }
+    }
+    if let Some(c) = connection {
+        claude_permission::cleanup(pending, &c.session_id, &c.request_id);
+        let mut sessions = state.lock().unwrap();
+        if let Some(session) = sessions.get_mut(&c.session_id) {
+            if claude_permission::finish_interaction(
+                &mut session.pending_interaction,
+                &c.request_id,
+                delivered,
+            ) {
+                let _ = app.emit("claude-session-update", &c.session_id);
+            }
+        }
+    }
+}
+
 /// Start the Claude IPC server.
 /// On macOS/Linux: Unix domain socket at /tmp/ooclaw-claude.sock
 /// On Windows: TCP server on localhost:19283
@@ -23602,47 +23892,11 @@ fn start_claude_socket_server(
                         let pending = pending.clone();
                         let codex_approvals = codex_approvals.clone();
                         std::thread::spawn(move || {
-                            use std::io::{Read, Write};
+                            use std::io::Read;
                             let mut s = s;
                             let mut buf = String::new();
                             let _ = s.read_to_string(&mut buf);
-                            if let Some(res) = process_claude_event(&buf, &state, &app, None) {
-                                if res.accepted && (res.hook_event == "PostToolUse" || res.hook_event == "Stop" || res.hook_event == "UserPromptSubmit") {
-                                    cleanup_codex_approval(&res.session_id, res.turn_id.as_deref(), &codex_approvals);
-                                }
-                                if res.hook_event == "PermissionRequest" {
-                                    let session_id = res.session_id;
-                                    let source = {
-                                        let sessions = state.lock().unwrap();
-                                        sessions
-                                            .get(&session_id)
-                                            .map(|session| session.source.clone())
-                                            .unwrap_or_else(|| "cc".to_string())
-                                    };
-                                    if source == "codex" {
-                                        handle_codex_permission_relay(&session_id, &codex_approvals, &mut s);
-                                        return;
-                                    }
-                                    let (tx, rx) = std::sync::mpsc::channel::<String>();
-                                    {
-                                        let mut map = pending.lock().unwrap();
-                                        map.insert(session_id.clone(), tx);
-                                    }
-                                    log::info!("[claude_socket] blocking for PermissionRequest session={}", &session_id[..session_id.len().min(8)]);
-                                    match rx.recv_timeout(std::time::Duration::from_secs(600)) {
-                                        Ok(response_json) => {
-                                            log::info!("[claude_socket] sending permission response for session={}", &session_id[..session_id.len().min(8)]);
-                                            let _ = s.write_all(response_json.as_bytes());
-                                            let _ = s.flush();
-                                        }
-                                        Err(_) => {
-                                            log::warn!("[claude_socket] permission timeout for session={}", &session_id[..session_id.len().min(8)]);
-                                        }
-                                    }
-                                    let mut map = pending.lock().unwrap();
-                                    map.remove(&session_id);
-                                }
-                            }
+                            dispatch_claude_socket_event(&buf, &mut s, &state, &pending, &codex_approvals, &app);
                         });
                     }
                     Err(e) => { log::error!("Claude socket accept error: {}", e); }
@@ -23673,7 +23927,7 @@ fn start_claude_socket_server(
                         let pending = pending.clone();
                         let codex_approvals = codex_approvals.clone();
                         std::thread::spawn(move || {
-                            use std::io::{Read, Write};
+                            use std::io::Read;
                             s.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
                             let mut buf = Vec::new();
                             let mut chunk = [0u8; 4096];
@@ -23705,61 +23959,8 @@ fn start_claude_socket_server(
                                 );
                                 return;
                             }
-                            if let Some(res) = process_claude_event(&text, &state, &app, None) {
-                                if res.accepted && (res.hook_event == "PostToolUse" || res.hook_event == "Stop" || res.hook_event == "UserPromptSubmit") {
-                                    cleanup_codex_approval(&res.session_id, res.turn_id.as_deref(), &codex_approvals);
-                                }
-                                if res.hook_event == "PermissionRequest" {
-                                    let session_id = res.session_id;
-                                    let source = {
-                                        let sessions = state.lock().unwrap();
-                                        sessions
-                                            .get(&session_id)
-                                            .map(|session| session.source.clone())
-                                            .unwrap_or_else(|| "cc".to_string())
-                                    };
-                                    if source == "codex" {
-                                        s.set_read_timeout(None).ok();
-                                        handle_codex_permission_relay(&session_id, &codex_approvals, &mut s);
-                                        return;
-                                    }
-                                    let (tx, rx) = std::sync::mpsc::channel::<String>();
-                                    {
-                                        let mut map = pending.lock().unwrap();
-                                        map.insert(session_id.clone(), tx);
-                                    }
-                                    s.set_read_timeout(None).ok();
-                                    match rx.recv_timeout(std::time::Duration::from_secs(600)) {
-                                        Ok(response_json) => {
-                                            let bytes = response_json.as_bytes();
-                                            let write_result = s.write_all(bytes);
-                                            let flush_result = s.flush();
-                                            // Only emit a log line if anything looked off — successful
-                                            // permission round-trips are silent in release to avoid noise.
-                                            if write_result.is_err() || flush_result.is_err() {
-                                                log::warn!(
-                                                    "[claude_tcp] permission response write failed session={} bytes={} write_ok={} flush_ok={}",
-                                                    &session_id[..session_id.len().min(8)],
-                                                    bytes.len(),
-                                                    write_result.is_ok(),
-                                                    flush_result.is_ok(),
-                                                );
-                                            } else if cfg!(debug_assertions) {
-                                                log::info!(
-                                                    "[claude_tcp] permission response written session={} bytes={}",
-                                                    &session_id[..session_id.len().min(8)],
-                                                    bytes.len(),
-                                                );
-                                            }
-                                        }
-                                        Err(_) => {
-                                            log::warn!("[claude_tcp] permission timeout for session={}", &session_id[..session_id.len().min(8)]);
-                                        }
-                                    }
-                                    let mut map = pending.lock().unwrap();
-                                    map.remove(&session_id);
-                                }
-                            }
+                            s.set_read_timeout(None).ok();
+                            dispatch_claude_socket_event(&text, &mut s, &state, &pending, &codex_approvals, &app);
                         });
                     }
                     Err(e) => { log::error!("Claude TCP accept error: {}", e); }

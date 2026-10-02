@@ -69,6 +69,7 @@ export interface PendingInteraction {
   detail?: string
   justification?: string
   requestId?: string
+  deliveryError?: string
   approvalActions?: ApprovalActions
 }
 
@@ -241,6 +242,7 @@ export interface QuotaWindow {
 }
 
 export interface HarnessQuotaSummary {
+  status_message?: string | null
   harness: 'codex' | 'antigravity' | 'claude'
   connected: boolean
   plan_label?: string | null

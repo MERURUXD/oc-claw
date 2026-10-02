@@ -55,7 +55,7 @@ fn call_id(event: &Value) -> Option<String> {
 }
 
 pub fn from_hook(event: &Value, name: &str, source: &str) -> Option<PendingInteraction> {
-    if !matches!(source, "codex" | "antigravity") {
+    if !matches!(source, "cc" | "codex" | "antigravity") {
         return None;
     }
     if source == "codex" && matches!(name, "PreToolUse" | "PermissionRequest") {
@@ -121,7 +121,11 @@ pub fn from_hook(event: &Value, name: &str, source: &str) -> Option<PendingInter
             .or_else(|| args.get("description"))
             .and_then(Value::as_str)
             .map(str::to_owned),
-        request_id: None,
+        request_id: event
+            .get("request_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        delivery_error: None,
         approval_actions: None,
     })
 }
@@ -139,7 +143,7 @@ pub fn stale_turn(current: Option<&str>, event: &Value, name: &str) -> bool {
 
 /// A missing transcript record is not a resolution. Only an explicit matching
 /// result, reply, cancellation or new turn can release a hook-owned interaction.
-pub fn retain(previous: &PendingInteraction, event: &Value, name: &str) -> bool {
+pub fn retain(previous: &PendingInteraction, event: &Value, name: &str, source: &str) -> bool {
     if !previous.hook_owned {
         return false;
     }
@@ -170,6 +174,10 @@ pub fn retain(previous: &PendingInteraction, event: &Value, name: &str) -> bool 
     if name == "PostToolUse" {
         let matches = match (previous.call_id.as_deref(), call_id(event)) {
             (Some(a), Some(b)) => a == b,
+            // PermissionRequest officially omits tool_use_id. A same-tool
+            // parallel result cannot identify this approval; its relay
+            // acknowledgement or an explicit lifecycle boundary owns removal.
+            _ if source == "cc" && previous.kind == "approval" => false,
             _ => previous.tool.as_deref() == Some(tool_name(event)),
         };
         if matches {
@@ -386,6 +394,59 @@ pub fn codex_hooks_config(content: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // Most existing fixtures exercise Codex's native interaction protocol.
+    fn retain(previous: &PendingInteraction, event: &Value, name: &str) -> bool {
+        super::retain(previous, event, name, "codex")
+    }
+
+    #[test]
+    fn claude_parallel_same_tool_result_cannot_resolve_idless_approval() {
+        let event = json!({"tool_name":"Bash","request_id":"claude:1",
+            "tool_input":{"command":"pending command"}});
+        let approval = from_hook(&event, "PermissionRequest", "cc").unwrap();
+        assert!(approval.call_id.is_none());
+        for result in [
+            json!({"tool_name":"Bash","tool_use_id":"parallel"}),
+            json!({"tool_name":"Bash"}),
+        ] {
+            assert!(super::retain(&approval, &result, "PostToolUse", "cc"));
+        }
+        assert!(!super::retain(&approval, &json!({}), "SessionEnd", "cc"));
+        assert!(!super::retain(
+            &approval,
+            &json!({}),
+            "UserPromptSubmit",
+            "cc"
+        ));
+    }
+
+    #[test]
+    fn claude_command_approval_and_question_are_distinct_and_keep_request_identity() {
+        let event = json!({"tool_name":"Bash", "request_id":"r",
+            "tool_input":{"command":"echo test"}});
+        let approval = from_hook(&event, "PermissionRequest", "cc").unwrap();
+        assert_eq!(approval.kind, "approval");
+        assert_eq!(approval.interaction_type.as_deref(), Some("command"));
+        assert_eq!(approval.request_id.as_deref(), Some("r"));
+        assert!(approval.call_id.is_none());
+        assert_eq!(approval.summary.as_deref(), Some("echo test"));
+        assert!(from_hook(&event, "PreToolUse", "cc").is_none());
+        assert!(super::retain(
+            &approval,
+            &json!({"tool_use_id":"other", "tool_name":"Bash"}),
+            "PostToolUse",
+            "cc"
+        ));
+        assert!(super::retain(&approval, &event, "PostToolUse", "cc"));
+        let question = json!({"tool_name":"AskUserQuestion", "tool_use_id":"q",
+            "tool_input":{"questions":[{"question":"Pick a color"}]}});
+        let question = from_hook(&question, "PreToolUse", "cc").unwrap();
+        assert_eq!(question.kind, "user_input");
+        assert_eq!(question.summary.as_deref(), Some("Pick a color"));
+        assert!(super::retain(&question, &json!({}), "SubagentStop", "cc"));
+        assert!(!super::retain(&question, &json!({}), "Stop", "cc"));
+    }
 
     #[test]
     fn native_approval_survives_unrelated_result_and_resolves_matching_call() {

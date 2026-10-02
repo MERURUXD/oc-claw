@@ -200,7 +200,7 @@ const memoryCache: Record<QuotaHarness, HarnessQuotaSummary | null> = {
   claude: null,
 }
 
-function updateHarnessQuotaCache(
+export function updateHarnessQuotaCache(
   harness: QuotaHarness,
   summary: HarnessQuotaSummary | null,
 ) {

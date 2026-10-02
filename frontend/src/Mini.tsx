@@ -16,6 +16,7 @@ import { ChatList } from './components/ChatList'
 import { getStore, getBubbleStatusMotion, DEFAULT_CHAR, DEFAULT_CHAR_NAME, loadCharacters, loadOcConnections, saveOcConnections, setBubbleStatusMotion as persistBubbleStatusMotion } from './lib/store'
 import type { AgentMetrics, BubbleSessionDetail, BubbleStatusMotion, BubbleStyle, BubbleTransitionEvent, HarnessQuotaSummary, MascotBubblePayload, OcConnection, SubagentDetail } from './lib/types'
 import { calculateRemainingPercent, createQuotaRecoveryStateMachine, computeResetCheckDelay, extractQuotaWindows, fetchHarnessQuota, subscribeHarnessQuota, type QuotaHarness, type QuotaRecoveryStateMachine, type WindowRecord } from './lib/quotaRecovery'
+import { submitClaudePermission } from './lib/claudePermission'
 import { deriveSessionActivity, isSameBubblePayload } from './lib/sessionActivity'
 import {
   beginPanelUiTransition,
@@ -3668,6 +3669,8 @@ export default function Mini() {
   // In-flight Codex permission resolution states: { [sessionId]: 'allow' | 'deny' | 'fallback' }
   const [resolvingCodex, setResolvingCodex] = useState<Record<string, 'allow' | 'deny' | 'fallback'>>({})
   const [codexError, setCodexError] = useState<Record<string, string>>({})
+  const [resolvingClaude, setResolvingClaude] = useState<Record<string, boolean>>({})
+  const [claudePermissionError, setClaudePermissionError] = useState<Record<string, string>>({})
   // Clear dismissals once the session is no longer waiting, so the next
   // permission/clarify cycle re-shows the buttons.
   useEffect(() => {
@@ -5632,6 +5635,9 @@ export default function Mini() {
     }
 
     const quotaHarnesses: QuotaHarness[] = ['codex', 'antigravity', 'claude']
+    const nativeQuotaListener = listen<string>('harness-quota-invalidated', (event) => {
+      if (mounted && event.payload === 'claude') fetchHarnessQuota('claude').catch(() => {})
+    })
     const unsubscribers = quotaHarnesses.map((harness) =>
       subscribeHarnessQuota(harness, (summary) => onQuotaSummary(summary, harness)),
     )
@@ -5651,6 +5657,7 @@ export default function Mini() {
     return () => {
       mounted = false
       clearInterval(pollInterval)
+      nativeQuotaListener.then((unlisten) => unlisten()).catch(() => {})
       unsubscribers.forEach((unsub) => unsub())
       for (const timer of resetTimers.values()) {
         clearTimeout(timer)
@@ -7558,20 +7565,29 @@ export default function Mini() {
                                         </div>
                                           </>
                                         )}
+                                        {(cs.pendingInteraction?.deliveryError || claudePermissionError[`${cs.sessionId}:${cs.pendingInteraction?.requestId}`]) && (
+                                          <div data-no-drag role="alert" className="mt-2 text-[11px] text-rose-400 bg-rose-950/40 border border-rose-800/40 rounded px-2 py-1">
+                                            {cs.pendingInteraction?.deliveryError || claudePermissionError[`${cs.sessionId}:${cs.pendingInteraction?.requestId}`]}
+                                          </div>
+                                        )}
                                         <div className="flex gap-2 shrink-0 mt-2">
                                           {(() => {
-                                            // Immediately clear the waiting state locally so
-                                            // the permission popup closes without waiting for
-                                            // the next 2s poll cycle.
-                                            const resolvePermission = (decision: string) => {
-                                              if (!isInteractiveSession(cs)) return
-                                              if (cs.source === 'codex') return
-                                              invoke('resolve_claude_permission', { sessionId: cs.sessionId, decision }).catch(() => {})
-                                              // Clear waiting state locally so popup disappears instantly
-                                              setClaudeSessions((prev) => prev.map((s) => (s.sessionId === cs.sessionId ? { ...s, status: 'processing', tool: undefined, toolInput: undefined } : s)))
-                                              // Collapse the panel
-                                              hoverExpandedRef.current = false
-                                              collapse()
+                                            const resolvePermission = async (decision: string) => {
+                                              const requestId = cs.pendingInteraction?.requestId
+                                              if (!isInteractiveSession(cs) || cs.source !== 'cc' || !requestId || resolvingClaude[`${cs.sessionId}:${cs.pendingInteraction?.requestId}`]) return
+                                              const requestKey = `${cs.sessionId}:${requestId}`
+                                              await submitClaudePermission({
+                                                deliver: () => invoke('resolve_claude_permission', { sessionId: cs.sessionId, requestId, decision }),
+                                                isCurrent: () => claudeSessionsRef.current.find((s) => s.sessionId === cs.sessionId)?.pendingInteraction?.requestId === requestId,
+                                                setBusy: (busy) => setResolvingClaude((prev) => ({ ...prev, [requestKey]: busy })),
+                                                setError: (error) => setClaudePermissionError((prev) => ({ ...prev, [requestKey]: error })),
+                                                onDelivered: () => {
+                                                  // Socket delivery is confirmed; Claude's next hook
+                                                  // still owns the session lifecycle transition.
+                                                  hoverExpandedRef.current = false
+                                                  collapse()
+                                                },
+                                              })
                                             }
                                               // Codex granular permission approval relay: allow/deny directly in panel
                                               if (cs.source === 'codex' && cs.pendingInteraction?.kind === 'approval') {
@@ -7756,10 +7772,9 @@ export default function Mini() {
                                                   </div>
                                                 )
                                               }
-                                             // Codex / Gemini / OpenCode / Hermes, and Antigravity interactive questions,
-                                             // require approval / input in their own UI.
-                                             // Regular Antigravity tool approvals can be directly approved/denied via oc-claw.
-                                             if (cs.source === 'codex' || cs.source === 'gemini' || cs.source === 'opencode' || cs.source === 'hermes' || cs.source === 'antigravity') {
+                                             // Native interactions and disconnected Claude hooks are
+                                             // handled in the client's own UI.
+                                             if (cs.source !== 'cc' || !cs.pendingInteraction?.requestId) {
                                               const hermesPlatLabel = (() => {
                                                 if (cs.source !== 'hermes' || !cs.platform) return ''
                                                 const p = (cs.platform || '').toLowerCase()
@@ -7843,6 +7858,7 @@ export default function Mini() {
                                               <>
                                                 <button
                                                   data-no-drag
+                                                  disabled={!!resolvingClaude[`${cs.sessionId}:${cs.pendingInteraction?.requestId}`]}
                                                   onClick={(e) => {
                                                     e.stopPropagation()
                                                     resolvePermission('deny')
@@ -7853,6 +7869,7 @@ export default function Mini() {
                                                 </button>
                                                 <button
                                                   data-no-drag
+                                                  disabled={!!resolvingClaude[`${cs.sessionId}:${cs.pendingInteraction?.requestId}`]}
                                                   onClick={(e) => {
                                                     e.stopPropagation()
                                                     resolvePermission('allow_once')
@@ -7863,6 +7880,7 @@ export default function Mini() {
                                                 </button>
                                                 <button
                                                   data-no-drag
+                                                  disabled={!!resolvingClaude[`${cs.sessionId}:${cs.pendingInteraction?.requestId}`]}
                                                   onClick={(e) => {
                                                     e.stopPropagation()
                                                     resolvePermission('allow_all')
@@ -7873,6 +7891,7 @@ export default function Mini() {
                                                 </button>
                                                 <button
                                                   data-no-drag
+                                                  disabled={!!resolvingClaude[`${cs.sessionId}:${cs.pendingInteraction?.requestId}`]}
                                                   onClick={(e) => {
                                                     e.stopPropagation()
                                                     resolvePermission('auto_approve')

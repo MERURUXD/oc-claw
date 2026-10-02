@@ -76,6 +76,9 @@ pub struct PendingInteraction {
     pub justification: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// Relay delivery failure survives removal of disconnected controls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_actions: Option<ApprovalActions>,
 }
@@ -1243,6 +1246,7 @@ pub fn reconstruct_codex_pending_interaction(
                                     detail: Some(detail),
                                     justification,
                                     request_id: None,
+                                    delivery_error: None,
                                     approval_actions: None,
                                 });
                             }
@@ -1291,6 +1295,7 @@ pub fn reconstruct_codex_pending_interaction(
                                     detail: Some(detail),
                                     justification,
                                     request_id: None,
+                                    delivery_error: None,
                                     approval_actions: None,
                                 });
                             }
@@ -1318,6 +1323,7 @@ pub fn reconstruct_codex_pending_interaction(
                                         detail: Some(detail),
                                         justification,
                                         request_id: None,
+                                        delivery_error: None,
                                         approval_actions: None,
                                     });
                                 }
@@ -1402,6 +1408,7 @@ pub fn reconstruct_codex_pending_interaction(
                             detail,
                             justification,
                             request_id: None,
+                            delivery_error: None,
                             approval_actions: None,
                         });
                     }
@@ -1457,6 +1464,7 @@ pub fn reconstruct_codex_pending_interaction(
                         detail,
                         justification,
                         request_id: None,
+                        delivery_error: None,
                         approval_actions: None,
                     });
                 }
