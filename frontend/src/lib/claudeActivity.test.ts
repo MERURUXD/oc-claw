@@ -19,7 +19,32 @@ test('Claude tool description takes priority over a raw command or generic activ
   const result = resolveBubbleStatus(live, t)
   assert.equal(result.kind, 'running')
   assert.equal(result.content, 'Committing the approval fix')
-  assert.equal(formatClaudeToolActivity(session('Agent', { description: 'Reviewing the transport changes' }), t), 'Reviewing the transport changes')
+  for (const tool of ['Bash', 'PowerShell', 'Agent', 'Task']) {
+    assert.equal(formatClaudeToolActivity(session(tool, { description: 'Reviewing the transport changes' }), t), 'Reviewing the transport changes', tool)
+  }
+})
+
+test('Task management uses activeForm or its label without exposing the detailed description', () => {
+  for (const tool of ['TaskCreate', 'TaskUpdate']) {
+    const input = { subject: 'Cover authentication', description: 'Cover login/logout/refresh and store detailed acceptance criteria.' }
+    assert.equal(resolveBubbleStatus(session(tool, input), t).content, 'Updating task plan', tool)
+    assert.equal(resolveBubbleStatus(session(tool, { ...input, activeForm: '**Checking authentication coverage**\nDetails' }), t).content, 'Checking authentication coverage', tool)
+    for (const activeForm of ['  \n ', 42, null]) {
+      assert.equal(resolveBubbleStatus(session(tool, { ...input, activeForm }), t).content, 'Updating task plan', `${tool}: ${activeForm}`)
+    }
+  }
+  assert.equal(resolveBubbleStatus(session('TodoWrite', { description: 'Detailed task body' }), t).content, 'Updating task plan')
+})
+
+test('Custom and MCP description fields are business data, not activity summaries', () => {
+  for (const tool of ['create_ticket', 'mcp__crm__create_ticket', 'mcp__tasks__TaskCreate', 'mcp__shell__Bash']) {
+    const live = session(tool, { description: 'Private detailed business text', activeForm: 'Custom business field' })
+    const result = resolveBubbleStatus(live, t)
+    assert.ok(result.content.length > 0, tool)
+    assert.ok(!result.content.includes('Private detailed business text'), tool)
+    assert.ok(!result.content.includes('Custom business field'), tool)
+    assert.equal(result.content, formatClaudeToolActivity(live, t), tool)
+  }
 })
 
 test('Claude command summaries recognize executable operations and common options', () => {

@@ -86,10 +86,13 @@ export function formatClaudeToolActivity(session: BubbleSessionDetail, t: TFunct
     // A malformed/truncated hook payload still has a usable tool name/activity.
   }
   const field = (key: string) => typeof input[key] === 'string' ? (input[key] as string).trim() : ''
-  const description = normalizeActivitySummary(field('description'))
-  if (description) return description
-
   const tool = session.tool.toLowerCase()
+  // Only these built-ins define description as a short activity label. Task
+  // management and arbitrary MCP tools may use it for detailed business data.
+  if (['bash', 'powershell', 'agent', 'task'].includes(tool)) {
+    const description = normalizeActivitySummary(field('description'))
+    if (description) return description
+  }
   if (tool === 'bash' || tool === 'powershell') {
     const activity = commandActivity(field('command'))
     return activity ? t(`mini.claudeActivity.${activity}`, commandLabels[activity]) : null
@@ -112,7 +115,10 @@ export function formatClaudeToolActivity(session: BubbleSessionDetail, t: TFunct
     try { target = new URL(field('url')).hostname } catch { /* Omit an invalid URL. */ }
     return [t('mini.claudeActivity.fetch', 'Reading web page'), target].filter(Boolean).join(' · ')
   }
-  if (['todowrite', 'taskcreate', 'taskupdate'].includes(tool)) {
+  if (tool === 'taskcreate' || tool === 'taskupdate') {
+    return normalizeActivitySummary(field('activeForm')) || t('mini.claudeActivity.updateTasks', 'Updating task plan')
+  }
+  if (tool === 'todowrite') {
     return t('mini.claudeActivity.updateTasks', 'Updating task plan')
   }
   if (['tasklist', 'taskget'].includes(tool)) return t('mini.claudeActivity.readTasks', 'Checking task progress')
