@@ -295,6 +295,7 @@ export function isSamePendingInteraction(
     a.detail === b.detail &&
     a.justification === b.justification &&
     a.requestId === b.requestId &&
+    a.deliveryError === b.deliveryError &&
     isSameApprovalActions(a.approvalActions, b.approvalActions)
   )
 }

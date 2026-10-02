@@ -11561,7 +11561,13 @@ async fn resolve_claude_permission(
             _ => return Err(format!("Unknown decision: {}", decision)),
     };
 
-    claude_permission::resolve(&state.pending_permissions, &session_id, &request_id, response_json.clone())?;
+    claude_permission::resolve(
+        &state.pending_permissions,
+        &session_id,
+        &request_id,
+        response_json.clone(),
+    )
+    .await?;
     if cfg!(debug_assertions) {
         log::info!(
             "[resolve_permission] sending decision='{}' tool={:?} session={} response_json={}",
@@ -17652,6 +17658,7 @@ pub fn parse_codex_permission_request(event: &serde_json::Value) -> Option<Pendi
         detail: Some(detail),
         justification,
         request_id: None,
+        delivery_error: None,
         approval_actions: None,
     })
 }
@@ -17779,6 +17786,7 @@ pub fn apply_codex_permission_relay_to_session(
                 detail: None,
                 justification: reason_str,
                 request_id: None,
+                delivery_error: None,
                 approval_actions: None,
             }
         });
@@ -18745,6 +18753,7 @@ mod codex_adapter_tests {
                 detail: Some("网络访问".to_string()),
                 justification: Some("curl baidu".to_string()),
                 request_id: None,
+                delivery_error: None,
                 approval_actions: None,
             }),
         };
@@ -19246,6 +19255,7 @@ mod codex_adapter_tests {
                 detail: None,
                 justification: None,
                 request_id: None,
+                delivery_error: None,
                 approval_actions: None,
             }),
         };
@@ -19320,6 +19330,7 @@ mod codex_adapter_tests {
                 detail: None,
                 justification: None,
                 request_id: None,
+                delivery_error: None,
                 approval_actions: None,
             }),
         };
@@ -19392,6 +19403,7 @@ mod codex_adapter_tests {
                 detail: None,
                 justification: None,
                 request_id: None,
+                delivery_error: None,
                 approval_actions: None,
             }),
         };
@@ -19466,6 +19478,7 @@ mod codex_adapter_tests {
                 detail: None,
                 justification: Some("curl test".to_string()),
                 request_id: Some("req_turn_1_timeout".to_string()),
+                delivery_error: None,
                 approval_actions: Some(ApprovalActions {
                     can_deny: true,
                     can_allow_turn: true,
@@ -23771,10 +23784,7 @@ fn dispatch_claude_socket_event<S: std::io::Write>(
                     .recv_timeout(std::time::Duration::from_secs(claude_permission::WAIT_SECS))
                 {
                     Ok(response) => {
-                        delivered = stream
-                            .write_all(response.as_bytes())
-                            .and_then(|_| stream.flush())
-                            .is_ok();
+                        delivered = response.deliver(stream);
                         if !delivered {
                             log::warn!(
                                 "[claude_socket] approval response write failed session={}",

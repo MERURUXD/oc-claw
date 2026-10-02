@@ -125,6 +125,7 @@ pub fn from_hook(event: &Value, name: &str, source: &str) -> Option<PendingInter
             .get("request_id")
             .and_then(Value::as_str)
             .map(str::to_owned),
+        delivery_error: None,
         approval_actions: None,
     })
 }

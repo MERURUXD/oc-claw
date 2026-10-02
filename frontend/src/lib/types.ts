@@ -69,6 +69,7 @@ export interface PendingInteraction {
   detail?: string
   justification?: string
   requestId?: string
+  deliveryError?: string
   approvalActions?: ApprovalActions
 }
 

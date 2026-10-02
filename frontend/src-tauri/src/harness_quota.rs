@@ -1031,6 +1031,32 @@ fn claude_state_path() -> Option<std::path::PathBuf> {
     dirs::data_dir().map(|d| d.join(APP_DATA_DIRNAME).join(CLAUDE_STATE_FILE))
 }
 
+/// Never import the legacy shared CLI state: its account cannot be proved.
+/// Custom configs have no verified identity metadata yet, so they use only
+/// token-scoped in-memory reuse rather than borrowing another login's disk data.
+fn scoped_claude_state_path(
+    base: &Path,
+    desktop_key: Option<&str>,
+    cli_identity: Option<&(String, String)>,
+    custom_config: bool,
+) -> Option<std::path::PathBuf> {
+    let key = if let Some(key) = desktop_key {
+        key.to_owned()
+    } else {
+        if custom_config {
+            return None;
+        }
+        let (account, org) = cli_identity?;
+        if account.trim().is_empty() || org.trim().is_empty() {
+            return None;
+        }
+        // JSON encodes both IDs unambiguously; CLI and Desktop namespaces differ.
+        format!("cli-{}", serde_json::to_string(&(account, org)).ok()?)
+    };
+    let safe = percent_encoding::utf8_percent_encode(&key, percent_encoding::NON_ALPHANUMERIC);
+    Some(base.with_file_name(format!("claude-usage-{safe}.json")))
+}
+
 fn load_claude_state(path: &Path) -> ClaudePersistedState {
     std::fs::read_to_string(path)
         .ok()
@@ -1374,15 +1400,14 @@ async fn fetch_claude_quota(
             }
         }
     }
-    // Keep Desktop history/cooldown separate from CLI and from other accounts.
-    let state_path = claude_state_path().map(|path| {
-        if let Some(key) = desktop_key.as_ref() {
-            let safe =
-                percent_encoding::utf8_percent_encode(key, percent_encoding::NON_ALPHANUMERIC);
-            path.with_file_name(format!("claude-usage-{safe}.json"))
-        } else {
-            path
-        }
+    // Every persisted reading/cooldown belongs to one known account and org.
+    let state_path = claude_state_path().and_then(|path| {
+        scoped_claude_state_path(
+            &path,
+            desktop_key.as_deref(),
+            identity.as_ref(),
+            std::env::var_os("CLAUDE_CONFIG_DIR").is_some_and(|v| !v.is_empty()),
+        )
     });
     let state = state_path
         .as_deref()
@@ -1407,6 +1432,26 @@ async fn fetch_claude_quota(
         ));
     }
     result
+}
+
+fn claude_rate_limited(
+    now: u64,
+    creds: &ClaudeOauthCredentials,
+    state_path: Option<&Path>,
+    mut state: ClaudePersistedState,
+    cooldown: u64,
+) -> (HarnessQuotaSummary, Option<u64>) {
+    state.retry_at = Some(now + cooldown);
+    state.cooldown_token_expires_at_ms = creds.expires_at_ms;
+    if let Some(path) = state_path {
+        save_claude_state(path, &state);
+    }
+    let mut summary = claude_fallback_summary(&state, now);
+    summary.status_message = Some(format!(
+        "Claude 暂时限制配额查询，将在约 {} 分钟后重试。",
+        cooldown.div_ceil(60)
+    ));
+    (summary, Some(cooldown))
 }
 
 async fn poll_claude_usage(
@@ -1471,17 +1516,7 @@ async fn poll_claude_usage(
             "[harness_quota] Claude 429 rate limit hit, cooling down for {}s",
             cooldown
         );
-        state.retry_at = Some(now + cooldown);
-        state.cooldown_token_expires_at_ms = creds.expires_at_ms;
-        if let Some(path) = state_path.as_deref() {
-            save_claude_state(path, &state);
-        }
-        let mut summary = claude_fallback_summary(&state, now);
-        summary.status_message = Some(format!(
-            "Claude 暂时限制配额查询，将在约 {} 分钟后重试。",
-            cooldown.div_ceil(60)
-        ));
-        return Ok((summary, Some(cooldown)));
+        return Ok(claude_rate_limited(now, creds, state_path, state, cooldown));
     }
 
     // 403: token lacks the `user:profile` scope (e.g. a `setup-token` login) or
@@ -1627,6 +1662,121 @@ pub async fn get_harness_quota(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_account_switch_does_not_borrow_a_balance_or_cooldown_on_b_429() {
+        let dir = std::env::temp_dir().join(format!("oc-claw-cli-429-{}", std::process::id()));
+        let base = dir.join(CLAUDE_STATE_FILE);
+        let a = ("account-a".into(), "org".into());
+        let b = ("account-b".into(), "org".into());
+        let path_a = scoped_claude_state_path(&base, None, Some(&a), false).unwrap();
+        let path_b = scoped_claude_state_path(&base, None, Some(&b), false).unwrap();
+        let state_a = ClaudePersistedState {
+            last_good: Some(decode_claude_usage(
+                &serde_json::json!({"five_hour":{"utilization":91}}),
+                None,
+                1000,
+            )),
+            retry_at: Some(5000),
+            cooldown_token_expires_at_ms: Some(2000000),
+        };
+        save_claude_state(&path_a, &state_a);
+        // The old shared file also must never migrate into B's state.
+        save_claude_state(&base, &state_a);
+        assert_ne!(path_a, path_b);
+        let state_b = load_claude_state(&path_b);
+        assert_eq!(state_b, ClaudePersistedState::default());
+        let creds_b = ClaudeOauthCredentials {
+            access_token: "b-token".into(),
+            expires_at_ms: Some(2000000),
+            subscription_type: None,
+            rate_limit_tier: None,
+        };
+        let (quota_b, retry) = claude_rate_limited(1001, &creds_b, Some(&path_b), state_b, 600);
+        assert!(quota_b.primary.is_none());
+        assert_eq!(retry, Some(600));
+        let persisted_b = load_claude_state(&path_b);
+        assert!(persisted_b.last_good.is_none());
+        assert_eq!(
+            persisted_b.cooldown_remaining(Some(2000000), 1001),
+            Some(600)
+        );
+        assert_eq!(load_claude_state(&path_a), state_a);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cli_account_switch_does_not_borrow_a_balance_with_b_expired_token() {
+        let dir = std::env::temp_dir().join(format!("oc-claw-cli-expired-{}", std::process::id()));
+        let base = dir.join(CLAUDE_STATE_FILE);
+        let a = ("account-a".into(), "org".into());
+        let b = ("account-b".into(), "org".into());
+        let path_a = scoped_claude_state_path(&base, None, Some(&a), false).unwrap();
+        let path_b = scoped_claude_state_path(&base, None, Some(&b), false).unwrap();
+        let state_a = ClaudePersistedState {
+            last_good: Some(decode_claude_usage(
+                &serde_json::json!({"five_hour":{"utilization":91}}),
+                None,
+                1000,
+            )),
+            ..Default::default()
+        };
+        save_claude_state(&path_a, &state_a);
+        save_claude_state(&base, &state_a);
+        let expired = ClaudeOauthCredentials {
+            access_token: "b-token".into(),
+            expires_at_ms: Some(1),
+            subscription_type: None,
+            rate_limit_tier: None,
+        };
+        let result = poll_claude_usage(
+            1001,
+            &expired,
+            Some(&path_b),
+            load_claude_state(&path_b),
+            false,
+        )
+        .await;
+        assert!(result.unwrap_err().contains("token expired"));
+        // Its own known balance remains usable; no HTTP is made for expired tokens.
+        let own = poll_claude_usage(
+            1001,
+            &expired,
+            Some(&path_a),
+            load_claude_state(&path_a),
+            false,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(own.primary.unwrap().percent, 91.0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cli_persistence_requires_known_identity_and_never_shares_custom_config_state() {
+        let base = Path::new("cache").join(CLAUDE_STATE_FILE);
+        let account = ("account".into(), "org".into());
+        let other_org = ("account".into(), "other-org".into());
+        let cli = scoped_claude_state_path(&base, None, Some(&account), false).unwrap();
+        assert_ne!(cli, base);
+        assert_ne!(
+            cli,
+            scoped_claude_state_path(&base, None, Some(&other_org), false).unwrap()
+        );
+        assert_ne!(
+            cli,
+            scoped_claude_state_path(&base, Some("account:org"), None, false).unwrap()
+        );
+        assert!(scoped_claude_state_path(&base, None, None, false).is_none());
+        assert!(
+            scoped_claude_state_path(&base, None, Some(&("".into(), "org".into())), false)
+                .is_none()
+        );
+        // Even supplied default metadata cannot prove a custom config's account.
+        assert!(scoped_claude_state_path(&base, None, Some(&account), true).is_none());
+        assert!(scoped_claude_state_path(&base, None, None, true).is_none());
+    }
 
     #[test]
     fn cli_a_statusline_cannot_replace_desktop_b_oauth_quota() {

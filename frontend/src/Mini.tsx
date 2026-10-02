@@ -16,6 +16,7 @@ import { ChatList } from './components/ChatList'
 import { getStore, getBubbleStatusMotion, DEFAULT_CHAR, DEFAULT_CHAR_NAME, loadCharacters, loadOcConnections, saveOcConnections, setBubbleStatusMotion as persistBubbleStatusMotion } from './lib/store'
 import type { AgentMetrics, BubbleSessionDetail, BubbleStatusMotion, BubbleStyle, BubbleTransitionEvent, HarnessQuotaSummary, MascotBubblePayload, OcConnection, SubagentDetail } from './lib/types'
 import { calculateRemainingPercent, createQuotaRecoveryStateMachine, computeResetCheckDelay, extractQuotaWindows, fetchHarnessQuota, subscribeHarnessQuota, type QuotaHarness, type QuotaRecoveryStateMachine, type WindowRecord } from './lib/quotaRecovery'
+import { submitClaudePermission } from './lib/claudePermission'
 import { deriveSessionActivity, isSameBubblePayload } from './lib/sessionActivity'
 import {
   beginPanelUiTransition,
@@ -7564,9 +7565,9 @@ export default function Mini() {
                                         </div>
                                           </>
                                         )}
-                                        {claudePermissionError[`${cs.sessionId}:${cs.pendingInteraction?.requestId}`] && (
+                                        {(cs.pendingInteraction?.deliveryError || claudePermissionError[`${cs.sessionId}:${cs.pendingInteraction?.requestId}`]) && (
                                           <div data-no-drag role="alert" className="mt-2 text-[11px] text-rose-400 bg-rose-950/40 border border-rose-800/40 rounded px-2 py-1">
-                                            {claudePermissionError[`${cs.sessionId}:${cs.pendingInteraction?.requestId}`]}
+                                            {cs.pendingInteraction?.deliveryError || claudePermissionError[`${cs.sessionId}:${cs.pendingInteraction?.requestId}`]}
                                           </div>
                                         )}
                                         <div className="flex gap-2 shrink-0 mt-2">
@@ -7575,20 +7576,18 @@ export default function Mini() {
                                               const requestId = cs.pendingInteraction?.requestId
                                               if (!isInteractiveSession(cs) || cs.source !== 'cc' || !requestId || resolvingClaude[`${cs.sessionId}:${cs.pendingInteraction?.requestId}`]) return
                                               const requestKey = `${cs.sessionId}:${requestId}`
-                                              setResolvingClaude((prev) => ({ ...prev, [requestKey]: true }))
-                                              setClaudePermissionError((prev) => ({ ...prev, [requestKey]: '' }))
-                                              try {
-                                                await invoke('resolve_claude_permission', { sessionId: cs.sessionId, requestId, decision })
-                                                // Acknowledgement dismisses this popup; the hook's next
-                                                // lifecycle event owns the next session state.
-                                                if (claudeSessionsRef.current.find((s) => s.sessionId === cs.sessionId)?.pendingInteraction?.requestId !== requestId) return
-                                                hoverExpandedRef.current = false
-                                                collapse()
-                                              } catch (err) {
-                                                setClaudePermissionError((prev) => ({ ...prev, [requestKey]: String(err) }))
-                                              } finally {
-                                                setResolvingClaude((prev) => ({ ...prev, [requestKey]: false }))
-                                              }
+                                              await submitClaudePermission({
+                                                deliver: () => invoke('resolve_claude_permission', { sessionId: cs.sessionId, requestId, decision }),
+                                                isCurrent: () => claudeSessionsRef.current.find((s) => s.sessionId === cs.sessionId)?.pendingInteraction?.requestId === requestId,
+                                                setBusy: (busy) => setResolvingClaude((prev) => ({ ...prev, [requestKey]: busy })),
+                                                setError: (error) => setClaudePermissionError((prev) => ({ ...prev, [requestKey]: error })),
+                                                onDelivered: () => {
+                                                  // Socket delivery is confirmed; Claude's next hook
+                                                  // still owns the session lifecycle transition.
+                                                  hoverExpandedRef.current = false
+                                                  collapse()
+                                                },
+                                              })
                                             }
                                               // Codex granular permission approval relay: allow/deny directly in panel
                                               if (cs.source === 'codex' && cs.pendingInteraction?.kind === 'approval') {

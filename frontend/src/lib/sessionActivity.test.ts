@@ -524,3 +524,9 @@ test('isSameSessionDetail distinguishes same session/content/status with differe
 
 
 
+test('relay delivery failure remains visible after disconnected request controls disappear', () => {
+  const before: PendingInteraction = { kind: 'approval' }
+  const failed: PendingInteraction = { ...before, deliveryError: 'Approve in Claude' }
+  assert.equal(isSamePendingInteraction(before, failed), false)
+  assert.equal(isSamePendingInteraction(failed, { ...failed }), true)
+})

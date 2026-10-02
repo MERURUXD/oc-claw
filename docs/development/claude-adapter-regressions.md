@@ -39,6 +39,21 @@ Reinstallation does not nest wrappers; unsupported configurations are unchanged.
   PowerShell invocation, legacy-wrapper restoration, reinstall, and user removal.
   The standalone transport fixture has no Bash lookup/dependency. These tests
   do not establish GUI approval acceptance or native shell selection.
+- The approval command now awaits a writer-to-command oneshot result after
+  `write_all` and `flush`. Queue acceptance alone never dismisses the panel;
+  write/flush failure and a lost acknowledgement reject the command. Delivery
+  failure remains attached to the exact interaction after disconnected controls
+  disappear, so session refresh preserves the visible error. Replacements do
+  not inherit it. Frontend deferred-promise tests cover disabled/open while
+  delivery is pending, failure, confirmed success, and stale success.
+- CLI persisted quota/cooldown files now use the default account/organization
+  identity, in a namespace separate from Desktop. The old shared CLI file is
+  never imported because its owner cannot be established. Default logins without
+  known identity and custom configs use token-scoped in-memory reuse only:
+  they do not read/write shared persisted balances or cooldowns, and restart
+  loses their process-local fallback/cooldown. Tests exercise A-to-B 429 and
+  expired-token paths, organization separation, legacy-file rejection, and
+  unknown/custom identity rejection without contacting Anthropic.
 
 ## Protocol references and limits
 
@@ -151,15 +166,16 @@ payload was persisted. Installed Claude settings/hooks and OC-Claw remain untouc
 
 ## Validation
 
-- `pnpm test`: 172 passed after rebasing onto main with #85.
-- `cargo test --locked`: 175 passed, 2 existing ignored tests after review repairs.
+- `pnpm test`: 175 passed after the delivery-ack review repair.
+- `cargo test --locked`: 180 passed, 2 existing ignored tests after review repairs.
 - `cargo check --locked`: passed.
 - A temporary Rust probe compiled the actual Desktop reader and read the
   installed data: 20 exact CLI titles loaded, including the session whose
   transcript has no title, and the historical 0% / 44% usage sample decoded.
   The probe only reads metadata; it does not launch OC-Claw or install hooks.
-- `python scripts/test_claude_hook_transport.py`: 4 passed, including actual
-  PowerShell transport of an idless approval with large Unicode parameters and
+- `python scripts/test_claude_hook_transport.py`: 4 passed during earlier PR
+  validation; scripts are unchanged by the delivery-ack/CLI-state repair. This
+  includes actual PowerShell transport of an idless approval with large Unicode parameters and
   a standalone observer without Bash. Unix fixtures preserve the original
   statusline's stdin/stdout/exit code and use socket mocks.
 - `python scripts/test_codex_hook_transport.py`: 7 passed during the original
@@ -167,8 +183,8 @@ payload was persisted. Installed Claude settings/hooks and OC-Claw remain untouc
 - `pnpm build` and `pnpm exec tauri build --no-bundle`: passed.
 - `pnpm lint`: advisory baseline findings, including Tauri generated assets
   incorrectly included by the existing lint configuration. Comparison of the
-  modified frontend files against HEAD added no findings (Mini: 71, quota
-  component: 7, quota module: 0, types: 1).
+  modified frontend files against the previous PR head added no findings;
+  the new approval submission helper/tests have no lint findings.
 - `cargo fmt --check`: repository baseline differences remain; new modules are
   formatted. No broad formatting cleanup is included.
 
