@@ -14997,7 +14997,7 @@ async fn jump_to_claude_terminal(session_id: String, state: tauri::State<'_, Cla
     let source = session.source.clone();
     let host_terminal = session.host_terminal.clone();
     let platform = session.platform.clone();
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "windows"))]
     let cwd = session.cwd.clone();
     #[cfg(target_os = "macos")]
     let terminal_id = session.terminal_id.clone();
