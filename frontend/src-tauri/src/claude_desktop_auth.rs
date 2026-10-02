@@ -14,6 +14,19 @@ pub struct Credentials {
 
 const OFFICIAL_CLIENT: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
+/// An undecryptable/expired login still establishes account ownership; it
+/// must not be replaced by an unrelated session's unscoped statusline reading.
+pub fn has_selected_account() -> bool {
+    crate::claude_desktop::roots()
+        .pop()
+        .and_then(|root| crate::claude_desktop::json_file(&root.join("config.json")))
+        .is_some_and(|config| {
+            config["lastKnownAccountUuid"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty())
+        })
+}
+
 fn select_token(
     caches: &[Value],
     account: &str,

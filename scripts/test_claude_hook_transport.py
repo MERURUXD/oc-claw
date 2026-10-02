@@ -34,14 +34,16 @@ class ClaudeTransportTests(unittest.TestCase):
                 sock = MagicMock()
                 sock.recv.side_effect = [reply, b'']
                 data = {'hook_event_name': event, 'session_id': 'fixture',
-                        'transcript_path': '/fixture/s.jsonl', 'tool_use_id': 'call',
+                        'transcript_path': '/fixture/s.jsonl',
                         'tool_name': 'Bash', 'tool_input': {'command': 'echo 中文'}}
+                if event == 'PostToolUse':
+                    data['tool_use_id'] = 'call'
                 output = io.StringIO()
                 with patch('socket.AF_UNIX', 1, create=True), patch('socket.socket', return_value=sock), \
                      patch('sys.stdin', io.StringIO(json.dumps(data))), contextlib.redirect_stdout(output):
                     exec(compile(payload, 'claude-hook', 'exec'), {})
                 sent = json.loads(sock.sendall.call_args.args[0])
-                self.assertEqual(sent['tool_use_id'], 'call')
+                self.assertEqual(sent.get('tool_use_id'), data.get('tool_use_id'))
                 self.assertEqual(sent['transcript_path'], '/fixture/s.jsonl')
                 self.assertEqual(output.getvalue(), reply.decode() if event == 'PermissionRequest' else '')
                 if event != 'PermissionRequest':
@@ -68,24 +70,25 @@ class ClaudeTransportTests(unittest.TestCase):
 
     @unittest.skipUnless(POWERSHELL, 'PowerShell unavailable')
     def test_windows_permission_response_and_large_unicode_payload(self):
-        data = {'session_id': 'fixture', 'hook_event_name': 'PermissionRequest', 'tool_use_id': 'call',
+        data = {'session_id': 'fixture', 'hook_event_name': 'PermissionRequest',
                 'tool_name': 'Bash', 'tool_input': {'command': 'echo 中文' * 1000}}
         reply = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'deny'}}}
         output, received = self.run_windows(SCRIPTS[1], data, json.dumps(reply).encode())
         self.assertEqual(json.loads(output.stdout), reply)
         self.assertEqual(received['tool_input'], data['tool_input'])
-        self.assertEqual(received['tool_use_id'], 'call')
+        self.assertNotIn('tool_use_id', received)
 
     @unittest.skipUnless(POWERSHELL, 'PowerShell unavailable')
-    def test_windows_statusline_forwards_native_data_and_runs_original_command(self):
+    def test_windows_statusline_without_git_bash_forwards_native_data(self):
         data = {'session_id': 'fixture', 'session_name': '中文标题', 'rate_limits': {
             'five_hour': {'used_percentage': 0, 'resets_at': 9999999999}}}
-        original = "cat\nprintf '\\n原有状态行\\n'\nexit 7\n"
-        output, received = self.run_windows(WINDOWS_STATUSLINE, data, b'', original, expected_exit=7)
+        # Existing user commands remain in Claude's settings unchanged; only
+        # an otherwise absent statusline receives this standalone observer.
+        self.assertNotIn('bash', WINDOWS_STATUSLINE.lower())
+        output, received = self.run_windows(WINDOWS_STATUSLINE, data, b'')
         self.assertEqual(received['event'], 'StatusLine')
         self.assertEqual(received['rate_limits'], data['rate_limits'])
-        self.assertEqual(json.loads(output.stdout.splitlines()[0]), data)
-        self.assertEqual(output.stdout.splitlines()[1], '原有状态行')
+        self.assertEqual(output.stdout, '')
 
     def run_windows(self, script_text, data, reply, original=None, expected_exit=0):
         listener = socket.socket()

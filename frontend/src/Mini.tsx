@@ -15,7 +15,7 @@ import { QuotaSideRail } from './components/QuotaCapsule'
 import { ChatList } from './components/ChatList'
 import { getStore, getBubbleStatusMotion, DEFAULT_CHAR, DEFAULT_CHAR_NAME, loadCharacters, loadOcConnections, saveOcConnections, setBubbleStatusMotion as persistBubbleStatusMotion } from './lib/store'
 import type { AgentMetrics, BubbleSessionDetail, BubbleStatusMotion, BubbleStyle, BubbleTransitionEvent, HarnessQuotaSummary, MascotBubblePayload, OcConnection, SubagentDetail } from './lib/types'
-import { calculateRemainingPercent, createQuotaRecoveryStateMachine, computeResetCheckDelay, extractQuotaWindows, fetchHarnessQuota, subscribeHarnessQuota, updateHarnessQuotaCache, type QuotaHarness, type QuotaRecoveryStateMachine, type WindowRecord } from './lib/quotaRecovery'
+import { calculateRemainingPercent, createQuotaRecoveryStateMachine, computeResetCheckDelay, extractQuotaWindows, fetchHarnessQuota, subscribeHarnessQuota, type QuotaHarness, type QuotaRecoveryStateMachine, type WindowRecord } from './lib/quotaRecovery'
 import { deriveSessionActivity, isSameBubblePayload } from './lib/sessionActivity'
 import {
   beginPanelUiTransition,
@@ -5634,8 +5634,8 @@ export default function Mini() {
     }
 
     const quotaHarnesses: QuotaHarness[] = ['codex', 'antigravity', 'claude']
-    const nativeQuotaListener = listen<HarnessQuotaSummary>('harness-quota-update', (event) => {
-      if (event.payload.harness === 'claude') updateHarnessQuotaCache('claude', event.payload)
+    const nativeQuotaListener = listen<string>('harness-quota-invalidated', (event) => {
+      if (mounted && event.payload === 'claude') fetchHarnessQuota('claude').catch(() => {})
     })
     const unsubscribers = quotaHarnesses.map((harness) =>
       subscribeHarnessQuota(harness, (summary) => onQuotaSummary(summary, harness)),

@@ -23,31 +23,6 @@ try {
         $client.Close()
     }
 } catch {}
-$original = Join-Path $PSScriptRoot 'ooclaw-statusline-original.sh'
-if (Test-Path -LiteralPath $original) {
-    $start = [System.Diagnostics.ProcessStartInfo]::new()
-    $bash = $env:CLAUDE_CODE_GIT_BASH_PATH
-    if (-not $bash -or -not (Test-Path -LiteralPath $bash)) {
-        $bash = @(
-            (Join-Path $env:ProgramFiles 'Git\bin\bash.exe'),
-            (Join-Path $env:LOCALAPPDATA 'Programs\Git\bin\bash.exe'),
-            (Get-Command bash -ErrorAction SilentlyContinue).Source
-        ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
-    }
-    if (-not $bash) { exit 1 }
-    $start.FileName = $bash
-    $start.Arguments = '"' + $original.Replace('\', '/') + '"'
-    $start.UseShellExecute = $false
-    $start.CreateNoWindow = $true
-    $start.RedirectStandardInput = $true
-    $start.StandardInputEncoding = [System.Text.UTF8Encoding]::new($false)
-    # Preserve stdout/stderr directly, including ANSI escapes and newlines.
-    $process = [System.Diagnostics.Process]::Start($start)
-    $process.StandardInput.Write($raw)
-    $process.StandardInput.Close()
-    $process.WaitForExit()
-    exit $process.ExitCode
-}
 "#;
 
 #[cfg(not(windows))]
@@ -81,6 +56,24 @@ pub fn install(settings: &mut Value, hooks_dir: &Path, command: &str) -> Result<
     }
     let original = existing.and_then(|v| v["command"].as_str());
     let original_path = hooks_dir.join("ooclaw-statusline-original.sh");
+    #[cfg(windows)]
+    if let Some(original) = original {
+        if !original.contains("ooclaw-statusline.") {
+            // Claude owns Bash/PowerShell selection. We cannot infer the
+            // original shell from a command string, so leave it fully intact.
+            // Desktop/CLI OAuth and title metadata work without this relay.
+            return Ok(());
+        }
+        if original_path.exists() {
+            // Migrate the earlier wrapper that forced all Windows commands
+            // through Bash: restore the exact saved command for Claude to run.
+            let saved = std::fs::read_to_string(&original_path).map_err(|e| e.to_string())?;
+            let mut restored = existing.cloned().unwrap();
+            restored["command"] = json!(saved);
+            root.insert("statusLine".into(), restored);
+            return Ok(());
+        }
+    }
     if let Some(original) = original.filter(|s| !s.contains("ooclaw-statusline.")) {
         std::fs::write(&original_path, original).map_err(|e| e.to_string())?;
     } else if original.is_none() && original_path.exists() {
@@ -97,6 +90,7 @@ pub fn install(settings: &mut Value, hooks_dir: &Path, command: &str) -> Result<
 mod tests {
     use super::*;
     #[test]
+    #[cfg(not(windows))]
     fn install_preserves_user_command_and_settings_and_never_recursively_wraps() {
         let dir = std::env::temp_dir().join(format!("oc-claw-statusline-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -120,6 +114,52 @@ mod tests {
         settings.as_object_mut().unwrap().remove("statusLine");
         install(&mut settings, &dir, "pwsh -File ooclaw-statusline.ps1").unwrap();
         assert!(!dir.join("ooclaw-statusline-original.sh").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_leaves_existing_powershell_and_bash_semantics_to_claude() {
+        // No shell lookup or invocation occurs, so this also covers hosts
+        // without Git Bash and hosts whose Bash/PowerShell choice changes.
+        let dir =
+            std::env::temp_dir().join(format!("oc-claw-statusline-shell-{}", std::process::id()));
+        for command in [
+            r#"$raw = [Console]::In.ReadToEnd(); Write-Output "$raw"; exit 7"#,
+            r#"cat; printf '\noriginal\n'; exit 7"#,
+            "powershell -NoProfile -File C:/statusline.ps1",
+        ] {
+            let mut settings = json!({"statusLine":{"type":"command","command":command,"padding":2,"refreshInterval":5}});
+            let before = settings.clone();
+            install(&mut settings, &dir, "pwsh -File ooclaw-statusline.ps1").unwrap();
+            assert_eq!(settings, before);
+        }
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_restores_legacy_wrapper_and_does_not_resurrect_removed_commands() {
+        let dir =
+            std::env::temp_dir().join(format!("oc-claw-statusline-migrate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let saved = "$raw = [Console]::In.ReadToEnd(); Write-Output '中文'; exit 7";
+        let path = dir.join("ooclaw-statusline-original.sh");
+        std::fs::write(&path, saved).unwrap();
+        let mut settings = json!({"statusLine":{"type":"command","command":"powershell -File ooclaw-statusline.ps1","padding":2}});
+        install(&mut settings, &dir, "pwsh -File ooclaw-statusline.ps1").unwrap();
+        assert_eq!(settings["statusLine"]["command"], saved);
+        assert_eq!(settings["statusLine"]["padding"], 2);
+        let once = settings.clone();
+        install(&mut settings, &dir, "pwsh -File ooclaw-statusline.ps1").unwrap();
+        assert_eq!(settings, once);
+        settings.as_object_mut().unwrap().remove("statusLine");
+        install(&mut settings, &dir, "pwsh -File ooclaw-statusline.ps1").unwrap();
+        assert_eq!(
+            settings["statusLine"]["command"],
+            "pwsh -File ooclaw-statusline.ps1"
+        );
+        assert!(!path.exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

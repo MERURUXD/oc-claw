@@ -862,7 +862,8 @@ const CLAUDE_COOLDOWN_MAX_SECS: u64 = 3600;
 /// In-memory reuse window for a successful poll (Codex/Antigravity use 300s).
 const CLAUDE_CACHE_TTL_SECS: u64 = 120;
 const CLAUDE_NATIVE_TTL_SECS: u64 = 120;
-static CLAUDE_NATIVE_USAGE: Mutex<Option<HarnessQuotaSummary>> = Mutex::new(None);
+static CLAUDE_NATIVE_USAGE: std::sync::LazyLock<Mutex<HashMap<String, HarnessQuotaSummary>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 static CLAUDE_FETCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 // The identity is process-local, never serialized: CLI may omit account UUIDs.
 // Re-read credentials before reusing quota so an account switch cannot reuse bars.
@@ -893,21 +894,29 @@ fn reusable_claude_entry(
             })
 }
 
-/// Native statusline usage is measured by Claude itself. It remains available
-/// even when a separate OAuth usage request is throttled or has no credential.
-pub fn observe_claude_usage(event: &serde_json::Value) -> Option<HarnessQuotaSummary> {
-    let summary = decode_claude_statusline(event, unix_now())?;
-    *CLAUDE_NATIVE_USAGE.lock().unwrap() = Some(summary.clone());
-    let mut cache = get_cache().lock().unwrap();
-    cache.insert(
-        "claude".into(),
-        QuotaCacheEntry {
-            summary: summary.clone(),
-            cached_at: summary.updated_at,
-            backoff_until: 0,
-        },
-    );
-    Some(summary)
+/// Statusline schema has a session ID but no account/org. Store it separately:
+/// it cannot overwrite OAuth-owned quota or bypass credential selection.
+pub fn observe_claude_usage(event: &serde_json::Value) -> bool {
+    record_claude_native_usage(&mut CLAUDE_NATIVE_USAGE.lock().unwrap(), event, unix_now())
+}
+
+fn record_claude_native_usage(
+    readings: &mut HashMap<String, HarnessQuotaSummary>,
+    event: &serde_json::Value,
+    now: u64,
+) -> bool {
+    let Some(session) = event["session_id"].as_str().filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let Some(summary) = decode_claude_statusline(event, now) else {
+        return false;
+    };
+    readings.retain(|_, s| s.updated_at <= now && now - s.updated_at < CLAUDE_NATIVE_TTL_SECS);
+    if !readings.contains_key(session) && readings.len() >= 128 {
+        return false;
+    }
+    readings.insert(session.to_owned(), summary);
+    true
 }
 
 fn decode_claude_statusline(event: &serde_json::Value, now: u64) -> Option<HarnessQuotaSummary> {
@@ -944,15 +953,27 @@ fn decode_claude_statusline(event: &serde_json::Value, now: u64) -> Option<Harne
     })
 }
 
-fn fresh_claude_native_usage(now: u64) -> Option<HarnessQuotaSummary> {
-    CLAUDE_NATIVE_USAGE.lock().unwrap().clone().filter(|s| {
-        now.saturating_sub(s.updated_at) < CLAUDE_NATIVE_TTL_SECS
+fn unscoped_claude_native_usage(
+    readings: &HashMap<String, HarnessQuotaSummary>,
+    oauth_identity: bool,
+    now: u64,
+) -> Option<HarnessQuotaSummary> {
+    if oauth_identity {
+        return None;
+    }
+    let mut fresh = readings.values().filter(|s| {
+        s.updated_at <= now
+            && now - s.updated_at < CLAUDE_NATIVE_TTL_SECS
             && s.primary
                 .as_ref()
                 .and_then(|w| w.resets_at.as_ref())
                 .and_then(|r| DateTime::parse_from_rfc3339(r).ok())
                 .is_none_or(|r| r.timestamp() > now as i64)
-    })
+    });
+    let only = fresh.next()?.clone();
+    // The aggregate UI has no selected session; don't choose among sessions
+    // whose accounts cannot be proven equal.
+    fresh.next().is_none().then_some(only)
 }
 /// How long a persisted last-good reading may still be shown while the
 /// endpoint is unreachable or cooling down.
@@ -1319,6 +1340,15 @@ async fn fetch_claude_quota(
     {
         Some(c) => c,
         None => {
+            let oauth_identity =
+                identity.is_some() || crate::claude_desktop_auth::has_selected_account();
+            if let Some(native) = unscoped_claude_native_usage(
+                &CLAUDE_NATIVE_USAGE.lock().unwrap(),
+                oauth_identity,
+                now,
+            ) {
+                return Ok((native, None));
+            }
             if let Some(usage) = crate::claude_desktop::snapshot().usage {
                 return Ok((desktop_claude_quota(usage, now), None));
             }
@@ -1508,11 +1538,6 @@ pub async fn get_harness_quota(
         None
     };
     let now = unix_now();
-    if harness_key == "claude" {
-        if let Some(summary) = fresh_claude_native_usage(now) {
-            return Ok(Some(summary));
-        }
-    }
 
     // Check cache and active 429 backoff
     {
@@ -1549,14 +1574,6 @@ pub async fn get_harness_quota(
 
     match result {
         Ok((summary, backoff_opt)) => {
-            // A native reading can arrive while the HTTP request is in flight.
-            if harness_key == "claude" {
-                if let Some(native) =
-                    fresh_claude_native_usage(unix_now()).filter(|s| s.updated_at >= now)
-                {
-                    return Ok(Some(native));
-                }
-            }
             let backoff_until = if let Some(secs) = backoff_opt {
                 now + secs
             } else {
@@ -1579,11 +1596,6 @@ pub async fn get_harness_quota(
                 harness_key,
                 err
             );
-            if harness_key == "claude" {
-                if let Some(native) = fresh_claude_native_usage(unix_now()) {
-                    return Ok(Some(native));
-                }
-            }
             // Fall back to cached entry if present
             let cache = get_cache().lock().unwrap();
             if harness_key == "claude" {
@@ -1615,6 +1627,37 @@ pub async fn get_harness_quota(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_a_statusline_cannot_replace_desktop_b_oauth_quota() {
+        let mut readings = HashMap::new();
+        let cli_a = serde_json::json!({"session_id":"cli-account-a",
+            "rate_limits":{"five_hour":{"used_percentage":91,"resets_at":2000}}});
+        assert!(record_claude_native_usage(&mut readings, &cli_a, 1000));
+        assert_eq!(
+            unscoped_claude_native_usage(&readings, false, 1001)
+                .unwrap()
+                .primary
+                .unwrap()
+                .percent,
+            91.0
+        );
+        // Desktop B owns the aggregate UI even if its OAuth lookup is expired,
+        // cooling down or unavailable; the unbound A reading is never eligible.
+        assert!(unscoped_claude_native_usage(&readings, true, 1001).is_none());
+        let desktop_b = serde_json::json!({"session_id":"desktop-account-b",
+            "rate_limits":{"five_hour":{"used_percentage":12,"resets_at":2000}}});
+        assert!(record_claude_native_usage(&mut readings, &desktop_b, 1001));
+        assert_eq!(readings.len(), 2);
+        assert!(unscoped_claude_native_usage(&readings, false, 1001).is_none());
+        assert!(unscoped_claude_native_usage(&readings, true, 1001).is_none());
+        assert!(unscoped_claude_native_usage(&readings, false, 1121).is_none());
+        assert!(!record_claude_native_usage(
+            &mut readings,
+            &serde_json::json!({"rate_limits":{"five_hour":{"used_percentage":5}}}),
+            1001
+        ));
+    }
 
     #[test]
     fn desktop_usage_keeps_measurement_age_and_hides_stale_or_future_balances() {

@@ -73,6 +73,28 @@ pub fn cleanup(pending: &PendingPermissions, session_id: &str, request_id: &str)
     }
 }
 
+/// A successful socket write acknowledges this relay request, not tool
+/// completion. Leave lifecycle state to Claude; stale callbacks cannot clear
+/// a replacement, and failed delivery only removes our unavailable controls.
+pub fn finish_interaction(
+    interaction: &mut Option<crate::session_activity::PendingInteraction>,
+    request_id: &str,
+    delivered: bool,
+) -> bool {
+    if !interaction
+        .as_ref()
+        .is_some_and(|p| p.request_id.as_deref() == Some(request_id))
+    {
+        return false;
+    }
+    if delivered {
+        *interaction = None;
+    } else {
+        interaction.as_mut().unwrap().request_id = None;
+    }
+    true
+}
+
 pub fn resolve(
     pending: &PendingPermissions,
     session_id: &str,
@@ -98,6 +120,43 @@ pub fn resolve(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn idless_approval_survives_parallel_result_until_its_own_relay_ack() {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (event, conn) = prepare(
+            r#"{"session_id":"s","hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"pending"}}"#,
+            &pending,
+        );
+        let conn = conn.unwrap();
+        let event: Value = serde_json::from_str(&event).unwrap();
+        let mut interaction =
+            crate::interaction_state::from_hook(&event, "PermissionRequest", "cc");
+        assert!(crate::interaction_state::retain(
+            interaction.as_ref().unwrap(),
+            &json!({"tool_name":"Bash","tool_use_id":"other"}),
+            "PostToolUse",
+            "cc"
+        ));
+        resolve(&pending, "s", &conn.request_id, "allow".into()).unwrap();
+        assert_eq!(conn.receiver.recv().unwrap(), "allow");
+        assert!(!finish_interaction(&mut interaction, "older", true));
+        assert!(finish_interaction(&mut interaction, &conn.request_id, true));
+        assert!(interaction.is_none());
+        let mut replacement = crate::interaction_state::from_hook(
+            &json!({"tool_name":"Bash","request_id":"replacement"}),
+            "PermissionRequest",
+            "cc",
+        );
+        assert!(!finish_interaction(
+            &mut replacement,
+            &conn.request_id,
+            true
+        ));
+        assert!(finish_interaction(&mut replacement, "replacement", false));
+        assert!(replacement.is_some());
+        assert!(replacement.unwrap().request_id.is_none());
+    }
 
     #[test]
     fn relay_is_ready_before_event_publication_and_old_requests_cannot_resolve_or_remove_new_ones()

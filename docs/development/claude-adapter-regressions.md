@@ -9,22 +9,48 @@ fix in #84. It does not install or launch the built application.
 | --- | --- | --- |
 | No quota captured | Only CLI OAuth credentials are read; this Desktop installation has no CLI credentials file. Missing credentials and 403 silently hide the entry. A 429 without a previous reading leaves empty data; the side rail represents missing data as 100% remaining. | Read Desktop OAuth credentials with strict account matching and query live usage; accept measured statusline events and recent Desktop history as alternate sources; serialize queries, retain cooldown, display unavailable/error information, and show unknown quota as a dash. |
 | Workspace name instead of session title | Only hook-provided title fields are read. Transcript metadata, Desktop's own title metadata, and the native session name are unused. One live Desktop title has not been written into its transcript yet. | Preserve the exact hook transcript path; read Desktop metadata keyed by `cliSessionId`, `custom-title` and summary/index metadata; accept statusline `session_name`. Scan complete appended transcript records incrementally and re-read on truncation. Metadata never changes turn status. |
-| Command approval shown as a question | Claude is excluded from the unified pending-interaction parser. | Normalize `PermissionRequest` as approval and `AskUserQuestion` as user input, preserving call identity and tool arguments. |
+| Command approval shown as a question | Claude is excluded from the unified pending-interaction parser. | Normalize `PermissionRequest` as approval and `AskUserQuestion` as user input, preserving relay request identity and tool arguments. Claude approval has no native tool-use ID. |
 | Approval click has no effect | Waiting is published before the response channel is registered; missing/disconnected channels return success; the UI swallows errors and assumes processing. The hook's timeout is not aligned with the server's 600-second wait. | Register the channel before publishing; identify each connection by request ID; reject stale clicks and protect replacement requests from old cleanup; configure a 630-second hook timeout; display errors and await acknowledgement. The next hook owns the lifecycle transition. |
 | Long work becomes inactive | Desktop without PID still uses silence timeout; an old transcript interruption can stop a new live Claude turn; root Stop does not keep the session active for unfinished descendants. | Remove Claude silence timeout; use explicit lifecycle or confirmed process exit; leave Claude transcript watchers out of lifecycle decisions; defer root completion until descendant work finishes. Query errors do not prove process exit. |
 
-The statusline relay preserves existing command, padding, stdin, stdout, stderr,
-and exit status. Reinstallation replaces the wrapper rather than nesting it.
-Existing unsupported statusline configurations are left unchanged.
+On Unix, the statusline relay preserves the existing command, padding, stdin,
+stdout, stderr, and exit status. On Windows, an existing user statusline is left
+exactly unchanged so Claude retains ownership of Bash/PowerShell selection.
+The earlier Windows wrapper is migrated back to its saved original command.
+Only an absent Windows statusline receives our standalone PowerShell observer;
+existing Windows commands therefore do not forward native usage/title events.
+OAuth quota queries and Desktop/transcript title readers remain available.
+Reinstallation does not nest wrappers; unsupported configurations are unchanged.
+
+## PR #86 review regressions
+
+- Claude `PermissionRequest` officially omits `tool_use_id`. A parallel same-tool
+  `PostToolUse` cannot identify an idless approval and no longer clears its popup
+  or relay. Successful socket delivery clears only the matching relay request;
+  failed delivery removes disconnected controls, and stale acknowledgements
+  cannot clear a replacement. Explicit Claude hooks still own turn lifecycle.
+- Native statusline measurements are stored by exact `session_id`, without an
+  inferred account/org. They cannot overwrite OAuth-owned cache or push directly
+  into the frontend. A statusline event requests the normal credential-gated
+  query; native fallback is eligible only with no known OAuth identity and one
+  fresh, unambiguous session. An expired/undecryptable selected Desktop account
+  still prevents borrowing an unrelated CLI reading.
+- Windows command-preservation fixtures cover inline PowerShell, Bash, explicit
+  PowerShell invocation, legacy-wrapper restoration, reinstall, and user removal.
+  The standalone transport fixture has no Bash lookup/dependency. These tests
+  do not establish GUI approval acceptance or native shell selection.
 
 ## Protocol references and limits
 
 - [Claude hooks reference](https://code.claude.com/docs/en/hooks):
-  `PermissionRequest` returns `hookSpecificOutput.decision.behavior`; timeout
+  `PermissionRequest` input has no `tool_use_id`, and its output returns
+  `hookSpecificOutput.decision.behavior`; timeout
   discards hook output and returns control to the client's normal flow.
 - [Claude statusline reference](https://code.claude.com/docs/en/statusline):
   `session_name` is the native custom/generated title. `rate_limits` contains
-  measured `used_percentage` and Unix `resets_at`; quota fields require a
+  measured `used_percentage` and Unix `resets_at`, with `session_id` but no
+  account/org identity. On Windows, Claude uses Git Bash when present and
+  PowerShell otherwise. Quota fields require a
   supporting client version (the reference specifies v2.1.251+) and appear only
   after an API response on an eligible account. Older clients retain OAuth
   fallback. Desktop support must be verified on the user's client.
@@ -106,8 +132,10 @@ existing CLI credentials and passive history; macOS Desktop OAuth still needs a
 noninteractive Keychain/CBC adapter and native verification.
 
 Backend query cache and frontend Claude polling both use two minutes. Native
-statusline events update immediately when available; passive history uses the
-existing two-second metadata cache and does not wait for the HTTP TTL. Manual
+statusline events request a credential-gated query without overriding its HTTP
+cache or cooldown; an unbound native measurement is used only when no OAuth
+identity exists and exactly one session has fresh data. Passive history uses
+the existing two-second metadata cache and does not wait for the HTTP TTL. Manual
 refresh skips the query cache, but never skips the server's cooldown. Credential
 changes invalidate process quota reuse; Desktop persisted state is separated
 by account/organization from CLI and from other Desktop accounts. Reset boundaries
@@ -124,16 +152,18 @@ payload was persisted. Installed Claude settings/hooks and OC-Claw remain untouc
 ## Validation
 
 - `pnpm test`: 172 passed after rebasing onto main with #85.
-- `cargo test --locked`: 171 passed, 2 existing ignored tests.
+- `cargo test --locked`: 175 passed, 2 existing ignored tests after review repairs.
 - `cargo check --locked`: passed.
 - A temporary Rust probe compiled the actual Desktop reader and read the
   installed data: 20 exact CLI titles loaded, including the session whose
   transcript has no title, and the historical 0% / 44% usage sample decoded.
   The probe only reads metadata; it does not launch OC-Claw or install hooks.
 - `python scripts/test_claude_hook_transport.py`: 4 passed, including actual
-  PowerShell transport of large Unicode parameters and preservation of the
-  original statusline's stdin/stdout/exit code. Unix payloads use socket mocks.
-- `python scripts/test_codex_hook_transport.py`: 7 passed.
+  PowerShell transport of an idless approval with large Unicode parameters and
+  a standalone observer without Bash. Unix fixtures preserve the original
+  statusline's stdin/stdout/exit code and use socket mocks.
+- `python scripts/test_codex_hook_transport.py`: 7 passed during the original
+  PR validation; no Codex transport changes in the review repairs.
 - `pnpm build` and `pnpm exec tauri build --no-bundle`: passed.
 - `pnpm lint`: advisory baseline findings, including Tauri generated assets
   incorrectly included by the existing lint configuration. Comparison of the

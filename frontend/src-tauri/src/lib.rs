@@ -20243,8 +20243,10 @@ fn process_claude_event(
             .or_else(|| event.get("hookEvent"))
             .and_then(|v| v.as_str()).unwrap_or("").to_string();
         if raw_hook_event == "StatusLine" {
-            if let Some(summary) = harness_quota::observe_claude_usage(&event) {
-                let _ = app.emit("harness-quota-update", summary);
+            if harness_quota::observe_claude_usage(&event) {
+                // UI must re-enter credential selection before updating its
+                // aggregate quota; this session supplies no account/org ID.
+                let _ = app.emit("harness-quota-invalidated", "claude");
             }
             let mut sessions = state.lock().unwrap();
             if let Some(session) = sessions.get_mut(&session_id).filter(|s| s.source == "cc") {
@@ -20982,7 +20984,10 @@ fn process_claude_event(
 
                 if matches!(session.source.as_str(), "cc" | "codex" | "antigravity") {
                     let observed = interaction_state::from_hook(&event, &hook_event, &session.source);
-                    let retained = previous_interaction.filter(|p| !stop_was_interrupted && interaction_state::retain(p, &event, &hook_event));
+                    let retained = previous_interaction.filter(|p| {
+                        !stop_was_interrupted
+                            && interaction_state::retain(p, &event, &hook_event, &session.source)
+                    });
                     if let Some(interaction) = observed.or(retained) {
                         session.needs_review = Some(interaction.kind == "approval");
                         session.tool = interaction.tool.clone();
@@ -23725,6 +23730,7 @@ fn dispatch_claude_socket_event<S: std::io::Write>(
             ))
         });
     let result = process_claude_event(&buf, state, app, None);
+    let mut delivered = false;
     if let Some(res) = result.as_ref().filter(|r| r.accepted) {
         if let Some((ref sid, ref request)) = previous_request {
             let still_pending = state
@@ -23765,11 +23771,11 @@ fn dispatch_claude_socket_event<S: std::io::Write>(
                     .recv_timeout(std::time::Duration::from_secs(claude_permission::WAIT_SECS))
                 {
                     Ok(response) => {
-                        if stream
+                        delivered = stream
                             .write_all(response.as_bytes())
                             .and_then(|_| stream.flush())
-                            .is_err()
-                        {
+                            .is_ok();
+                        if !delivered {
                             log::warn!(
                                 "[claude_socket] approval response write failed session={}",
                                 c.session_id
@@ -23787,14 +23793,12 @@ fn dispatch_claude_socket_event<S: std::io::Write>(
     if let Some(c) = connection {
         claude_permission::cleanup(pending, &c.session_id, &c.request_id);
         let mut sessions = state.lock().unwrap();
-        if let Some(interaction) = sessions
-            .get_mut(&c.session_id)
-            .and_then(|s| s.pending_interaction.as_mut())
-        {
-            if interaction.request_id.as_deref() == Some(&c.request_id) {
-                // Keep the native waiting state until a lifecycle event resolves
-                // it, but no longer present a disconnected relay as actionable.
-                interaction.request_id = None;
+        if let Some(session) = sessions.get_mut(&c.session_id) {
+            if claude_permission::finish_interaction(
+                &mut session.pending_interaction,
+                &c.request_id,
+                delivered,
+            ) {
                 let _ = app.emit("claude-session-update", &c.session_id);
             }
         }
