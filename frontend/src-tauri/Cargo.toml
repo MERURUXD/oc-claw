@@ -53,3 +53,8 @@ encoding_rs = "0.8"
 tauri = { version = "2", features = ["macos-private-api", "tray-icon", "image-png"] }
 notify = { version = "6" }
 libc = "0.2"
+
+# tao 0.34.8 with the Windows event-loop runner count made atomic. Remove once
+# tauri-apps/tauri#15408 is fixed upstream; see vendor/tao/OC-CLAW-PATCH.md.
+[patch.crates-io]
+tao = { path = "vendor/tao" }
