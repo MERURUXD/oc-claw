@@ -1,6 +1,7 @@
 import type { TFunction } from 'i18next'
 import type { BubbleSessionDetail } from './types.ts'
 import { formatActivity } from './activityFormat.ts'
+import { formatClaudeToolActivity } from './claudeActivity.ts'
 
 export type BubbleStatusKind = 'answer' | 'approval' | 'running' | 'working'
 
@@ -142,11 +143,14 @@ export function resolveBubbleStatus(
   // 2. Running command state
   const isCommandActivity = isRunning && session.activity?.kind === 'command'
   const isCommandToolLegacy = session.status === 'tool_running' && isCommandLike(session.tool)
+  const claudeActivity = formatClaudeToolActivity(session, t)
 
   if (isCommandActivity || isCommandToolLegacy) {
     const statusLabel = t('mini.statusRunning', '正在运行')
     let cmd = ''
-    if (session.activity?.summary && session.activity.summary !== 'Running command' && session.activity.summary !== 'Ran command') {
+    if (claudeActivity) {
+      cmd = claudeActivity
+    } else if (session.activity?.summary && session.activity.summary !== 'Running command' && session.activity.summary !== 'Ran command') {
       cmd = session.activity.summary
     } else {
       const param = extractToolParam(session.toolInput)
@@ -166,6 +170,8 @@ export function resolveBubbleStatus(
 
   if (session.status === 'compacting') {
     content = t('mini.compacting', 'compacting...')
+  } else if (claudeActivity) {
+    content = claudeActivity
   } else if (isRunning && session.activity) {
     if (session.activity.kind === 'subagent') {
       content = t('mini.statusWaitingSubagents', '等待子代理')
