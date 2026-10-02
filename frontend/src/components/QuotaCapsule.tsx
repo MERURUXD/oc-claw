@@ -63,7 +63,7 @@ export function CodexIcon({ className = 'w-4 h-4' }: { className?: string }) {
 }
 
 /**
- * Hook to fetch and poll harness quota summary with 5-minute background interval
+ * Hook to poll Claude every 2 minutes and other harnesses every 5 minutes,
  * and manual refresh capability.
  */
 export function useHarnessQuota(harness: QuotaHarness | null | undefined) {
@@ -118,10 +118,11 @@ export function useHarnessQuota(harness: QuotaHarness | null | undefined) {
     // Initial fetch
     fetchQuota(false)
 
-    // Poll every 5 minutes in background
+    // Claude shares its upstream query budget with the native client; the
+    // backend coalesces mounted consumers and honours persisted 429 cooldowns.
     const interval = setInterval(() => {
       fetchQuota(false)
-    }, 300_000)
+    }, harness === 'claude' ? 120_000 : 300_000)
 
     return () => {
       unsub()
@@ -287,7 +288,7 @@ export function QuotaCard({
   const handleRefresh = propOnRefresh ?? hookResult.refresh
   const now = useQuotaTicker()
 
-  if (!data || !data.connected) {
+  if (!data || (!data.connected && !data.status_message)) {
     return null
   }
 
@@ -350,6 +351,11 @@ export function QuotaCard({
 
       {/* Rows: Each Window (Codeburn compact layout) */}
       <div className="flex flex-col gap-2.5">
+        {(data.status_message || allWindows.length === 0) && (
+          <p role="status" className="text-[11px] leading-relaxed text-white/60">
+            {data.status_message || '尚未收到 Claude 的配额数据。'}
+          </p>
+        )}
         {allWindows.map((win, idx) => {
           const remaining = Math.max(0, Math.min(100, Math.round(100 - win.percent)))
           const winLadder = getQuotaColorLadder(remaining)
@@ -457,7 +463,7 @@ export function QuotaMiniBadge({
   return (
     <span
       className={`mascot-bubble-quota-badge inline-flex items-center gap-1 h-[18px] px-1.5 rounded-full text-[10px] font-medium font-mono tabular-nums border shrink-0 transition-colors select-none ${toneInfo.className}`}
-      title={`${harnessLabel} ${primary.label || '配额'}: 剩余 ${remainingPercent}%${countdown ? ` (重置倒计时: ${countdown})` : ''}`}
+      title={`${harnessLabel} ${primary.label || '配额'}: 剩余 ${remainingPercent}%${countdown ? ` (重置倒计时: ${countdown})` : ''}${data.status_message ? ` · ${data.status_message}` : ''}`}
     >
       {toneInfo.hasDot && <span className={`w-1 h-1 rounded-full shrink-0 ${toneInfo.dotClass}`} />}
       <span>{remainingPercent}%</span>
@@ -562,7 +568,7 @@ export function QuotaSideRail({
       name: HARNESS_DISPLAY_NAMES.codex,
     })
   }
-  if (claude.data && claude.data.connected) {
+  if (claude.data && (claude.data.connected || claude.data.status_message)) {
     items.push({
       harness: 'claude',
       data: claude.data,
@@ -667,7 +673,7 @@ export function QuotaSideRail({
         const primary = item.data.primary || item.data.details[0]
         const remainingPercent = primary
           ? Math.max(0, Math.min(100, Math.round(100 - primary.percent)))
-          : 100
+          : 0
         const ladder = getQuotaColorLadder(remainingPercent)
         const countdown = primary?.resets_at
           ? formatCountdown(primary.resets_at, now, { short: true })
@@ -693,7 +699,7 @@ export function QuotaSideRail({
                   ? 'ring-2 ring-white/30 scale-105'
                   : 'hover:scale-105 active:scale-95'
               }`}
-              title={`${item.name} · 剩余 ${remainingPercent}%${countdown ? ` (重置倒计时: ${countdown})` : ''}`}
+              title={primary ? `${item.name} · 剩余 ${remainingPercent}%${countdown ? ` (重置倒计时: ${countdown})` : ''}${item.data.status_message ? ` · ${item.data.status_message}` : ''}` : `${item.name} · ${item.data.status_message || '配额未知'}`}
             >
               {/* Corner/border SVG progress arc along the squircle */}
               <svg className="absolute inset-0 w-full h-full pointer-events-none" viewBox="0 0 44 44">
@@ -735,7 +741,7 @@ export function QuotaSideRail({
 
             {/* Percentage text right below (Clean white Codeburn style) */}
             <span className="text-xs font-semibold font-mono text-white text-center mt-1.5 leading-none">
-              {remainingPercent}%
+              {primary ? `${remainingPercent}%` : '—'}
             </span>
           </div>
         )
