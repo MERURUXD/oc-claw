@@ -4105,9 +4105,13 @@ async fn set_ime_mode(_app: tauri::AppHandle, _active: bool) -> Result<(), Strin
 /// Resize/reposition the mini window between collapsed and expanded states.
 #[tauri::command]
 async fn set_mini_expanded(app: tauri::AppHandle, expanded: bool, position: Option<String>, efficiency: Option<bool>, #[allow(unused_variables)] max_height: Option<f64>, mascot_scale: Option<f64>, large_mascot: Option<bool>, keep_position: Option<bool>, large_mascot_scale: Option<f64>) -> Result<(), String> {
-    MINI_IS_EXPANDED.store(expanded, Ordering::SeqCst);
     #[cfg(target_os = "windows")]
-    mascot_geometry::platform::set_mini_layout_owned(true);
+    let _geometry_update_guard = PET_GEOMETRY_UPDATE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    #[cfg(target_os = "windows")]
+    let mut layout_guard = mascot_geometry::platform::begin_mini_layout();
+    MINI_IS_EXPANDED.store(expanded, Ordering::SeqCst);
     if !expanded {
         BUBBLE_GEOMETRY.lock().unwrap().anchor = None;
     }
@@ -4250,8 +4254,11 @@ async fn set_mini_expanded(app: tauri::AppHandle, expanded: bool, position: Opti
                     "[mini-pos] set_mini_expanded(win,expanded) frame x={:.1} y={:.1} w={:.1} h={:.1} ui={:.2}",
                     x, y, win_w, win_h, ui
                 );
-                let _ = win.set_size(tauri::LogicalSize::new(win_w, win_h));
-                let _ = win.set_position(tauri::LogicalPosition::new(x, y));
+                win.set_size(tauri::LogicalSize::new(win_w, win_h))
+                    .map_err(|e| e.to_string())?;
+                win.set_position(tauri::LogicalPosition::new(x, y))
+                    .map_err(|e| e.to_string())?;
+                layout_guard.keep_owned();
                 if let Ok(mut f) = MINI_WINDOW_FRAME.lock() {
                     *f = Some((x, y, win_w, win_h));
                 }
@@ -4289,8 +4296,7 @@ async fn set_mini_expanded(app: tauri::AppHandle, expanded: bool, position: Opti
                         final_y = y;
                     }
                 }
-                let _guard = PET_GEOMETRY_UPDATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-                mascot_geometry::platform::set_mini_layout_owned(false);
+                layout_guard.release();
                 let body = mascot_geometry::platform::body_for_frame(&win, win_w, win_h);
                 let applied = set_window_frame_atomic(&win, final_x, final_y, win_w, win_h, body)?;
                 set_mini_window_frame(applied);
@@ -6733,7 +6739,11 @@ async fn set_mini_size(
     large_mascot_scale: Option<f64>,
 ) -> Result<(), String> {
     #[cfg(target_os = "windows")]
-    mascot_geometry::platform::set_mini_layout_owned(true);
+    let _geometry_update_guard = PET_GEOMETRY_UPDATE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    #[cfg(target_os = "windows")]
+    let mut layout_guard = mascot_geometry::platform::begin_mini_layout();
     if restore {
         MINI_IS_EXPANDED.store(false, Ordering::SeqCst);
         BUBBLE_GEOMETRY.lock().unwrap().anchor = None;
@@ -6957,8 +6967,7 @@ async fn set_mini_size(
                     let x = mx + if pos == "left" { sw / 2.0 - notch_off - win_w } else { sw / 2.0 + notch_off };
                     (x, my + (MASCOT_TOP_INSET * ui).round())
                 };
-                let _guard = PET_GEOMETRY_UPDATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-                mascot_geometry::platform::set_mini_layout_owned(false);
+                layout_guard.release();
                 let body = mascot_geometry::platform::body_for_frame(&win, win_w, win_h);
                 set_mini_window_frame(set_window_frame_atomic(&win, x, y, win_w, win_h, body)?);
             } else {
@@ -6966,8 +6975,11 @@ async fn set_mini_size(
                 let win_h = (sh * 0.85).round();
                 let x = mx + (sw - win_w) / 2.0;
                 let _ = win.set_always_on_top(want_top && !PRESENTATION.active());
-                let _ = win.set_size(tauri::LogicalSize::new(win_w, win_h));
-                let _ = win.set_position(tauri::LogicalPosition::new(x, my));
+                win.set_size(tauri::LogicalSize::new(win_w, win_h))
+                    .map_err(|e| e.to_string())?;
+                win.set_position(tauri::LogicalPosition::new(x, my))
+                    .map_err(|e| e.to_string())?;
+                layout_guard.keep_owned();
             }
         }
     }

@@ -3,6 +3,50 @@
 //! horizontally, but the visible body must stay above the taskbar.
 
 use serde::{Deserialize, Serialize};
+#[cfg(any(target_os = "windows", test))]
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Temporary layout ownership must end even if a monitor/window disappears.
+/// Callers serialize transitions with PET_GEOMETRY_UPDATE_LOCK; only a completed
+/// panel/settings layout may retain ownership beyond this scope.
+#[cfg(any(target_os = "windows", test))]
+pub struct MiniLayoutGuard<'a> {
+    owned: &'a AtomicBool,
+    release_on_drop: bool,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl<'a> MiniLayoutGuard<'a> {
+    fn new(owned: &'a AtomicBool) -> Self {
+        owned.store(true, Ordering::SeqCst);
+        Self {
+            owned,
+            release_on_drop: true,
+        }
+    }
+
+    pub fn release(&mut self) {
+        self.owned.store(false, Ordering::SeqCst);
+    }
+
+    pub fn keep_owned(mut self) {
+        self.release_on_drop = false;
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl Drop for MiniLayoutGuard<'_> {
+    fn drop(&mut self) {
+        if self.release_on_drop {
+            self.release();
+        }
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn mini_layout_owned(owned: &AtomicBool, expanded: bool) -> bool {
+    owned.load(Ordering::SeqCst) || expanded
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Rect {
@@ -92,17 +136,18 @@ pub mod platform {
     // The probe's full rotation envelope is distinct from its interaction hitbox.
     // Canvas dimensions prevent a stale probe envelope constraining a panel.
     static MOTION_BOUNDS: Mutex<Vec<(String, f64, f64, Rect)>> = Mutex::new(Vec::new());
-    static MINI_LAYOUT_OWNED: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
+    static MINI_LAYOUT_OWNED: AtomicBool = AtomicBool::new(false);
 
-    pub fn set_mini_layout_owned(owned: bool) {
-        MINI_LAYOUT_OWNED.store(owned, std::sync::atomic::Ordering::SeqCst);
+    pub fn begin_mini_layout() -> MiniLayoutGuard<'static> {
+        MiniLayoutGuard::new(&MINI_LAYOUT_OWNED)
     }
 
     pub fn layout_owned(win: &tauri::WebviewWindow) -> bool {
         win.label() == "mini"
-            && (MINI_LAYOUT_OWNED.load(std::sync::atomic::Ordering::SeqCst)
-                || crate::MINI_IS_EXPANDED.load(std::sync::atomic::Ordering::SeqCst))
+            && mini_layout_owned(
+                &MINI_LAYOUT_OWNED,
+                crate::MINI_IS_EXPANDED.load(Ordering::SeqCst),
+            )
     }
 
     pub fn set_motion_bounds(label: &str, canvas_w: f64, canvas_h: f64, bounds: Option<Rect>) {
@@ -379,6 +424,76 @@ pub fn is_mascot_label(label: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collapse_and_settings_restore_resume_floor_after_monitor_recovers() {
+        // Both commands clear MINI_IS_EXPANDED before looking up the monitor.
+        // A missing monitor skips the resize; an API/window error may return early.
+        fn interrupted_restore(
+            owned: &AtomicBool,
+            monitor: Result<Option<Rect>, &'static str>,
+        ) -> Result<(), &'static str> {
+            let _layout_guard = MiniLayoutGuard::new(owned);
+            let _monitor = monitor?;
+            Ok(())
+        }
+
+        let work = Rect {
+            left: 0.0,
+            top: 0.0,
+            width: 1920.0,
+            height: 1032.0,
+        };
+        let body = Rect {
+            left: 0.0,
+            top: 20.0,
+            width: 100.0,
+            height: 140.0,
+        };
+        for was_owned in [false, true] {
+            for unavailable in [Ok(None), Err("monitor unavailable")] {
+                let owned = AtomicBool::new(was_owned);
+                assert_eq!(
+                    interrupted_restore(&owned, unavailable),
+                    unavailable.map(|_| ())
+                );
+                // The same ownership check gates both poll and constrain. Once
+                // the monitor is back, no further layout command is needed.
+                assert!(!mini_layout_owned(&owned, false));
+                let recovered_y = if mini_layout_owned(&owned, false) {
+                    950.0
+                } else {
+                    floor_y(950.0, body, work)
+                };
+                assert_eq!(recovered_y, 872.0);
+                assert_eq!(body.translated(0.0, recovered_y).bottom(), work.bottom());
+            }
+        }
+    }
+
+    #[test]
+    fn collapsed_resize_releases_before_floor_check_and_on_later_error() {
+        let owned = AtomicBool::new(true);
+        let failed_resize = (|| -> Result<(), &'static str> {
+            let mut guard = MiniLayoutGuard::new(&owned);
+            assert!(mini_layout_owned(&owned, false));
+            guard.release();
+            assert!(!mini_layout_owned(&owned, false));
+            Err("native resize failed")
+        })();
+        assert!(failed_resize.is_err());
+        assert!(!mini_layout_owned(&owned, false));
+    }
+
+    #[test]
+    fn completed_panel_or_settings_layout_keeps_ownership_until_restore() {
+        let owned = AtomicBool::new(false);
+        MiniLayoutGuard::new(&owned).keep_owned();
+        assert!(mini_layout_owned(&owned, false)); // Settings need no expanded flag.
+        assert!(mini_layout_owned(&owned, true));
+        drop(MiniLayoutGuard::new(&owned));
+        assert!(!mini_layout_owned(&owned, false));
+    }
 
     #[test]
     fn floor_uses_body_not_transparent_canvas_and_preserves_horizontal_peek() {
