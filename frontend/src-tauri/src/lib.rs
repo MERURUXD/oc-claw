@@ -6,6 +6,7 @@ use std::time::SystemTime;
 
 mod presentation;
 mod interaction_state;
+mod mascot_geometry;
 mod claude_permission;
 mod claude_metadata;
 mod claude_desktop;
@@ -3738,8 +3739,7 @@ async fn move_mini_by(app: tauri::AppHandle, dx: f64, dy: f64) -> Result<(), Str
             let scale = win.scale_factor().unwrap_or(1.0);
             let logical_x = pos.x as f64 / scale;
             let logical_y = pos.y as f64 / scale;
-            win.set_position(tauri::LogicalPosition::new(logical_x + dx, logical_y + dy))
-                .map_err(|e| e.to_string())?;
+            mascot_geometry::platform::set_position(&win, logical_x + dx, logical_y + dy)?;
             if let (Ok(new_pos), Ok(size)) = (win.outer_position(), win.outer_size()) {
                 let actual_scale = win.scale_factor().unwrap_or(scale);
                 let frame = (
@@ -3859,7 +3859,8 @@ async fn get_mini_monitor_rect(app: tauri::AppHandle) -> Result<(f64, f64, f64, 
 /// `confine` (default true) clamps the target into the current monitor's
 /// rect. Set `Some(false)` for live drag flows so the user can pull the
 /// mascot across to a neighbouring monitor — the per-monitor clamp here
-/// is what previously made cross-monitor drag impossible.
+/// is what previously made cross-monitor drag impossible. Windows still
+/// constrains the visible body's bottom above the target monitor's taskbar.
 #[tauri::command]
 async fn set_mini_origin(
     app: tauri::AppHandle,
@@ -3954,8 +3955,7 @@ async fn set_mini_origin(
             );
             let old = (win.outer_position(), win.outer_size());
             let old_scale = win.scale_factor().unwrap_or(1.0);
-            win.set_position(tauri::LogicalPosition::new(x, y))
-                .map_err(|e| e.to_string())?;
+            mascot_geometry::platform::set_position(&win, x, y)?;
             if let (Ok(old_pos), Ok(new_pos), Ok(size)) = (old.0, win.outer_position(), win.outer_size()) {
                 let new_scale = win.scale_factor().unwrap_or(old_scale);
                 let old_x = old_pos.x as f64 / old_scale;
@@ -3999,8 +3999,7 @@ async fn set_mini_origin(
                 "[mini-pos] set_mini_origin(win) clamped x={:.1}->{:.1} y={:.1}->{:.1} bounds x[{:.1},{:.1}] y[{:.1},{:.1}]",
                 x, clamped_x, y, clamped_y, min_x, max_x, min_y, max_y
             );
-            win.set_position(tauri::LogicalPosition::new(clamped_x, clamped_y))
-                .map_err(|e| e.to_string())?;
+            mascot_geometry::platform::set_position(&win, clamped_x, clamped_y)?;
             if let (Ok(pos), Ok(size)) = (win.outer_position(), win.outer_size()) {
                 let actual_scale = win.scale_factor().unwrap_or(scale);
                 set_mini_window_frame((
@@ -4018,8 +4017,7 @@ async fn set_mini_origin(
                 "[mini-pos] set_mini_origin(win,fallback) apply x={:.1} y={:.1} (with inset)",
                 x, y + MASCOT_TOP_INSET
             );
-            win.set_position(tauri::LogicalPosition::new(x, y + MASCOT_TOP_INSET))
-                .map_err(|e| e.to_string())?;
+            mascot_geometry::platform::set_position(&win, x, y + MASCOT_TOP_INSET)?;
             if let (Ok(pos), Ok(size)) = (win.outer_position(), win.outer_size()) {
                 let scale = win.scale_factor().unwrap_or(1.0);
                 set_mini_window_frame((
@@ -4036,6 +4034,67 @@ async fn set_mini_origin(
     Ok(())
 }
 
+/// Extra/demo mascot drag entrypoint. Only mascot windows may use it;
+/// Windows applies the same floor policy as the primary mascot.
+#[tauri::command]
+async fn set_mascot_origin(
+    app: tauri::AppHandle,
+    window_label: String,
+    x: f64,
+    y: f64,
+) -> Result<(), String> {
+    if !mascot_geometry::is_mascot_label(&window_label) || window_label == "mini" {
+        return Err("use set_mini_origin for the primary mascot".into());
+    }
+    if !x.is_finite() || !y.is_finite() {
+        return Err("invalid mascot origin".into());
+    }
+    let win = app
+        .get_webview_window(&window_label)
+        .ok_or("mascot window not found")?;
+    #[cfg(target_os = "windows")]
+    {
+        let _guard = PET_GEOMETRY_UPDATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        mascot_geometry::platform::set_position(&win, x, y)?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    win.set_position(tauri::LogicalPosition::new(x, y))
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Read-only animation integration point. Coordinates and distances are
+/// physical pixels; screen edges include intentional off-screen probe exposure.
+#[tauri::command]
+async fn get_mascot_geometry(
+    app: tauri::AppHandle,
+    window_label: String,
+) -> Result<Option<mascot_geometry::Snapshot>, String> {
+    if !mascot_geometry::is_mascot_label(&window_label) {
+        return Err("not a mascot window".into());
+    }
+    let win = app
+        .get_webview_window(&window_label)
+        .ok_or("mascot window not found")?;
+    #[cfg(target_os = "windows")]
+    {
+        let _guard = PET_GEOMETRY_UPDATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if mascot_geometry::platform::layout_owned(&win) {
+            return Ok(None);
+        }
+        return mascot_geometry::platform::snapshot(&win).map(Some);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = win;
+        Ok(None)
+    }
+}
+
 /// Kept as a compatibility no-op while macOS IME handling is fixed directly on
 /// the underlying Wry webview class.
 #[tauri::command]
@@ -4047,6 +4106,8 @@ async fn set_ime_mode(_app: tauri::AppHandle, _active: bool) -> Result<(), Strin
 #[tauri::command]
 async fn set_mini_expanded(app: tauri::AppHandle, expanded: bool, position: Option<String>, efficiency: Option<bool>, #[allow(unused_variables)] max_height: Option<f64>, mascot_scale: Option<f64>, large_mascot: Option<bool>, keep_position: Option<bool>, large_mascot_scale: Option<f64>) -> Result<(), String> {
     MINI_IS_EXPANDED.store(expanded, Ordering::SeqCst);
+    #[cfg(target_os = "windows")]
+    mascot_geometry::platform::set_mini_layout_owned(true);
     if !expanded {
         BUBBLE_GEOMETRY.lock().unwrap().anchor = None;
     }
@@ -4207,7 +4268,6 @@ async fn set_mini_expanded(app: tauri::AppHandle, expanded: bool, position: Opti
                 } else {
                     (mx, my)
                 };
-                let _ = win.set_size(tauri::LogicalSize::new(win_w, win_h));
                 if !keep_position.unwrap_or(false) {
                     if large_mascot.unwrap_or(false) {
                         // Large mascot defaults to bottom-right corner.
@@ -4217,7 +4277,6 @@ async fn set_mini_expanded(app: tauri::AppHandle, expanded: bool, position: Opti
                         let y = my + sh - win_h - margin;
                         final_x = x;
                         final_y = y;
-                        let _ = win.set_position(tauri::LogicalPosition::new(x, y));
                     } else {
                         let notch_off = (80.0 * ui).round();
                         let x = mx + if pos == "left" { sw / 2.0 - notch_off - win_w } else { sw / 2.0 + notch_off };
@@ -4228,12 +4287,13 @@ async fn set_mini_expanded(app: tauri::AppHandle, expanded: bool, position: Opti
                         );
                         final_x = x;
                         final_y = y;
-                        let _ = win.set_position(tauri::LogicalPosition::new(x, y));
                     }
                 }
-                if let Ok(mut f) = MINI_WINDOW_FRAME.lock() {
-                    *f = Some((final_x, final_y, win_w, win_h));
-                }
+                let _guard = PET_GEOMETRY_UPDATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                mascot_geometry::platform::set_mini_layout_owned(false);
+                let body = mascot_geometry::platform::body_for_frame(&win, win_w, win_h);
+                let applied = set_window_frame_atomic(&win, final_x, final_y, win_w, win_h, body)?;
+                set_mini_window_frame(applied);
             }
         }
         if !PRESENTATION.active() {
@@ -5814,6 +5874,7 @@ async fn set_pet_canvas_bounds(
     hitbox_w: Option<f64>,
     hitbox_h: Option<f64>,
     anchor_mode: Option<String>,
+    motion_bounds: Option<mascot_geometry::Rect>,
 ) -> Result<(), String> {
     let target_label = window_label.unwrap_or_else(|| "mini".to_string());
     let supplied_count = [canvas_w, canvas_h, hitbox_x, hitbox_y, hitbox_w, hitbox_h]
@@ -5831,6 +5892,14 @@ async fn set_pet_canvas_bounds(
         }
     }
     let has_bounds = supplied_count == 6;
+    if let Some(bounds) = motion_bounds {
+        if !has_bounds || !bounds.valid() || bounds.left < 0.0 || bounds.top < 0.0
+            || bounds.left + bounds.width > canvas_w.unwrap_or(0.0)
+            || bounds.top + bounds.height > canvas_h.unwrap_or(0.0)
+        {
+            return Err("invalid mascot motion bounds".into());
+        }
+    }
 
     #[cfg(target_os = "macos")]
     {
@@ -5943,7 +6012,8 @@ async fn set_pet_canvas_bounds(
                     }
                 }
             };
-            let native_frame = set_window_frame_atomic(&win, x, y, cw, ch)?;
+            let body = motion_bounds.unwrap_or(mascot_geometry::Rect { left: hx, top: hy, width: hw, height: hh });
+            let native_frame = set_window_frame_atomic(&win, x, y, cw, ch, body)?;
             let entry = MascotHitboxEntry { canvas_w: native_frame.2, canvas_h: native_frame.3, hitbox_x: hx, hitbox_y: hy, hitbox_w: hw, hitbox_h: hh };
             if target_label == "mini" {
                 set_mini_window_frame(native_frame);
@@ -5953,8 +6023,10 @@ async fn set_pet_canvas_bounds(
                 if let Ok(mut bounds) = PET_HITBOX_BOUNDS.lock() { *bounds = Some((hx, hy, hw, hh)); }
             }
             set_mascot_hitbox_entry(target_label.clone(), entry);
+            mascot_geometry::platform::set_motion_bounds(&target_label, native_frame.2, native_frame.3, motion_bounds);
         } else {
             remove_mascot_hitbox_entry(&target_label);
+            mascot_geometry::platform::set_motion_bounds(&target_label, 0.0, 0.0, None);
             if target_label == "mini" {
                 if let (Ok(pos), Ok(size)) = (win.outer_position(), win.outer_size()) {
                     let scale = win.scale_factor().unwrap_or(1.0);
@@ -6660,6 +6732,8 @@ async fn set_mini_size(
     large_mascot: Option<bool>,
     large_mascot_scale: Option<f64>,
 ) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    mascot_geometry::platform::set_mini_layout_owned(true);
     if restore {
         MINI_IS_EXPANDED.store(false, Ordering::SeqCst);
         BUBBLE_GEOMETRY.lock().unwrap().anchor = None;
@@ -6874,21 +6948,19 @@ async fn set_mini_size(
                 };
                 let win_w = (base_w * ui).round();
                 let win_h = (base_h * ui).round();
-                let _ = win.set_size(tauri::LogicalSize::new(win_w, win_h));
                 let _ = win.set_always_on_top(want_top && !PRESENTATION.active());
-                if large_mascot.unwrap_or(false) {
+                let (x, y) = if large_mascot.unwrap_or(false) {
                     let margin = (10.0 * ui).round();
-                    let x = mx + sw - win_w - margin;
-                    let y = my + sh - win_h - margin;
-                    let _ = win.set_position(tauri::LogicalPosition::new(x, y));
+                    (mx + sw - win_w - margin, my + sh - win_h - margin)
                 } else {
                     let notch_off = (80.0 * ui).round();
                     let x = mx + if pos == "left" { sw / 2.0 - notch_off - win_w } else { sw / 2.0 + notch_off };
-                    let _ = win.set_position(tauri::LogicalPosition::new(
-                        x,
-                        my + (MASCOT_TOP_INSET * ui).round(),
-                    ));
-                }
+                    (x, my + (MASCOT_TOP_INSET * ui).round())
+                };
+                let _guard = PET_GEOMETRY_UPDATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                mascot_geometry::platform::set_mini_layout_owned(false);
+                let body = mascot_geometry::platform::body_for_frame(&win, win_w, win_h);
+                set_mini_window_frame(set_window_frame_atomic(&win, x, y, win_w, win_h, body)?);
             } else {
                 let win_w = (sw * 0.85).round();
                 let win_h = (sh * 0.85).round();
@@ -12700,12 +12772,14 @@ fn set_window_frame_atomic(
     y: f64,
     width: f64,
     height: f64,
+    body: mascot_geometry::Rect,
 ) -> Result<(f64, f64, f64, f64), String> {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
         SetWindowPos, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER,
     };
 
+    let (x, y) = mascot_geometry::platform::constrain(win, x, y, body)?;
     let hwnd_raw = win.hwnd().map_err(|e| e.to_string())?.0;
     let scale = win.scale_factor().unwrap_or(1.0);
     let flags = SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER;
@@ -12714,7 +12788,7 @@ fn set_window_frame_atomic(
             HWND(hwnd_raw as _),
             HWND::default(),
             (x * scale).round() as i32,
-            (y * scale).round() as i32,
+            (y * scale).floor() as i32,
             (width * scale).round() as i32,
             (height * scale).round() as i32,
             flags,
@@ -12722,6 +12796,7 @@ fn set_window_frame_atomic(
         .map_err(|e| e.to_string())?;
     }
 
+    mascot_geometry::platform::reconcile_body(win, body)?;
     let actual_scale = win.scale_factor().unwrap_or(scale);
     let pos = win.outer_position().map_err(|e| e.to_string())?;
     let size = win.outer_size().map_err(|e| e.to_string())?;
@@ -24488,6 +24563,12 @@ pub fn run() {
                 }
             }
 
+            #[cfg(target_os = "windows")]
+            {
+                let app_handle = app.handle().clone();
+                std::thread::spawn(move || mascot_geometry::platform::poll(app_handle));
+            }
+
             // Windows: suppress presentation when a fullscreen app is on the SAME
             // monitor as the mini window. Restore without activation to avoid
             // a focus event expanding the panel. Native positions remain intact.
@@ -24666,7 +24747,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_antigravity_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, resolve_codex_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, get_build_info, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, sync_mascot_bubble, ensure_mascot_bubble, set_mascot_bubble_visible, get_mascot_presentation_suppressed, trace_bubble_event, set_bubble_runtime_trace, get_bubble_runtime_trace, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, set_pet_canvas_bounds, get_now_playing, get_system_idle_time, get_keyboard_idle_secs, fetch_petdex_manifest, download_codex_pet, delete_custom_codex_pet, get_hermes_remote_conversation, get_harness_quota])
+        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_mascot_origin, get_mascot_geometry, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_antigravity_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, resolve_codex_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, get_build_info, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, sync_mascot_bubble, ensure_mascot_bubble, set_mascot_bubble_visible, get_mascot_presentation_suppressed, trace_bubble_event, set_bubble_runtime_trace, get_bubble_runtime_trace, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, set_pet_canvas_bounds, get_now_playing, get_system_idle_time, get_keyboard_idle_secs, fetch_petdex_manifest, download_codex_pet, delete_custom_codex_pet, get_hermes_remote_conversation, get_harness_quota])
         .manage(ActiveAgentPid { pid: Mutex::new(None) })
         .manage(ClaudeState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
