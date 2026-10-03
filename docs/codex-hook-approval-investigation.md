@@ -81,3 +81,37 @@ approval-requiring operation with the hook disabled and enabled, under the same
 permission mode. Record native card timing separately from hook completion;
 repeat cancellation, mode switch, and unresponsive OC-Claw frontend cases. In
 automatic mode, preserve Codex's own outcome rather than expecting a card.
+
+## Follow-up: keep OC-Claw out of the approval gate (2026-10-03)
+
+The user reports that Codex Desktop 26.930.31730 still does not show native
+approval with OC-Claw at `863c1b3`. That revision already contains the
+observation-only scripts above, so the old blocking responder alone does not
+explain this report. The desktop's behavior has not been reproduced in this
+Linux workspace.
+
+The selected behavior is native Codex approval, with OC-Claw providing reminders
+and a jump action. The installer now removes OC-Claw's `PermissionRequest`
+registrations and does not recreate them. This removes our handler from that
+gate entirely. It keeps `PreToolUse` and native transcript observation for
+detectable escalation and permission requests, and leaves the empty-response
+compatibility path in place for previously loaded hooks. Other tools' approval
+handlers remain intact, including handlers sharing a matcher group with ours.
+Malformed JSON is reported instead of replaced; changed configuration is
+written through a sibling temporary file, and unchanged configuration is not
+rewritten.
+
+The approval panel's details now scroll without shrinking the command and
+justification blocks; its actions remain outside that scrolling area.
+
+After building and launching this revision, restart Codex so it reloads the
+hook configuration. Native approval timing, cancellation, and permission-mode
+changes still require verification on the affected Windows desktop.
+
+Validation: 185 frontend tests and the frontend build passed. Three registration
+tests passed in an isolated Rust crate using dependency versions and checksums
+from the repository lockfile. Headless Chromium checks using the actual approval
+JSX covered short commands, long commands/reasons, and questions. Frontend lint
+still reports its existing baseline; the touched component adds no findings.
+Full Tauri compilation was not run because this environment lacks the Linux
+GTK/WebKit development libraries. No installed hooks or running apps were changed.
