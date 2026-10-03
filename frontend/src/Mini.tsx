@@ -7433,9 +7433,9 @@ export default function Mini() {
                                        全部允许、自动批准。
                                        用途：让用户无需切换到终端即可快速处理权限请求。 */}
                                     {(isWaiting || isReview) && cs.source !== 'cursor' && !dismissedWaitingIds.has(cs.sessionId) && (
-                                      <div className="mt-2 flex flex-col" style={{ maxHeight: panelMaxHeight - 140 }}>
+                                      <div className="mt-2 flex flex-col" style={{ maxHeight: cs.source === 'codex' ? Math.max(160, panelMaxHeight - 140) : panelMaxHeight - 140 }}>
                                         {cs.source === 'codex' ? (
-                                          <div className="flex flex-col gap-2 mb-2" style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
+                                          <div className="flex flex-col gap-2 mb-2 overflow-y-auto scrollbar-thin [&>div]:shrink-0" style={{ flex: 1, minHeight: 0 }}>
                                             {cs.pendingInteraction?.kind === 'approval' ? (
                                               <>
                                                 <div className="flex items-center gap-2">
