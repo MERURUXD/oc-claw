@@ -97,6 +97,7 @@ import {
   EdgeProbeMachine,
   computeProbeEnvelope,
   computeRotatedBounds,
+  computeProbeMotionBounds,
   detectEdgeAtRest,
   probeWindowX,
   EDGE_IDLE_SECONDS,
@@ -1232,6 +1233,10 @@ export default function Mini() {
   }, [clearProbeTimer])
 
   const restoreProbeEnvelope = useCallback(async () => {
+    // Finish the active native probe move before restoring/clearing its motion
+    // bounds, so an old completion cannot reapply the expanded-envelope origin.
+    probeQueueRef.current.invalidate()
+    await probeQueueRef.current.drain()
     const envelope = probeEnvelopeRef.current
     const normalMetrics = probeNormalMetricsRef.current
     probeEnvelopeRef.current = null
@@ -1385,6 +1390,7 @@ export default function Mini() {
       if (!side) return
 
       const envelope = computeProbeEnvelope(normalMetrics)
+      const motion = computeProbeMotionBounds(normalMetrics)
       probeMonitorRef.current = monitor
       probeNormalMetricsRef.current = normalMetrics
       probeEnvelopeRef.current = envelope
@@ -1400,6 +1406,11 @@ export default function Mini() {
         hitboxW: envelope.bodyWidth,
         hitboxH: envelope.bodyHeight,
         anchorMode: 'bottom-right',
+        motionBounds: {
+          ...motion,
+          left: motion.left + envelope.contentOffsetX,
+          top: motion.top + envelope.contentOffsetY,
+        },
       })
 
       if (!probeEnvelopeRef.current) return

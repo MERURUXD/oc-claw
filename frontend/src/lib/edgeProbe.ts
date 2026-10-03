@@ -122,21 +122,33 @@ export function computeRotatedBounds(
   }
 }
 
+/** Swept body bounds for the entire probe transition, including the extrema
+ * between 0 and 45 degrees. Reserving this before rotating keeps the floor
+ * stable while clicking/straightening instead of moving Y on every frame.
+ */
+export function computeProbeMotionBounds(metrics: PetRenderMetricsLite) {
+  const { width, height } = metrics.hitbox
+  const limit = EDGE_PROBE_ANGLE * Math.PI / 180
+  const widthAngle = Math.min(limit, Math.atan2(height, width))
+  const heightAngle = Math.min(limit, Math.atan2(width, height))
+  const sweptWidth = width * Math.cos(widthAngle) + height * Math.sin(widthAngle)
+  const sweptHeight = height * Math.cos(heightAngle) + width * Math.sin(heightAngle)
+  return {
+    left: metrics.hitbox.left + width / 2 - sweptWidth / 2,
+    top: metrics.hitbox.top + height / 2 - sweptHeight / 2,
+    width: sweptWidth,
+    height: sweptHeight,
+  }
+}
+
 /**
  * Universally calculates the expanded canvas envelope and placement offsets for any pet.
  * Ensures the rotated body at +/-45 degrees around its true body center never clips
  * against either DOM container bounds or native window borders.
  */
 export function computeProbeEnvelope(metrics: PetRenderMetricsLite): ProbeEnvelope {
-  const bodyCenterX = metrics.hitbox.left + metrics.body.width / 2
-  const bodyCenterY = metrics.hitbox.top + metrics.body.height / 2
-
-  // AABB at 45 degrees rotation
-  const rotatedAABB = computeRotatedBounds(
-    metrics.hitbox,
-    { x: bodyCenterX, y: bodyCenterY },
-    EDGE_PROBE_ANGLE,
-  )
+  // Cover the full sweep, whose maximum height/width need not occur at 45°.
+  const rotatedAABB = computeProbeMotionBounds(metrics)
 
   const extraLeft = Math.max(0, -rotatedAABB.left)
   const extraTop = Math.max(0, -rotatedAABB.top)

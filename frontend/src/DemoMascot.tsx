@@ -10,6 +10,7 @@ import { loadCodexPetById, loadDefaultCodexPet, type CodexPetState } from './lib
 import { getPetAspectRatio, getPetRenderMetrics, isVideoPet, type PetAsset } from './lib/petAsset'
 import { clearReactionIfCurrent } from './lib/videoPet'
 import { classifyMascotPointerOutcome } from './lib/mascotInteraction'
+import { createLatestWinsSerialQueue, type LatestWinsSerialQueue } from './lib/miniPetGeometry'
 import {
   advanceShenshenLifecyclePlayback,
   createShenshenAnimationScheduler,
@@ -232,6 +233,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
   const [hitboxHovered, setHitboxHovered] = useState(false)
   const [size, setSize] = useState(DEFAULT_MASCOT_SIZE)
   const dragActiveRef = useRef(false)
+  const dragPositionQueueRef = useRef<LatestWinsSerialQueue<{ x: number; y: number }> | null>(null)
   const actualDraggingRef = useRef(false)
   const baseSizeRef = useRef(MASCOT_BASE_SIZE)
   const largeScaleRef = useRef(5)
@@ -261,7 +263,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
     if (!currentPet || newSize <= 0) return
     const win = getCurrentWebviewWindow()
     const metrics = getPetRenderMetrics(currentPet, newSize)
-    if (isVideoPet(currentPet)) {
+    if (isWindowsPlatform || isVideoPet(currentPet)) {
       invoke('set_pet_canvas_bounds', {
         windowLabel: win.label,
         canvasW: metrics.canvas.width,
@@ -291,7 +293,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
   const isVideo = pet ? isVideoPet(pet) : false
   useEffect(() => {
     return () => {
-      if (isVideo) {
+      if (isWindowsPlatform || isVideo) {
         const win = getCurrentWebviewWindow()
         invoke('set_pet_canvas_bounds', {
           windowLabel: win.label,
@@ -487,6 +489,13 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
     e.preventDefault()
     dragActiveRef.current = true
     const win = getCurrentWebviewWindow()
+    if (!dragPositionQueueRef.current) {
+      dragPositionQueueRef.current = createLatestWinsSerialQueue(({ x, y }) => isWindowsPlatform
+        ? invoke('set_mascot_origin', { windowLabel: win.label, x, y })
+        : win.setPosition(new LogicalPosition(x, y)))
+    }
+    const positionQueue = dragPositionQueueRef.current
+    let active = true
     const startX = e.screenX
     const startY = e.screenY
     let lastX = e.screenX
@@ -518,7 +527,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
 
     const flushPosition = () => {
       rafId = null
-      if (!originReady || !dragActiveRef.current) return
+      if (!originReady || !active) return
       if (positionInFlight) {
         positionDirty = true
         return
@@ -526,11 +535,12 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
       positionInFlight = true
       const x = targetX
       const y = targetY
-      win.setPosition(new LogicalPosition(x, y))
+      const request = positionQueue.enqueue({ x, y })
+      request
         .catch(() => {})
         .finally(() => {
           positionInFlight = false
-          if (positionDirty && dragActiveRef.current) {
+          if (positionDirty && active) {
             positionDirty = false
             schedulePosition()
           }
@@ -572,6 +582,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
     }
 
     const cleanup = () => {
+      active = false
       dragActiveRef.current = false
       actualDraggingRef.current = false
       if (rafId !== null) {
@@ -579,7 +590,7 @@ export function DemoMascot({ functional = false }: { functional?: boolean } = {}
         rafId = null
       }
       if (originReady) {
-        win.setPosition(new LogicalPosition(targetX, targetY)).catch(() => {})
+        positionQueue.enqueue({ x: targetX, y: targetY }).catch(() => {})
       }
       setWalkDir(0)
       setDragging(false)

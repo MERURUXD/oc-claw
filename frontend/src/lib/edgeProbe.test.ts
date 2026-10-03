@@ -4,6 +4,7 @@ import {
   detectEdgeAtRest,
   computeRotatedBounds,
   computeProbeEnvelope,
+  computeProbeMotionBounds,
   probeWindowX,
   EdgeProbeMachine,
   type PetRenderMetricsLite,
@@ -139,6 +140,34 @@ test('probeWindowX: calculates exact exposure on left and right edges', () => {
   // Rotated body right on screen: 1808 + 180 = 1988.
   // Rotated body left on screen: 1988 - 150 = 1838.
   // Portion on screen: 1920 - 1838 = 82 px ≈ 55%!
+})
+
+test('probe motion bounds contain every intermediate tilt without covering transparent canvas', () => {
+  for (const [width, height] of [[129, 140], [240, 60], [60, 240]]) {
+    const metrics: PetRenderMetricsLite = {
+      canvas: { width: width + 400, height: height + 400 },
+      body: { width, height },
+      hitbox: { left: 200, top: 200, width, height },
+    }
+    const swept = computeProbeMotionBounds(metrics)
+    const pivot = { x: 200 + width / 2, y: 200 + height / 2 }
+    const envelope = computeProbeEnvelope(metrics)
+    // Large transparent margins already contain the motion, so no expansion.
+    assert.equal(envelope.canvasWidth, metrics.canvas.width)
+    assert.ok(swept.width < metrics.canvas.width)
+    for (let angle = -45; angle <= 45; angle += 0.5) {
+      const rotated = computeRotatedBounds(metrics.hitbox, pivot, angle)
+      assert.ok(rotated.left >= swept.left - 1e-8)
+      assert.ok(rotated.top >= swept.top - 1e-8)
+      assert.ok(rotated.left + rotated.width <= swept.left + swept.width + 1e-8)
+      assert.ok(rotated.top + rotated.height <= swept.top + swept.height + 1e-8)
+      // Native Y can be reserved once for the swept bottom, and every pose
+      // will stay above the taskbar floor throughout click/return transitions.
+      const taskbarTop = 1032
+      const windowY = taskbarTop - (swept.top + swept.height)
+      assert.ok(windowY + rotated.top + rotated.height <= taskbarTop + 1e-8)
+    }
+  }
 })
 
 test('EdgeProbeMachine: full lifecycle from entry to click, straighten, hold, and return', () => {
