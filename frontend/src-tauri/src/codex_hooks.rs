@@ -2,12 +2,14 @@
 use serde_json::{json, Value};
 
 fn is_ours(handler: &Value) -> bool {
-    ["command", "command_windows"].iter().any(|key| {
-        handler
-            .get(key)
-            .and_then(Value::as_str)
-            .is_some_and(|command| command.contains("ooclaw-codex-hook"))
-    })
+    ["command", "command_windows", "commandWindows"]
+        .iter()
+        .any(|key| {
+            handler
+                .get(key)
+                .and_then(Value::as_str)
+                .is_some_and(|command| command.contains("ooclaw-codex-hook"))
+        })
 }
 
 pub fn register(config: &mut Value, command: &str, append_event: bool) -> Result<(), String> {
@@ -104,15 +106,17 @@ mod tests {
 
     #[test]
     fn migration_removes_old_gate_and_preserves_other_handlers_in_shared_groups() {
-        let external = json!({"type": "command", "command": "company-policy", "timeout": 20});
+        let external = json!({"type": "command", "command": "company-policy", "commandWindows": "company-policy.exe", "timeout": 20});
         let mut config = json!({
             "metadata": "keep",
             "hooks": {
                 "PermissionRequest": [
                     {"command": "ooclaw-codex-hook.sh", "timeout": 600},
+                    {"commandWindows": "pwsh ooclaw-codex-hook.ps1"},
                     {"hooks": [{"command_windows": "pwsh ooclaw-codex-hook.ps1"}]},
                     {"matcher": "Bash", "custom": "keep", "hooks": [
-                        {"command": "ooclaw-codex-hook.sh"}, external.clone()
+                        {"command": "ooclaw-codex-hook.sh"},
+                        {"commandWindows": "pwsh ooclaw-codex-hook.ps1"}, external.clone()
                     ]}
                 ],
                 "PreToolUse": [{"matcher": "Write", "hooks": [external.clone()]}]
@@ -134,10 +138,15 @@ mod tests {
 
     #[test]
     fn migration_removes_permission_event_when_only_our_hook_was_registered() {
-        let mut config = json!({"hooks": {"PermissionRequest": [
-            {"matcher": "*", "hooks": [{"command": "pwsh ooclaw-codex-hook.ps1 PermissionRequest", "timeout": 600}]}
-        ]}});
-        register(&mut config, "ooclaw-codex-hook.sh", false).unwrap();
-        assert!(config["hooks"].get("PermissionRequest").is_none());
+        for key in ["command", "command_windows", "commandWindows"] {
+            let mut handler = json!({"type": "command", "timeout": 600});
+            handler[key] = json!("pwsh ooclaw-codex-hook.ps1 PermissionRequest");
+            let mut config = json!({"hooks": {"PermissionRequest": [
+                handler.clone(),
+                {"matcher": "*", "hooks": [handler]}
+            ]}});
+            register(&mut config, "ooclaw-codex-hook.sh", false).unwrap();
+            assert!(config["hooks"].get("PermissionRequest").is_none(), "{key}");
+        }
     }
 }
