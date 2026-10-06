@@ -6,6 +6,7 @@ use std::time::SystemTime;
 
 mod presentation;
 mod interaction_state;
+mod codex_hooks;
 mod mascot_geometry;
 mod claude_permission;
 mod claude_metadata;
@@ -17555,102 +17556,35 @@ except:
     }
 
     let hooks_json_path = codex_dir.join("hooks.json");
-    let mut config: serde_json::Value = if hooks_json_path.exists() {
+    let original: serde_json::Value = if hooks_json_path.exists() {
         let content = std::fs::read_to_string(&hooks_json_path).map_err(|e| e.to_string())?;
-        serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
+        serde_json::from_str(&content).map_err(|e| {
+            format!("{} is not valid JSON ({e}); leaving it untouched", hooks_json_path.display())
+        })?
     } else {
         serde_json::json!({})
     };
-    if config.get("hooks").is_none() {
-        config["hooks"] = serde_json::json!({});
-    }
-    let hooks = config["hooks"].as_object_mut().ok_or("hooks is not an object")?;
+    let mut config = original.clone();
 
     #[cfg(windows)]
-    let hook_command_windows_base = format!(
+    let hook_command = format!(
         "{} -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
         get_powershell_executable(),
         hook_path.to_string_lossy().replace('\\', "/"),
     );
     #[cfg(not(windows))]
-    let hook_command_base = hook_path.to_string_lossy().to_string();
+    let hook_command = hook_path.to_string_lossy().to_string();
 
-    let has_our_hook = |entry: &serde_json::Value| -> bool {
-        let is_ours = |cmd: &str| -> bool {
-            cmd.contains("ooclaw-codex-hook")
-        };
-        entry.get("command").and_then(|c| c.as_str()).map_or(false, |c| is_ours(c))
-            || entry
-                .get("command_windows")
-                .and_then(|c| c.as_str())
-                .map_or(false, |c| is_ours(c))
-            || entry.get("hooks").and_then(|hs| hs.as_array()).map_or(false, |hs| {
-                hs.iter().any(|inner| {
-                    inner
-                        .get("command")
-                        .and_then(|c| c.as_str())
-                        .map_or(false, |c| is_ours(c))
-                        || inner
-                            .get("command_windows")
-                            .and_then(|c| c.as_str())
-                            .map_or(false, |c| is_ours(c))
-                })
-            })
-    };
-
-    for event_hooks in hooks.values_mut() {
-        if let Some(list) = event_hooks.as_array_mut() {
-            list.retain(|entry| !has_our_hook(entry));
-        }
+    codex_hooks::register(&mut config, &hook_command, cfg!(windows))?;
+    if config != original {
+        let tmp_path = codex_dir.join("hooks.json.ooclaw-tmp");
+        let json_str = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+        std::fs::write(&tmp_path, json_str).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp_path, &hooks_json_path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            e.to_string()
+        })?;
     }
-
-    #[cfg(windows)]
-    let make_hook_def = |event_name: &str| {
-        let hook_command = format!("{} {}", hook_command_windows_base, event_name);
-        let timeout = 5;
-        serde_json::json!({
-            "type": "command",
-            "command": hook_command.clone(),
-            "timeout": timeout,
-        })
-    };
-    #[cfg(not(windows))]
-    let make_hook_def = |_event_name: &str| {
-        let timeout = 5;
-        serde_json::json!({
-            "type": "command",
-            "command": hook_command_base.clone(),
-            "timeout": timeout,
-        })
-    };
-
-    let hook_configs = vec![
-        ("SessionStart", false),
-        ("SessionEnd", false),
-        ("Interrupt", false),
-        ("UserPromptSubmit", false),
-        ("PreToolUse", true),
-        ("PermissionRequest", true),
-        ("PostToolUse", true),
-        ("PreCompact", true),
-        ("PostCompact", true),
-        ("SubagentStart", true),
-        ("SubagentStop", true),
-        ("Stop", false),
-    ];
-    for (event_name, needs_matcher) in hook_configs {
-        let hook_def = make_hook_def(event_name);
-        let arr = hooks.entry(event_name.to_string()).or_insert(serde_json::json!([]));
-        let list = arr.as_array_mut().ok_or("hook event is not an array")?;
-        if needs_matcher {
-            list.push(serde_json::json!({"matcher": "*", "hooks": [hook_def.clone()]}));
-        } else {
-            list.push(serde_json::json!({"hooks": [hook_def.clone()]}));
-        }
-    }
-
-    let json_str = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
-    std::fs::write(&hooks_json_path, json_str).map_err(|e| e.to_string())?;
     ensure_codex_hooks_feature_enabled(&codex_dir)?;
 
     log::info!("[codex_hooks] installed hooks to {:?}", hooks_json_path);
